@@ -1,32 +1,38 @@
-```rust
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
+
+use crc32fast::Hasher;
+use memmap2::Mmap;
 
 use crate::error::FireLiteError;
 
 pub type Result<T> = std::result::Result<T, FireLiteError>;
 
-/// Log record layout
-///
-/// [record_len: u32]
-/// [key_len: u32]
-/// [key bytes]
-/// [doc_len: u32]
-/// [doc bytes]
-///
+/// Record structure returned by reads
 #[derive(Debug, Clone)]
 pub struct Record {
     pub key: String,
     pub doc: Vec<u8>,
 }
 
+/// Binary layout
+///
+/// [record_len u32]
+/// [crc32 u32]
+/// [key_len u32]
+/// [key bytes]
+/// [doc_len u32]
+/// [doc bytes]
+///
 pub struct Log {
     file: File,
+    writer: BufWriter<File>,
+    mmap: Option<Mmap>,
 }
 
 impl Log {
-    /// Open or create a log file
+    /// Open log file
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = OpenOptions::new()
             .create(true)
@@ -34,77 +40,118 @@ impl Log {
             .write(true)
             .open(path)?;
 
-        Ok(Self { file })
+        let writer = BufWriter::new(file.try_clone()?);
+
+        Ok(Self {
+            file,
+            writer,
+            mmap: None,
+        })
     }
 
-    /// Append a record to the end of the log
-    /// Returns the offset where the record was written
+    /// Append record to log
     pub fn append(&mut self, record: &Record) -> Result<u64> {
         let encoded = encode_record(record);
 
         let offset = self.file.seek(SeekFrom::End(0))?;
 
-        self.file.write_all(&encoded)?;
-        self.file.flush()?;
+        self.writer.write_all(&encoded)?;
 
         Ok(offset)
     }
 
-    /// Read record at specific offset
-    pub fn read_at(&mut self, offset: u64) -> Result<Record> {
-        self.file.seek(SeekFrom::Start(offset))?;
+    /// Flush buffered writes
+    pub fn flush(&mut self) -> Result<()> {
+        self.writer.flush()?;
+        self.file.sync_data()?;
 
-        // read record length
-        let mut len_buf = [0u8; 4];
-        self.file.read_exact(&mut len_buf)?;
+        // refresh mmap after writes
+        self.mmap = None;
 
-        let record_len = u32::from_le_bytes(len_buf) as usize;
-
-        // read remaining record bytes
-        let mut buf = vec![0u8; record_len];
-        self.file.read_exact(&mut buf)?;
-
-        decode_record(&buf)
+        Ok(())
     }
 
-    /// Scan the log and rebuild the primary index
-    ///
-    /// Returns Vec<(key, offset)>
+    /// Ensure mmap exists
+    fn ensure_mmap(&mut self) -> Result<()> {
+        if self.mmap.is_none() {
+            let mmap = unsafe { Mmap::map(&self.file)? };
+            self.mmap = Some(mmap);
+        }
+
+        Ok(())
+    }
+
+    /// Read record at offset
+    pub fn read_at(&mut self, offset: u64) -> Result<Record> {
+        self.ensure_mmap()?;
+
+        let mmap = self.mmap.as_ref().unwrap();
+
+        let mut pos = offset as usize;
+
+        if pos + 4 > mmap.len() {
+            return Err(FireLiteError::InvalidRecord);
+        }
+
+        let record_len =
+            u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()) as usize;
+
+        pos += 4;
+
+        let crc =
+            u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap());
+
+        pos += 4;
+
+        let record_bytes = &mmap[pos..pos + record_len];
+
+        verify_crc(record_bytes, crc)?;
+
+        decode_record(record_bytes)
+    }
+
+    /// Scan entire log and rebuild index
     pub fn scan(&mut self) -> Result<Vec<(String, u64)>> {
-        let mut index = Vec::new();
+        self.ensure_mmap()?;
 
-        self.file.seek(SeekFrom::Start(0))?;
+        let mmap = self.mmap.as_ref().unwrap();
 
-        let mut offset = 0u64;
+        let mut offset = 0usize;
+        let mut result = Vec::new();
 
-        loop {
-            let mut len_buf = [0u8; 4];
+        while offset + 8 < mmap.len() {
+            let record_len =
+                u32::from_le_bytes(mmap[offset..offset + 4].try_into().unwrap())
+                    as usize;
 
-            match self.file.read_exact(&mut len_buf) {
-                Ok(_) => {}
-                Err(_) => break,
-            }
+            let crc =
+                u32::from_le_bytes(mmap[offset + 4..offset + 8].try_into().unwrap());
 
-            let record_len = u32::from_le_bytes(len_buf) as usize;
+            let start = offset + 8;
+            let end = start + record_len;
 
-            let mut buf = vec![0u8; record_len];
-
-            if self.file.read_exact(&mut buf).is_err() {
+            if end > mmap.len() {
                 break;
             }
 
-            if let Ok(record) = decode_record(&buf) {
-                index.push((record.key, offset));
+            let record_bytes = &mmap[start..end];
+
+            if verify_crc(record_bytes, crc).is_err() {
+                break;
             }
 
-            offset += 4 + record_len as u64;
+            if let Ok(record) = decode_record(record_bytes) {
+                result.push((record.key, offset as u64));
+            }
+
+            offset = end;
         }
 
-        Ok(index)
+        Ok(result)
     }
 }
 
-/// Encode record into binary format
+/// Encode record
 fn encode_record(record: &Record) -> Vec<u8> {
     let key_bytes = record.key.as_bytes();
     let doc_bytes = &record.doc;
@@ -114,43 +161,42 @@ fn encode_record(record: &Record) -> Vec<u8> {
 
     let record_len = 4 + key_len + 4 + doc_len;
 
-    let mut buf = Vec::with_capacity((record_len + 4) as usize);
+    let mut record_buf = Vec::with_capacity(record_len as usize);
+
+    record_buf.extend(&key_len.to_le_bytes());
+    record_buf.extend(key_bytes);
+    record_buf.extend(&doc_len.to_le_bytes());
+    record_buf.extend(doc_bytes);
+
+    let mut hasher = Hasher::new();
+    hasher.update(&record_buf);
+    let crc = hasher.finalize();
+
+    let mut buf = Vec::with_capacity((record_len + 8) as usize);
 
     buf.extend(&(record_len as u32).to_le_bytes());
-    buf.extend(&key_len.to_le_bytes());
-    buf.extend(key_bytes);
-    buf.extend(&doc_len.to_le_bytes());
-    buf.extend(doc_bytes);
+    buf.extend(&crc.to_le_bytes());
+    buf.extend(record_buf);
 
     buf
 }
 
-/// Decode record from binary format
+/// Decode record
 fn decode_record(buf: &[u8]) -> Result<Record> {
     let mut pos = 0;
 
-    // key_len
-    let key_len = u32::from_le_bytes(
-        buf[pos..pos + 4]
-            .try_into()
-            .map_err(|_| FireLiteError::InvalidRecord)?,
-    ) as usize;
+    let key_len =
+        u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
 
     pos += 4;
 
-    let key = String::from_utf8(
-        buf[pos..pos + key_len].to_vec(),
-    )
-    .map_err(|_| FireLiteError::InvalidRecord)?;
+    let key = String::from_utf8(buf[pos..pos + key_len].to_vec())
+        .map_err(|_| FireLiteError::InvalidRecord)?;
 
     pos += key_len;
 
-    // doc_len
-    let doc_len = u32::from_le_bytes(
-        buf[pos..pos + 4]
-            .try_into()
-            .map_err(|_| FireLiteError::InvalidRecord)?,
-    ) as usize;
+    let doc_len =
+        u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
 
     pos += 4;
 
@@ -158,4 +204,16 @@ fn decode_record(buf: &[u8]) -> Result<Record> {
 
     Ok(Record { key, doc })
 }
-```
+
+/// Verify CRC integrity
+fn verify_crc(data: &[u8], expected: u32) -> Result<()> {
+    let mut hasher = Hasher::new();
+    hasher.update(data);
+    let crc = hasher.finalize();
+
+    if crc != expected {
+        return Err(FireLiteError::InvalidRecord);
+    }
+
+    Ok(())
+}
