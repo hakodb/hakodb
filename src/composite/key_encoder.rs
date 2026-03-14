@@ -73,3 +73,5 @@ fn encode_value(
         _ => {}
     }
 }
+
+pub fn encode_doc_id(doc_id: &str, buf: &mut Vec<u8>) { buf.push(doc_id.len() as u8); buf.extend(doc_id.as_bytes()); }
