@@ -13,10 +13,17 @@ pub struct Pointer {
     pub len: u32,
 }
 
+#[derive(Debug, Clone)]
+pub enum StorageMutation {
+    Put { key: String, value: Vec<u8> },
+    Delete { key: String },
+}
+
 pub struct StorageEngine {
     segment: Segment,
     wal: Wal,
     index: HashMap<String, Pointer>,
+    next_tx_id: u64,
 }
 
 impl StorageEngine {
@@ -29,6 +36,7 @@ impl StorageEngine {
             segment,
             wal,
             index: HashMap::new(),
+            next_tx_id: 1,
         };
         engine.recover()?;
         Ok(engine)
@@ -53,24 +61,69 @@ impl StorageEngine {
                 WalOp::Delete { key } => {
                     self.index.remove(&key);
                 }
+                WalOp::BeginTx { .. } | WalOp::CommitTx { .. } => {}
             }
         }
         Ok(())
     }
 
-    pub fn put(&mut self, key: String, value: &[u8]) -> Result<()> {
-        let offset = self.segment.append(value)?;
-        let pointer = Pointer {
-            offset,
-            len: value.len() as u32,
-        };
-        self.wal.append(&WalOp::Put {
-            key: key.clone(),
-            segment_offset: pointer.offset,
-            len: pointer.len,
-        })?;
-        self.index.insert(key, pointer);
+    pub fn apply_batch(&mut self, mutations: &[StorageMutation]) -> Result<()> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+
+        let tx_id = self.next_tx_id;
+        self.next_tx_id += 1;
+
+        let mut wal_ops = Vec::with_capacity(mutations.len() + 2);
+        wal_ops.push(WalOp::BeginTx { tx_id });
+
+        let mut index_updates = Vec::with_capacity(mutations.len());
+
+        for mutation in mutations {
+            match mutation {
+                StorageMutation::Put { key, value } => {
+                    let offset = self.segment.append(value)?;
+                    let pointer = Pointer {
+                        offset,
+                        len: value.len() as u32,
+                    };
+                    wal_ops.push(WalOp::Put {
+                        key: key.clone(),
+                        segment_offset: pointer.offset,
+                        len: pointer.len,
+                    });
+                    index_updates.push((key.clone(), Some(pointer)));
+                }
+                StorageMutation::Delete { key } => {
+                    wal_ops.push(WalOp::Delete { key: key.clone() });
+                    index_updates.push((key.clone(), None));
+                }
+            }
+        }
+
+        wal_ops.push(WalOp::CommitTx { tx_id });
+        self.wal.append_batch(&wal_ops)?;
+
+        for (key, pointer) in index_updates {
+            match pointer {
+                Some(pointer) => {
+                    self.index.insert(key, pointer);
+                }
+                None => {
+                    self.index.remove(&key);
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    pub fn put(&mut self, key: String, value: &[u8]) -> Result<()> {
+        self.apply_batch(&[StorageMutation::Put {
+            key,
+            value: value.to_vec(),
+        }])
     }
 
     pub fn get(&mut self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -81,11 +134,9 @@ impl StorageEngine {
     }
 
     pub fn delete(&mut self, key: &str) -> Result<()> {
-        self.wal.append(&WalOp::Delete {
+        self.apply_batch(&[StorageMutation::Delete {
             key: key.to_string(),
-        })?;
-        self.index.remove(key);
-        Ok(())
+        }])
     }
 
     pub fn scan_prefix(&mut self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
