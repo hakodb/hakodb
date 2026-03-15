@@ -1,44 +1,57 @@
 # FireLite
 
-FireLite is a Rust-native embedded document database inspired by Google Firestore’s developer ergonomics and SQLite’s deployability.
+FireLite is a Rust-native embedded document database inspired by Google Firestore ergonomics and SQLite-style embedding.
 
-It is designed to run in-process (no external server), store typed binary documents, and provide durable local persistence with transactional write batching.
+It runs in-process (no external service), stores typed binary documents, and provides local durability through a WAL + segment storage engine.
 
 ---
 
-## Current Project Status
+## Current Status (Updated)
 
-FireLite is currently in **active foundational development**.
+FireLite is in **advanced foundation stage**: core architecture is in place and multiple end-to-end features are implemented, but production hardening is still in progress.
 
-### Implemented Today
+### Implemented
 
-- Embedded Rust library API (`FireLite`) with:
-  - `open`
-  - `put`
-  - `get`
-  - `delete`
-  - `query`
-  - `compact`
-  - `write_batch` (atomic multi-mutation commit)
-- Binary document format (`FireLiteDoc`) with typed values and decode support
-- WAL + segment-backed storage engine
-- Transaction markers in WAL (`BeginTx`/`CommitTx`) and replay of committed transactions
-- Storage-level batch mutation application (`apply_batch`)
-- Basic composite index definitions and manager
-- Query planner/executor with filtering, ordering, limits, and parallel task sharding
-- mmap-backed memory layer and page cache modules
-- Basic examples and unit tests
+- Core engine API (`FireLite`)
+  - `open`, `put`, `get`, `delete`, `query`, `compact`, `flush`
+  - batched writes via `write_batch`
+- Transaction workflow
+  - `begin_transaction` + staged mutations + `commit`
+  - serialized commit path for atomic multi-document writes
+- Durable storage stack
+  - segment-backed value storage
+  - WAL with transactional markers (`BeginTx` / `CommitTx`)
+  - committed-op recovery replay
+- Durability tuning
+  - configurable `DurabilityMode`: `Always`, `Interval`, `Manual`
+  - group commit control via `group_commit_max_ops`
+- Query features
+  - filters (`Eq`, `Ne`, `Gt`, `Gte`, `Lt`, `Lte`)
+  - ordering and limit
+  - parallel task-sharded execution
+- Composite indexes
+  - index definitions and manager
+  - planner hook for equality composite scans
+  - executor candidate pruning via exact-match composite lookup
+- Real-time local watch streams
+  - `watch_collection` with change events (`Put`/`Delete`)
+- Subcollections
+  - `put_subdocument`, `get_subdocument`, `delete_subdocument`, `query_subcollection`
+- Document layer
+  - `FireLiteDoc` typed binary format
+  - `FireLiteDocView` read path for borrowed decoding
+- Performance scaffolding
+  - Criterion benchmark target
+  - CI workflow to run benchmark job
 
-### Not Yet Production-Ready (Important)
+### Still Missing for True Production Readiness
 
-FireLite has important missing pieces before real-world production use, including but not limited to:
-
-- Formal on-disk format compatibility/versioning guarantees
-- Robust crash-consistency semantics for index + storage dual-write reconciliation
-- Complete Firestore feature parity (subcollections, realtime listeners, auth rules, etc.)
-- Comprehensive benchmarking, fuzzing, and fault-injection validation
-- Security hardening and encryption-at-rest
-- Operational observability (metrics/tracing/logging maturity)
+- Full serializable transaction model with conflict detection/version checks
+- Strong index + data transactional coupling guarantees under all crash scenarios
+- Multi-segment LSM-style compaction tiers and background compaction scheduler
+- Cost-based planner and deeper predicate/index pushdown
+- Broader zero-copy query path (decode minimization across full pipeline)
+- Encryption at rest, auth/rules model, audit logging, and stronger hardening
 
 ---
 
@@ -57,10 +70,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     doc.insert("name", Value::String("alice".to_string()));
     doc.insert("age", Value::Int(30));
 
-    // Single write
     db.put("users", "1", &doc)?;
 
-    // Atomic write batch (multiple mutations committed as one unit)
     db.write_batch(vec![
         BatchMutation::Put {
             collection: "users".into(),
@@ -73,16 +84,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     ])?;
 
-    let loaded = db.get("users", "1")?;
-    println!("loaded = {:?}", loaded);
-
+    db.flush()?;
     Ok(())
 }
 ```
 
 ---
 
-## Architecture (Current)
+## Architecture
 
 ```text
 API (FireLite)
@@ -92,112 +101,78 @@ API (FireLite)
         -> Memory (mmap + page cache)
 ```
 
-High-level design goals:
-
-- Keep the API ergonomic and embedded
-- Keep writes durable and recoverable
-- Keep reads efficient with typed binary docs and indexing hooks
-- Keep module boundaries explicit for future evolution
-
 ---
 
-## Firestore Feature Comparison
-
-The table below compares Firestore capabilities with FireLite’s current status.
+## Firestore Comparison (Updated)
 
 Legend:
-
 - ✅ Implemented
-- 🟡 Partial / basic
-- 🔜 Planned / target
+- 🟡 Partial
+- 🔜 Target
 - ❌ Not implemented
 
-| Capability | Google Firestore | FireLite (Current) | FireLite Target |
+| Capability | Google Firestore | FireLite Current | FireLite Target |
 |---|---|---|---|
-| Embedded local runtime | ❌ (managed cloud service) | ✅ | ✅ |
-| Collection/document model | ✅ | ✅ | ✅ |
-| Document CRUD | ✅ | ✅ | ✅ |
-| Atomic write batch | ✅ | ✅ (local transactional unit) | ✅ |
-| Multi-document ACID transactions | ✅ | 🟡 (batch semantics, no full conflict/serializable model) | ✅ |
-| Query filters/order/limit | ✅ | 🟡 (basic support) | ✅ |
-| Composite indexes | ✅ | 🟡 (definition + manager + planner hooks) | ✅ |
-| Index auto-build lifecycle | ✅ | ❌ | 🔜 |
-| Real-time listeners / watch streams | ✅ | ❌ | 🔜 |
-| Offline sync w/ cloud | ✅ (SDK dependent) | ❌ | 🔜 (optional replication layer) |
-| Subcollections | ✅ | ❌ | 🔜 |
-| Security rules engine | ✅ | ❌ | 🔜 |
-| Managed auth integration | ✅ | ❌ | 🔜 |
-| Serverless triggers | ✅ | ❌ | 🔜 |
-| Built-in geo queries | ✅ (with patterns/extensions) | ❌ | 🔜 |
-| TTL policies | ✅ | ❌ | 🔜 |
-| PITR / backups | ✅ | ❌ | 🔜 |
-| Encryption at rest | ✅ | ❌ (not yet integrated) | ✅ |
-| Multi-region availability | ✅ | ❌ (single embedded process) | N/A / out of scope |
+| Embedded local runtime | ❌ | ✅ | ✅ |
+| Collection/document CRUD | ✅ | ✅ | ✅ |
+| Atomic write batch | ✅ | ✅ | ✅ |
+| Multi-document transactions | ✅ | 🟡 (atomic commit path; no conflict model) | ✅ |
+| Filters/order/limit | ✅ | ✅ | ✅ |
+| Composite indexes | ✅ | 🟡 (equality-path integrated) | ✅ |
+| Real-time listeners / watch | ✅ | 🟡 (local collection watch streams) | ✅ |
+| Subcollections | ✅ | ✅ (API-level support) | ✅ |
+| Security rules | ✅ | ❌ | 🔜 |
+| Cloud sync/replication | ✅ | ❌ | 🔜 |
+| Encryption at rest | ✅ | ❌ | ✅ |
+| Managed multi-region | ✅ | ❌ (embedded single process) | N/A |
 
 ---
 
-## Performance Suggestions (Next Updates)
+## Updated Improvement List
 
-1. **WAL group commit + fsync policy tuning**
-   - Add configurable durability modes (`always`, `interval`, `manual`) and group commit to reduce sync overhead.
-2. **Segment compaction improvements**
-   - Move to multi-segment LSM-like compaction tiers and background compaction scheduling.
-3. **Query execution optimization**
-   - Add cost-based planning, predicate pushdown, and index-only scan pathways.
-4. **Zero-copy reads end-to-end**
-   - Extend borrowed document views through query pipeline to minimize allocations.
-5. **Bench + profiling pipeline**
-   - Add criterion benchmarks + flamegraph profiling + CI performance gates.
+### Performance
 
----
-
-## Security Suggestions (Next Updates)
-
-1. **Encryption at rest**
-   - Encrypt WAL/segment pages (AES-GCM or ChaCha20-Poly1305) with key rotation support.
-2. **Integrity and tamper checks**
-   - Add authenticated record/page checksums and startup verification modes.
-3. **Input and resource hardening**
-   - Enforce document/key size limits, query complexity limits, and configurable memory ceilings.
-4. **Crash safety + recovery auditability**
-   - Add deterministic recovery journal validation and corruption quarantine.
-5. **Supply chain and release hardening**
-   - SBOM generation, dependency audit CI, signed releases, and reproducible builds.
-
----
-
-## Additional Suggestions
+1. Multi-segment compaction tiers + background scheduler
+2. Cost-based query planning
+3. Index-only execution for projected fields
+4. End-to-end zero-copy query path
+5. Bench gating on p95 write/query latency in CI
 
 ### Reliability
 
-- Add randomized fault-injection tests (power-loss simulation during WAL append/commit).
-- Add model-based tests for storage/index consistency after recovery.
-- Add long-running soak tests for memory/page cache behavior.
+1. Crash fault-injection harness for WAL commit boundaries
+2. Recovery invariants test suite (index/data consistency)
+3. Long-running soak tests for mmap/page cache pressure
+
+### Security
+
+1. Encryption at rest for WAL + segment files
+2. Integrity validation mode at startup
+3. Query/document size limits and resource quotas
 
 ### Developer Experience
 
-- Provide a stable schema/migration story for persisted data.
-- Add higher-level fluent API helpers (Firestore-like builders).
-- Add detailed examples for write batches, indexing, and query patterns.
+1. Fluent Firestore-like query builder APIs
+2. Better subcollection/index examples
+3. Schema/version migration playbook
 
-### Observability
+---
 
-- Add metrics (`ops/sec`, WAL flush latency, compaction duration, query scan counts).
-- Add tracing spans for write path/query path.
-- Add structured logs with event IDs and transaction IDs.
+## Bench & CI
+
+- Local benchmark target: `cargo bench --bench engine_bench`
+- CI performance workflow: `.github/workflows/perf.yml`
 
 ---
 
 ## Contribution Notes
 
-When proposing significant changes:
-
-- Keep module boundaries aligned with `STRUCTURE.md`.
-- Prefer adding tests for crash/recovery semantics when touching storage or WAL.
-- Document format changes must include versioning and backward-compatibility notes.
+- Keep module boundaries aligned with `STRUCTURE.md`
+- Add recovery tests when touching storage/WAL/indexing
+- Document binary format or compatibility-impacting changes
 
 ---
 
 ## License
 
-TBD.
+TBD
