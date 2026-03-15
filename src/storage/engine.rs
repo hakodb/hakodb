@@ -37,6 +37,7 @@ pub struct StorageEngine {
     index: HashMap<String, Pointer>,
     next_tx_id: u64,
     compaction_threshold_bytes: usize,
+    encryption: Option<EncryptionContext>,
 }
 
 impl StorageEngine {
@@ -99,6 +100,7 @@ impl StorageEngine {
             index: HashMap::new(),
             next_tx_id: 1,
             compaction_threshold_bytes: cfg.auto_compaction_threshold_bytes,
+            encryption,
         };
         engine.recover()?;
         Ok(engine)
@@ -192,7 +194,7 @@ impl StorageEngine {
 
     pub fn run_background_maintenance(&mut self) -> Result<()> {
         self.maybe_rotate_active_segment()?;
-        self.compact_tiers_once()
+        self.compact_tiers_once().map(|_| ())
     }
 
     fn maybe_rotate_active_segment(&mut self) -> Result<()> {
@@ -210,7 +212,7 @@ impl StorageEngine {
         let new_id = self.next_segment_id;
         self.next_segment_id += 1;
         let path = segment_path(&self.base_dir, 0, new_id);
-        let encryption = None;
+        let encryption = self.encryption.clone();
         let segment = Segment::open(path, encryption)?;
         self.segments.insert(
             new_id,
@@ -224,7 +226,7 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn compact_tiers_once(&mut self) -> Result<()> {
+    fn compact_tiers_once(&mut self) -> Result<bool> {
         // find two immutable segments on same level
         let mut by_level: HashMap<u32, Vec<u64>> = HashMap::new();
         for (id, meta) in &self.segments {
@@ -243,7 +245,7 @@ impl StorageEngine {
         }
 
         let Some((level, s1, s2)) = candidate else {
-            return Ok(());
+            return Ok(false);
         };
 
         let target_level = level + 1;
@@ -265,7 +267,7 @@ impl StorageEngine {
         }
 
         let target_path = segment_path(&self.base_dir, target_level, target_id);
-        let mut target = Segment::open(target_path, None)?;
+        let mut target = Segment::open(target_path, self.encryption.clone())?;
 
         let mut new_index = HashMap::new();
         compact_segment(&mut target, &entries, &mut new_index, target_id)?;
@@ -291,7 +293,7 @@ impl StorageEngine {
         );
 
         self.rewrite_wal_snapshot()?;
-        Ok(())
+        Ok(true)
     }
 
     fn rewrite_wal_snapshot(&mut self) -> Result<()> {
@@ -360,7 +362,7 @@ impl StorageEngine {
     }
 
     pub fn compact(&mut self) -> Result<()> {
-        while self.compact_tiers_once().is_ok() {
+        while self.compact_tiers_once()? {
             let by_level_count = self
                 .segments
                 .values()
@@ -382,7 +384,7 @@ impl StorageEngine {
         let target_id = self.next_segment_id;
         self.next_segment_id += 1;
         let target_path = segment_path(&self.base_dir, 1, target_id);
-        let mut target = Segment::open(target_path, None)?;
+        let mut target = Segment::open(target_path, self.encryption.clone())?;
         let mut rebuilt = HashMap::new();
         compact_segment(&mut target, &entries, &mut rebuilt, target_id)?;
 
@@ -416,4 +418,89 @@ fn parse_segment_name(name: &str) -> Option<(u32, u64)> {
     let core = &name[9..name.len() - 4];
     let (level, id) = core.split_once('-')?;
     Some((level.parse().ok()?, id.parse().ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use crate::config::FireLiteConfig;
+
+    use super::{segment_path, Segment, SegmentMeta, StorageEngine};
+
+    fn temp_path(prefix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "{}-{}",
+            prefix,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after unix epoch")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn rotation_preserves_encryption_across_reopen() {
+        let path = temp_path("firelite-storage-encryption");
+        let cfg = FireLiteConfig {
+            auto_compaction_threshold_bytes: 1,
+            encryption_key: Some("test-secret".to_string()),
+            ..FireLiteConfig::default()
+        };
+
+        {
+            let mut engine = StorageEngine::open(&path, &cfg).expect("engine open should succeed");
+            engine
+                .put("k1".to_string(), b"value-1")
+                .expect("first put should succeed");
+            engine
+                .put("k2".to_string(), b"value-2")
+                .expect("second put should succeed");
+        }
+
+        let mut reopened = StorageEngine::open(&path, &cfg).expect("reopen should succeed");
+        assert_eq!(
+            reopened.get("k1").expect("read should succeed"),
+            Some(b"value-1".to_vec())
+        );
+        assert_eq!(
+            reopened.get("k2").expect("read should succeed"),
+            Some(b"value-2".to_vec())
+        );
+
+        fs::remove_dir_all(path).expect("temp db dir should be removable");
+    }
+
+    #[test]
+    fn compact_returns_when_no_same_level_merge_candidate_exists() {
+        let path = temp_path("firelite-storage-compact");
+        let cfg = FireLiteConfig::default();
+        let mut engine = StorageEngine::open(&path, &cfg).expect("engine open should succeed");
+
+        engine
+            .put("k1".to_string(), b"value-1")
+            .expect("put should succeed");
+        engine
+            .maybe_rotate_active_segment()
+            .expect("rotation should succeed");
+
+        let extra_id = engine.next_segment_id;
+        engine.next_segment_id += 1;
+        let extra_path = segment_path(&path, 1, extra_id);
+        let extra_segment = Segment::open(extra_path, None).expect("segment open should succeed");
+        engine.segments.insert(
+            extra_id,
+            SegmentMeta {
+                id: extra_id,
+                level: 1,
+                segment: extra_segment,
+            },
+        );
+
+        engine
+            .compact()
+            .expect("compaction should return successfully");
+
+        fs::remove_dir_all(path).expect("temp db dir should be removable");
+    }
 }
