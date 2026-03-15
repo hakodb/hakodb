@@ -655,7 +655,18 @@ impl FireLite {
         for (id, raw) in docs {
             if matches_filters_borrowed(&raw, &query.filters) {
                 let projected = project_fields_borrowed(&raw, fields);
-                out.push((id, projected));
+                let order_value = query
+                    .order_by
+                    .as_ref()
+                    .and_then(|order| extract_field_value_borrowed(&raw, &order.field));
+                out.push((id, projected, order_value));
+            }
+        }
+
+        if let Some(order) = &query.order_by {
+            out.sort_by(|(_, _, av), (_, _, bv)| format!("{:?}", av).cmp(&format!("{:?}", bv)));
+            if !order.ascending {
+                out.reverse();
             }
         }
 
@@ -663,7 +674,10 @@ impl FireLite {
             out.truncate(limit);
         }
 
-        Ok(out)
+        Ok(out
+            .into_iter()
+            .map(|(id, projected, _)| (id, projected))
+            .collect())
     }
 
     pub fn query_subcollection(
@@ -727,6 +741,16 @@ fn matches_filters_borrowed(raw: &[u8], filters: &[crate::query::filter::Filter]
     })
 }
 
+fn extract_field_value_borrowed(raw: &[u8], field: &str) -> Option<crate::document::value::Value> {
+    let view = crate::document::firelite_doc::FireLiteDocView::new(raw)?;
+    for (k, v) in view.iter() {
+        if k == field {
+            return v.to_owned_value();
+        }
+    }
+    None
+}
+
 fn project_fields_borrowed(
     raw: &[u8],
     fields: &[String],
@@ -756,6 +780,7 @@ mod tests {
     use super::{AccessOp, BatchMutation, ChangeKind, FireLite, SecurityRule};
     use crate::config::FireLiteConfig;
     use crate::document::firelite_doc::FireLiteDoc;
+    use crate::query::query::Query;
 
     fn temp_path(prefix: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -766,6 +791,31 @@ mod tests {
                 .expect("clock should be after unix epoch")
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn projected_query_applies_order_before_limit() {
+        let path = temp_path("firelite-projected-order");
+        let db = FireLite::open(&path, FireLiteConfig::default()).expect("db open should succeed");
+
+        for (id, score) in [("a", 3), ("b", 1), ("c", 2)] {
+            let mut doc = FireLiteDoc::default();
+            doc.insert("score", Value::Int(score));
+            doc.insert("name", Value::String(id.to_string()));
+            db.put("users", id, &doc).expect("put should succeed");
+        }
+
+        let query = Query::new("users").order_by("score", true).limit(2);
+        let fields = vec!["name".to_string()];
+        let rows = db
+            .query_projected_zero_copy(query, &fields)
+            .expect("projected query should succeed");
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].0.ends_with(":b"));
+        assert!(rows[1].0.ends_with(":c"));
+
+        fs::remove_dir_all(path).expect("temp db dir should be removable");
     }
 
     #[test]
