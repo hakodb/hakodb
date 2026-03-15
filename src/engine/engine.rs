@@ -4,8 +4,9 @@ use std::sync::Mutex;
 use crate::config::FireLiteConfig;
 use crate::document::firelite_doc::FireLiteDoc;
 use crate::error::Result;
+use crate::index::composite::definition::{CompositeIndexDefinition, SortDirection};
 use crate::index::manager::IndexManager;
-use crate::query::executor::ParallelQueryExecutor;
+use crate::query::executor::executor::ParallelQueryExecutor;
 use crate::query::planner::QueryPlanner;
 use crate::query::query::Query;
 use crate::storage::engine::StorageEngine;
@@ -25,11 +26,15 @@ impl FireLite {
         })
     }
 
-    pub fn create_composite_index(&self, collection: &str, fields: Vec<String>) {
+    pub fn create_composite_index(
+        &self,
+        collection: &str,
+        fields: Vec<(String, SortDirection)>,
+    ) -> u32 {
         self.indexes
             .lock()
             .expect("indexes lock poisoned")
-            .create_composite_index(collection, &fields);
+            .create_index(CompositeIndexDefinition::new(collection).with_fields(fields))
     }
 
     pub fn put(&self, collection: &str, doc_id: &str, doc: &FireLiteDoc) -> Result<()> {
@@ -37,7 +42,12 @@ impl FireLite {
         self.storage
             .lock()
             .expect("storage lock poisoned")
-            .put(key, &doc.encode())
+            .put(key, &doc.encode())?;
+        self.indexes
+            .lock()
+            .expect("indexes lock poisoned")
+            .index_document(collection, doc_id, doc);
+        Ok(())
     }
 
     pub fn get(&self, collection: &str, doc_id: &str) -> Result<Option<FireLiteDoc>> {
@@ -52,6 +62,12 @@ impl FireLite {
 
     pub fn delete(&self, collection: &str, doc_id: &str) -> Result<()> {
         let key = format!("{}:{}", collection, doc_id);
+        if let Some(doc) = self.get(collection, doc_id)? {
+            self.indexes
+                .lock()
+                .expect("indexes lock poisoned")
+                .remove_document(collection, doc_id, &doc);
+        }
         self.storage
             .lock()
             .expect("storage lock poisoned")

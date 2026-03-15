@@ -6,5 +6,6 @@ pub mod index;
 pub mod memory;
 pub mod query;
 pub mod storage;
+pub mod util;
 
 pub use engine::FireLite;

@@ -1,4 +1,5 @@
-use super::query::Filter;
+use super::filter::Filter;
+use super::order::OrderBy;
 
 #[derive(Debug, Clone)]
 pub enum ScanType {
@@ -11,5 +12,6 @@ pub struct QueryPlan {
     pub collection: String,
     pub scan: ScanType,
     pub filters: Vec<Filter>,
+    pub order_by: Option<OrderBy>,
     pub limit: Option<usize>,
 }

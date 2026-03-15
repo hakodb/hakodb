@@ -1,4 +1,3 @@
-use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -7,50 +6,13 @@ use crate::error::{FireLiteError, Result};
 use super::allocator::Allocator;
 use super::mmap_store::MmapStore;
 use super::page::{Page, DEFAULT_PAGE_SIZE};
-
-#[derive(Debug)]
-struct LruPageCache {
-    capacity: usize,
-    order: VecDeque<u64>,
-    pages: HashMap<u64, Page>,
-}
-
-impl LruPageCache {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            order: VecDeque::new(),
-            pages: HashMap::new(),
-        }
-    }
-
-    fn get(&mut self, id: u64) -> Option<Page> {
-        if let Some(pos) = self.order.iter().position(|v| *v == id) {
-            self.order.remove(pos);
-            self.order.push_back(id);
-        }
-        self.pages.get(&id).cloned()
-    }
-
-    fn put(&mut self, page: Page) {
-        if self.pages.contains_key(&page.id) {
-            self.order.retain(|id| *id != page.id);
-        }
-        self.order.push_back(page.id);
-        self.pages.insert(page.id, page);
-        if self.pages.len() > self.capacity {
-            if let Some(old) = self.order.pop_front() {
-                self.pages.remove(&old);
-            }
-        }
-    }
-}
+use super::page_cache::PageCache;
 
 pub struct MemoryEngine {
     page_size: usize,
     store: Arc<MmapStore>,
     allocator: Allocator,
-    cache: Mutex<LruPageCache>,
+    cache: Mutex<PageCache>,
 }
 
 impl MemoryEngine {
@@ -59,7 +21,7 @@ impl MemoryEngine {
             page_size: DEFAULT_PAGE_SIZE,
             store: Arc::new(MmapStore::open(path, size)?),
             allocator: Allocator::new(),
-            cache: Mutex::new(LruPageCache::new(cache_capacity)),
+            cache: Mutex::new(PageCache::new(cache_capacity)),
         })
     }
 

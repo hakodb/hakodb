@@ -1,53 +1,35 @@
-use std::collections::HashMap;
+use crate::document::firelite_doc::FireLiteDoc;
 
-use crate::document::firelite_doc::Value;
-
-use super::index_key::encode_composite_key;
-use super::secondary_index::SecondaryIndex;
+use super::composite::definition::CompositeIndexDefinition;
+use super::composite::manager::CompositeIndexManager;
 
 #[derive(Default)]
 pub struct IndexManager {
-    // (collection, fields joined by \x1f) -> index
-    indexes: HashMap<(String, String), SecondaryIndex>,
+    composite: CompositeIndexManager,
 }
 
 impl IndexManager {
-    pub fn create_composite_index(&mut self, collection: &str, fields: &[String]) {
-        self.indexes
-            .entry((collection.to_string(), fields.join("\x1f")))
-            .or_default();
+    pub fn create_index(&mut self, definition: CompositeIndexDefinition) -> u32 {
+        self.composite.create_index(definition)
     }
 
     pub fn has_index(&self, collection: &str, fields: &[String]) -> bool {
-        self.indexes
-            .contains_key(&(collection.to_string(), fields.join("\x1f")))
+        self.composite
+            .indexes_for_collection(collection)
+            .any(|idx| {
+                idx.definition
+                    .fields
+                    .iter()
+                    .map(|f| f.field.as_str())
+                    .eq(fields.iter().map(String::as_str))
+            })
     }
 
-    pub fn index_doc(
-        &mut self,
-        collection: &str,
-        fields: &[String],
-        values: &[Value],
-        doc_id: &str,
-    ) {
-        if let Some(index) = self
-            .indexes
-            .get_mut(&(collection.to_string(), fields.join("\x1f")))
-        {
-            index.insert(encode_composite_key(values, doc_id), doc_id.to_string());
-        }
+    pub fn index_document(&mut self, collection: &str, doc_id: &str, doc: &FireLiteDoc) {
+        self.composite.index_document(collection, doc_id, doc);
     }
 
-    pub fn range_scan(
-        &self,
-        collection: &str,
-        fields: &[String],
-        start: &[u8],
-        end: &[u8],
-    ) -> Vec<String> {
-        self.indexes
-            .get(&(collection.to_string(), fields.join("\x1f")))
-            .map(|idx| idx.range_scan(start, end))
-            .unwrap_or_default()
+    pub fn remove_document(&mut self, collection: &str, doc_id: &str, doc: &FireLiteDoc) {
+        self.composite.remove_document(collection, doc_id, doc);
     }
 }

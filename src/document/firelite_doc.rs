@@ -1,17 +1,9 @@
 use std::collections::BTreeMap;
 
+use crate::document::value::Value;
+
 const MAGIC: u8 = 0xF1;
 const VERSION: u8 = 1;
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Value {
-    Null,
-    Bool(bool),
-    Int(i64),
-    Float(f64),
-    String(String),
-    Binary(Vec<u8>),
-}
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FireLiteDoc {
@@ -49,7 +41,7 @@ impl FireLiteDoc {
 
 pub struct FireLiteDocView<'a> {
     bytes: &'a [u8],
-    data_offset: usize,
+    pos: usize,
     fields: u16,
 }
 
@@ -61,7 +53,7 @@ impl<'a> FireLiteDocView<'a> {
         let fields = u16::from_le_bytes(bytes[2..4].try_into().ok()?);
         Some(Self {
             bytes,
-            data_offset: 4,
+            pos: 4,
             fields,
         })
     }
@@ -69,7 +61,7 @@ impl<'a> FireLiteDocView<'a> {
     pub fn iter(&self) -> FireLiteDocIter<'a> {
         FireLiteDocIter {
             bytes: self.bytes,
-            pos: self.data_offset,
+            pos: self.pos,
             remaining: self.fields,
         }
     }
@@ -103,6 +95,7 @@ impl<'a> Iterator for FireLiteDocIter<'a> {
         self.pos += 1;
         let key = std::str::from_utf8(self.bytes.get(self.pos..self.pos + key_len)?).ok()?;
         self.pos += key_len;
+
         let tag = *self.bytes.get(self.pos)?;
         self.pos += 1;
         let len =
@@ -110,6 +103,7 @@ impl<'a> Iterator for FireLiteDocIter<'a> {
         self.pos += 4;
         let data = self.bytes.get(self.pos..self.pos + len)?;
         self.pos += len;
+
         self.remaining -= 1;
         Some((key, BorrowedValue { tag, data }))
     }

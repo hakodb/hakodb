@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default, Debug)]
 pub struct SecondaryIndex {
-    pub map: BTreeMap<Vec<u8>, BTreeSet<String>>,
+    map: BTreeMap<Vec<u8>, BTreeSet<String>>,
 }
 
 impl SecondaryIndex {

@@ -1,20 +1,20 @@
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use crate::error::{FireLiteError, Result};
+use crate::error::Result;
 
-use super::log::{Wal, WalOp};
+use super::compaction::compact_segment;
+use super::segment::Segment;
+use super::wal::{Wal, WalOp};
 
 #[derive(Debug, Clone)]
-struct Pointer {
-    offset: u64,
-    len: u32,
+pub struct Pointer {
+    pub offset: u64,
+    pub len: u32,
 }
 
 pub struct StorageEngine {
-    segment: File,
+    segment: Segment,
     wal: Wal,
     index: HashMap<String, Pointer>,
 }
@@ -22,14 +22,9 @@ pub struct StorageEngine {
 impl StorageEngine {
     pub fn open(base_dir: impl AsRef<Path>) -> Result<Self> {
         std::fs::create_dir_all(base_dir.as_ref())?;
-        let segment_path = base_dir.as_ref().join("segment-0.dat");
-        let wal_path = base_dir.as_ref().join("wal.log");
-        let segment = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(segment_path)?;
-        let wal = Wal::open(wal_path)?;
+        let segment = Segment::open(base_dir.as_ref().join("segment-0.dat"))?;
+        let wal = Wal::open(base_dir.as_ref().join("wal.log"))?;
+
         let mut engine = Self {
             segment,
             wal,
@@ -64,40 +59,25 @@ impl StorageEngine {
     }
 
     pub fn put(&mut self, key: String, value: &[u8]) -> Result<()> {
-        let offset = self.segment.seek(SeekFrom::End(0))?;
-        self.segment
-            .write_all(&(value.len() as u32).to_le_bytes())?;
-        self.segment.write_all(value)?;
-        self.segment.sync_data()?;
+        let offset = self.segment.append(value)?;
+        let pointer = Pointer {
+            offset,
+            len: value.len() as u32,
+        };
         self.wal.append(&WalOp::Put {
             key: key.clone(),
-            segment_offset: offset,
-            len: value.len() as u32,
+            segment_offset: pointer.offset,
+            len: pointer.len,
         })?;
-        self.index.insert(
-            key,
-            Pointer {
-                offset,
-                len: value.len() as u32,
-            },
-        );
+        self.index.insert(key, pointer);
         Ok(())
     }
 
     pub fn get(&mut self, key: &str) -> Result<Option<Vec<u8>>> {
-        let Some(ptr) = self.index.get(key).cloned() else {
+        let Some(pointer) = self.index.get(key).cloned() else {
             return Ok(None);
         };
-        self.segment.seek(SeekFrom::Start(ptr.offset))?;
-        let mut len_buf = [0; 4];
-        self.segment.read_exact(&mut len_buf)?;
-        let len = u32::from_le_bytes(len_buf);
-        if len != ptr.len {
-            return Err(FireLiteError::Corrupt("segment length mismatch".into()));
-        }
-        let mut value = vec![0; len as usize];
-        self.segment.read_exact(&mut value)?;
-        Ok(Some(value))
+        Ok(Some(self.segment.read_at(pointer.offset, pointer.len)?))
     }
 
     pub fn delete(&mut self, key: &str) -> Result<()> {
@@ -115,7 +95,8 @@ impl StorageEngine {
             .filter(|k| k.starts_with(prefix))
             .cloned()
             .collect();
-        let mut out = Vec::new();
+
+        let mut out = Vec::with_capacity(keys.len());
         for key in keys {
             if let Some(value) = self.get(&key)? {
                 out.push((key, value));
@@ -127,16 +108,19 @@ impl StorageEngine {
     pub fn compact(&mut self) -> Result<()> {
         let mut entries = Vec::new();
         for key in self.index.keys().cloned().collect::<Vec<_>>() {
-            if let Some(v) = self.get(&key)? {
-                entries.push((key, v));
+            if let Some(value) = self.get(&key)? {
+                entries.push((key, value));
             }
         }
-        self.segment.set_len(0)?;
-        self.segment.seek(SeekFrom::Start(0))?;
-        self.index.clear();
+
+        compact_segment(&mut self.segment, &entries, &mut self.index)?;
         self.wal.reset()?;
-        for (key, value) in entries {
-            self.put(key, &value)?;
+        for (key, pointer) in self.index.clone() {
+            self.wal.append(&WalOp::Put {
+                key,
+                segment_offset: pointer.offset,
+                len: pointer.len,
+            })?;
         }
         Ok(())
     }
