@@ -32,6 +32,7 @@ export interface NativeBindings {
   queryWhereEqInt(query: Handle, field: string, value: number): number;
   queryOrderBy(query: Handle, field: string, ascending: boolean): number;
   queryLimit(query: Handle, limit: number): number;
+  querySelectField(query: Handle, field: string): number;
   queryExecute(engine: Handle, query: Handle): string | null;
 
   lastError(): string;
@@ -97,6 +98,7 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     fl_query_where_eq_int: { args: [FFIType.ptr, FFIType.cstring, FFIType.i64], returns: FFIType.i32 },
     fl_query_order_by: { args: [FFIType.ptr, FFIType.cstring, FFIType.bool], returns: FFIType.i32 },
     fl_query_limit: { args: [FFIType.ptr, FFIType.usize], returns: FFIType.i32 },
+    fl_query_select_field: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.i32 },
     fl_query_execute: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.ptr },
 
     fl_last_error: { args: [], returns: FFIType.ptr },
@@ -140,6 +142,7 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     queryWhereEqInt: (query, field, value) => symbols.fl_query_where_eq_int(query, field, BigInt(Math.trunc(value))),
     queryOrderBy: (query, field, asc) => symbols.fl_query_order_by(query, field, asc),
     queryLimit: (query, limit) => symbols.fl_query_limit(query, limit),
+    querySelectField: (query, field) => symbols.fl_query_select_field(query, field),
     queryExecute: (engine, query) => ptrToStringAndFree(symbols.fl_query_execute(engine, query)),
 
     lastError: () => {
@@ -184,6 +187,7 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_query_where_eq_int: lib.func('int fl_query_where_eq_int(FL_Query* query, const char* field, int64_t value)'),
     fl_query_order_by: lib.func('int fl_query_order_by(FL_Query* query, const char* field, bool ascending)'),
     fl_query_limit: lib.func('int fl_query_limit(FL_Query* query, uintptr_t limit)'),
+    fl_query_select_field: lib.func('int fl_query_select_field(FL_Query* query, const char* field)'),
     fl_query_execute: lib.func('char* fl_query_execute(FL_Engine* engine, const FL_Query* query)'),
 
     fl_last_error: lib.func('const char* fl_last_error()'),
@@ -227,6 +231,7 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     queryWhereEqInt: (query, field, value) => fn.fl_query_where_eq_int(query, field, Math.trunc(value)),
     queryOrderBy: (query, field, asc) => fn.fl_query_order_by(query, field, asc),
     queryLimit: (query, limit) => fn.fl_query_limit(query, limit),
+    querySelectField: (query, field) => fn.fl_query_select_field(query, field),
     queryExecute: (engine, query) => ptrToStringAndFree(fn.fl_query_execute(engine, query)),
 
     lastError: () => (fn.fl_last_error() as string) || 'unknown ffi error'

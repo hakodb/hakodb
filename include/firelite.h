@@ -78,6 +78,8 @@ int32_t fl_query_order_by(struct FL_Query *query, const char *field, bool ascend
 
 int32_t fl_query_limit(struct FL_Query *query, uintptr_t limit);
 
+int32_t fl_query_select_field(struct FL_Query *query, const char *field);
+
 char *fl_query_execute(struct FL_Engine *engine, const struct FL_Query *query);
 
 char *fl_doc_to_json(const struct FL_Doc *doc);

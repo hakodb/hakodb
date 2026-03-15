@@ -34,7 +34,7 @@ FireLite is in **advanced foundation stage**: core architecture and major vertic
   - ordering and limit
   - cost-aware planner decision using collection/cardinality heuristics
   - predicate pushdown shortcut via doc-view prefilter before full decode
-  - zero-copy projection API via `query_projected_zero_copy` for borrowed-view projection paths
+  - rich projection pushdown across Rust API, C-FFI, JS client, and Tauri gateway
   - parallel task-sharded execution
 - Composite indexes
   - index definitions and manager
@@ -65,7 +65,6 @@ FireLite is in **advanced foundation stage**: core architecture and major vertic
 ### Still Missing for Full Production Readiness
 
 - Distributed/cloud-grade security primitives (authn/authz federation, remote policy service)
-- Rich projection pushdown across all SDK/FFI surfaces (currently available in Rust engine API)
 
 ---
 
@@ -131,6 +130,7 @@ const rows = await db
   .where("age", "==", 30)
   .orderBy("name", "asc")
   .limit(10)
+  .select("name", "age")
   .get();
 
 const batch = db.batch();
@@ -267,7 +267,7 @@ Header generation is automated via `build.rs` + `cbindgen.toml`.
 **Query operations**
 - `fl_query_new`, `fl_query_free`
 - `fl_query_where_eq_str`, `fl_query_where_eq_int`
-- `fl_query_order_by`, `fl_query_limit`
+- `fl_query_order_by`, `fl_query_limit`, `fl_query_select_field`
 - `fl_query_execute`
 
 ---
@@ -297,7 +297,7 @@ API (FireLite + FFI + JS/TS client)
 | Transactions | ✅ Implemented | Serializable conflict-aware transactions via read/write version validation |
 | Composite indexes | ✅ Implemented | Equality composite scans integrated |
 | Query filters/order/limit | ✅ Implemented | Core operators + ordering + limit + cost-aware planning heuristics |
-| Zero-copy projection pipeline | ✅ Implemented | Rust API `query_projected_zero_copy` uses borrowed document views |
+| Zero-copy projection pipeline | ✅ Implemented | Borrowed-view projection available in Rust engine, C-FFI, JS SDK, and Tauri gateway |
 | Real-time listeners/watch | ✅ Implemented | Local watch streams in Rust engine |
 | Subcollections | ✅ Implemented | Subdocument helpers exposed in Rust API |
 | JS/TS Firestore-style client | ✅ Implemented | `collection().doc().set/get/delete`, query builder, batch |

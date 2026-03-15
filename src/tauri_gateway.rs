@@ -36,6 +36,7 @@ pub enum FireLiteOp {
         filters: Vec<FilterInput>,
         order_by: Option<OrderByInput>,
         limit: Option<usize>,
+        projection: Option<Vec<String>>,
     },
     Batch {
         mutations: Vec<BatchInput>,
@@ -47,6 +48,7 @@ pub enum FireLiteOp {
         filters: Vec<FilterInput>,
         order_by: Option<OrderByInput>,
         limit: Option<usize>,
+        projection: Option<Vec<String>>,
         event_name: Option<String>,
     },
     Unsubscribe {
@@ -162,6 +164,7 @@ impl FireLiteGateway {
         filters: Vec<FilterInput>,
         order_by: Option<OrderByInput>,
         limit: Option<usize>,
+        projection: Option<Vec<String>>,
         event_name: String,
     ) -> Result<(), String> {
         self.unsubscribe(&listener_id);
@@ -171,6 +174,7 @@ impl FireLiteGateway {
             filters,
             order_by,
             limit,
+            projection,
         };
 
         let rx = self.db.watch_collection(&query_template.collection);
@@ -230,6 +234,7 @@ struct QueryInput {
     filters: Vec<FilterInput>,
     order_by: Option<OrderByInput>,
     limit: Option<usize>,
+    projection: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -278,6 +283,7 @@ pub fn firelite_exec<R: Runtime>(
             filters,
             order_by,
             limit,
+            projection,
         } => {
             let rows = execute_query_input(
                 &state.db,
@@ -286,6 +292,7 @@ pub fn firelite_exec<R: Runtime>(
                     filters,
                     order_by,
                     limit,
+                    projection,
                 },
             )?;
             Ok(FireLiteResponse::QueryResult { rows })
@@ -324,6 +331,7 @@ pub fn firelite_exec<R: Runtime>(
             filters,
             order_by,
             limit,
+            projection,
             event_name,
         } => {
             state.register_subscription(
@@ -333,6 +341,7 @@ pub fn firelite_exec<R: Runtime>(
                 filters,
                 order_by,
                 limit,
+                projection,
                 event_name.unwrap_or_else(|| "firelite://snapshot".to_string()),
             )?;
             Ok(FireLiteResponse::SubscriptionAck { listener_id })
@@ -364,6 +373,18 @@ fn execute_query_input(
 
     if let Some(limit) = input.limit {
         query = query.limit(limit);
+    }
+
+    if let Some(projection) = &input.projection {
+        if !projection.is_empty() {
+            let rows = db
+                .query_projected_zero_copy(query.clone(), projection)
+                .map_err(|e| e.to_string())?;
+            return rows
+                .into_iter()
+                .map(|(_, fields)| projection_fields_to_json(fields))
+                .collect();
+        }
     }
 
     let rows = db.query(query).map_err(|e| e.to_string())?;
@@ -432,6 +453,14 @@ fn doc_to_json_value(doc: &FireLiteDoc) -> Result<serde_json::Value, String> {
     let mut map = serde_json::Map::new();
     for (k, v) in &doc.fields {
         map.insert(k.clone(), value_to_json(v)?);
+    }
+    Ok(serde_json::Value::Object(map))
+}
+
+fn projection_fields_to_json(fields: Vec<(String, Value)>) -> Result<serde_json::Value, String> {
+    let mut map = serde_json::Map::new();
+    for (k, v) in fields {
+        map.insert(k, value_to_json(&v)?);
     }
     Ok(serde_json::Value::Object(map))
 }

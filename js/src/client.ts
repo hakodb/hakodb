@@ -170,7 +170,8 @@ export class FireLiteClient {
     collection: string,
     filters: QueryConstraint[],
     order?: QueryOrder,
-    queryLimit?: number
+    queryLimit?: number,
+    projection: string[] = []
   ): Promise<FireLiteDocData[]> {
     this.assertOpen();
 
@@ -205,6 +206,10 @@ export class FireLiteClient {
 
       if (queryLimit !== undefined) {
         ensureOk(this.native.queryLimit(query, queryLimit), this.native, 'fl_query_limit');
+      }
+
+      for (const field of projection) {
+        ensureOk(this.native.querySelectField(query, field), this.native, 'fl_query_select_field');
       }
 
       const json = this.native.queryExecute(this.engine, query);
@@ -254,6 +259,10 @@ export class CollectionReference {
     return new Query(this.client, this.name).limit(max);
   }
 
+  select(...fields: string[]): Query {
+    return new Query(this.client, this.name).select(...fields);
+  }
+
   async get(): Promise<FireLiteDocData[]> {
     return this.client.runQuery(this.name, []);
   }
@@ -289,6 +298,7 @@ export class Query {
   private readonly filters: QueryConstraint[] = [];
   private order?: QueryOrder;
   private queryLimit?: number;
+  private projection: string[] = [];
 
   constructor(client: FireLiteClient, collection: string) {
     this.client = client;
@@ -310,8 +320,13 @@ export class Query {
     return this;
   }
 
+  select(...fields: string[]): Query {
+    this.projection = fields;
+    return this;
+  }
+
   async get(): Promise<FireLiteDocData[]> {
-    return this.client.runQuery(this.collection, this.filters, this.order, this.queryLimit);
+    return this.client.runQuery(this.collection, this.filters, this.order, this.queryLimit, this.projection);
   }
 }
 

@@ -9,6 +9,7 @@ pub struct Query {
     pub filters: Vec<Filter>,
     pub order_by: Option<OrderBy>,
     pub limit: Option<usize>,
+    pub projection: Vec<String>,
 }
 
 impl Query {
@@ -18,6 +19,7 @@ impl Query {
             filters: Vec::new(),
             order_by: None,
             limit: None,
+            projection: Vec::new(),
         }
     }
 
@@ -44,6 +46,16 @@ impl Query {
 
     pub fn limit(mut self, n: usize) -> Self {
         self.limit = Some(n);
+        self
+    }
+
+    pub fn select_fields(mut self, fields: Vec<String>) -> Self {
+        self.projection = fields;
+        self
+    }
+
+    pub fn select(mut self, field: &str) -> Self {
+        self.projection.push(field.to_string());
         self
     }
 

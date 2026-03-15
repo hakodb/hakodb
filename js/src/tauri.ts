@@ -16,6 +16,7 @@ type FireLiteOp =
       filters: FilterInput[];
       orderBy?: OrderByInput;
       limit?: number;
+      projection?: string[];
     }
   | { op: 'batch'; mutations: BatchInput[] }
   | {
@@ -25,6 +26,7 @@ type FireLiteOp =
       filters: FilterInput[];
       orderBy?: OrderByInput;
       limit?: number;
+      projection?: string[];
       eventName: string;
     }
   | { op: 'unsubscribe'; listenerId: string };
@@ -106,7 +108,8 @@ export class TauriFireLite {
     collection: string,
     filters: FilterInput[],
     orderBy?: OrderByInput,
-    limit?: number
+    limit?: number,
+    projection?: string[]
   ): Promise<FireLiteRecord[]> {
     const normalizedFilters = filters.map((f) => ({
       ...f,
@@ -118,7 +121,8 @@ export class TauriFireLite {
       collection,
       filters: normalizedFilters,
       orderBy,
-      limit
+      limit,
+      projection
     });
 
     if ('queryResult' in res) {
@@ -133,6 +137,7 @@ export class TauriFireLite {
       filters: FilterInput[];
       orderBy?: OrderByInput;
       limit?: number;
+      projection?: string[];
       eventName: string;
     },
     callback: (rows: FireLiteRecord[]) => void
@@ -151,6 +156,7 @@ export class TauriFireLite {
       filters: params.filters,
       orderBy: params.orderBy,
       limit: params.limit,
+      projection: params.projection,
       eventName: params.eventName
     });
 
@@ -178,6 +184,10 @@ export class TauriCollectionReference {
 
   limit(limit: number): TauriQuery {
     return new TauriQuery(this._collection).limit(limit);
+  }
+
+  select(...fields: string[]): TauriQuery {
+    return new TauriQuery(this._collection).select(...fields);
   }
 
   async get(): Promise<FireLiteRecord[]> {
@@ -217,6 +227,7 @@ export class TauriQuery {
   private readonly filters: FilterInput[] = [];
   private orderByDef?: OrderByInput;
   private limitDef?: number;
+  private projectionDef?: string[];
 
   constructor(private readonly collection: string) {}
 
@@ -235,8 +246,13 @@ export class TauriQuery {
     return this;
   }
 
+  select(...fields: string[]): TauriQuery {
+    this.projectionDef = fields;
+    return this;
+  }
+
   async get(): Promise<FireLiteRecord[]> {
-    return new TauriFireLite().query(this.collection, this.filters, this.orderByDef, this.limitDef);
+    return new TauriFireLite().query(this.collection, this.filters, this.orderByDef, this.limitDef, this.projectionDef);
   }
 
   async onSnapshot(callback: (rows: FireLiteRecord[]) => void): Promise<() => Promise<void>> {
@@ -246,6 +262,7 @@ export class TauriQuery {
         filters: this.filters,
         orderBy: this.orderByDef,
         limit: this.limitDef,
+        projection: this.projectionDef,
         eventName: 'firelite://snapshot'
       },
       callback

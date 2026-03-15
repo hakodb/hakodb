@@ -81,6 +81,28 @@ fn doc_to_json(doc: &FireLiteDoc) -> Result<String, String> {
     serde_json::to_string(&serde_json::Value::Object(map)).map_err(|e| e.to_string())
 }
 
+fn projection_to_json(fields: Vec<(String, Value)>) -> Result<serde_json::Value, String> {
+    let mut map = serde_json::Map::new();
+    for (k, v) in fields {
+        let jv = match v {
+            Value::Null => serde_json::Value::Null,
+            Value::Bool(v) => serde_json::Value::Bool(v),
+            Value::Int(v) => serde_json::Value::Number(v.into()),
+            Value::Float(v) => serde_json::Number::from_f64(v)
+                .map(serde_json::Value::Number)
+                .ok_or_else(|| "invalid float".to_string())?,
+            Value::String(v) => serde_json::Value::String(v),
+            Value::Binary(v) => serde_json::Value::Array(
+                v.into_iter()
+                    .map(|b| serde_json::Value::Number((b as u64).into()))
+                    .collect(),
+            ),
+        };
+        map.insert(k, jv);
+    }
+    Ok(serde_json::Value::Object(map))
+}
+
 #[no_mangle]
 pub extern "C" fn fl_engine_open(path: *const c_char) -> *mut FL_Engine {
     let path = match cstr_to_string(path) {
@@ -519,6 +541,21 @@ pub extern "C" fn fl_query_limit(query: *mut FL_Query, limit: usize) -> i32 {
 }
 
 #[no_mangle]
+pub extern "C" fn fl_query_select_field(query: *mut FL_Query, field: *const c_char) -> i32 {
+    if query.is_null() {
+        return set_last_error("null query handle");
+    }
+    let field = match cstr_to_string(field) {
+        Ok(v) => v,
+        Err(e) => return set_last_error(e),
+    };
+    let query = unsafe { &mut *query };
+    query.query = query.query.clone().select(&field);
+    clear_last_error();
+    0
+}
+
+#[no_mangle]
 pub extern "C" fn fl_query_execute(engine: *mut FL_Engine, query: *const FL_Query) -> *mut c_char {
     if engine.is_null() || query.is_null() {
         set_last_error("null engine/query handle");
@@ -528,20 +565,35 @@ pub extern "C" fn fl_query_execute(engine: *mut FL_Engine, query: *const FL_Quer
     let engine = unsafe { &mut *engine };
     let query = unsafe { &*query };
 
-    match engine.db.query(query.query.clone()) {
-        Ok(rows) => {
-            let mut arr = Vec::with_capacity(rows.len());
-            for (_, doc) in rows {
-                match doc_to_json(&doc).and_then(|s| {
-                    serde_json::from_str::<serde_json::Value>(&s).map_err(|e| e.to_string())
-                }) {
-                    Ok(v) => arr.push(v),
-                    Err(e) => {
-                        set_last_error(e);
-                        return ptr::null_mut();
-                    }
-                }
-            }
+    let query_obj = query.query.clone();
+    let rows_res: Result<Vec<serde_json::Value>, String> = if query_obj.projection.is_empty() {
+        engine
+            .db
+            .query(query_obj)
+            .map_err(|e| e.to_string())
+            .and_then(|rows| {
+                rows.into_iter()
+                    .map(|(_, doc)| {
+                        doc_to_json(&doc).and_then(|s| {
+                            serde_json::from_str::<serde_json::Value>(&s).map_err(|e| e.to_string())
+                        })
+                    })
+                    .collect()
+            })
+    } else {
+        engine
+            .db
+            .query_projected_zero_copy(query_obj.clone(), &query_obj.projection)
+            .map_err(|e| e.to_string())
+            .and_then(|rows| {
+                rows.into_iter()
+                    .map(|(_, fields)| projection_to_json(fields))
+                    .collect()
+            })
+    };
+
+    match rows_res {
+        Ok(arr) => {
             match CString::new(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())) {
                 Ok(s) => {
                     clear_last_error();
@@ -554,7 +606,7 @@ pub extern "C" fn fl_query_execute(engine: *mut FL_Engine, query: *const FL_Quer
             }
         }
         Err(e) => {
-            set_last_error(e.to_string());
+            set_last_error(e);
             ptr::null_mut()
         }
     }
