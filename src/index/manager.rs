@@ -1,4 +1,5 @@
 use crate::document::firelite_doc::FireLiteDoc;
+use crate::document::value::Value;
 
 use super::composite::definition::CompositeIndexDefinition;
 use super::composite::manager::CompositeIndexManager;
@@ -23,6 +24,16 @@ impl IndexManager {
                     .map(|f| f.field.as_str())
                     .eq(fields.iter().map(String::as_str))
             })
+    }
+
+    pub fn exact_match_doc_ids(
+        &self,
+        collection: &str,
+        fields: &[String],
+        values: &[Value],
+    ) -> Option<Vec<String>> {
+        self.composite
+            .exact_match_doc_ids(collection, fields, values)
     }
 
     pub fn index_document(&mut self, collection: &str, doc_id: &str, doc: &FireLiteDoc) {

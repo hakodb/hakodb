@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::config::FireLiteConfig;
 use crate::error::Result;
 
 use super::compaction::compact_segment;
@@ -27,10 +28,14 @@ pub struct StorageEngine {
 }
 
 impl StorageEngine {
-    pub fn open(base_dir: impl AsRef<Path>) -> Result<Self> {
+    pub fn open(base_dir: impl AsRef<Path>, cfg: &FireLiteConfig) -> Result<Self> {
         std::fs::create_dir_all(base_dir.as_ref())?;
         let segment = Segment::open(base_dir.as_ref().join("segment-0.dat"))?;
-        let wal = Wal::open(base_dir.as_ref().join("wal.log"))?;
+        let wal = Wal::open(
+            base_dir.as_ref().join("wal.log"),
+            cfg.durability_mode,
+            cfg.group_commit_max_ops,
+        )?;
 
         let mut engine = Self {
             segment,
@@ -117,6 +122,10 @@ impl StorageEngine {
         }
 
         Ok(())
+    }
+
+    pub fn flush_wal(&mut self) -> Result<()> {
+        self.wal.flush()
     }
 
     pub fn put(&mut self, key: String, value: &[u8]) -> Result<()> {

@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crc32fast::Hasher;
 
+use crate::config::DurabilityMode;
 use crate::error::{FireLiteError, Result};
 
 #[derive(Debug, Clone)]
@@ -26,16 +27,28 @@ pub enum WalOp {
 
 pub struct Wal {
     file: File,
+    mode: DurabilityMode,
+    group_commit_max_ops: usize,
+    pending_ops_since_sync: usize,
 }
 
 impl Wal {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn open(
+        path: impl AsRef<Path>,
+        mode: DurabilityMode,
+        group_commit_max_ops: usize,
+    ) -> Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
             .open(path)?;
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            mode,
+            group_commit_max_ops: group_commit_max_ops.max(1),
+            pending_ops_since_sync: 0,
+        })
     }
 
     pub fn append(&mut self, op: &WalOp) -> Result<()> {
@@ -46,15 +59,42 @@ impl Wal {
         self.file.write_all(&(payload.len() as u32).to_le_bytes())?;
         self.file.write_all(&crc.to_le_bytes())?;
         self.file.write_all(&payload)?;
-        self.file.sync_data()?;
-        Ok(())
+        self.pending_ops_since_sync += 1;
+        self.maybe_sync(false)
     }
 
     pub fn append_batch(&mut self, ops: &[WalOp]) -> Result<()> {
         for op in ops {
-            self.append(op)?;
+            let payload = encode(op);
+            let mut hasher = Hasher::new();
+            hasher.update(&payload);
+            let crc = hasher.finalize();
+            self.file.write_all(&(payload.len() as u32).to_le_bytes())?;
+            self.file.write_all(&crc.to_le_bytes())?;
+            self.file.write_all(&payload)?;
+            self.pending_ops_since_sync += 1;
         }
+        self.maybe_sync(true)
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        self.file.sync_data()?;
+        self.pending_ops_since_sync = 0;
         Ok(())
+    }
+
+    fn maybe_sync(&mut self, is_batch_boundary: bool) -> Result<()> {
+        match self.mode {
+            DurabilityMode::Always => self.flush(),
+            DurabilityMode::Interval => {
+                if self.pending_ops_since_sync >= self.group_commit_max_ops || is_batch_boundary {
+                    self.flush()
+                } else {
+                    Ok(())
+                }
+            }
+            DurabilityMode::Manual => Ok(()),
+        }
     }
 
     pub fn replay(&mut self) -> Result<Vec<WalOp>> {
@@ -89,6 +129,7 @@ impl Wal {
     pub fn reset(&mut self) -> Result<()> {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
+        self.pending_ops_since_sync = 0;
         Ok(())
     }
 }
@@ -223,6 +264,8 @@ fn decode(payload: &[u8]) -> Result<WalOp> {
 mod tests {
     use std::fs;
 
+    use crate::config::DurabilityMode;
+
     use super::{Wal, WalOp};
 
     #[test]
@@ -231,28 +274,26 @@ mod tests {
             "firelite-wal-{}.log",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock should be after unix epoch")
+                .expect("clock")
                 .as_nanos()
         ));
 
-        let mut wal = Wal::open(&path).expect("wal open should succeed");
-        wal.append(&WalOp::BeginTx { tx_id: 1 })
-            .expect("append begin should succeed");
+        let mut wal = Wal::open(&path, DurabilityMode::Always, 2).expect("open");
+        wal.append(&WalOp::BeginTx { tx_id: 1 }).expect("begin");
         wal.append(&WalOp::Put {
             key: "users:1".into(),
             segment_offset: 10,
             len: 3,
         })
-        .expect("append put should succeed");
+        .expect("put");
 
-        let replayed = wal.replay().expect("replay should succeed");
+        let replayed = wal.replay().expect("replay");
         assert!(replayed.is_empty());
 
-        wal.append(&WalOp::CommitTx { tx_id: 1 })
-            .expect("append commit should succeed");
-        let replayed = wal.replay().expect("replay should succeed");
+        wal.append(&WalOp::CommitTx { tx_id: 1 }).expect("commit");
+        let replayed = wal.replay().expect("replay2");
         assert_eq!(replayed.len(), 1);
 
-        fs::remove_file(path).expect("temp wal file should be removable");
+        fs::remove_file(path).expect("cleanup");
     }
 }

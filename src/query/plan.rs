@@ -1,10 +1,15 @@
+use crate::document::value::Value;
+
 use super::filter::Filter;
 use super::order::OrderBy;
 
 #[derive(Debug, Clone)]
 pub enum ScanType {
     FullCollection,
-    CompositeIndex,
+    CompositeIndex {
+        fields: Vec<String>,
+        values: Vec<Value>,
+    },
 }
 
 #[derive(Debug, Clone)]

@@ -30,6 +30,10 @@ impl Query {
         self
     }
 
+    pub fn where_eq(self, field: &str, value: Value) -> Self {
+        self.where_filter(field, Operator::Eq, value)
+    }
+
     pub fn order_by(mut self, field: &str, ascending: bool) -> Self {
         self.order_by = Some(OrderBy {
             field: field.to_string(),

@@ -2,6 +2,8 @@ use std::thread;
 
 use crate::document::firelite_doc::FireLiteDoc;
 use crate::error::Result;
+use crate::index::manager::IndexManager;
+use crate::query::plan::ScanType;
 use crate::storage::engine::StorageEngine;
 
 use super::super::plan::QueryPlan;
@@ -22,9 +24,28 @@ impl ParallelQueryExecutor {
     pub fn execute(
         &self,
         storage: &mut StorageEngine,
+        indexes: &IndexManager,
         plan: QueryPlan,
     ) -> Result<Vec<(String, FireLiteDoc)>> {
-        let docs = storage.scan_prefix(&format!("{}:", plan.collection))?;
+        let docs = match &plan.scan {
+            ScanType::FullCollection => storage.scan_prefix(&format!("{}:", plan.collection))?,
+            ScanType::CompositeIndex { fields, values } => {
+                if let Some(doc_ids) = indexes.exact_match_doc_ids(&plan.collection, fields, values)
+                {
+                    let mut out = Vec::new();
+                    for doc_id in doc_ids {
+                        let key = format!("{}:{}", plan.collection, doc_id);
+                        if let Some(raw) = storage.get(&key)? {
+                            out.push((key, raw));
+                        }
+                    }
+                    out
+                } else {
+                    storage.scan_prefix(&format!("{}:", plan.collection))?
+                }
+            }
+        };
+
         let tasks = shard_tasks(docs, self.workers, plan.clone());
         let mut handles = Vec::new();
         for task in tasks {

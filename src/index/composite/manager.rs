@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 
 use crate::document::firelite_doc::FireLiteDoc;
+use crate::document::value::Value;
 
 use super::composite_index::CompositeIndex;
 use super::definition::CompositeIndexDefinition;
+use super::range_builder::build_prefix_range;
 
 #[derive(Default)]
 pub struct CompositeIndexManager {
@@ -68,5 +70,32 @@ impl CompositeIndexManager {
                 index.remove_document(doc_id, doc);
             }
         }
+    }
+
+    pub fn exact_match_doc_ids(
+        &self,
+        collection: &str,
+        fields: &[String],
+        values: &[Value],
+    ) -> Option<Vec<String>> {
+        for idx in self.indexes_for_collection(collection) {
+            let idx_fields: Vec<&str> = idx
+                .definition
+                .fields
+                .iter()
+                .map(|f| f.field.as_str())
+                .collect();
+            if idx_fields.len() >= fields.len()
+                && idx_fields
+                    .iter()
+                    .take(fields.len())
+                    .copied()
+                    .eq(fields.iter().map(String::as_str))
+            {
+                let range = build_prefix_range(&idx.definition, values);
+                return Some(idx.range_scan(&range.start, &range.end));
+            }
+        }
+        None
     }
 }
