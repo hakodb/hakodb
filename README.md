@@ -44,9 +44,12 @@ FireLite is in **advanced foundation stage**: core architecture and major vertic
   - opaque handle types (`FL_Engine`, `FL_Doc`, `FL_Batch`, `FL_Query`)
   - C ABI document builder, CRUD, query, and atomic batch commit functions
   - thread-local `fl_last_error` and explicit free APIs
-- Performance scaffolding
-  - Criterion benchmark target
-  - CI workflow to run benchmark job
+- JavaScript/TypeScript SDK (`js/`)
+  - Node.js + Bun dynamic loading
+  - Firestore-like API: `db.collection().doc().set()/get()/delete()`
+  - fluent query builder: `where().orderBy().limit().get()`
+  - atomic write batches: `batch.set/delete/commit`
+  - object -> `FL_Doc` field insertion path via `fl_doc_insert_*` (no JSON payload mutation path)
 
 ### Still Missing for Full Production Readiness
 
@@ -82,6 +85,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+---
+
+## JavaScript / TypeScript Client (Node.js + Bun)
+
+A high-level SDK is available under `js/`, built over the C-FFI layer.
+
+### Install dependencies
+
+```bash
+cd js
+npm install
+```
+
+### Firestore-style usage
+
+```ts
+import { FireLiteClient } from "@firelite/client";
+
+const db = await FireLiteClient.open("./data.firelite", {
+  libraryPath: "./target/release/libfirelite.so", // optional override
+});
+
+await db.collection("users").doc("alice").set({
+  name: "Alice",
+  age: 30,
+  active: true,
+});
+
+const snap = await db.collection("users").doc("alice").get();
+if (snap.exists) {
+  console.log(snap.data());
+}
+
+const rows = await db
+  .collection("users")
+  .where("age", "==", 30)
+  .orderBy("name", "asc")
+  .limit(10)
+  .get();
+
+const batch = db.batch();
+batch
+  .set(db.collection("users").doc("bob"), { name: "Bob", age: 31 })
+  .delete(db.collection("users").doc("alice"));
+await batch.commit();
+
+await db.close();
+```
+
+### API coverage in JS SDK
+
+- CRUD: `set/get/delete`
+- Fluent query: `where(==)`, `orderBy`, `limit`, `get`
+- Atomic batch: `set/delete/commit`
+- Value mapping to FFI builder:
+  - `string` -> `fl_doc_insert_str`
+  - `number (int)` -> `fl_doc_insert_int`
+  - `number (float)` -> `fl_doc_insert_float`
+  - `boolean` -> `fl_doc_insert_bool`
+  - `null` -> `fl_doc_insert_null`
+  - `Uint8Array` -> `fl_doc_insert_bin`
 
 ---
 
@@ -150,36 +215,12 @@ Header generation is automated via `build.rs` + `cbindgen.toml`.
 - `fl_query_order_by`, `fl_query_limit`
 - `fl_query_execute`
 
-### Minimal C Usage
-
-```c
-#include "firelite.h"
-
-int main(void) {
-    FL_Engine* engine = fl_engine_open("./data.firelite");
-    if (!engine) return 1;
-
-    FL_Doc* doc = fl_doc_new();
-    fl_doc_insert_str(doc, "name", "alice");
-    fl_doc_insert_int(doc, "age", 30);
-
-    if (fl_engine_insert(engine, "users", "1", doc) != 0) {
-        const char* err = fl_last_error();
-        (void)err;
-    }
-
-    fl_doc_free(doc);
-    fl_engine_free(engine);
-    return 0;
-}
-```
-
 ---
 
 ## Architecture
 
 ```text
-API (FireLite + FFI)
+API (FireLite + FFI + JS/TS client)
   -> Query (planner + executor)
     -> Index (composite manager)
       -> Storage (encrypted WAL + encrypted segment + compaction)
@@ -188,15 +229,36 @@ API (FireLite + FFI)
 
 ---
 
-## Updated Implementation List
+## Implementation Tables
 
-- `src/engine/*`: core API, transactions, watch streams, subcollection helpers
-- `src/storage/*`: WAL, encrypted segment store, compaction, crypto
-- `src/index/*`: composite index definitions/manager and storage helpers
-- `src/query/*`: filters, planner, parallel executor and worker sharding
-- `src/document/*`: binary document model and typed values
-- `src/ffi.rs`: comprehensive flat C ABI with opaque handles
-- `include/firelite.h`: generated C header for external consumers
+### Feature status vs Firestore-style target
+
+| Area | FireLite status | Notes |
+|---|---|---|
+| Embedded engine | ✅ Implemented | In-process Rust runtime |
+| Durable WAL + recovery | ✅ Implemented | Tx markers and replay |
+| Encryption at rest | ✅ Implemented | Optional WAL + segment encryption |
+| Multi-document atomic batches | ✅ Implemented | Engine + C-FFI batch commit |
+| Transactions | ⚠️ Partial | Atomic commit path exists; full conflict-aware serializable model pending |
+| Composite indexes | ✅ Implemented | Equality composite scans integrated |
+| Query filters/order/limit | ✅ Implemented | Core operators + ordering + limit |
+| Real-time listeners/watch | ✅ Implemented | Local watch streams in Rust engine |
+| Subcollections | ✅ Implemented | Subdocument helpers exposed in Rust API |
+| JS/TS Firestore-style client | ✅ Implemented | `collection().doc().set/get/delete`, query builder, batch |
+| Firestore parity (full cloud API) | ❌ Not targeted yet | No remote service, rules engine, auth, distributed infra |
+
+### Module implementation map
+
+| Module | Path | Status |
+|---|---|---|
+| Engine API | `src/engine/*` | ✅ |
+| Storage + crypto | `src/storage/*` | ✅ |
+| Indexing | `src/index/*` | ✅ |
+| Query planner/executor | `src/query/*` | ✅ |
+| Document model | `src/document/*` | ✅ |
+| C-FFI | `src/ffi.rs`, `include/firelite.h` | ✅ |
+| JS/TS SDK | `js/src/*` | ✅ |
+| Bench + perf CI | `benches/engine_bench.rs`, `.github/workflows/perf.yml` | ✅ |
 
 ---
 
@@ -213,6 +275,7 @@ API (FireLite + FFI)
 - Add recovery tests when touching storage/WAL/indexing
 - Document binary format or compatibility-impacting changes
 - Keep C ABI additions reflected in cbindgen config + generated header
+- Keep JS SDK API changes reflected in this README and examples
 
 ---
 
