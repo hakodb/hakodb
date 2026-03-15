@@ -1,89 +1,65 @@
-use crate::document::firelite_doc::Value;
+use crate::document::value::Value;
 
-#[derive(Debug, Clone)]
-pub enum Operator {
-    Eq,
-    Gt,
-    Gte,
-    Lt,
-    Lte,
-}
-
-#[derive(Debug, Clone)]
-pub struct Filter {
-    pub field: String,
-    pub op: Operator,
-    pub value: Value,
-}
-
-#[derive(Debug, Clone)]
-pub struct OrderBy {
-    pub field: String,
-    pub ascending: bool,
-}
+use super::filter::{Filter, Operator};
+use super::order::OrderBy;
 
 #[derive(Debug, Clone)]
 pub struct Query {
-
     pub collection: String,
-
     pub filters: Vec<Filter>,
-
     pub order_by: Option<OrderBy>,
-
     pub limit: Option<usize>,
+    pub projection: Vec<String>,
 }
 
 impl Query {
-
     pub fn new(collection: &str) -> Self {
-
         Self {
             collection: collection.to_string(),
-            filters: vec![],
+            filters: Vec::new(),
             order_by: None,
             limit: None,
+            projection: Vec::new(),
         }
     }
 
-    pub fn where_filter(
-        mut self,
-        field: &str,
-        op: Operator,
-        value: Value
-    ) -> Self {
-
-        self.filters.push(
-            Filter {
-                field: field.to_string(),
-                op,
-                value
-            }
-        );
-
+    pub fn where_filter(mut self, field: &str, op: Operator, value: Value) -> Self {
+        self.filters.push(Filter {
+            field: field.to_string(),
+            op,
+            value,
+        });
         self
     }
 
-    pub fn order_by(
-        mut self,
-        field: &str,
-        ascending: bool
-    ) -> Self {
+    pub fn where_eq(self, field: &str, value: Value) -> Self {
+        self.where_filter(field, Operator::Eq, value)
+    }
 
-        self.order_by = Some(
-            OrderBy {
-                field: field.to_string(),
-                ascending
-            }
-        );
-
+    pub fn order_by(mut self, field: &str, ascending: bool) -> Self {
+        self.order_by = Some(OrderBy {
+            field: field.to_string(),
+            ascending,
+        });
         self
     }
 
     pub fn limit(mut self, n: usize) -> Self {
-
         self.limit = Some(n);
-
         self
+    }
+
+    pub fn select_fields(mut self, fields: Vec<String>) -> Self {
+        self.projection = fields;
+        self
+    }
+
+    pub fn select(mut self, field: &str) -> Self {
+        self.projection.push(field.to_string());
+        self
+    }
+
+    pub fn composite_fields(&self) -> Vec<String> {
+        self.filters.iter().map(|f| f.field.clone()).collect()
     }
 }
