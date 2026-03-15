@@ -6,6 +6,10 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+tauri-gateway = ["dep:tauri"]
+
 [dependencies]
 memmap2 = "0.9"
 crc32fast = "1"
@@ -17,6 +21,7 @@ rand = "0.8"
 sha2 = "0.10"
 chacha20poly1305 = "0.10"
 libc = "0.2"
+tauri = { version = "2", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"

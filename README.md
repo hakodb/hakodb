@@ -50,6 +50,10 @@ FireLite is in **advanced foundation stage**: core architecture and major vertic
   - fluent query builder: `where().orderBy().limit().get()`
   - atomic write batches: `batch.set/delete/commit`
   - object -> `FL_Doc` field insertion path via `fl_doc_insert_*` (no JSON payload mutation path)
+- Tauri unified gateway
+  - single-command dispatcher `firelite_exec` with tagged `FireLiteOp` routing
+  - subscription registry for reactive `onSnapshot` flows via `Window::emit`
+  - subscribe/unsubscribe lifecycle hooks and window-level cleanup support
 
 ### Still Missing for Full Production Readiness
 
@@ -150,6 +154,54 @@ await db.close();
 
 ---
 
+---
+
+## Tauri Unified Dispatcher Gateway
+
+FireLite now includes an optional Tauri bridge that routes all operations through a **single command entrypoint**.
+
+### Enable feature
+
+```toml
+firelite = { version = "0.1", features = ["tauri-gateway"] }
+```
+
+### Rust bridge surface
+
+- Command: `firelite_exec`
+- Internal-tagged operation enum: `FireLiteOp`
+  - `Get`, `Set`, `Delete`, `Query`, `Batch`, `Subscribe`, `Unsubscribe`
+- Reactive subscription registry:
+  - tracks listener IDs per window
+  - re-runs query snapshots on collection change
+  - emits updates with `Window::emit("firelite://snapshot", payload)`
+- Lifecycle helpers:
+  - unsubscribe command support
+  - `cleanup_window_subscriptions(window_label)` for close-event cleanup
+
+### Frontend SDK usage (Tauri)
+
+```ts
+import { TauriFireLite } from "@firelite/client";
+
+const db = new TauriFireLite();
+
+await db.collection("users").doc("u1").set({ name: "alice", age: 30 });
+
+const stop = await db
+  .collection("users")
+  .where("age", "gte", 18)
+  .orderBy("name", "asc")
+  .limit(25)
+  .onSnapshot((rows) => {
+    console.log("live rows", rows);
+  });
+
+// later
+await stop();
+```
+
+
 ## Multi-Language Platform Support (C ABI)
 
 FireLite supports cross-language embedding through a flat C ABI intended for Node.js/Python/C++/C# integration layers.
@@ -245,6 +297,7 @@ API (FireLite + FFI + JS/TS client)
 | Real-time listeners/watch | ✅ Implemented | Local watch streams in Rust engine |
 | Subcollections | ✅ Implemented | Subdocument helpers exposed in Rust API |
 | JS/TS Firestore-style client | ✅ Implemented | `collection().doc().set/get/delete`, query builder, batch |
+| Tauri unified dispatcher gateway | ✅ Implemented | Single `firelite_exec`, reactive subscriptions, lifecycle controls |
 | Firestore parity (full cloud API) | ❌ Not targeted yet | No remote service, rules engine, auth, distributed infra |
 
 ### Module implementation map
@@ -258,6 +311,7 @@ API (FireLite + FFI + JS/TS client)
 | Document model | `src/document/*` | ✅ |
 | C-FFI | `src/ffi.rs`, `include/firelite.h` | ✅ |
 | JS/TS SDK | `js/src/*` | ✅ |
+| Tauri gateway | `src/tauri_gateway.rs`, `js/src/tauri.ts` | ✅ |
 | Bench + perf CI | `benches/engine_bench.rs`, `.github/workflows/perf.yml` | ✅ |
 
 ---

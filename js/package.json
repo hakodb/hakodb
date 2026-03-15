@@ -8,11 +8,18 @@
   "exports": {
     ".": "./src/index.ts"
   },
-  "keywords": ["firelite", "firestore", "embedded", "database", "ffi"],
+  "keywords": [
+    "firelite",
+    "firestore",
+    "embedded",
+    "database",
+    "ffi"
+  ],
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
-    "koffi": "^2.8.0"
+    "koffi": "^2.8.0",
+    "@tauri-apps/api": "^2.0.0"
   }
 }

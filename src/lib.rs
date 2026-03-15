@@ -8,5 +8,8 @@ pub mod memory;
 pub mod query;
 pub mod storage;
 pub mod util;
+#[cfg(feature = "tauri-gateway")]
+pub mod tauri_gateway;
+
 
 pub use engine::FireLite;
