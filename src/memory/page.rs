@@ -1,44 +1,16 @@
-pub const PAGE_SIZE:usize = 4096;
+pub const DEFAULT_PAGE_SIZE: usize = 4096;
 
+#[derive(Debug, Clone)]
 pub struct Page {
-
-    pub id:u64,
-
-    pub data:Vec<u8>,
-
+    pub id: u64,
+    pub data: Vec<u8>,
 }
 
 impl Page {
-
-    pub fn new(id:u64)->Self{
-
-        Self{
+    pub fn new(id: u64, page_size: usize) -> Self {
+        Self {
             id,
-            data:vec![0;PAGE_SIZE]
+            data: vec![0; page_size],
         }
-
     }
-
-    pub fn read(
-        &self,
-        offset:usize,
-        len:usize
-    )->&[u8]{
-
-        &self.data[offset..offset+len]
-
-    }
-
-    pub fn write(
-        &mut self,
-        offset:usize,
-        bytes:&[u8]
-    ){
-
-        let end = offset+bytes.len();
-
-        self.data[offset..end].copy_from_slice(bytes);
-
-    }
-
 }

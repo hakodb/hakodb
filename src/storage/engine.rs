@@ -1,256 +1,419 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::error::FireLiteError;
-use crate::storage::log::Log;
+use crate::config::FireLiteConfig;
+use crate::error::{FireLiteError, Result};
 
-pub type Result<T> = std::result::Result<T, FireLiteError>;
+use super::compaction::compact_segment;
+use super::crypto::EncryptionContext;
+use super::segment::Segment;
+use super::wal::{Wal, WalOp};
 
-const OP_INSERT: u8 = 1;
-const OP_DELETE: u8 = 2;
-
-#[derive(Clone)]
-struct DocMeta {
-    offset: u64,
+#[derive(Debug, Clone)]
+pub struct Pointer {
+    pub segment_id: u64,
+    pub offset: u64,
+    pub len: u32,
 }
 
-pub struct FireLiteEngine {
-    log: Log,
-
-    /// collection_name -> collection_id
-    collections: HashMap<String, u32>,
-
-    /// collection_id -> name
-    reverse_collections: HashMap<u32, String>,
-
-    /// next collection id
-    next_collection_id: u32,
-
-    /// (collection_id, doc_id) -> record offset
-    index: HashMap<(u32, String), DocMeta>,
+#[derive(Debug, Clone)]
+pub enum StorageMutation {
+    Put { key: String, value: Vec<u8> },
+    Delete { key: String },
 }
 
-impl FireLiteEngine {
+struct SegmentMeta {
+    id: u64,
+    level: u32,
+    segment: Segment,
+}
 
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+pub struct StorageEngine {
+    base_dir: PathBuf,
+    segments: HashMap<u64, SegmentMeta>,
+    active_segment_id: u64,
+    next_segment_id: u64,
+    wal: Wal,
+    index: HashMap<String, Pointer>,
+    next_tx_id: u64,
+    compaction_threshold_bytes: usize,
+}
 
-        let mut log = Log::open(path)?;
+impl StorageEngine {
+    pub fn open(base_dir: impl AsRef<Path>, cfg: &FireLiteConfig) -> Result<Self> {
+        std::fs::create_dir_all(base_dir.as_ref())?;
+
+        let encryption = cfg
+            .encryption_key
+            .as_ref()
+            .map(|secret| EncryptionContext::from_secret(secret));
+
+        let wal = Wal::open(
+            base_dir.as_ref().join("wal.log"),
+            cfg.durability_mode,
+            cfg.group_commit_max_ops,
+            encryption.clone(),
+        )?;
+
+        let mut segments = HashMap::new();
+        let mut max_id = 0;
+        let mut active_segment_id = 0;
+
+        for entry in std::fs::read_dir(base_dir.as_ref())? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some((level, id)) = parse_segment_name(&name) {
+                let segment = Segment::open(entry.path(), encryption.clone())?;
+                segments.insert(id, SegmentMeta { id, level, segment });
+                if id > max_id {
+                    max_id = id;
+                }
+                if id >= active_segment_id {
+                    active_segment_id = id;
+                }
+            }
+        }
+
+        if segments.is_empty() {
+            let path = segment_path(base_dir.as_ref(), 0, 0);
+            let segment = Segment::open(path, encryption.clone())?;
+            segments.insert(
+                0,
+                SegmentMeta {
+                    id: 0,
+                    level: 0,
+                    segment,
+                },
+            );
+            max_id = 0;
+            active_segment_id = 0;
+        }
 
         let mut engine = Self {
-            log,
-            collections: HashMap::new(),
-            reverse_collections: HashMap::new(),
-            next_collection_id: 1,
+            base_dir: base_dir.as_ref().to_path_buf(),
+            segments,
+            active_segment_id,
+            next_segment_id: max_id + 1,
+            wal,
             index: HashMap::new(),
+            next_tx_id: 1,
+            compaction_threshold_bytes: cfg.auto_compaction_threshold_bytes,
         };
-
-        engine.rebuild_index()?;
-
+        engine.recover()?;
         Ok(engine)
     }
 
-    fn get_or_create_collection(&mut self, name: &str) -> u32 {
-
-        if let Some(id) = self.collections.get(name) {
-            return *id;
+    fn recover(&mut self) -> Result<()> {
+        for op in self.wal.replay()? {
+            match op {
+                WalOp::Put {
+                    key,
+                    segment_id,
+                    segment_offset,
+                    len,
+                } => {
+                    self.index.insert(
+                        key,
+                        Pointer {
+                            segment_id,
+                            offset: segment_offset,
+                            len,
+                        },
+                    );
+                }
+                WalOp::Delete { key } => {
+                    self.index.remove(&key);
+                }
+                WalOp::BeginTx { .. } | WalOp::CommitTx { .. } => {}
+            }
         }
-
-        let id = self.next_collection_id;
-
-        self.collections.insert(name.to_string(), id);
-        self.reverse_collections.insert(id, name.to_string());
-
-        self.next_collection_id += 1;
-
-        id
-    }
-
-    pub fn insert(
-        &mut self,
-        collection: &str,
-        doc_id: &str,
-        document: Vec<u8>,
-    ) -> Result<()> {
-
-        let cid = self.get_or_create_collection(collection);
-
-        let record = encode_record(
-            cid,
-            doc_id,
-            OP_INSERT,
-            &document
-        );
-
-        let offset = self.log.append_raw(&record)?;
-
-        self.index.insert(
-            (cid, doc_id.to_string()),
-            DocMeta { offset },
-        );
-
         Ok(())
     }
 
-    pub fn get(
-        &mut self,
-        collection: &str,
-        doc_id: &str,
-    ) -> Result<Option<Vec<u8>>> {
+    pub fn apply_batch(&mut self, mutations: &[StorageMutation]) -> Result<()> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
 
-        let cid = match self.collections.get(collection) {
-            Some(v) => *v,
-            None => return Ok(None),
+        let tx_id = self.next_tx_id;
+        self.next_tx_id += 1;
+
+        let mut wal_ops = Vec::with_capacity(mutations.len() + 2);
+        wal_ops.push(WalOp::BeginTx { tx_id });
+
+        let mut index_updates = Vec::with_capacity(mutations.len());
+
+        for mutation in mutations {
+            match mutation {
+                StorageMutation::Put { key, value } => {
+                    let active = self
+                        .segments
+                        .get_mut(&self.active_segment_id)
+                        .ok_or_else(|| FireLiteError::Corrupt("active segment missing".into()))?;
+                    let (offset, stored_len) = active.segment.append(value)?;
+                    let pointer = Pointer {
+                        segment_id: self.active_segment_id,
+                        offset,
+                        len: stored_len,
+                    };
+                    wal_ops.push(WalOp::Put {
+                        key: key.clone(),
+                        segment_id: pointer.segment_id,
+                        segment_offset: pointer.offset,
+                        len: pointer.len,
+                    });
+                    index_updates.push((key.clone(), Some(pointer)));
+                }
+                StorageMutation::Delete { key } => {
+                    wal_ops.push(WalOp::Delete { key: key.clone() });
+                    index_updates.push((key.clone(), None));
+                }
+            }
+        }
+
+        wal_ops.push(WalOp::CommitTx { tx_id });
+        self.wal.append_batch(&wal_ops)?;
+
+        for (key, pointer) in index_updates {
+            match pointer {
+                Some(pointer) => {
+                    self.index.insert(key, pointer);
+                }
+                None => {
+                    self.index.remove(&key);
+                }
+            }
+        }
+
+        self.maybe_rotate_active_segment()?;
+        Ok(())
+    }
+
+    pub fn run_background_maintenance(&mut self) -> Result<()> {
+        self.maybe_rotate_active_segment()?;
+        self.compact_tiers_once()
+    }
+
+    fn maybe_rotate_active_segment(&mut self) -> Result<()> {
+        let size = self
+            .segments
+            .get_mut(&self.active_segment_id)
+            .ok_or_else(|| FireLiteError::Corrupt("active segment missing".into()))?
+            .segment
+            .size_bytes()? as usize;
+
+        if size < self.compaction_threshold_bytes.max(1024 * 1024) {
+            return Ok(());
+        }
+
+        let new_id = self.next_segment_id;
+        self.next_segment_id += 1;
+        let path = segment_path(&self.base_dir, 0, new_id);
+        let encryption = None;
+        let segment = Segment::open(path, encryption)?;
+        self.segments.insert(
+            new_id,
+            SegmentMeta {
+                id: new_id,
+                level: 0,
+                segment,
+            },
+        );
+        self.active_segment_id = new_id;
+        Ok(())
+    }
+
+    fn compact_tiers_once(&mut self) -> Result<()> {
+        // find two immutable segments on same level
+        let mut by_level: HashMap<u32, Vec<u64>> = HashMap::new();
+        for (id, meta) in &self.segments {
+            if *id == self.active_segment_id {
+                continue;
+            }
+            by_level.entry(meta.level).or_default().push(*id);
+        }
+
+        let mut candidate: Option<(u32, u64, u64)> = None;
+        for (level, ids) in by_level {
+            if ids.len() >= 2 {
+                candidate = Some((level, ids[0], ids[1]));
+                break;
+            }
+        }
+
+        let Some((level, s1, s2)) = candidate else {
+            return Ok(());
         };
 
-        let meta = match self.index.get(&(cid, doc_id.to_string())) {
-            Some(v) => v,
-            None => return Ok(None),
-        };
+        let target_level = level + 1;
+        let target_id = self.next_segment_id;
+        self.next_segment_id += 1;
 
-        let record = self.log.read_raw(meta.offset)?;
+        let mut entries = Vec::new();
+        let snapshot: Vec<(String, Pointer)> = self
+            .index
+            .iter()
+            .map(|(k, p)| (k.clone(), p.clone()))
+            .collect();
+        for (key, pointer) in snapshot {
+            if pointer.segment_id == s1 || pointer.segment_id == s2 {
+                if let Some(value) = self.read_pointer(&pointer)? {
+                    entries.push((key, value));
+                }
+            }
+        }
 
-        let decoded = decode_record(&record)?;
+        let target_path = segment_path(&self.base_dir, target_level, target_id);
+        let mut target = Segment::open(target_path, None)?;
 
-        if decoded.op == OP_DELETE {
+        let mut new_index = HashMap::new();
+        compact_segment(&mut target, &entries, &mut new_index, target_id)?;
+
+        for (k, p) in new_index {
+            self.index.insert(k, p);
+        }
+
+        if let Some(meta) = self.segments.remove(&s1) {
+            let _ = std::fs::remove_file(meta.segment.path());
+        }
+        if let Some(meta) = self.segments.remove(&s2) {
+            let _ = std::fs::remove_file(meta.segment.path());
+        }
+
+        self.segments.insert(
+            target_id,
+            SegmentMeta {
+                id: target_id,
+                level: target_level,
+                segment: target,
+            },
+        );
+
+        self.rewrite_wal_snapshot()?;
+        Ok(())
+    }
+
+    fn rewrite_wal_snapshot(&mut self) -> Result<()> {
+        self.wal.reset()?;
+        for (key, pointer) in self.index.clone() {
+            self.wal.append(&WalOp::Put {
+                key,
+                segment_id: pointer.segment_id,
+                segment_offset: pointer.offset,
+                len: pointer.len,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn read_pointer(&mut self, pointer: &Pointer) -> Result<Option<Vec<u8>>> {
+        let Some(segment) = self.segments.get_mut(&pointer.segment_id) else {
             return Ok(None);
-        }
-
-        Ok(Some(decoded.document))
-    }
-
-    pub fn delete(
-        &mut self,
-        collection: &str,
-        doc_id: &str,
-    ) -> Result<()> {
-
-        let cid = match self.collections.get(collection) {
-            Some(v) => *v,
-            None => return Ok(()),
         };
-
-        let record = encode_record(
-            cid,
-            doc_id,
-            OP_DELETE,
-            &[]
-        );
-
-        self.log.append_raw(&record)?;
-
-        self.index.remove(&(cid, doc_id.to_string()));
-
-        Ok(())
+        Ok(Some(segment.segment.read_at(pointer.offset, pointer.len)?))
     }
 
-    fn rebuild_index(&mut self) -> Result<()> {
+    pub fn flush_wal(&mut self) -> Result<()> {
+        self.wal.flush()
+    }
 
-        let entries = self.log.scan_raw()?;
+    pub fn put(&mut self, key: String, value: &[u8]) -> Result<()> {
+        self.apply_batch(&[StorageMutation::Put {
+            key,
+            value: value.to_vec(),
+        }])
+    }
 
-        for (offset, record_bytes) in entries {
+    pub fn get(&mut self, key: &str) -> Result<Option<Vec<u8>>> {
+        let Some(pointer) = self.index.get(key).cloned() else {
+            return Ok(None);
+        };
+        self.read_pointer(&pointer)
+    }
 
-            let record = decode_record(&record_bytes)?;
+    pub fn delete(&mut self, key: &str) -> Result<()> {
+        self.apply_batch(&[StorageMutation::Delete {
+            key: key.to_string(),
+        }])
+    }
 
-            let cid = record.collection_id;
+    pub fn count_prefix(&self, prefix: &str) -> usize {
+        self.index.keys().filter(|k| k.starts_with(prefix)).count()
+    }
 
-            if !self.reverse_collections.contains_key(&cid) {
-                let name = format!("collection_{}", cid);
+    pub fn scan_prefix(&mut self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let keys: Vec<String> = self
+            .index
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect();
 
-                self.reverse_collections.insert(cid, name.clone());
-                self.collections.insert(name, cid);
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(value) = self.get(&key)? {
+                out.push((key, value));
             }
+        }
+        Ok(out)
+    }
 
-            if record.op == OP_INSERT {
-
-                self.index.insert(
-                    (cid, record.doc_id.clone()),
-                    DocMeta { offset },
-                );
-
-            } else {
-
-                self.index.remove(&(cid, record.doc_id.clone()));
+    pub fn compact(&mut self) -> Result<()> {
+        while self.compact_tiers_once().is_ok() {
+            let by_level_count = self
+                .segments
+                .values()
+                .filter(|m| m.id != self.active_segment_id)
+                .count();
+            if by_level_count < 2 {
+                break;
             }
         }
 
-        Ok(())
+        // full snapshot compaction fallback
+        let mut entries = Vec::new();
+        for key in self.index.keys().cloned().collect::<Vec<_>>() {
+            if let Some(value) = self.get(&key)? {
+                entries.push((key, value));
+            }
+        }
+
+        let target_id = self.next_segment_id;
+        self.next_segment_id += 1;
+        let target_path = segment_path(&self.base_dir, 1, target_id);
+        let mut target = Segment::open(target_path, None)?;
+        let mut rebuilt = HashMap::new();
+        compact_segment(&mut target, &entries, &mut rebuilt, target_id)?;
+
+        for meta in self.segments.values() {
+            let _ = std::fs::remove_file(meta.segment.path());
+        }
+        self.segments.clear();
+        self.segments.insert(
+            target_id,
+            SegmentMeta {
+                id: target_id,
+                level: 1,
+                segment: target,
+            },
+        );
+        self.active_segment_id = target_id;
+        self.index = rebuilt;
+
+        self.rewrite_wal_snapshot()
     }
 }
 
-struct DecodedRecord {
-    collection_id: u32,
-    doc_id: String,
-    op: u8,
-    document: Vec<u8>,
+fn segment_path(base: &Path, level: u32, id: u64) -> PathBuf {
+    base.join(format!("segment-l{}-{}.dat", level, id))
 }
 
-fn encode_record(
-    collection_id: u32,
-    doc_id: &str,
-    op: u8,
-    doc: &[u8],
-) -> Vec<u8> {
-
-    use crc32fast::Hasher;
-
-    let doc_id_bytes = doc_id.as_bytes();
-
-    let mut payload = Vec::new();
-
-    payload.extend(&collection_id.to_le_bytes());
-
-    payload.extend(&(doc_id_bytes.len() as u16).to_le_bytes());
-    payload.extend(doc_id_bytes);
-
-    payload.push(op);
-
-    payload.extend(&(doc.len() as u32).to_le_bytes());
-    payload.extend(doc);
-
-    let mut hasher = Hasher::new();
-    hasher.update(&payload);
-
-    let crc = hasher.finalize();
-
-    let mut record = Vec::new();
-
-    record.extend(&(payload.len() as u32).to_le_bytes());
-    record.extend(&crc.to_le_bytes());
-    record.extend(payload);
-
-    record
-}
-
-fn decode_record(buf: &[u8]) -> Result<DecodedRecord> {
-
-    let mut pos = 0;
-
-    let collection_id =
-        u32::from_le_bytes(buf[pos..pos+4].try_into().unwrap());
-    pos += 4;
-
-    let doc_id_len =
-        u16::from_le_bytes(buf[pos..pos+2].try_into().unwrap()) as usize;
-    pos += 2;
-
-    let doc_id =
-        String::from_utf8(buf[pos..pos+doc_id_len].to_vec())
-        .map_err(|_| FireLiteError::InvalidRecord)?;
-    pos += doc_id_len;
-
-    let op = buf[pos];
-    pos += 1;
-
-    let doc_len =
-        u32::from_le_bytes(buf[pos..pos+4].try_into().unwrap()) as usize;
-    pos += 4;
-
-    let document = buf[pos..pos+doc_len].to_vec();
-
-    Ok(DecodedRecord {
-        collection_id,
-        doc_id,
-        op,
-        document,
-    })
+fn parse_segment_name(name: &str) -> Option<(u32, u64)> {
+    if !name.starts_with("segment-l") || !name.ends_with(".dat") {
+        return None;
+    }
+    let core = &name[9..name.len() - 4];
+    let (level, id) = core.split_once('-')?;
+    Some((level.parse().ok()?, id.parse().ok()?))
 }

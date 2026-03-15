@@ -1,476 +1,389 @@
 # FireLite
 
-**FireLite** is a lightweight embedded NoSQL document database written in Rust.
+FireLite is a Rust-native embedded document database inspired by Google Firestore ergonomics and SQLite-style embedding.
 
-It aims to provide a **Firestore-like developer experience** while maintaining the **simplicity and portability of an embedded database like SQLite**.
-
-FireLite is designed for:
-
-* offline-first applications
-* desktop software
-* edge computing
-* IoT devices
-* local-first systems
-* embedded applications
-
-The goal is a **small, fast, dependency-light document database** that runs entirely inside your application.
+It runs in-process (no external service), stores typed binary documents, and provides local durability through a WAL + segment storage engine.
 
 ---
 
-# Vision
+## Current Status (Latest)
 
-Modern applications often need a database that is:
+FireLite is in **advanced foundation stage**: core architecture and major vertical slices are implemented, while production hardening is still in progress.
 
-* simple to embed
-* easy to use
-* resource efficient
-* capable of storing flexible documents
+### Implemented Today
 
-FireLite combines ideas from:
+- Core engine API (`FireLite`)
+  - `open`, `put`, `get`, `delete`, `query`, `compact`, `flush`
+  - batched writes via `write_batch`
+- Transactions
+  - `begin_transaction` + staged mutations + `commit`
+  - `begin_serializable_transaction` with conflict-aware commit validation (read/write version checks)
+- Durable storage stack
+  - multi-segment value storage with level tiers (`segment-l{level}-{id}.dat`)
+  - WAL with transactional markers (`BeginTx` / `CommitTx`)
+  - committed-op recovery replay
+  - WAL snapshot rewrite after tier compaction for index+data coupling
+- Durability tuning
+  - configurable `DurabilityMode`: `Always`, `Interval`, `Manual`
+  - group commit control via `group_commit_max_ops`
+- Encryption at rest
+  - optional key-based encryption for WAL payloads
+  - optional key-based encryption for segment payloads
+- Query features
+  - filters (`Eq`, `Ne`, `Gt`, `Gte`, `Lt`, `Lte`)
+  - ordering and limit
+  - cost-aware planner decision using collection/cardinality heuristics
+  - predicate pushdown shortcut via doc-view prefilter before full decode
+  - rich projection pushdown across Rust API, C-FFI, JS client, and Tauri gateway
+  - parallel task-sharded execution
+- Composite indexes
+  - index definitions and manager
+  - planner hook for equality composite scans
+  - executor candidate pruning via exact-match composite lookup
+- Real-time local watch streams
+  - `watch_collection` with change events (`Put` / `Delete`)
+- Subcollections
+  - `put_subdocument`, `get_subdocument`, `delete_subdocument`, `query_subcollection`
+- Security and operational controls
+  - collection-prefix policy rules for allow/deny by operation
+  - in-memory + file-backed audit logging (`audit.log`)
+- Multi-language FFI layer
+  - opaque handle types (`FL_Engine`, `FL_Doc`, `FL_Batch`, `FL_Query`)
+  - C ABI document builder, CRUD, query, and atomic batch commit functions
+  - thread-local `fl_last_error` and explicit free APIs
+- JavaScript/TypeScript SDK (`js/`)
+  - Node.js + Bun dynamic loading
+  - Firestore-like API: `db.collection().doc().set()/get()/delete()`
+  - fluent query builder: `where().orderBy().limit().get()`
+  - atomic write batches: `batch.set/delete/commit`
+  - object -> `FL_Doc` field insertion path via `fl_doc_insert_*` (no JSON payload mutation path)
+- Lazarus/Free Pascal wrapper (`pascal/`)
+  - raw FFI header translation unit (`FireLiteRaw.pas`)
+  - object-oriented Firestore-style API (`FireLite.pas`)
+  - query projection pushdown support via `fl_query_select_field`
+  - polling-based `OnSnapshot` callback bridge with optional UI-thread queue dispatch
+- Tauri unified gateway
+  - single-command dispatcher `firelite_exec` with tagged `FireLiteOp` routing
+  - subscription registry for reactive `onSnapshot` flows via `Window::emit`
+  - subscribe/unsubscribe lifecycle hooks and window-level cleanup support
 
-* document databases
-* embedded databases
-* log-structured storage engines
+### Still Missing for Full Production Readiness
 
-The result is a **small document store that requires zero external services**.
+- Distributed/cloud-grade security primitives (authn/authz federation, remote policy service)
 
 ---
 
-# Key Features (Planned)
-
-* Embedded database (single file)
-* Document-based data model
-* Firestore-style collections and documents
-* JSON developer API
-* Automatic JSON → binary conversion
-* High-performance binary storage
-* Simple query API
-* Secondary indexes
-* Append-only storage engine
-* Crash-safe writes
-* Automatic compaction
-* Minimal memory usage
-
----
-
-# Developer Experience
-
-FireLite is designed to feel **very similar to Firestore** while running locally inside your application.
-
-Example usage:
+## Quick Start (Rust)
 
 ```rust
-let db = FireLite::open("data.firelite")?;
+use firelite::config::FireLiteConfig;
+use firelite::document::firelite_doc::FireLiteDoc;
+use firelite::document::value::Value;
+use firelite::engine::{BatchMutation, FireLite};
 
-db.collection("users")
-  .doc("123")
-  .set(json!({
-      "name": "Alice",
-      "age": 25
-  }))?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cfg = FireLiteConfig::default();
+    cfg.encryption_key = Some("change-me-secret".to_string());
 
-let user = db.collection("users")
-             .doc("123")
-             .get()?;
-```
+    let db = FireLite::open(".firelite-example", cfg)?;
 
-Query example:
+    let mut doc = FireLiteDoc::default();
+    doc.insert("name", Value::String("alice".to_string()));
+    doc.insert("age", Value::Int(30));
 
-```rust
-let users = db.collection("users")
-    .where_gt("age", 20)
-    .limit(10)
-    .get()?;
-```
-
-Developers interact with **JSON documents**, while FireLite handles all internal optimizations automatically.
-
----
-
-# Data Model
-
-FireLite follows a **collection → document** model.
-
-Example structure:
-
-```
-users/
-   123
-   456
-
-orders/
-   999
-```
-
-Documents contain arbitrary JSON data:
-
-```json
-{
-  "name": "Alice",
-  "age": 25,
-  "active": true
+    db.put("users", "1", &doc)?;
+    db.flush()?;
+    Ok(())
 }
 ```
 
-Internally, documents are stored as key-value pairs:
+---
 
+## JavaScript / TypeScript Client (Node.js + Bun)
+
+A high-level SDK is available under `js/`, built over the C-FFI layer.
+
+### Install dependencies
+
+```bash
+cd js
+npm install
 ```
-users:123 → binary document
+
+### Firestore-style usage
+
+```ts
+import { FireLiteClient } from "@firelite/client";
+
+const db = await FireLiteClient.open("./data.firelite", {
+  libraryPath: "./target/release/libfirelite.so", // optional override
+});
+
+await db.collection("users").doc("alice").set({
+  name: "Alice",
+  age: 30,
+  active: true,
+});
+
+const snap = await db.collection("users").doc("alice").get();
+if (snap.exists) {
+  console.log(snap.data());
+}
+
+const rows = await db
+  .collection("users")
+  .where("age", "==", 30)
+  .orderBy("name", "asc")
+  .limit(10)
+  .select("name", "age")
+  .get();
+
+const batch = db.batch();
+batch
+  .set(db.collection("users").doc("bob"), { name: "Bob", age: 31 })
+  .delete(db.collection("users").doc("alice"));
+await batch.commit();
+
+await db.close();
+```
+
+### API coverage in JS SDK
+
+- CRUD: `set/get/delete`
+- Fluent query: `where(==)`, `orderBy`, `limit`, `get`
+- Atomic batch: `set/delete/commit`
+- Value mapping to FFI builder:
+  - `string` -> `fl_doc_insert_str`
+  - `number (int)` -> `fl_doc_insert_int`
+  - `number (float)` -> `fl_doc_insert_float`
+  - `boolean` -> `fl_doc_insert_bool`
+  - `null` -> `fl_doc_insert_null`
+  - `Uint8Array` -> `fl_doc_insert_bin`
+
+---
+
+---
+
+## Tauri Unified Dispatcher Gateway
+
+FireLite now includes an optional Tauri bridge that routes all operations through a **single command entrypoint**.
+
+### Enable feature
+
+```toml
+firelite = { version = "0.1", features = ["tauri-gateway"] }
+```
+
+### Rust bridge surface
+
+- Command: `firelite_exec`
+- Internal-tagged operation enum: `FireLiteOp`
+  - `Get`, `Set`, `Delete`, `Query`, `Batch`, `Subscribe`, `Unsubscribe`
+- Reactive subscription registry:
+  - tracks listener IDs per window
+  - re-runs query snapshots on collection change
+  - emits updates with `Window::emit("firelite://snapshot", payload)`
+- Lifecycle helpers:
+  - unsubscribe command support
+  - `cleanup_window_subscriptions(window_label)` for close-event cleanup
+
+### Frontend SDK usage (Tauri)
+
+```ts
+import { TauriFireLite } from "@firelite/client";
+
+const db = new TauriFireLite();
+
+await db.collection("users").doc("u1").set({ name: "alice", age: 30 });
+
+const stop = await db
+  .collection("users")
+  .where("age", "gte", 18)
+  .orderBy("name", "asc")
+  .limit(25)
+  .onSnapshot((rows) => {
+    console.log("live rows", rows);
+  });
+
+// later
+await stop();
+```
+
+
+---
+
+## Lazarus / Free Pascal (FPC) Wrapper
+
+A production-focused Pascal wrapper is available under `pascal/`:
+
+- `pascal/FireLiteRaw.pas`
+  - C-ABI translation with opaque handles (`PFL_Engine`, `PFL_Doc`, `PFL_Batch`, `PFL_Query`)
+  - external imports with `cdecl` for Windows/Linux/macOS dynamic libraries.
+- `pascal/FireLite.pas`
+  - object-oriented API: `TFireLite`, `TFLCollection`, `TFLDocument`, `TFLQuery`, `TFLBatch`, `TFLTransaction`
+  - fluent Firestore-like flow (`Collection(...).Doc(...).Set/Get/Delete`, query chaining)
+  - projection pushdown (`Select([...])`) wired to `fl_query_select_field`
+  - callback-based `OnSnapshot` via a polling thread and optional `TThread.Queue` UI dispatch.
+
+### Minimal Pascal usage
+
+```pascal
+var
+  DB: TFireLite;
+  Col: TFLCollection;
+  Doc: TFLDocument;
+begin
+  DB := TFireLite.Create('./data.firelite');
+  try
+    Col := DB.Collection('users');
+    Doc := TFLDocument.Create.InsertStr('name', 'alice').InsertInt('age', 30);
+    try
+      Col.Doc('u1').Set(Doc);
+    finally
+      Doc.Free;
+    end;
+  finally
+    DB.Free;
+  end;
+end;
+```
+
+## Multi-Language Platform Support (C ABI)
+
+FireLite supports cross-language embedding through a flat C ABI intended for Node.js/Python/C++/C# integration layers.
+
+### Build Artifacts
+
+- Cargo crate types include:
+  - `cdylib` (for dynamic library consumers)
+  - `rlib` (for Rust consumers)
+- Auto-generated C header:
+  - `include/firelite.h`
+
+Platform outputs:
+
+- Linux: `libfirelite.so`
+- macOS: `libfirelite.dylib`
+- Windows: `firelite.dll`
+
+### Build
+
+```bash
+cargo build --release
+```
+
+Header generation is automated via `build.rs` + `cbindgen.toml`.
+
+### Opaque Handle Types
+
+- `FL_Engine`
+- `FL_Doc`
+- `FL_Batch`
+- `FL_Query`
+
+### Exposed C API (Flat)
+
+**Engine / Memory management**
+- `fl_engine_open`, `fl_engine_free`
+- `fl_last_error`, `fl_string_free`
+
+**Document builder**
+- `fl_doc_new`, `fl_doc_free`
+- `fl_doc_insert_str`
+- `fl_doc_insert_int`
+- `fl_doc_insert_float`
+- `fl_doc_insert_bool`
+- `fl_doc_insert_null`
+- `fl_doc_insert_bin`
+- `fl_doc_to_json`
+
+**Firestore-style collection operations**
+- `fl_engine_insert`
+- `fl_engine_get`
+- `fl_engine_delete`
+
+**Atomic batch operations**
+- `fl_batch_new`, `fl_batch_free`
+- `fl_batch_set`, `fl_batch_delete`
+- `fl_batch_commit`
+
+**Query operations**
+- `fl_query_new`, `fl_query_free`
+- `fl_query_where_eq_str`, `fl_query_where_eq_int`
+- `fl_query_order_by`, `fl_query_limit`, `fl_query_select_field`
+- `fl_query_execute`
+
+---
+
+## Architecture
+
+```text
+API (FireLite + FFI + JS/TS client)
+  -> Query (planner + executor)
+    -> Index (composite manager)
+      -> Storage (encrypted WAL + encrypted segment + compaction)
+        -> Memory (mmap + page cache)
 ```
 
 ---
 
-# Architecture
+## Implementation Tables
 
-FireLite uses a **layered architecture**.
+### Feature status vs Firestore-style target
 
-```
-┌─────────────────────────┐
-│       FireLite API      │
-│ Firestore-like queries  │
-│ JSON document interface │
-└─────────────┬───────────┘
-              │
-┌─────────────▼───────────┐
-│     Document Engine     │
-│ JSON → binary encoding  │
-│ query processing        │
-│ secondary indexes       │
-└─────────────┬───────────┘
-              │
-┌─────────────▼───────────┐
-│     Storage Engine      │
-│ append-only log         │
-│ in-memory key index     │
-│ compaction system       │
-└─────────────────────────┘
-```
+| Area | FireLite status | Notes |
+|---|---|---|
+| Embedded engine | ✅ Implemented | In-process Rust runtime |
+| Durable WAL + recovery | ✅ Implemented | Tx markers, replay, and WAL snapshot rewrite after tier compaction |
+| Encryption at rest | ✅ Implemented | Optional WAL + segment encryption |
+| Multi-document atomic batches | ✅ Implemented | Engine + C-FFI batch commit |
+| Transactions | ✅ Implemented | Serializable conflict-aware transactions via read/write version validation |
+| Composite indexes | ✅ Implemented | Equality composite scans integrated |
+| Query filters/order/limit | ✅ Implemented | Core operators + ordering + limit + cost-aware planning heuristics |
+| Zero-copy projection pipeline | ✅ Implemented | Borrowed-view projection available in Rust engine, C-FFI, JS SDK, and Tauri gateway |
+| Real-time listeners/watch | ✅ Implemented | Local watch streams in Rust engine |
+| Subcollections | ✅ Implemented | Subdocument helpers exposed in Rust API |
+| JS/TS Firestore-style client | ✅ Implemented | `collection().doc().set/get/delete`, query builder, batch |
+| Lazarus/FPC wrapper | ✅ Implemented | Raw C-ABI unit + OO wrapper + snapshot callback bridge |
+| Tauri unified dispatcher gateway | ✅ Implemented | Single `firelite_exec`, reactive subscriptions, lifecycle controls |
+| Security policy + audit logging | ✅ Implemented | Collection-prefix rules and append audit trail |
+| Multi-segment LSM-style compaction | ✅ Implemented | Tiered segment files + background maintenance scheduler |
+| Firestore parity (full cloud API) | ❌ Not targeted yet | No remote service/auth service, distributed infra |
 
----
+### Module implementation map
 
-# JSON API with Binary Storage
-
-FireLite provides a **JSON-based API** for simplicity.
-
-Internally, JSON documents are automatically converted into an optimized **binary document format**.
-
-```
-User JSON
-   ↓
-serde_json
-   ↓
-binary document format
-   ↓
-append-only storage engine
-```
-
-Benefits:
-
-* fast document access
-* smaller disk usage
-* minimal parsing overhead
-* predictable memory layout
-
-This design allows FireLite to maintain a **simple developer API while achieving high performance internally**.
+| Module | Path | Status |
+|---|---|---|
+| Engine API | `src/engine/*` | ✅ |
+| Storage + crypto | `src/storage/*` | ✅ |
+| Indexing | `src/index/*` | ✅ |
+| Query planner/executor | `src/query/*` | ✅ |
+| Document model | `src/document/*` | ✅ |
+| C-FFI | `src/ffi.rs`, `include/firelite.h` | ✅ |
+| JS/TS SDK | `js/src/*` | ✅ |
+| Lazarus/FPC wrapper | `pascal/FireLiteRaw.pas`, `pascal/FireLite.pas` | ✅ |
+| Tauri gateway | `src/tauri_gateway.rs`, `js/src/tauri.ts` | ✅ |
+| Bench + perf CI | `benches/engine_bench.rs`, `.github/workflows/perf.yml` | ✅ |
 
 ---
 
-# Binary Document Format
+## Bench & CI
 
-Internally, documents are stored as **typed binary records**.
-
-Example layout:
-
-```
-document_length
-field_count
-
-[field]
-key_length
-key
-type
-value
-```
-
-Supported value types:
-
-* string
-* integer
-* float
-* boolean
-* null
-* object
-* array
-
-Binary documents allow:
-
-* faster reads
-* smaller storage size
-* efficient indexing
+- Local benchmark target: `cargo bench --bench engine_bench`
+- CI performance workflow: `.github/workflows/perf.yml`
 
 ---
 
-# Storage Engine Design
+## Contribution Notes
 
-FireLite uses a **log-structured append-only storage engine**.
-
-Records are appended sequentially:
-
-```
-[record_size][key][binary_document]
-[record_size][key][binary_document]
-[record_size][key][binary_document]
-```
-
-An in-memory index maps document keys to file offsets:
-
-```
-HashMap<Key, Offset>
-```
-
-Advantages:
-
-* very fast writes
-* crash-safe operations
-* simple storage design
-
-Background compaction periodically removes obsolete records.
+- Keep module boundaries aligned with `STRUCTURE.md`
+- Add recovery tests when touching storage/WAL/indexing
+- Document binary format or compatibility-impacting changes
+- Keep C ABI additions reflected in cbindgen config + generated header
+- Keep JS SDK API changes reflected in this README and examples
 
 ---
 
-# Indexing
+## License
 
-Secondary indexes allow efficient queries.
-
-Example index:
-
-```
-users.age
-```
-
-Index entries:
-
-```
-25 → doc_id
-30 → doc_id
-```
-
-Internally indexes use binary typed values for fast comparisons.
-
----
-
-# Caching
-
-FireLite includes multiple caching layers.
-
-### Document Cache
-
-Frequently accessed documents are stored in memory.
-
-```
-LRU Cache
-doc_id → binary document
-```
-
-### Storage Page Cache
-
-Disk pages may be cached to reduce IO.
-
----
-
-# Concurrency
-
-FireLite is designed to be **thread-safe**.
-
-Concurrency model:
-
-* multiple concurrent readers
-* serialized writes
-
-Implementation approach:
-
-* `Arc`
-* `RwLock`
-* lock-efficient data structures
-
-This allows safe use across multiple threads.
-
----
-
-# Compaction
-
-Because FireLite uses append-only storage, old records accumulate.
-
-Background compaction:
-
-```
-scan log
-keep latest document
-rewrite storage file
-```
-
-This process reclaims disk space and maintains performance.
-
----
-
-# Technology Stack
-
-Rust ecosystem libraries used by FireLite:
-
-Core:
-
-* `serde`
-* `serde_json`
-
-Performance:
-
-* `bytes`
-* `memmap2`
-
-Concurrency:
-
-* `parking_lot`
-
-Caching:
-
-* `lru`
-
-Utilities:
-
-* `hashbrown`
-
----
-
-# Project Structure
-
-```
-firelite/
-│
-├─ src/
-│
-├─ api/
-│   db.rs
-│   collection.rs
-│   query.rs
-│
-├─ document/
-│   document.rs
-│   encoding.rs
-│
-├─ index/
-│   index.rs
-│
-├─ storage/
-│   engine.rs
-│   log.rs
-│   compaction.rs
-│
-└─ lib.rs
-```
-
----
-
-# Design Goals
-
-FireLite prioritizes:
-
-* simplicity
-* small binary size
-* predictable performance
-* minimal dependencies
-* fast startup time
-
-Non-goals (for now):
-
-* distributed clustering
-* complex SQL support
-* heavy query planners
-
----
-
-# Roadmap
-
-## Phase 1 — Core Storage
-
-* [ ] append-only log file
-* [ ] record format
-* [ ] in-memory key index
-* [ ] crash recovery
-* [ ] basic get / put operations
-
----
-
-## Phase 2 — Document Layer
-
-* [ ] JSON → binary document encoding
-* [ ] document decoding
-* [ ] collection abstraction
-* [ ] document CRUD operations
-
----
-
-## Phase 3 — Query Engine
-
-* [ ] simple filtering
-* [ ] secondary indexes
-* [ ] query builder API
-* [ ] sorting and limits
-
----
-
-## Phase 4 — Performance
-
-* [ ] memory-mapped storage
-* [ ] batch writes
-* [ ] background compaction
-* [ ] document cache
-
----
-
-## Phase 5 — Advanced Features
-
-* [ ] transactions
-* [ ] real-time change streams
-* [ ] replication support
-* [ ] synchronization layer
-
----
-
-# Performance Goals
-
-Target performance:
-
-* single-file database
-* <10MB memory usage
-* high sequential write throughput
-* microsecond read latency
-
----
-
-# Status
-
-FireLite is **currently in early development**.
-
-The storage engine and document format are under active design.
-
-APIs may change during early development.
-
----
-
-# License
-
-MIT License
-
----
-
-# Contributing
-
-Contributions are welcome.
-
-Areas where help is appreciated:
-
-* storage engine improvements
-* indexing algorithms
-* performance optimization
-* benchmarking
-* documentation
+TBD
