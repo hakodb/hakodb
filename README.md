@@ -1,476 +1,203 @@
 # FireLite
 
-**FireLite** is a lightweight embedded NoSQL document database written in Rust.
+FireLite is a Rust-native embedded document database inspired by Google Firestore’s developer ergonomics and SQLite’s deployability.
 
-It aims to provide a **Firestore-like developer experience** while maintaining the **simplicity and portability of an embedded database like SQLite**.
-
-FireLite is designed for:
-
-* offline-first applications
-* desktop software
-* edge computing
-* IoT devices
-* local-first systems
-* embedded applications
-
-The goal is a **small, fast, dependency-light document database** that runs entirely inside your application.
+It is designed to run in-process (no external server), store typed binary documents, and provide durable local persistence with transactional write batching.
 
 ---
 
-# Vision
+## Current Project Status
 
-Modern applications often need a database that is:
+FireLite is currently in **active foundational development**.
 
-* simple to embed
-* easy to use
-* resource efficient
-* capable of storing flexible documents
+### Implemented Today
 
-FireLite combines ideas from:
+- Embedded Rust library API (`FireLite`) with:
+  - `open`
+  - `put`
+  - `get`
+  - `delete`
+  - `query`
+  - `compact`
+  - `write_batch` (atomic multi-mutation commit)
+- Binary document format (`FireLiteDoc`) with typed values and decode support
+- WAL + segment-backed storage engine
+- Transaction markers in WAL (`BeginTx`/`CommitTx`) and replay of committed transactions
+- Storage-level batch mutation application (`apply_batch`)
+- Basic composite index definitions and manager
+- Query planner/executor with filtering, ordering, limits, and parallel task sharding
+- mmap-backed memory layer and page cache modules
+- Basic examples and unit tests
 
-* document databases
-* embedded databases
-* log-structured storage engines
+### Not Yet Production-Ready (Important)
 
-The result is a **small document store that requires zero external services**.
+FireLite has important missing pieces before real-world production use, including but not limited to:
+
+- Formal on-disk format compatibility/versioning guarantees
+- Robust crash-consistency semantics for index + storage dual-write reconciliation
+- Complete Firestore feature parity (subcollections, realtime listeners, auth rules, etc.)
+- Comprehensive benchmarking, fuzzing, and fault-injection validation
+- Security hardening and encryption-at-rest
+- Operational observability (metrics/tracing/logging maturity)
 
 ---
 
-# Key Features (Planned)
-
-* Embedded database (single file)
-* Document-based data model
-* Firestore-style collections and documents
-* JSON developer API
-* Automatic JSON → binary conversion
-* High-performance binary storage
-* Simple query API
-* Secondary indexes
-* Append-only storage engine
-* Crash-safe writes
-* Automatic compaction
-* Minimal memory usage
-
----
-
-# Developer Experience
-
-FireLite is designed to feel **very similar to Firestore** while running locally inside your application.
-
-Example usage:
+## Quick Start
 
 ```rust
-let db = FireLite::open("data.firelite")?;
+use firelite::config::FireLiteConfig;
+use firelite::document::firelite_doc::FireLiteDoc;
+use firelite::document::value::Value;
+use firelite::engine::{BatchMutation, FireLite};
 
-db.collection("users")
-  .doc("123")
-  .set(json!({
-      "name": "Alice",
-      "age": 25
-  }))?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = FireLite::open(".firelite-example", FireLiteConfig::default())?;
 
-let user = db.collection("users")
-             .doc("123")
-             .get()?;
-```
+    let mut doc = FireLiteDoc::default();
+    doc.insert("name", Value::String("alice".to_string()));
+    doc.insert("age", Value::Int(30));
 
-Query example:
+    // Single write
+    db.put("users", "1", &doc)?;
 
-```rust
-let users = db.collection("users")
-    .where_gt("age", 20)
-    .limit(10)
-    .get()?;
-```
+    // Atomic write batch (multiple mutations committed as one unit)
+    db.write_batch(vec![
+        BatchMutation::Put {
+            collection: "users".into(),
+            doc_id: "2".into(),
+            doc: doc.clone(),
+        },
+        BatchMutation::Delete {
+            collection: "users".into(),
+            doc_id: "legacy-user".into(),
+        },
+    ])?;
 
-Developers interact with **JSON documents**, while FireLite handles all internal optimizations automatically.
+    let loaded = db.get("users", "1")?;
+    println!("loaded = {:?}", loaded);
 
----
-
-# Data Model
-
-FireLite follows a **collection → document** model.
-
-Example structure:
-
-```
-users/
-   123
-   456
-
-orders/
-   999
-```
-
-Documents contain arbitrary JSON data:
-
-```json
-{
-  "name": "Alice",
-  "age": 25,
-  "active": true
+    Ok(())
 }
 ```
 
-Internally, documents are stored as key-value pairs:
+---
 
+## Architecture (Current)
+
+```text
+API (FireLite)
+  -> Query (planner + executor)
+    -> Index (composite manager)
+      -> Storage (WAL + segment + compaction)
+        -> Memory (mmap + page cache)
 ```
-users:123 → binary document
-```
+
+High-level design goals:
+
+- Keep the API ergonomic and embedded
+- Keep writes durable and recoverable
+- Keep reads efficient with typed binary docs and indexing hooks
+- Keep module boundaries explicit for future evolution
 
 ---
 
-# Architecture
+## Firestore Feature Comparison
 
-FireLite uses a **layered architecture**.
+The table below compares Firestore capabilities with FireLite’s current status.
 
-```
-┌─────────────────────────┐
-│       FireLite API      │
-│ Firestore-like queries  │
-│ JSON document interface │
-└─────────────┬───────────┘
-              │
-┌─────────────▼───────────┐
-│     Document Engine     │
-│ JSON → binary encoding  │
-│ query processing        │
-│ secondary indexes       │
-└─────────────┬───────────┘
-              │
-┌─────────────▼───────────┐
-│     Storage Engine      │
-│ append-only log         │
-│ in-memory key index     │
-│ compaction system       │
-└─────────────────────────┘
-```
+Legend:
 
----
+- ✅ Implemented
+- 🟡 Partial / basic
+- 🔜 Planned / target
+- ❌ Not implemented
 
-# JSON API with Binary Storage
-
-FireLite provides a **JSON-based API** for simplicity.
-
-Internally, JSON documents are automatically converted into an optimized **binary document format**.
-
-```
-User JSON
-   ↓
-serde_json
-   ↓
-binary document format
-   ↓
-append-only storage engine
-```
-
-Benefits:
-
-* fast document access
-* smaller disk usage
-* minimal parsing overhead
-* predictable memory layout
-
-This design allows FireLite to maintain a **simple developer API while achieving high performance internally**.
+| Capability | Google Firestore | FireLite (Current) | FireLite Target |
+|---|---|---|---|
+| Embedded local runtime | ❌ (managed cloud service) | ✅ | ✅ |
+| Collection/document model | ✅ | ✅ | ✅ |
+| Document CRUD | ✅ | ✅ | ✅ |
+| Atomic write batch | ✅ | ✅ (local transactional unit) | ✅ |
+| Multi-document ACID transactions | ✅ | 🟡 (batch semantics, no full conflict/serializable model) | ✅ |
+| Query filters/order/limit | ✅ | 🟡 (basic support) | ✅ |
+| Composite indexes | ✅ | 🟡 (definition + manager + planner hooks) | ✅ |
+| Index auto-build lifecycle | ✅ | ❌ | 🔜 |
+| Real-time listeners / watch streams | ✅ | ❌ | 🔜 |
+| Offline sync w/ cloud | ✅ (SDK dependent) | ❌ | 🔜 (optional replication layer) |
+| Subcollections | ✅ | ❌ | 🔜 |
+| Security rules engine | ✅ | ❌ | 🔜 |
+| Managed auth integration | ✅ | ❌ | 🔜 |
+| Serverless triggers | ✅ | ❌ | 🔜 |
+| Built-in geo queries | ✅ (with patterns/extensions) | ❌ | 🔜 |
+| TTL policies | ✅ | ❌ | 🔜 |
+| PITR / backups | ✅ | ❌ | 🔜 |
+| Encryption at rest | ✅ | ❌ (not yet integrated) | ✅ |
+| Multi-region availability | ✅ | ❌ (single embedded process) | N/A / out of scope |
 
 ---
 
-# Binary Document Format
+## Performance Suggestions (Next Updates)
 
-Internally, documents are stored as **typed binary records**.
-
-Example layout:
-
-```
-document_length
-field_count
-
-[field]
-key_length
-key
-type
-value
-```
-
-Supported value types:
-
-* string
-* integer
-* float
-* boolean
-* null
-* object
-* array
-
-Binary documents allow:
-
-* faster reads
-* smaller storage size
-* efficient indexing
+1. **WAL group commit + fsync policy tuning**
+   - Add configurable durability modes (`always`, `interval`, `manual`) and group commit to reduce sync overhead.
+2. **Segment compaction improvements**
+   - Move to multi-segment LSM-like compaction tiers and background compaction scheduling.
+3. **Query execution optimization**
+   - Add cost-based planning, predicate pushdown, and index-only scan pathways.
+4. **Zero-copy reads end-to-end**
+   - Extend borrowed document views through query pipeline to minimize allocations.
+5. **Bench + profiling pipeline**
+   - Add criterion benchmarks + flamegraph profiling + CI performance gates.
 
 ---
 
-# Storage Engine Design
+## Security Suggestions (Next Updates)
 
-FireLite uses a **log-structured append-only storage engine**.
-
-Records are appended sequentially:
-
-```
-[record_size][key][binary_document]
-[record_size][key][binary_document]
-[record_size][key][binary_document]
-```
-
-An in-memory index maps document keys to file offsets:
-
-```
-HashMap<Key, Offset>
-```
-
-Advantages:
-
-* very fast writes
-* crash-safe operations
-* simple storage design
-
-Background compaction periodically removes obsolete records.
+1. **Encryption at rest**
+   - Encrypt WAL/segment pages (AES-GCM or ChaCha20-Poly1305) with key rotation support.
+2. **Integrity and tamper checks**
+   - Add authenticated record/page checksums and startup verification modes.
+3. **Input and resource hardening**
+   - Enforce document/key size limits, query complexity limits, and configurable memory ceilings.
+4. **Crash safety + recovery auditability**
+   - Add deterministic recovery journal validation and corruption quarantine.
+5. **Supply chain and release hardening**
+   - SBOM generation, dependency audit CI, signed releases, and reproducible builds.
 
 ---
 
-# Indexing
+## Additional Suggestions
 
-Secondary indexes allow efficient queries.
+### Reliability
 
-Example index:
+- Add randomized fault-injection tests (power-loss simulation during WAL append/commit).
+- Add model-based tests for storage/index consistency after recovery.
+- Add long-running soak tests for memory/page cache behavior.
 
-```
-users.age
-```
+### Developer Experience
 
-Index entries:
+- Provide a stable schema/migration story for persisted data.
+- Add higher-level fluent API helpers (Firestore-like builders).
+- Add detailed examples for write batches, indexing, and query patterns.
 
-```
-25 → doc_id
-30 → doc_id
-```
+### Observability
 
-Internally indexes use binary typed values for fast comparisons.
-
----
-
-# Caching
-
-FireLite includes multiple caching layers.
-
-### Document Cache
-
-Frequently accessed documents are stored in memory.
-
-```
-LRU Cache
-doc_id → binary document
-```
-
-### Storage Page Cache
-
-Disk pages may be cached to reduce IO.
+- Add metrics (`ops/sec`, WAL flush latency, compaction duration, query scan counts).
+- Add tracing spans for write path/query path.
+- Add structured logs with event IDs and transaction IDs.
 
 ---
 
-# Concurrency
+## Contribution Notes
 
-FireLite is designed to be **thread-safe**.
+When proposing significant changes:
 
-Concurrency model:
-
-* multiple concurrent readers
-* serialized writes
-
-Implementation approach:
-
-* `Arc`
-* `RwLock`
-* lock-efficient data structures
-
-This allows safe use across multiple threads.
+- Keep module boundaries aligned with `STRUCTURE.md`.
+- Prefer adding tests for crash/recovery semantics when touching storage or WAL.
+- Document format changes must include versioning and backward-compatibility notes.
 
 ---
 
-# Compaction
+## License
 
-Because FireLite uses append-only storage, old records accumulate.
-
-Background compaction:
-
-```
-scan log
-keep latest document
-rewrite storage file
-```
-
-This process reclaims disk space and maintains performance.
-
----
-
-# Technology Stack
-
-Rust ecosystem libraries used by FireLite:
-
-Core:
-
-* `serde`
-* `serde_json`
-
-Performance:
-
-* `bytes`
-* `memmap2`
-
-Concurrency:
-
-* `parking_lot`
-
-Caching:
-
-* `lru`
-
-Utilities:
-
-* `hashbrown`
-
----
-
-# Project Structure
-
-```
-firelite/
-│
-├─ src/
-│
-├─ api/
-│   db.rs
-│   collection.rs
-│   query.rs
-│
-├─ document/
-│   document.rs
-│   encoding.rs
-│
-├─ index/
-│   index.rs
-│
-├─ storage/
-│   engine.rs
-│   log.rs
-│   compaction.rs
-│
-└─ lib.rs
-```
-
----
-
-# Design Goals
-
-FireLite prioritizes:
-
-* simplicity
-* small binary size
-* predictable performance
-* minimal dependencies
-* fast startup time
-
-Non-goals (for now):
-
-* distributed clustering
-* complex SQL support
-* heavy query planners
-
----
-
-# Roadmap
-
-## Phase 1 — Core Storage
-
-* [ ] append-only log file
-* [ ] record format
-* [ ] in-memory key index
-* [ ] crash recovery
-* [ ] basic get / put operations
-
----
-
-## Phase 2 — Document Layer
-
-* [ ] JSON → binary document encoding
-* [ ] document decoding
-* [ ] collection abstraction
-* [ ] document CRUD operations
-
----
-
-## Phase 3 — Query Engine
-
-* [ ] simple filtering
-* [ ] secondary indexes
-* [ ] query builder API
-* [ ] sorting and limits
-
----
-
-## Phase 4 — Performance
-
-* [ ] memory-mapped storage
-* [ ] batch writes
-* [ ] background compaction
-* [ ] document cache
-
----
-
-## Phase 5 — Advanced Features
-
-* [ ] transactions
-* [ ] real-time change streams
-* [ ] replication support
-* [ ] synchronization layer
-
----
-
-# Performance Goals
-
-Target performance:
-
-* single-file database
-* <10MB memory usage
-* high sequential write throughput
-* microsecond read latency
-
----
-
-# Status
-
-FireLite is **currently in early development**.
-
-The storage engine and document format are under active design.
-
-APIs may change during early development.
-
----
-
-# License
-
-MIT License
-
----
-
-# Contributing
-
-Contributions are welcome.
-
-Areas where help is appreciated:
-
-* storage engine improvements
-* indexing algorithms
-* performance optimization
-* benchmarking
-* documentation
+TBD.
