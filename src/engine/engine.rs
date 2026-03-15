@@ -1,11 +1,12 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Mutex;
 
 use crate::config::FireLiteConfig;
 use crate::document::firelite_doc::FireLiteDoc;
-use crate::error::Result;
+use crate::error::{FireLiteError, Result};
 use crate::index::composite::definition::{CompositeIndexDefinition, SortDirection};
 use crate::index::manager::IndexManager;
 use crate::query::executor::executor::ParallelQueryExecutor;
@@ -36,6 +37,30 @@ pub enum ChangeKind {
 pub struct ChangeEvent {
     pub path: String,
     pub kind: ChangeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessOp {
+    Get,
+    Put,
+    Delete,
+    Query,
+    Batch,
+}
+
+#[derive(Debug, Clone)]
+pub struct SecurityRule {
+    pub collection_prefix: String,
+    pub op: AccessOp,
+    pub allow: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuditEntry {
+    pub op: AccessOp,
+    pub collection: String,
+    pub doc_id: Option<String>,
+    pub ok: bool,
 }
 
 pub struct Transaction {
@@ -78,29 +103,113 @@ impl Transaction {
     }
 }
 
+pub struct SerializableTransaction {
+    reads: HashMap<String, Option<u64>>,
+    mutations: Vec<BatchMutation>,
+}
+
+impl SerializableTransaction {
+    pub fn get(
+        &mut self,
+        db: &FireLite,
+        collection: &str,
+        doc_id: &str,
+    ) -> Result<Option<FireLiteDoc>> {
+        let key = doc_key(collection, doc_id);
+        let doc = db.get(collection, doc_id)?;
+        let version = db.current_version(&key);
+        self.reads.insert(key, version);
+        Ok(doc)
+    }
+
+    pub fn put(&mut self, collection: &str, doc_id: &str, doc: FireLiteDoc) {
+        self.mutations.push(BatchMutation::Put {
+            collection: collection.to_string(),
+            doc_id: doc_id.to_string(),
+            doc,
+        });
+    }
+
+    pub fn delete(&mut self, collection: &str, doc_id: &str) {
+        self.mutations.push(BatchMutation::Delete {
+            collection: collection.to_string(),
+            doc_id: doc_id.to_string(),
+        });
+    }
+
+    pub fn commit(self, db: &FireLite) -> Result<()> {
+        db.commit_serializable(self.reads, self.mutations)
+    }
+}
+
 pub struct FireLite {
     storage: Mutex<StorageEngine>,
     indexes: Mutex<IndexManager>,
     executor: ParallelQueryExecutor,
     tx_lock: Mutex<()>,
     listeners: Mutex<HashMap<String, Vec<Sender<ChangeEvent>>>>,
+    doc_versions: Mutex<HashMap<String, u64>>,
+    global_version: Mutex<u64>,
+    security_rules: Mutex<Vec<SecurityRule>>,
+    audit: Mutex<Vec<AuditEntry>>,
+    audit_file: Mutex<Option<std::fs::File>>,
 }
 
 impl FireLite {
     pub fn open(path: impl AsRef<Path>, config: FireLiteConfig) -> Result<Self> {
-        Ok(Self {
+        std::fs::create_dir_all(path.as_ref())?;
+        let mut audit_file = None;
+        if config.enable_audit_log {
+            let log_path = config.audit_log_path.clone().unwrap_or_else(|| {
+                path.as_ref()
+                    .join("audit.log")
+                    .to_string_lossy()
+                    .to_string()
+            });
+            audit_file = Some(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(log_path)?,
+            );
+        }
+
+        let db = Self {
             storage: Mutex::new(StorageEngine::open(path, &config)?),
             indexes: Mutex::new(IndexManager::default()),
             executor: ParallelQueryExecutor::new(config.query_workers),
             tx_lock: Mutex::new(()),
             listeners: Mutex::new(HashMap::new()),
-        })
+            doc_versions: Mutex::new(HashMap::new()),
+            global_version: Mutex::new(1),
+            security_rules: Mutex::new(Vec::new()),
+            audit: Mutex::new(Vec::new()),
+            audit_file: Mutex::new(audit_file),
+        };
+
+        db.rebuild_indexes_from_storage()?;
+        Ok(db)
     }
 
     pub fn begin_transaction(&self) -> Transaction {
         Transaction {
             mutations: Vec::new(),
         }
+    }
+
+    pub fn begin_serializable_transaction(&self) -> SerializableTransaction {
+        SerializableTransaction {
+            reads: HashMap::new(),
+            mutations: Vec::new(),
+        }
+    }
+
+    pub fn set_security_rules(&self, rules: Vec<SecurityRule>) {
+        *self.security_rules.lock().expect("rules lock poisoned") = rules;
+    }
+
+    pub fn audit_entries(&self) -> Vec<AuditEntry> {
+        self.audit.lock().expect("audit lock poisoned").clone()
     }
 
     pub fn create_composite_index(
@@ -136,9 +245,116 @@ impl FireLite {
         }
     }
 
-    pub fn write_batch(&self, mutations: Vec<BatchMutation>) -> Result<()> {
+    fn allowed(&self, collection: &str, op: AccessOp) -> bool {
+        let rules = self.security_rules.lock().expect("rules lock poisoned");
+        if rules.is_empty() {
+            return true;
+        }
+        let mut decision = true;
+        for rule in rules
+            .iter()
+            .filter(|r| op == r.op && collection.starts_with(&r.collection_prefix))
+        {
+            decision = rule.allow;
+        }
+        decision
+    }
+
+    fn record_audit(&self, entry: AuditEntry) {
+        self.audit
+            .lock()
+            .expect("audit lock poisoned")
+            .push(entry.clone());
+        if let Some(file) = self
+            .audit_file
+            .lock()
+            .expect("audit file lock poisoned")
+            .as_mut()
+        {
+            let _ = writeln!(
+                file,
+                "op={:?} collection={} doc_id={} ok={}",
+                entry.op,
+                entry.collection,
+                entry.doc_id.clone().unwrap_or_default(),
+                entry.ok
+            );
+        }
+    }
+
+    fn current_version(&self, key: &str) -> Option<u64> {
+        self.doc_versions
+            .lock()
+            .expect("versions lock poisoned")
+            .get(key)
+            .cloned()
+    }
+
+    fn bump_versions_for_mutations(&self, mutations: &[BatchMutation]) {
+        let mut global = self
+            .global_version
+            .lock()
+            .expect("global version lock poisoned");
+        let mut versions = self.doc_versions.lock().expect("versions lock poisoned");
+        for m in mutations {
+            let key = match m {
+                BatchMutation::Put {
+                    collection, doc_id, ..
+                } => doc_key(collection, doc_id),
+                BatchMutation::Delete { collection, doc_id } => doc_key(collection, doc_id),
+            };
+            *global += 1;
+            versions.insert(key, *global);
+        }
+    }
+
+    fn rebuild_indexes_from_storage(&self) -> Result<()> {
+        let entries = self
+            .storage
+            .lock()
+            .expect("storage lock poisoned")
+            .scan_prefix("")?;
+
+        let mut indexes = self.indexes.lock().expect("indexes lock poisoned");
+        let mut versions = self.doc_versions.lock().expect("versions lock poisoned");
+        let mut gv = self
+            .global_version
+            .lock()
+            .expect("global version lock poisoned");
+
+        for (key, bytes) in entries {
+            if let Some((collection, doc_id)) = key.split_once(':') {
+                if let Some(doc) = FireLiteDoc::decode(&bytes) {
+                    indexes.index_document(collection, doc_id, &doc);
+                    *gv += 1;
+                    versions.insert(key, *gv);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn commit_serializable(
+        &self,
+        reads: HashMap<String, Option<u64>>,
+        mutations: Vec<BatchMutation>,
+    ) -> Result<()> {
         let _tx_guard = self.tx_lock.lock().expect("transaction lock poisoned");
 
+        for (key, expected) in reads {
+            let actual = self.current_version(&key);
+            if actual != expected {
+                return Err(FireLiteError::Corrupt(format!(
+                    "serializable transaction conflict on key '{}'",
+                    key
+                )));
+            }
+        }
+
+        self.write_batch_internal(mutations)
+    }
+
+    fn write_batch_internal(&self, mutations: Vec<BatchMutation>) -> Result<()> {
         let mut storage_mutations = Vec::with_capacity(mutations.len());
         let mut removed_docs = Vec::new();
         let mut change_events = Vec::new();
@@ -187,7 +403,7 @@ impl FireLite {
         }
 
         let mut indexes = self.indexes.lock().expect("indexes lock poisoned");
-        for mutation in mutations {
+        for mutation in mutations.clone() {
             match mutation {
                 BatchMutation::Put {
                     collection,
@@ -202,6 +418,8 @@ impl FireLite {
             indexes.remove_document(&collection, &doc_id, &old_doc);
         }
 
+        self.bump_versions_for_mutations(&mutations);
+
         for (collection, event) in change_events {
             self.notify_watchers(&collection, event);
         }
@@ -209,12 +427,62 @@ impl FireLite {
         Ok(())
     }
 
+    pub fn write_batch(&self, mutations: Vec<BatchMutation>) -> Result<()> {
+        let _tx_guard = self.tx_lock.lock().expect("transaction lock poisoned");
+        if !mutations.iter().all(|m| {
+            let collection = match m {
+                BatchMutation::Put { collection, .. } => collection,
+                BatchMutation::Delete { collection, .. } => collection,
+            };
+            self.allowed(collection, AccessOp::Batch)
+        }) {
+            self.record_audit(AuditEntry {
+                op: AccessOp::Batch,
+                collection: "<batch>".to_string(),
+                doc_id: None,
+                ok: false,
+            });
+            return Err(FireLiteError::Corrupt(
+                "security policy denied batch".to_string(),
+            ));
+        }
+
+        let result = self.write_batch_internal(mutations);
+        self.record_audit(AuditEntry {
+            op: AccessOp::Batch,
+            collection: "<batch>".to_string(),
+            doc_id: None,
+            ok: result.is_ok(),
+        });
+        result
+    }
+
     pub fn put(&self, collection: &str, doc_id: &str, doc: &FireLiteDoc) -> Result<()> {
-        self.write_batch(vec![BatchMutation::Put {
+        if !self.allowed(collection, AccessOp::Put) {
+            self.record_audit(AuditEntry {
+                op: AccessOp::Put,
+                collection: collection.to_string(),
+                doc_id: Some(doc_id.to_string()),
+                ok: false,
+            });
+            return Err(FireLiteError::Corrupt(
+                "security policy denied put".to_string(),
+            ));
+        }
+
+        let result = self.write_batch(vec![BatchMutation::Put {
             collection: collection.to_string(),
             doc_id: doc_id.to_string(),
             doc: doc.clone(),
-        }])
+        }]);
+
+        self.record_audit(AuditEntry {
+            op: AccessOp::Put,
+            collection: collection.to_string(),
+            doc_id: Some(doc_id.to_string()),
+            ok: result.is_ok(),
+        });
+        result
     }
 
     pub fn put_subdocument(
@@ -233,13 +501,34 @@ impl FireLite {
     }
 
     pub fn get(&self, collection: &str, doc_id: &str) -> Result<Option<FireLiteDoc>> {
+        if !self.allowed(collection, AccessOp::Get) {
+            self.record_audit(AuditEntry {
+                op: AccessOp::Get,
+                collection: collection.to_string(),
+                doc_id: Some(doc_id.to_string()),
+                ok: false,
+            });
+            return Err(FireLiteError::Corrupt(
+                "security policy denied get".to_string(),
+            ));
+        }
+
         let key = doc_key(collection, doc_id);
-        Ok(self
+        let res = self
             .storage
             .lock()
             .expect("storage lock poisoned")
             .get(&key)?
-            .and_then(|v| FireLiteDoc::decode(&v)))
+            .and_then(|v| FireLiteDoc::decode(&v));
+
+        self.record_audit(AuditEntry {
+            op: AccessOp::Get,
+            collection: collection.to_string(),
+            doc_id: Some(doc_id.to_string()),
+            ok: true,
+        });
+
+        Ok(res)
     }
 
     pub fn get_subdocument(
@@ -256,10 +545,30 @@ impl FireLite {
     }
 
     pub fn delete(&self, collection: &str, doc_id: &str) -> Result<()> {
-        self.write_batch(vec![BatchMutation::Delete {
+        if !self.allowed(collection, AccessOp::Delete) {
+            self.record_audit(AuditEntry {
+                op: AccessOp::Delete,
+                collection: collection.to_string(),
+                doc_id: Some(doc_id.to_string()),
+                ok: false,
+            });
+            return Err(FireLiteError::Corrupt(
+                "security policy denied delete".to_string(),
+            ));
+        }
+
+        let result = self.write_batch(vec![BatchMutation::Delete {
             collection: collection.to_string(),
             doc_id: doc_id.to_string(),
-        }])
+        }]);
+
+        self.record_audit(AuditEntry {
+            op: AccessOp::Delete,
+            collection: collection.to_string(),
+            doc_id: Some(doc_id.to_string()),
+            ok: result.is_ok(),
+        });
+        result
     }
 
     pub fn delete_subdocument(
@@ -276,13 +585,37 @@ impl FireLite {
     }
 
     pub fn query(&self, query: Query) -> Result<Vec<(String, FireLiteDoc)>> {
+        if !self.allowed(&query.collection, AccessOp::Query) {
+            self.record_audit(AuditEntry {
+                op: AccessOp::Query,
+                collection: query.collection.clone(),
+                doc_id: None,
+                ok: false,
+            });
+            return Err(FireLiteError::Corrupt(
+                "security policy denied query".to_string(),
+            ));
+        }
+
+        let mut storage = self.storage.lock().expect("storage lock poisoned");
+        let collection_rows = storage.count_prefix(&format!("{}:", query.collection));
+
         let plan = {
             let indexes = self.indexes.lock().expect("indexes lock poisoned");
-            QueryPlanner::plan(&query, &indexes)
+            QueryPlanner::plan(&query, &indexes, collection_rows)
         };
-        let mut storage = self.storage.lock().expect("storage lock poisoned");
+
         let indexes = self.indexes.lock().expect("indexes lock poisoned");
-        self.executor.execute(&mut storage, &indexes, plan)
+        let result = self.executor.execute(&mut storage, &indexes, plan);
+
+        self.record_audit(AuditEntry {
+            op: AccessOp::Query,
+            collection: query.collection.clone(),
+            doc_id: None,
+            ok: result.is_ok(),
+        });
+
+        result
     }
 
     pub fn query_subcollection(
@@ -327,7 +660,7 @@ mod tests {
 
     use crate::document::value::Value;
 
-    use super::{BatchMutation, ChangeKind, FireLite};
+    use super::{AccessOp, BatchMutation, ChangeKind, FireLite, SecurityRule};
     use crate::config::FireLiteConfig;
     use crate::document::firelite_doc::FireLiteDoc;
 
@@ -386,6 +719,47 @@ mod tests {
         let event = rx.recv().expect("watch should receive event");
         assert!(event.path.contains("users:7"));
         assert!(matches!(event.kind, ChangeKind::Put));
+
+        fs::remove_dir_all(path).expect("temp db dir should be removable");
+    }
+
+    #[test]
+    fn serializable_transaction_detects_conflict() {
+        let path = temp_path("firelite-tx");
+        let db = FireLite::open(&path, FireLiteConfig::default()).expect("db open should succeed");
+
+        let mut doc = FireLiteDoc::default();
+        doc.insert("v", Value::Int(1));
+        db.put("users", "1", &doc).expect("seed put");
+
+        let mut tx = db.begin_serializable_transaction();
+        let _ = tx.get(&db, "users", "1").expect("tx read");
+
+        let mut outside = FireLiteDoc::default();
+        outside.insert("v", Value::Int(2));
+        db.put("users", "1", &outside).expect("outside write");
+
+        let mut next = FireLiteDoc::default();
+        next.insert("v", Value::Int(3));
+        tx.put("users", "1", next);
+        assert!(tx.commit(&db).is_err());
+
+        fs::remove_dir_all(path).expect("temp db dir should be removable");
+    }
+
+    #[test]
+    fn security_rule_can_deny_operation() {
+        let path = temp_path("firelite-security");
+        let db = FireLite::open(&path, FireLiteConfig::default()).expect("db open should succeed");
+
+        db.set_security_rules(vec![SecurityRule {
+            collection_prefix: "users".to_string(),
+            op: AccessOp::Delete,
+            allow: false,
+        }]);
+
+        assert!(db.delete("users", "x").is_err());
+        assert!(!db.audit_entries().is_empty());
 
         fs::remove_dir_all(path).expect("temp db dir should be removable");
     }

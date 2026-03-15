@@ -344,7 +344,10 @@ pub fn firelite_exec<R: Runtime>(
     }
 }
 
-fn execute_query_input(db: &FireLite, input: &QueryInput) -> Result<Vec<serde_json::Value>, String> {
+fn execute_query_input(
+    db: &FireLite,
+    input: &QueryInput,
+) -> Result<Vec<serde_json::Value>, String> {
     let mut query = Query::new(&input.collection);
 
     for filter in &input.filters {

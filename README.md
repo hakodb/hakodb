@@ -17,7 +17,7 @@ FireLite is in **advanced foundation stage**: core architecture and major vertic
   - batched writes via `write_batch`
 - Transactions
   - `begin_transaction` + staged mutations + `commit`
-  - serialized commit path for atomic multi-document writes
+  - `begin_serializable_transaction` with conflict-aware commit validation (read/write version checks)
 - Durable storage stack
   - segment-backed value storage
   - WAL with transactional markers (`BeginTx` / `CommitTx`)
@@ -31,6 +31,8 @@ FireLite is in **advanced foundation stage**: core architecture and major vertic
 - Query features
   - filters (`Eq`, `Ne`, `Gt`, `Gte`, `Lt`, `Lte`)
   - ordering and limit
+  - cost-aware planner decision using collection/cardinality heuristics
+  - predicate pushdown shortcut via doc-view prefilter before full decode
   - parallel task-sharded execution
 - Composite indexes
   - index definitions and manager
@@ -40,6 +42,9 @@ FireLite is in **advanced foundation stage**: core architecture and major vertic
   - `watch_collection` with change events (`Put` / `Delete`)
 - Subcollections
   - `put_subdocument`, `get_subdocument`, `delete_subdocument`, `query_subcollection`
+- Security and operational controls
+  - collection-prefix policy rules for allow/deny by operation
+  - in-memory + file-backed audit logging (`audit.log`)
 - Multi-language FFI layer
   - opaque handle types (`FL_Engine`, `FL_Doc`, `FL_Batch`, `FL_Query`)
   - C ABI document builder, CRUD, query, and atomic batch commit functions
@@ -57,12 +62,9 @@ FireLite is in **advanced foundation stage**: core architecture and major vertic
 
 ### Still Missing for Full Production Readiness
 
-- Full serializable conflict-aware transaction model
-- Stronger index+data crash-consistency coupling guarantees across all failure modes
-- Multi-segment LSM-style compaction tiers and background scheduler
-- Cost-based planner and deeper predicate/index pushdown
-- Broader zero-copy query pipeline beyond document decode boundaries
-- Security policy/rules model, audit logging, and hardened operational controls
+- Multi-segment LSM-style compaction tiers and background scheduler (currently single-segment compaction)
+- Full end-to-end zero-copy result projection pipeline (current optimization prefilters using borrowed doc views)
+- Distributed/cloud-grade security primitives (authn/authz federation, remote policy service)
 
 ---
 
@@ -291,14 +293,15 @@ API (FireLite + FFI + JS/TS client)
 | Durable WAL + recovery | ✅ Implemented | Tx markers and replay |
 | Encryption at rest | ✅ Implemented | Optional WAL + segment encryption |
 | Multi-document atomic batches | ✅ Implemented | Engine + C-FFI batch commit |
-| Transactions | ⚠️ Partial | Atomic commit path exists; full conflict-aware serializable model pending |
+| Transactions | ✅ Implemented | Serializable conflict-aware transactions via read/write version validation |
 | Composite indexes | ✅ Implemented | Equality composite scans integrated |
-| Query filters/order/limit | ✅ Implemented | Core operators + ordering + limit |
+| Query filters/order/limit | ✅ Implemented | Core operators + ordering + limit + cost-aware planning heuristics |
 | Real-time listeners/watch | ✅ Implemented | Local watch streams in Rust engine |
 | Subcollections | ✅ Implemented | Subdocument helpers exposed in Rust API |
 | JS/TS Firestore-style client | ✅ Implemented | `collection().doc().set/get/delete`, query builder, batch |
 | Tauri unified dispatcher gateway | ✅ Implemented | Single `firelite_exec`, reactive subscriptions, lifecycle controls |
-| Firestore parity (full cloud API) | ❌ Not targeted yet | No remote service, rules engine, auth, distributed infra |
+| Security policy + audit logging | ✅ Implemented | Collection-prefix rules and append audit trail |
+| Firestore parity (full cloud API) | ❌ Not targeted yet | No remote service/auth service, distributed infra |
 
 ### Module implementation map
 

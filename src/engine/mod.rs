@@ -1,3 +1,6 @@
 pub mod engine;
 
-pub use engine::{BatchMutation, ChangeEvent, ChangeKind, FireLite, Transaction};
+pub use engine::{
+    AccessOp, AuditEntry, BatchMutation, ChangeEvent, ChangeKind, FireLite, SecurityRule,
+    SerializableTransaction, Transaction,
+};

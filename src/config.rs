@@ -15,6 +15,8 @@ pub struct FireLiteConfig {
     pub durability_mode: DurabilityMode,
     pub group_commit_max_ops: usize,
     pub encryption_key: Option<String>,
+    pub enable_audit_log: bool,
+    pub audit_log_path: Option<String>,
 }
 
 impl Default for FireLiteConfig {
@@ -28,6 +30,8 @@ impl Default for FireLiteConfig {
             durability_mode: DurabilityMode::Always,
             group_commit_max_ops: 128,
             encryption_key: None,
+            enable_audit_log: true,
+            audit_log_path: None,
         }
     }
 }

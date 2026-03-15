@@ -156,6 +156,10 @@ impl StorageEngine {
         }])
     }
 
+    pub fn count_prefix(&self, prefix: &str) -> usize {
+        self.index.keys().filter(|k| k.starts_with(prefix)).count()
+    }
+
     pub fn scan_prefix(&mut self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
         let keys: Vec<String> = self
             .index
