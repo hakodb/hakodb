@@ -5,6 +5,7 @@ use crate::config::FireLiteConfig;
 use crate::error::Result;
 
 use super::compaction::compact_segment;
+use super::crypto::EncryptionContext;
 use super::segment::Segment;
 use super::wal::{Wal, WalOp};
 
@@ -30,11 +31,18 @@ pub struct StorageEngine {
 impl StorageEngine {
     pub fn open(base_dir: impl AsRef<Path>, cfg: &FireLiteConfig) -> Result<Self> {
         std::fs::create_dir_all(base_dir.as_ref())?;
-        let segment = Segment::open(base_dir.as_ref().join("segment-0.dat"))?;
+
+        let encryption = cfg
+            .encryption_key
+            .as_ref()
+            .map(|secret| EncryptionContext::from_secret(secret));
+
+        let segment = Segment::open(base_dir.as_ref().join("segment-0.dat"), encryption.clone())?;
         let wal = Wal::open(
             base_dir.as_ref().join("wal.log"),
             cfg.durability_mode,
             cfg.group_commit_max_ops,
+            encryption,
         )?;
 
         let mut engine = Self {
@@ -88,10 +96,10 @@ impl StorageEngine {
         for mutation in mutations {
             match mutation {
                 StorageMutation::Put { key, value } => {
-                    let offset = self.segment.append(value)?;
+                    let (offset, stored_len) = self.segment.append(value)?;
                     let pointer = Pointer {
                         offset,
-                        len: value.len() as u32,
+                        len: stored_len,
                     };
                     wal_ops.push(WalOp::Put {
                         key: key.clone(),

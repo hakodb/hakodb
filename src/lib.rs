@@ -2,6 +2,7 @@ pub mod config;
 pub mod document;
 pub mod engine;
 pub mod error;
+pub mod ffi;
 pub mod index;
 pub mod memory;
 pub mod query;

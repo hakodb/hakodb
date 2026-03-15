@@ -7,6 +7,8 @@ use crc32fast::Hasher;
 use crate::config::DurabilityMode;
 use crate::error::{FireLiteError, Result};
 
+use super::crypto::EncryptionContext;
+
 #[derive(Debug, Clone)]
 pub enum WalOp {
     BeginTx {
@@ -30,6 +32,7 @@ pub struct Wal {
     mode: DurabilityMode,
     group_commit_max_ops: usize,
     pending_ops_since_sync: usize,
+    encryption: Option<EncryptionContext>,
 }
 
 impl Wal {
@@ -37,6 +40,7 @@ impl Wal {
         path: impl AsRef<Path>,
         mode: DurabilityMode,
         group_commit_max_ops: usize,
+        encryption: Option<EncryptionContext>,
     ) -> Result<Self> {
         let file = OpenOptions::new()
             .create(true)
@@ -48,24 +52,20 @@ impl Wal {
             mode,
             group_commit_max_ops: group_commit_max_ops.max(1),
             pending_ops_since_sync: 0,
+            encryption,
         })
     }
 
     pub fn append(&mut self, op: &WalOp) -> Result<()> {
-        let payload = encode(op);
-        let mut hasher = Hasher::new();
-        hasher.update(&payload);
-        let crc = hasher.finalize();
-        self.file.write_all(&(payload.len() as u32).to_le_bytes())?;
-        self.file.write_all(&crc.to_le_bytes())?;
-        self.file.write_all(&payload)?;
-        self.pending_ops_since_sync += 1;
-        self.maybe_sync(false)
+        self.append_batch(std::slice::from_ref(op))
     }
 
     pub fn append_batch(&mut self, ops: &[WalOp]) -> Result<()> {
         for op in ops {
-            let payload = encode(op);
+            let mut payload = encode(op);
+            if let Some(enc) = &self.encryption {
+                payload = enc.encrypt(&payload)?;
+            }
             let mut hasher = Hasher::new();
             hasher.update(&payload);
             let crc = hasher.finalize();
@@ -119,6 +119,11 @@ impl Wal {
             if hasher.finalize() != expected {
                 return Err(FireLiteError::Corrupt("wal checksum mismatch".into()));
             }
+
+            if let Some(enc) = &self.encryption {
+                payload = enc.decrypt(&payload)?;
+            }
+
             raw_ops.push(decode(&payload)?);
         }
         self.file.seek(SeekFrom::End(0))?;
@@ -278,7 +283,7 @@ mod tests {
                 .as_nanos()
         ));
 
-        let mut wal = Wal::open(&path, DurabilityMode::Always, 2).expect("open");
+        let mut wal = Wal::open(&path, DurabilityMode::Always, 2, None).expect("open");
         wal.append(&WalOp::BeginTx { tx_id: 1 }).expect("begin");
         wal.append(&WalOp::Put {
             key: "users:1".into(),

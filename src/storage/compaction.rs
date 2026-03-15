@@ -13,12 +13,12 @@ pub fn compact_segment(
     segment.truncate()?;
     index.clear();
     for (key, value) in entries {
-        let offset = segment.append(value)?;
+        let (offset, stored_len) = segment.append(value)?;
         index.insert(
             key.clone(),
             Pointer {
                 offset,
-                len: value.len() as u32,
+                len: stored_len,
             },
         );
     }

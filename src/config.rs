@@ -14,6 +14,7 @@ pub struct FireLiteConfig {
     pub auto_compaction_threshold_bytes: usize,
     pub durability_mode: DurabilityMode,
     pub group_commit_max_ops: usize,
+    pub encryption_key: Option<String>,
 }
 
 impl Default for FireLiteConfig {
@@ -26,6 +27,7 @@ impl Default for FireLiteConfig {
             auto_compaction_threshold_bytes: 256 * 1024 * 1024,
             durability_mode: DurabilityMode::Always,
             group_commit_max_ops: 128,
+            encryption_key: None,
         }
     }
 }
