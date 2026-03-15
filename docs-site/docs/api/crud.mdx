@@ -1,0 +1,62 @@
+---
+title: CRUD Operations
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Create / Read / Update / Delete
+
+<Tabs>
+<TabItem value="rust" label="Rust">
+
+```rust
+let mut doc = FireLiteDoc::default();
+doc.insert("name", Value::String("alice".into()));
+db.put("users", "u1", &doc)?; // create/update
+
+let loaded = db.get("users", "u1")?;
+db.delete("users", "u1")?;
+```
+
+</TabItem>
+<TabItem value="js" label="JS/TS">
+
+```ts
+await db.collection("users").doc("u1").set({ name: "alice", age: 30 });
+const snap = await db.collection("users").doc("u1").get();
+await db.collection("users").doc("u1").delete();
+```
+
+</TabItem>
+<TabItem value="tauri" label="Tauri/React">
+
+```ts
+await tauriDb.collection("users").doc("u1").set({ name: "alice" });
+const snap = await tauriDb.collection("users").doc("u1").get();
+await tauriDb.collection("users").doc("u1").delete();
+```
+
+</TabItem>
+<TabItem value="cffi" label="C-FFI">
+
+```c
+FL_Doc* doc = fl_doc_new();
+fl_doc_insert_str(doc, "name", "alice");
+fl_engine_insert(db, "users", "u1", doc);
+
+FL_Doc* loaded = fl_engine_get(db, "users", "u1");
+fl_engine_delete(db, "users", "u1");
+```
+
+</TabItem>
+<TabItem value="pascal" label="Lazarus/FPC">
+
+```pascal
+DB.Collection('users').Doc('u1').Set(TFLDocument.Create.InsertStr('name','alice'));
+Snap := DB.Collection('users').Doc('u1').Get;
+DB.Collection('users').Doc('u1').Delete;
+```
+
+</TabItem>
+</Tabs>
