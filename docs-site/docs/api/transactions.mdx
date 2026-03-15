@@ -1,0 +1,69 @@
+---
+title: Transactions
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Conflict-aware transaction patterns
+
+Rust is the authoritative implementation for explicit transactions: `begin_transaction` and `begin_serializable_transaction`.
+
+<Tabs>
+<TabItem value="rust" label="Rust">
+
+```rust
+let mut tx = db.begin_serializable_transaction();
+let before = tx.get(&db, "users", "u1")?;
+
+let mut updated = before.unwrap_or_default();
+updated.insert("name", Value::String("Alice".into()));
+tx.put("users", "u1", updated);
+
+// validates read/write versions before applying batch
+tx.commit(&db)?;
+```
+
+</TabItem>
+<TabItem value="js" label="JS/TS">
+
+```ts
+// JS SDK does not yet expose begin_transaction APIs.
+// Use atomic batches today for multi-document atomic writes:
+const b = db.batch();
+b.set(db.collection("users").doc("u1"), { name: "Alice" });
+await b.commit();
+```
+
+</TabItem>
+<TabItem value="tauri" label="Tauri/React">
+
+```ts
+// Tauri FireLiteOp currently supports get/set/delete/query/batch/subscribe/unsubscribe.
+// Use `batch` for atomic writes through firelite_exec.
+await tauriDb.batch()
+  .set(tauriDb.collection("users").doc("u1"), { name: "Alice" })
+  .commit();
+```
+
+</TabItem>
+<TabItem value="cffi" label="C-FFI">
+
+```c
+// Flat C API currently exposes batch atomicity, not explicit transaction begin/commit.
+FL_Batch* b = fl_batch_new();
+fl_batch_set(b, "users", "u1", doc);
+fl_batch_commit(db, b);
+```
+
+</TabItem>
+<TabItem value="pascal" label="Lazarus/FPC">
+
+```pascal
+var Tx: TFLTransaction;
+Tx := DB.StartTransaction;
+Tx.Set('users', 'u1', Doc).Delete('users', 'u2').Commit;
+```
+
+</TabItem>
+</Tabs>
