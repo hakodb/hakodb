@@ -1,256 +1,143 @@
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use crate::error::FireLiteError;
-use crate::storage::log::Log;
+use crate::error::{FireLiteError, Result};
 
-pub type Result<T> = std::result::Result<T, FireLiteError>;
+use super::log::{Wal, WalOp};
 
-const OP_INSERT: u8 = 1;
-const OP_DELETE: u8 = 2;
-
-#[derive(Clone)]
-struct DocMeta {
+#[derive(Debug, Clone)]
+struct Pointer {
     offset: u64,
+    len: u32,
 }
 
-pub struct FireLiteEngine {
-    log: Log,
-
-    /// collection_name -> collection_id
-    collections: HashMap<String, u32>,
-
-    /// collection_id -> name
-    reverse_collections: HashMap<u32, String>,
-
-    /// next collection id
-    next_collection_id: u32,
-
-    /// (collection_id, doc_id) -> record offset
-    index: HashMap<(u32, String), DocMeta>,
+pub struct StorageEngine {
+    segment: File,
+    wal: Wal,
+    index: HashMap<String, Pointer>,
 }
 
-impl FireLiteEngine {
-
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-
-        let mut log = Log::open(path)?;
-
+impl StorageEngine {
+    pub fn open(base_dir: impl AsRef<Path>) -> Result<Self> {
+        std::fs::create_dir_all(base_dir.as_ref())?;
+        let segment_path = base_dir.as_ref().join("segment-0.dat");
+        let wal_path = base_dir.as_ref().join("wal.log");
+        let segment = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(segment_path)?;
+        let wal = Wal::open(wal_path)?;
         let mut engine = Self {
-            log,
-            collections: HashMap::new(),
-            reverse_collections: HashMap::new(),
-            next_collection_id: 1,
+            segment,
+            wal,
             index: HashMap::new(),
         };
-
-        engine.rebuild_index()?;
-
+        engine.recover()?;
         Ok(engine)
     }
 
-    fn get_or_create_collection(&mut self, name: &str) -> u32 {
-
-        if let Some(id) = self.collections.get(name) {
-            return *id;
+    fn recover(&mut self) -> Result<()> {
+        for op in self.wal.replay()? {
+            match op {
+                WalOp::Put {
+                    key,
+                    segment_offset,
+                    len,
+                } => {
+                    self.index.insert(
+                        key,
+                        Pointer {
+                            offset: segment_offset,
+                            len,
+                        },
+                    );
+                }
+                WalOp::Delete { key } => {
+                    self.index.remove(&key);
+                }
+            }
         }
-
-        let id = self.next_collection_id;
-
-        self.collections.insert(name.to_string(), id);
-        self.reverse_collections.insert(id, name.to_string());
-
-        self.next_collection_id += 1;
-
-        id
+        Ok(())
     }
 
-    pub fn insert(
-        &mut self,
-        collection: &str,
-        doc_id: &str,
-        document: Vec<u8>,
-    ) -> Result<()> {
-
-        let cid = self.get_or_create_collection(collection);
-
-        let record = encode_record(
-            cid,
-            doc_id,
-            OP_INSERT,
-            &document
-        );
-
-        let offset = self.log.append_raw(&record)?;
-
+    pub fn put(&mut self, key: String, value: &[u8]) -> Result<()> {
+        let offset = self.segment.seek(SeekFrom::End(0))?;
+        self.segment
+            .write_all(&(value.len() as u32).to_le_bytes())?;
+        self.segment.write_all(value)?;
+        self.segment.sync_data()?;
+        self.wal.append(&WalOp::Put {
+            key: key.clone(),
+            segment_offset: offset,
+            len: value.len() as u32,
+        })?;
         self.index.insert(
-            (cid, doc_id.to_string()),
-            DocMeta { offset },
+            key,
+            Pointer {
+                offset,
+                len: value.len() as u32,
+            },
         );
-
         Ok(())
     }
 
-    pub fn get(
-        &mut self,
-        collection: &str,
-        doc_id: &str,
-    ) -> Result<Option<Vec<u8>>> {
-
-        let cid = match self.collections.get(collection) {
-            Some(v) => *v,
-            None => return Ok(None),
-        };
-
-        let meta = match self.index.get(&(cid, doc_id.to_string())) {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-
-        let record = self.log.read_raw(meta.offset)?;
-
-        let decoded = decode_record(&record)?;
-
-        if decoded.op == OP_DELETE {
+    pub fn get(&mut self, key: &str) -> Result<Option<Vec<u8>>> {
+        let Some(ptr) = self.index.get(key).cloned() else {
             return Ok(None);
-        }
-
-        Ok(Some(decoded.document))
-    }
-
-    pub fn delete(
-        &mut self,
-        collection: &str,
-        doc_id: &str,
-    ) -> Result<()> {
-
-        let cid = match self.collections.get(collection) {
-            Some(v) => *v,
-            None => return Ok(()),
         };
+        self.segment.seek(SeekFrom::Start(ptr.offset))?;
+        let mut len_buf = [0; 4];
+        self.segment.read_exact(&mut len_buf)?;
+        let len = u32::from_le_bytes(len_buf);
+        if len != ptr.len {
+            return Err(FireLiteError::Corrupt("segment length mismatch".into()));
+        }
+        let mut value = vec![0; len as usize];
+        self.segment.read_exact(&mut value)?;
+        Ok(Some(value))
+    }
 
-        let record = encode_record(
-            cid,
-            doc_id,
-            OP_DELETE,
-            &[]
-        );
-
-        self.log.append_raw(&record)?;
-
-        self.index.remove(&(cid, doc_id.to_string()));
-
+    pub fn delete(&mut self, key: &str) -> Result<()> {
+        self.wal.append(&WalOp::Delete {
+            key: key.to_string(),
+        })?;
+        self.index.remove(key);
         Ok(())
     }
 
-    fn rebuild_index(&mut self) -> Result<()> {
-
-        let entries = self.log.scan_raw()?;
-
-        for (offset, record_bytes) in entries {
-
-            let record = decode_record(&record_bytes)?;
-
-            let cid = record.collection_id;
-
-            if !self.reverse_collections.contains_key(&cid) {
-                let name = format!("collection_{}", cid);
-
-                self.reverse_collections.insert(cid, name.clone());
-                self.collections.insert(name, cid);
-            }
-
-            if record.op == OP_INSERT {
-
-                self.index.insert(
-                    (cid, record.doc_id.clone()),
-                    DocMeta { offset },
-                );
-
-            } else {
-
-                self.index.remove(&(cid, record.doc_id.clone()));
+    pub fn scan_prefix(&mut self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let keys: Vec<String> = self
+            .index
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect();
+        let mut out = Vec::new();
+        for key in keys {
+            if let Some(value) = self.get(&key)? {
+                out.push((key, value));
             }
         }
+        Ok(out)
+    }
 
+    pub fn compact(&mut self) -> Result<()> {
+        let mut entries = Vec::new();
+        for key in self.index.keys().cloned().collect::<Vec<_>>() {
+            if let Some(v) = self.get(&key)? {
+                entries.push((key, v));
+            }
+        }
+        self.segment.set_len(0)?;
+        self.segment.seek(SeekFrom::Start(0))?;
+        self.index.clear();
+        self.wal.reset()?;
+        for (key, value) in entries {
+            self.put(key, &value)?;
+        }
         Ok(())
     }
-}
-
-struct DecodedRecord {
-    collection_id: u32,
-    doc_id: String,
-    op: u8,
-    document: Vec<u8>,
-}
-
-fn encode_record(
-    collection_id: u32,
-    doc_id: &str,
-    op: u8,
-    doc: &[u8],
-) -> Vec<u8> {
-
-    use crc32fast::Hasher;
-
-    let doc_id_bytes = doc_id.as_bytes();
-
-    let mut payload = Vec::new();
-
-    payload.extend(&collection_id.to_le_bytes());
-
-    payload.extend(&(doc_id_bytes.len() as u16).to_le_bytes());
-    payload.extend(doc_id_bytes);
-
-    payload.push(op);
-
-    payload.extend(&(doc.len() as u32).to_le_bytes());
-    payload.extend(doc);
-
-    let mut hasher = Hasher::new();
-    hasher.update(&payload);
-
-    let crc = hasher.finalize();
-
-    let mut record = Vec::new();
-
-    record.extend(&(payload.len() as u32).to_le_bytes());
-    record.extend(&crc.to_le_bytes());
-    record.extend(payload);
-
-    record
-}
-
-fn decode_record(buf: &[u8]) -> Result<DecodedRecord> {
-
-    let mut pos = 0;
-
-    let collection_id =
-        u32::from_le_bytes(buf[pos..pos+4].try_into().unwrap());
-    pos += 4;
-
-    let doc_id_len =
-        u16::from_le_bytes(buf[pos..pos+2].try_into().unwrap()) as usize;
-    pos += 2;
-
-    let doc_id =
-        String::from_utf8(buf[pos..pos+doc_id_len].to_vec())
-        .map_err(|_| FireLiteError::InvalidRecord)?;
-    pos += doc_id_len;
-
-    let op = buf[pos];
-    pos += 1;
-
-    let doc_len =
-        u32::from_le_bytes(buf[pos..pos+4].try_into().unwrap()) as usize;
-    pos += 4;
-
-    let document = buf[pos..pos+doc_len].to_vec();
-
-    Ok(DecodedRecord {
-        collection_id,
-        doc_id,
-        op,
-        document,
-    })
 }

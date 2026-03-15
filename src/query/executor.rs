@@ -1,145 +1,84 @@
-use crate::query::plan::{QueryPlan, ScanType};
+use std::sync::Arc;
+use std::thread;
+
 use crate::document::firelite_doc::{FireLiteDoc, Value};
-use crate::storage::engine::FireLiteEngine;
-use crate::index::manager::IndexManager;
+use crate::error::Result;
+use crate::storage::engine::StorageEngine;
 
-pub struct QueryExecutor;
+use super::plan::QueryPlan;
+use super::query::{Filter, Operator};
 
-impl QueryExecutor {
+pub struct ParallelQueryExecutor {
+    workers: usize,
+}
+
+impl ParallelQueryExecutor {
+    pub fn new(workers: usize) -> Self {
+        Self {
+            workers: workers.max(1),
+        }
+    }
 
     pub fn execute(
-        engine: &mut FireLiteEngine,
-        indexes: &IndexManager,
-        plan: QueryPlan
-    ) -> Vec<(String, FireLiteDoc)> {
-
-        match plan.scan {
-
-            ScanType::CollectionScan => {
-
-                Self::collection_scan(engine, plan)
-            }
-
-            ScanType::IndexScan { field } => {
-
-                Self::index_scan(engine, indexes, plan, &field)
-            }
-        }
-    }
-
-    fn collection_scan(
-        engine: &mut FireLiteEngine,
-        plan: QueryPlan
-    ) -> Vec<(String, FireLiteDoc)> {
-
-        let mut results = Vec::new();
-
-        for (doc_id, raw_doc) in
-            engine.scan_collection(plan.collection_id)
-        {
-
-            if let Some(doc) = FireLiteDoc::decode(&raw_doc) {
-
-                if Self::matches_filters(&doc, &plan.filters) {
-
-                    results.push((doc_id, doc));
-                }
-            }
-
-            if let Some(limit) = plan.limit {
-
-                if results.len() >= limit {
-                    break;
-                }
-            }
-        }
-
-        results
-    }
-
-    fn index_scan(
-        engine: &mut FireLiteEngine,
-        indexes: &IndexManager,
+        &self,
+        storage: &mut StorageEngine,
         plan: QueryPlan,
-        field: &str
-    ) -> Vec<(String, FireLiteDoc)> {
-
-        let mut results = Vec::new();
-
-        let index =
-            indexes.get_index(plan.collection_id, field)
-            .unwrap();
-
-        let doc_ids =
-            index.find_all();
-
-        for doc_id in doc_ids {
-
-            if let Some(raw) =
-                engine.get_by_id(plan.collection_id, &doc_id)
-            {
-
-                if let Some(doc) = FireLiteDoc::decode(&raw) {
-
-                    if Self::matches_filters(&doc, &plan.filters) {
-
-                        results.push((doc_id.clone(), doc));
+    ) -> Result<Vec<(String, FireLiteDoc)>> {
+        let docs = storage.scan_prefix(&format!("{}:", plan.collection))?;
+        let chunk_size = (docs.len() / self.workers).max(1);
+        let filters = Arc::new(plan.filters);
+        let mut handles = Vec::new();
+        for chunk in docs.chunks(chunk_size) {
+            let local = chunk.to_vec();
+            let filters = filters.clone();
+            handles.push(thread::spawn(move || {
+                let mut out = Vec::new();
+                for (key, bytes) in local {
+                    if let Some(doc) = FireLiteDoc::decode(&bytes) {
+                        if matches_filters(&doc, &filters) {
+                            out.push((key, doc));
+                        }
                     }
                 }
-            }
-
-            if let Some(limit) = plan.limit {
-
-                if results.len() >= limit {
-                    break;
-                }
-            }
+                out
+            }));
         }
-
-        results
-    }
-
-    fn matches_filters(
-        doc: &FireLiteDoc,
-        filters: &Vec<crate::query::query::Filter>
-    ) -> bool {
-
-        for f in filters {
-
-            let val = match doc.fields.get(&f.field) {
-                Some(v) => v,
-                None => return false
-            };
-
-            if !compare(val, &f.op, &f.value) {
-                return false;
-            }
+        let mut out = Vec::new();
+        for h in handles {
+            out.extend(h.join().unwrap_or_default());
         }
-
-        true
+        if let Some(limit) = plan.limit {
+            out.truncate(limit);
+        }
+        Ok(out)
     }
 }
 
-fn compare(
-    a: &Value,
-    op: &crate::query::query::Operator,
-    b: &Value
-) -> bool {
+fn matches_filters(doc: &FireLiteDoc, filters: &[Filter]) -> bool {
+    filters.iter().all(|f| {
+        doc.fields
+            .get(&f.field)
+            .map(|v| compare(v, &f.op, &f.value))
+            .unwrap_or(false)
+    })
+}
 
-    match (a,b) {
-
-        (Value::Int(a), Value::Int(b)) => {
-
-            match op {
-
-                crate::query::query::Operator::Eq => a == b,
-                crate::query::query::Operator::Gt => a > b,
-                crate::query::query::Operator::Gte => a >= b,
-                crate::query::query::Operator::Lt => a < b,
-                crate::query::query::Operator::Lte => a <= b,
-            }
-        }
-
-        _ => false
+fn compare(a: &Value, op: &Operator, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Int(a), Value::Int(b)) => match op {
+            Operator::Eq => a == b,
+            Operator::Gt => a > b,
+            Operator::Gte => a >= b,
+            Operator::Lt => a < b,
+            Operator::Lte => a <= b,
+        },
+        (Value::String(a), Value::String(b)) => match op {
+            Operator::Eq => a == b,
+            Operator::Gt => a > b,
+            Operator::Gte => a >= b,
+            Operator::Lt => a < b,
+            Operator::Lte => a <= b,
+        },
+        _ => false,
     }
 }

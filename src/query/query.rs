@@ -17,73 +17,36 @@ pub struct Filter {
 }
 
 #[derive(Debug, Clone)]
-pub struct OrderBy {
-    pub field: String,
-    pub ascending: bool,
-}
-
-#[derive(Debug, Clone)]
 pub struct Query {
-
     pub collection: String,
-
     pub filters: Vec<Filter>,
-
-    pub order_by: Option<OrderBy>,
-
     pub limit: Option<usize>,
 }
 
 impl Query {
-
     pub fn new(collection: &str) -> Self {
-
         Self {
-            collection: collection.to_string(),
-            filters: vec![],
-            order_by: None,
+            collection: collection.into(),
+            filters: Vec::new(),
             limit: None,
         }
     }
 
-    pub fn where_filter(
-        mut self,
-        field: &str,
-        op: Operator,
-        value: Value
-    ) -> Self {
-
-        self.filters.push(
-            Filter {
-                field: field.to_string(),
-                op,
-                value
-            }
-        );
-
-        self
-    }
-
-    pub fn order_by(
-        mut self,
-        field: &str,
-        ascending: bool
-    ) -> Self {
-
-        self.order_by = Some(
-            OrderBy {
-                field: field.to_string(),
-                ascending
-            }
-        );
-
+    pub fn where_filter(mut self, field: &str, op: Operator, value: Value) -> Self {
+        self.filters.push(Filter {
+            field: field.into(),
+            op,
+            value,
+        });
         self
     }
 
     pub fn limit(mut self, n: usize) -> Self {
-
         self.limit = Some(n);
-
         self
+    }
+
+    pub fn index_fields(&self) -> Vec<String> {
+        self.filters.iter().map(|f| f.field.clone()).collect()
     }
 }

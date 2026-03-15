@@ -1,23 +1,15 @@
-use crate::query::query::Filter;
+use super::query::Filter;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ScanType {
-
-    CollectionScan,
-
-    IndexScan {
-        field: String
-    }
+    FullCollection,
+    CompositeIndex,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct QueryPlan {
-
-    pub collection_id: u32,
-
+    pub collection: String,
     pub scan: ScanType,
-
     pub filters: Vec<Filter>,
-
     pub limit: Option<usize>,
 }

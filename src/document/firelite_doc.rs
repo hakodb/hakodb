@@ -1,18 +1,9 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 const MAGIC: u8 = 0xF1;
-const VERSION: u8 = 2;
+const VERSION: u8 = 1;
 
-const TYPE_NULL: u8 = 1;
-const TYPE_BOOL: u8 = 2;
-const TYPE_INT: u8 = 3;
-const TYPE_FLOAT: u8 = 4;
-const TYPE_STRING: u8 = 5;
-const TYPE_BINARY: u8 = 6;
-const TYPE_ARRAY: u8 = 7;
-const TYPE_OBJECT: u8 = 8;
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
     Bool(bool),
@@ -20,269 +11,144 @@ pub enum Value {
     Float(f64),
     String(String),
     Binary(Vec<u8>),
-    Array(Vec<Value>),
-    Object(FireLiteDoc),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct FireLiteDoc {
-    pub fields: HashMap<String, Value>,
+    pub fields: BTreeMap<String, Value>,
 }
 
 impl FireLiteDoc {
-
-    pub fn new() -> Self {
-        Self {
-            fields: HashMap::new()
-        }
-    }
-
     pub fn insert(&mut self, key: impl Into<String>, value: Value) {
         self.fields.insert(key.into(), value);
     }
 
     pub fn encode(&self) -> Vec<u8> {
-
-        let mut header = Vec::new();
-        let mut data = Vec::new();
-
-        header.push(MAGIC);
-        header.push(VERSION);
-
-        header.extend(&(self.fields.len() as u16).to_le_bytes());
-
-        for (key, value) in &self.fields {
-
-            let key_bytes = key.as_bytes();
-
-            header.push(key_bytes.len() as u8);
-            header.extend(key_bytes);
-
-            let (value_type, encoded) = encode_value(value);
-
-            header.push(value_type);
-
-            let offset = data.len() as u32;
-            header.extend(&offset.to_le_bytes());
-
-            data.extend(encoded);
+        let mut out = vec![MAGIC, VERSION];
+        out.extend((self.fields.len() as u16).to_le_bytes());
+        for (k, v) in &self.fields {
+            out.push(k.len() as u8);
+            out.extend(k.as_bytes());
+            let (tag, bytes) = encode_value(v);
+            out.push(tag);
+            out.extend((bytes.len() as u32).to_le_bytes());
+            out.extend(bytes);
         }
-
-        header.extend(data);
-
-        header
+        out
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let view = FireLiteDocView::new(bytes)?;
+        let mut doc = FireLiteDoc::default();
+        for (k, v) in view.iter() {
+            doc.insert(k.to_string(), v.to_owned_value()?);
+        }
+        Some(doc)
+    }
+}
 
-        let mut pos = 0;
+pub struct FireLiteDocView<'a> {
+    bytes: &'a [u8],
+    data_offset: usize,
+    fields: u16,
+}
 
-        if bytes[pos] != MAGIC {
+impl<'a> FireLiteDocView<'a> {
+    pub fn new(bytes: &'a [u8]) -> Option<Self> {
+        if bytes.len() < 4 || bytes[0] != MAGIC || bytes[1] != VERSION {
             return None;
         }
+        let fields = u16::from_le_bytes(bytes[2..4].try_into().ok()?);
+        Some(Self {
+            bytes,
+            data_offset: 4,
+            fields,
+        })
+    }
 
-        pos += 1;
+    pub fn iter(&self) -> FireLiteDocIter<'a> {
+        FireLiteDocIter {
+            bytes: self.bytes,
+            pos: self.data_offset,
+            remaining: self.fields,
+        }
+    }
+}
 
-        let version = bytes[pos];
-        pos += 1;
+pub struct BorrowedValue<'a> {
+    tag: u8,
+    data: &'a [u8],
+}
 
-        if version != VERSION {
+impl<'a> BorrowedValue<'a> {
+    pub fn to_owned_value(&self) -> Option<Value> {
+        decode_value(self.tag, self.data)
+    }
+}
+
+pub struct FireLiteDocIter<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    remaining: u16,
+}
+
+impl<'a> Iterator for FireLiteDocIter<'a> {
+    type Item = (&'a str, BorrowedValue<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
             return None;
         }
-
-        let field_count =
-            u16::from_le_bytes(bytes[pos..pos+2].try_into().ok()?) as usize;
-
-        pos += 2;
-
-        let mut fields = HashMap::new();
-
-        let mut entries = Vec::new();
-
-        for _ in 0..field_count {
-
-            let key_len = bytes[pos] as usize;
-            pos += 1;
-
-            let key =
-                String::from_utf8(bytes[pos..pos+key_len].to_vec()).ok()?;
-
-            pos += key_len;
-
-            let value_type = bytes[pos];
-            pos += 1;
-
-            let offset =
-                u32::from_le_bytes(bytes[pos..pos+4].try_into().ok()?) as usize;
-
-            pos += 4;
-
-            entries.push((key, value_type, offset));
-        }
-
-        let data_start = pos;
-
-        for (key, t, offset) in entries {
-
-            let value = decode_value(
-                t,
-                &bytes[data_start + offset..]
-            )?;
-
-            fields.insert(key, value);
-        }
-
-        Some(Self { fields })
+        let key_len = *self.bytes.get(self.pos)? as usize;
+        self.pos += 1;
+        let key = std::str::from_utf8(self.bytes.get(self.pos..self.pos + key_len)?).ok()?;
+        self.pos += key_len;
+        let tag = *self.bytes.get(self.pos)?;
+        self.pos += 1;
+        let len =
+            u32::from_le_bytes(self.bytes.get(self.pos..self.pos + 4)?.try_into().ok()?) as usize;
+        self.pos += 4;
+        let data = self.bytes.get(self.pos..self.pos + len)?;
+        self.pos += len;
+        self.remaining -= 1;
+        Some((key, BorrowedValue { tag, data }))
     }
 }
 
 fn encode_value(v: &Value) -> (u8, Vec<u8>) {
-
     match v {
-
-        Value::Null => (TYPE_NULL, vec![]),
-
-        Value::Bool(b) => (TYPE_BOOL, vec![*b as u8]),
-
-        Value::Int(i) => (TYPE_INT, i.to_le_bytes().to_vec()),
-
-        Value::Float(f) => (TYPE_FLOAT, f.to_le_bytes().to_vec()),
-
-        Value::String(s) => {
-
-            let mut buf = Vec::new();
-
-            buf.extend(&(s.len() as u32).to_le_bytes());
-            buf.extend(s.as_bytes());
-
-            (TYPE_STRING, buf)
-        }
-
-        Value::Binary(b) => {
-
-            let mut buf = Vec::new();
-
-            buf.extend(&(b.len() as u32).to_le_bytes());
-            buf.extend(b);
-
-            (TYPE_BINARY, buf)
-        }
-
-        Value::Array(arr) => {
-
-            let mut buf = Vec::new();
-
-            buf.extend(&(arr.len() as u32).to_le_bytes());
-
-            for v in arr {
-
-                let (t, data) = encode_value(v);
-
-                buf.push(t);
-                buf.extend(data);
-            }
-
-            (TYPE_ARRAY, buf)
-        }
-
-        Value::Object(doc) => {
-
-            let encoded = doc.encode();
-
-            let mut buf = Vec::new();
-
-            buf.extend(&(encoded.len() as u32).to_le_bytes());
-            buf.extend(encoded);
-
-            (TYPE_OBJECT, buf)
-        }
+        Value::Null => (1, vec![]),
+        Value::Bool(v) => (2, vec![*v as u8]),
+        Value::Int(v) => (3, v.to_le_bytes().to_vec()),
+        Value::Float(v) => (4, v.to_le_bytes().to_vec()),
+        Value::String(v) => (5, v.as_bytes().to_vec()),
+        Value::Binary(v) => (6, v.clone()),
     }
 }
 
-fn decode_value(t: u8, bytes: &[u8]) -> Option<Value> {
+fn decode_value(tag: u8, bytes: &[u8]) -> Option<Value> {
+    Some(match tag {
+        1 => Value::Null,
+        2 => Value::Bool(*bytes.first()? == 1),
+        3 => Value::Int(i64::from_le_bytes(bytes.get(..8)?.try_into().ok()?)),
+        4 => Value::Float(f64::from_le_bytes(bytes.get(..8)?.try_into().ok()?)),
+        5 => Value::String(String::from_utf8(bytes.to_vec()).ok()?),
+        6 => Value::Binary(bytes.to_vec()),
+        _ => return None,
+    })
+}
 
-    let mut pos = 0;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    match t {
-
-        TYPE_NULL => Some(Value::Null),
-
-        TYPE_BOOL => Some(Value::Bool(bytes[pos] == 1)),
-
-        TYPE_INT => {
-
-            let v =
-                i64::from_le_bytes(bytes[pos..pos+8].try_into().ok()?);
-
-            Some(Value::Int(v))
-        }
-
-        TYPE_FLOAT => {
-
-            let v =
-                f64::from_le_bytes(bytes[pos..pos+8].try_into().ok()?);
-
-            Some(Value::Float(v))
-        }
-
-        TYPE_STRING => {
-
-            let len =
-                u32::from_le_bytes(bytes[pos..pos+4].try_into().ok()?) as usize;
-
-            pos += 4;
-
-            let s =
-                String::from_utf8(bytes[pos..pos+len].to_vec()).ok()?;
-
-            Some(Value::String(s))
-        }
-
-        TYPE_BINARY => {
-
-            let len =
-                u32::from_le_bytes(bytes[pos..pos+4].try_into().ok()?) as usize;
-
-            pos += 4;
-
-            Some(Value::Binary(bytes[pos..pos+len].to_vec()))
-        }
-
-        TYPE_ARRAY => {
-
-            let count =
-                u32::from_le_bytes(bytes[pos..pos+4].try_into().ok()?) as usize;
-
-            pos += 4;
-
-            let mut arr = Vec::new();
-
-            for _ in 0..count {
-
-                let t = bytes[pos];
-                pos += 1;
-
-                let val = decode_value(t, &bytes[pos..])?;
-
-                arr.push(val);
-            }
-
-            Some(Value::Array(arr))
-        }
-
-        TYPE_OBJECT => {
-
-            let len =
-                u32::from_le_bytes(bytes[pos..pos+4].try_into().ok()?) as usize;
-
-            pos += 4;
-
-            let doc =
-                FireLiteDoc::decode(&bytes[pos..pos+len])?;
-
-            Some(Value::Object(doc))
-        }
-
-        _ => None
+    #[test]
+    fn round_trip() {
+        let mut doc = FireLiteDoc::default();
+        doc.insert("name", Value::String("alice".into()));
+        doc.insert("age", Value::Int(42));
+        let encoded = doc.encode();
+        let decoded = FireLiteDoc::decode(&encoded).unwrap();
+        assert_eq!(decoded, doc);
     }
 }
