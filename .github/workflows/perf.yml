@@ -1,0 +1,14 @@
+name: perf
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  benchmarks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run benches
+        run: cargo bench --bench engine_bench

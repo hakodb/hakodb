@@ -1,72 +1,46 @@
-use std::collections::HashMap;
-
-use crate::index::secondary_index::SecondaryIndex;
 use crate::document::firelite_doc::FireLiteDoc;
+use crate::document::value::Value;
 
+use super::composite::definition::CompositeIndexDefinition;
+use super::composite::manager::CompositeIndexManager;
+
+#[derive(Default)]
 pub struct IndexManager {
-
-    indexes: HashMap<(u32,String), SecondaryIndex>,
+    composite: CompositeIndexManager,
 }
 
 impl IndexManager {
-
-    pub fn new() -> Self {
-
-        Self {
-            indexes: HashMap::new()
-        }
+    pub fn create_index(&mut self, definition: CompositeIndexDefinition) -> u32 {
+        self.composite.create_index(definition)
     }
 
-    pub fn create_index(
-        &mut self,
-        collection_id: u32,
-        field: &str
-    ) {
-
-        let index =
-            SecondaryIndex::new(collection_id, field);
-
-        self.indexes.insert(
-            (collection_id, field.to_string()),
-            index
-        );
+    pub fn has_index(&self, collection: &str, fields: &[String]) -> bool {
+        self.composite
+            .indexes_for_collection(collection)
+            .any(|idx| {
+                idx.definition
+                    .fields
+                    .iter()
+                    .map(|f| f.field.as_str())
+                    .eq(fields.iter().map(String::as_str))
+            })
     }
 
-    pub fn index_document(
-        &mut self,
-        collection_id: u32,
-        doc_id: &str,
-        doc: &FireLiteDoc,
-    ) {
-
-        for ((cid, field), index) in &mut self.indexes {
-
-            if *cid == collection_id {
-
-                if doc.fields.contains_key(field) {
-
-                    index.index_document(doc_id, doc);
-                }
-            }
-        }
+    pub fn exact_match_doc_ids(
+        &self,
+        collection: &str,
+        fields: &[String],
+        values: &[Value],
+    ) -> Option<Vec<String>> {
+        self.composite
+            .exact_match_doc_ids(collection, fields, values)
     }
 
-    pub fn remove_document(
-        &mut self,
-        collection_id: u32,
-        doc_id: &str,
-        doc: &FireLiteDoc,
-    ) {
+    pub fn index_document(&mut self, collection: &str, doc_id: &str, doc: &FireLiteDoc) {
+        self.composite.index_document(collection, doc_id, doc);
+    }
 
-        for ((cid, field), index) in &mut self.indexes {
-
-            if *cid == collection_id {
-
-                if doc.fields.contains_key(field) {
-
-                    index.remove_document(doc_id, doc);
-                }
-            }
-        }
+    pub fn remove_document(&mut self, collection: &str, doc_id: &str, doc: &FireLiteDoc) {
+        self.composite.remove_document(collection, doc_id, doc);
     }
 }

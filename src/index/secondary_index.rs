@@ -1,119 +1,28 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::document::firelite_doc::{FireLiteDoc, Value};
-use crate::index::index_key::encode_index_key;
-
+#[derive(Default, Debug)]
 pub struct SecondaryIndex {
-
-    pub collection_id: u32,
-    pub field: String,
-
-    tree: BTreeMap<Vec<u8>, String>,
+    map: BTreeMap<Vec<u8>, BTreeSet<String>>,
 }
 
 impl SecondaryIndex {
-
-    pub fn new(collection_id: u32, field: &str) -> Self {
-
-        Self {
-            collection_id,
-            field: field.to_string(),
-            tree: BTreeMap::new(),
-        }
+    pub fn insert(&mut self, key: Vec<u8>, doc_id: String) {
+        self.map.entry(key).or_default().insert(doc_id);
     }
 
-    pub fn index_document(
-        &mut self,
-        doc_id: &str,
-        doc: &FireLiteDoc,
-    ) {
-
-        if let Some(value) = doc.fields.get(&self.field) {
-
-            let key =
-                encode_index_key(
-                    self.collection_id,
-                    &self.field,
-                    value,
-                    doc_id
-                );
-
-            self.tree.insert(key, doc_id.to_string());
-        }
-    }
-
-    pub fn remove_document(
-        &mut self,
-        doc_id: &str,
-        doc: &FireLiteDoc,
-    ) {
-
-        if let Some(value) = doc.fields.get(&self.field) {
-
-            let key =
-                encode_index_key(
-                    self.collection_id,
-                    &self.field,
-                    value,
-                    doc_id
-                );
-
-            self.tree.remove(&key);
-        }
-    }
-
-    pub fn find_equal(
-        &self,
-        value: &Value
-    ) -> Vec<String> {
-
-        let mut results = Vec::new();
-
-        let start =
-            encode_index_key(
-                self.collection_id,
-                &self.field,
-                value,
-                ""
-            );
-
-        for (k, v) in self.tree.range(start..) {
-
-            if !k.starts_with(&start[..start.len()-1]) {
-                break;
+    pub fn remove(&mut self, key: &[u8], doc_id: &str) {
+        if let Some(ids) = self.map.get_mut(key) {
+            ids.remove(doc_id);
+            if ids.is_empty() {
+                self.map.remove(key);
             }
-
-            results.push(v.clone());
         }
-
-        results
     }
 
-    pub fn find_range(
-        &self,
-        min: &Value,
-        max: &Value
-    ) -> Vec<String> {
-
-        let start =
-            encode_index_key(
-                self.collection_id,
-                &self.field,
-                min,
-                ""
-            );
-
-        let end =
-            encode_index_key(
-                self.collection_id,
-                &self.field,
-                max,
-                "\xff"
-            );
-
-        self.tree
-            .range(start..=end)
-            .map(|(_,v)| v.clone())
+    pub fn range_scan(&self, start: &[u8], end: &[u8]) -> Vec<String> {
+        self.map
+            .range(start.to_vec()..=end.to_vec())
+            .flat_map(|(_, ids)| ids.iter().cloned())
             .collect()
     }
 }
