@@ -57,6 +57,11 @@ FireLite is in **advanced foundation stage**: core architecture and major vertic
   - fluent query builder: `where().orderBy().limit().get()`
   - atomic write batches: `batch.set/delete/commit`
   - object -> `FL_Doc` field insertion path via `fl_doc_insert_*` (no JSON payload mutation path)
+- Lazarus/Free Pascal wrapper (`pascal/`)
+  - raw FFI header translation unit (`FireLiteRaw.pas`)
+  - object-oriented Firestore-style API (`FireLite.pas`)
+  - query projection pushdown support via `fl_query_select_field`
+  - polling-based `OnSnapshot` callback bridge with optional UI-thread queue dispatch
 - Tauri unified gateway
   - single-command dispatcher `firelite_exec` with tagged `FireLiteOp` routing
   - subscription registry for reactive `onSnapshot` flows via `Window::emit`
@@ -205,6 +210,44 @@ await stop();
 ```
 
 
+---
+
+## Lazarus / Free Pascal (FPC) Wrapper
+
+A production-focused Pascal wrapper is available under `pascal/`:
+
+- `pascal/FireLiteRaw.pas`
+  - C-ABI translation with opaque handles (`PFL_Engine`, `PFL_Doc`, `PFL_Batch`, `PFL_Query`)
+  - external imports with `cdecl` for Windows/Linux/macOS dynamic libraries.
+- `pascal/FireLite.pas`
+  - object-oriented API: `TFireLite`, `TFLCollection`, `TFLDocument`, `TFLQuery`, `TFLBatch`, `TFLTransaction`
+  - fluent Firestore-like flow (`Collection(...).Doc(...).Set/Get/Delete`, query chaining)
+  - projection pushdown (`Select([...])`) wired to `fl_query_select_field`
+  - callback-based `OnSnapshot` via a polling thread and optional `TThread.Queue` UI dispatch.
+
+### Minimal Pascal usage
+
+```pascal
+var
+  DB: TFireLite;
+  Col: TFLCollection;
+  Doc: TFLDocument;
+begin
+  DB := TFireLite.Create('./data.firelite');
+  try
+    Col := DB.Collection('users');
+    Doc := TFLDocument.Create.InsertStr('name', 'alice').InsertInt('age', 30);
+    try
+      Col.Doc('u1').Set(Doc);
+    finally
+      Doc.Free;
+    end;
+  finally
+    DB.Free;
+  end;
+end;
+```
+
 ## Multi-Language Platform Support (C ABI)
 
 FireLite supports cross-language embedding through a flat C ABI intended for Node.js/Python/C++/C# integration layers.
@@ -301,6 +344,7 @@ API (FireLite + FFI + JS/TS client)
 | Real-time listeners/watch | ✅ Implemented | Local watch streams in Rust engine |
 | Subcollections | ✅ Implemented | Subdocument helpers exposed in Rust API |
 | JS/TS Firestore-style client | ✅ Implemented | `collection().doc().set/get/delete`, query builder, batch |
+| Lazarus/FPC wrapper | ✅ Implemented | Raw C-ABI unit + OO wrapper + snapshot callback bridge |
 | Tauri unified dispatcher gateway | ✅ Implemented | Single `firelite_exec`, reactive subscriptions, lifecycle controls |
 | Security policy + audit logging | ✅ Implemented | Collection-prefix rules and append audit trail |
 | Multi-segment LSM-style compaction | ✅ Implemented | Tiered segment files + background maintenance scheduler |
@@ -317,6 +361,7 @@ API (FireLite + FFI + JS/TS client)
 | Document model | `src/document/*` | ✅ |
 | C-FFI | `src/ffi.rs`, `include/firelite.h` | ✅ |
 | JS/TS SDK | `js/src/*` | ✅ |
+| Lazarus/FPC wrapper | `pascal/FireLiteRaw.pas`, `pascal/FireLite.pas` | ✅ |
 | Tauri gateway | `src/tauri_gateway.rs`, `js/src/tauri.ts` | ✅ |
 | Bench + perf CI | `benches/engine_bench.rs`, `.github/workflows/perf.yml` | ✅ |
 

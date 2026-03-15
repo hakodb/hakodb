@@ -1,0 +1,64 @@
+unit FireLiteRaw;
+
+{$mode objfpc}{$H+}
+
+interface
+
+uses
+  ctypes;
+
+type
+  PFL_Engine = Pointer;
+  PFL_Doc = Pointer;
+  PFL_Batch = Pointer;
+  PFL_Query = Pointer;
+
+{$ifdef Windows}
+const
+  FIRELITE_LIB = 'firelite.dll';
+{$elseif Darwin}
+const
+  FIRELITE_LIB = 'libfirelite.dylib';
+{$else}
+const
+  FIRELITE_LIB = 'libfirelite.so';
+{$endif}
+
+function fl_engine_open(path: PChar): PFL_Engine; cdecl; external FIRELITE_LIB;
+procedure fl_engine_free(engine: PFL_Engine); cdecl; external FIRELITE_LIB;
+
+function fl_doc_new: PFL_Doc; cdecl; external FIRELITE_LIB;
+procedure fl_doc_free(doc: PFL_Doc); cdecl; external FIRELITE_LIB;
+function fl_doc_insert_str(doc: PFL_Doc; key, value: PChar): cint32; cdecl; external FIRELITE_LIB;
+function fl_doc_insert_int(doc: PFL_Doc; key: PChar; value: cint64): cint32; cdecl; external FIRELITE_LIB;
+function fl_doc_insert_float(doc: PFL_Doc; key: PChar; value: cdouble): cint32; cdecl; external FIRELITE_LIB;
+function fl_doc_insert_bool(doc: PFL_Doc; key: PChar; value: cbool): cint32; cdecl; external FIRELITE_LIB;
+function fl_doc_insert_null(doc: PFL_Doc; key: PChar): cint32; cdecl; external FIRELITE_LIB;
+function fl_doc_insert_bin(doc: PFL_Doc; key: PChar; data: PByte; len: SizeUInt): cint32; cdecl; external FIRELITE_LIB;
+function fl_doc_to_json(doc: PFL_Doc): PChar; cdecl; external FIRELITE_LIB;
+
+function fl_engine_insert(engine: PFL_Engine; collection, doc_id: PChar; doc: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;
+function fl_engine_get(engine: PFL_Engine; collection, doc_id: PChar): PFL_Doc; cdecl; external FIRELITE_LIB;
+function fl_engine_delete(engine: PFL_Engine; collection, doc_id: PChar): cint32; cdecl; external FIRELITE_LIB;
+
+function fl_batch_new: PFL_Batch; cdecl; external FIRELITE_LIB;
+procedure fl_batch_free(batch: PFL_Batch); cdecl; external FIRELITE_LIB;
+function fl_batch_set(batch: PFL_Batch; collection, doc_id: PChar; doc: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;
+function fl_batch_delete(batch: PFL_Batch; collection, doc_id: PChar): cint32; cdecl; external FIRELITE_LIB;
+function fl_batch_commit(engine: PFL_Engine; batch: PFL_Batch): cint32; cdecl; external FIRELITE_LIB;
+
+function fl_query_new(collection: PChar): PFL_Query; cdecl; external FIRELITE_LIB;
+procedure fl_query_free(query: PFL_Query); cdecl; external FIRELITE_LIB;
+function fl_query_where_eq_str(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_where_eq_int(query: PFL_Query; field: PChar; value: cint64): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_order_by(query: PFL_Query; field: PChar; ascending: cbool): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_limit(query: PFL_Query; limit: SizeUInt): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_select_field(query: PFL_Query; field: PChar): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_execute(engine: PFL_Engine; query: PFL_Query): PChar; cdecl; external FIRELITE_LIB;
+
+function fl_last_error: PChar; cdecl; external FIRELITE_LIB;
+procedure fl_string_free(value: PChar); cdecl; external FIRELITE_LIB;
+
+implementation
+
+end.
