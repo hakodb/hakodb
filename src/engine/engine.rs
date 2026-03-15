@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use crate::config::FireLiteConfig;
 use crate::document::firelite_doc::FireLiteDoc;
@@ -143,7 +145,7 @@ impl SerializableTransaction {
 }
 
 pub struct FireLite {
-    storage: Mutex<StorageEngine>,
+    storage: Arc<Mutex<StorageEngine>>,
     indexes: Mutex<IndexManager>,
     executor: ParallelQueryExecutor,
     tx_lock: Mutex<()>,
@@ -153,6 +155,8 @@ pub struct FireLite {
     security_rules: Mutex<Vec<SecurityRule>>,
     audit: Mutex<Vec<AuditEntry>>,
     audit_file: Mutex<Option<std::fs::File>>,
+    maintenance_stop: Mutex<Option<Sender<()>>>,
+    maintenance_handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl FireLite {
@@ -175,7 +179,7 @@ impl FireLite {
         }
 
         let db = Self {
-            storage: Mutex::new(StorageEngine::open(path, &config)?),
+            storage: Arc::new(Mutex::new(StorageEngine::open(path, &config)?)),
             indexes: Mutex::new(IndexManager::default()),
             executor: ParallelQueryExecutor::new(config.query_workers),
             tx_lock: Mutex::new(()),
@@ -185,9 +189,30 @@ impl FireLite {
             security_rules: Mutex::new(Vec::new()),
             audit: Mutex::new(Vec::new()),
             audit_file: Mutex::new(audit_file),
+            maintenance_stop: Mutex::new(None),
+            maintenance_handle: Mutex::new(None),
         };
 
         db.rebuild_indexes_from_storage()?;
+
+        let (stop_tx, stop_rx) = channel::<()>();
+        let storage_bg = Arc::clone(&db.storage);
+        let handle = thread::spawn(move || loop {
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+            if let Ok(mut storage) = storage_bg.lock() {
+                let _ = storage.run_background_maintenance();
+            }
+            thread::sleep(Duration::from_millis(500));
+        });
+        *db.maintenance_stop
+            .lock()
+            .expect("maintenance stop lock poisoned") = Some(stop_tx);
+        *db.maintenance_handle
+            .lock()
+            .expect("maintenance handle lock poisoned") = Some(handle);
+
         Ok(db)
     }
 
@@ -618,6 +643,29 @@ impl FireLite {
         result
     }
 
+    pub fn query_projected_zero_copy(
+        &self,
+        query: Query,
+        fields: &[String],
+    ) -> Result<Vec<(String, Vec<(String, crate::document::value::Value)>)>> {
+        let mut storage = self.storage.lock().expect("storage lock poisoned");
+        let docs = storage.scan_prefix(&format!("{}:", query.collection))?;
+        let mut out = Vec::new();
+
+        for (id, raw) in docs {
+            if matches_filters_borrowed(&raw, &query.filters) {
+                let projected = project_fields_borrowed(&raw, fields);
+                out.push((id, projected));
+            }
+        }
+
+        if let Some(limit) = query.limit {
+            out.truncate(limit);
+        }
+
+        Ok(out)
+    }
+
     pub fn query_subcollection(
         &self,
         collection: &str,
@@ -652,6 +700,51 @@ fn doc_key(collection: &str, doc_id: &str) -> String {
 
 fn subcollection_prefix(collection: &str, doc_id: &str, subcollection: &str) -> String {
     format!("{}:{}/{}", collection, doc_id, subcollection)
+}
+
+fn matches_filters_borrowed(raw: &[u8], filters: &[crate::query::filter::Filter]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+
+    let Some(view) = crate::document::firelite_doc::FireLiteDocView::new(raw) else {
+        return false;
+    };
+
+    filters.iter().all(|f| {
+        let mut matched = None;
+        for (k, v) in view.iter() {
+            if k == f.field {
+                matched = v.to_owned_value();
+                break;
+            }
+        }
+
+        matched
+            .as_ref()
+            .map(|v| crate::query::filter::compare_values(v, &f.op, &f.value))
+            .unwrap_or(false)
+    })
+}
+
+fn project_fields_borrowed(
+    raw: &[u8],
+    fields: &[String],
+) -> Vec<(String, crate::document::value::Value)> {
+    let mut out = Vec::new();
+    let Some(view) = crate::document::firelite_doc::FireLiteDocView::new(raw) else {
+        return out;
+    };
+
+    for (k, v) in view.iter() {
+        if fields.is_empty() || fields.iter().any(|f| f == k) {
+            if let Some(value) = v.to_owned_value() {
+                out.push((k.to_string(), value));
+            }
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -762,5 +855,26 @@ mod tests {
         assert!(!db.audit_entries().is_empty());
 
         fs::remove_dir_all(path).expect("temp db dir should be removable");
+    }
+}
+
+impl Drop for FireLite {
+    fn drop(&mut self) {
+        if let Some(tx) = self
+            .maintenance_stop
+            .lock()
+            .expect("maintenance stop lock poisoned")
+            .take()
+        {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self
+            .maintenance_handle
+            .lock()
+            .expect("maintenance handle lock poisoned")
+            .take()
+        {
+            let _ = handle.join();
+        }
     }
 }

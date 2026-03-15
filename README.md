@@ -19,9 +19,10 @@ FireLite is in **advanced foundation stage**: core architecture and major vertic
   - `begin_transaction` + staged mutations + `commit`
   - `begin_serializable_transaction` with conflict-aware commit validation (read/write version checks)
 - Durable storage stack
-  - segment-backed value storage
+  - multi-segment value storage with level tiers (`segment-l{level}-{id}.dat`)
   - WAL with transactional markers (`BeginTx` / `CommitTx`)
   - committed-op recovery replay
+  - WAL snapshot rewrite after tier compaction for index+data coupling
 - Durability tuning
   - configurable `DurabilityMode`: `Always`, `Interval`, `Manual`
   - group commit control via `group_commit_max_ops`
@@ -33,6 +34,7 @@ FireLite is in **advanced foundation stage**: core architecture and major vertic
   - ordering and limit
   - cost-aware planner decision using collection/cardinality heuristics
   - predicate pushdown shortcut via doc-view prefilter before full decode
+  - zero-copy projection API via `query_projected_zero_copy` for borrowed-view projection paths
   - parallel task-sharded execution
 - Composite indexes
   - index definitions and manager
@@ -62,9 +64,8 @@ FireLite is in **advanced foundation stage**: core architecture and major vertic
 
 ### Still Missing for Full Production Readiness
 
-- Multi-segment LSM-style compaction tiers and background scheduler (currently single-segment compaction)
-- Full end-to-end zero-copy result projection pipeline (current optimization prefilters using borrowed doc views)
 - Distributed/cloud-grade security primitives (authn/authz federation, remote policy service)
+- Rich projection pushdown across all SDK/FFI surfaces (currently available in Rust engine API)
 
 ---
 
@@ -290,17 +291,19 @@ API (FireLite + FFI + JS/TS client)
 | Area | FireLite status | Notes |
 |---|---|---|
 | Embedded engine | ✅ Implemented | In-process Rust runtime |
-| Durable WAL + recovery | ✅ Implemented | Tx markers and replay |
+| Durable WAL + recovery | ✅ Implemented | Tx markers, replay, and WAL snapshot rewrite after tier compaction |
 | Encryption at rest | ✅ Implemented | Optional WAL + segment encryption |
 | Multi-document atomic batches | ✅ Implemented | Engine + C-FFI batch commit |
 | Transactions | ✅ Implemented | Serializable conflict-aware transactions via read/write version validation |
 | Composite indexes | ✅ Implemented | Equality composite scans integrated |
 | Query filters/order/limit | ✅ Implemented | Core operators + ordering + limit + cost-aware planning heuristics |
+| Zero-copy projection pipeline | ✅ Implemented | Rust API `query_projected_zero_copy` uses borrowed document views |
 | Real-time listeners/watch | ✅ Implemented | Local watch streams in Rust engine |
 | Subcollections | ✅ Implemented | Subdocument helpers exposed in Rust API |
 | JS/TS Firestore-style client | ✅ Implemented | `collection().doc().set/get/delete`, query builder, batch |
 | Tauri unified dispatcher gateway | ✅ Implemented | Single `firelite_exec`, reactive subscriptions, lifecycle controls |
 | Security policy + audit logging | ✅ Implemented | Collection-prefix rules and append audit trail |
+| Multi-segment LSM-style compaction | ✅ Implemented | Tiered segment files + background maintenance scheduler |
 | Firestore parity (full cloud API) | ❌ Not targeted yet | No remote service/auth service, distributed infra |
 
 ### Module implementation map

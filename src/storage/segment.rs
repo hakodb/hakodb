@@ -1,6 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{FireLiteError, Result};
 
@@ -8,17 +8,20 @@ use super::crypto::EncryptionContext;
 
 pub struct Segment {
     file: File,
+    path: PathBuf,
     encryption: Option<EncryptionContext>,
 }
 
 impl Segment {
     pub fn open(path: impl AsRef<Path>, encryption: Option<EncryptionContext>) -> Result<Self> {
+        let path_buf = path.as_ref().to_path_buf();
         Ok(Self {
             file: OpenOptions::new()
                 .create(true)
                 .read(true)
                 .append(true)
-                .open(path)?,
+                .open(&path_buf)?,
+            path: path_buf,
             encryption,
         })
     }
@@ -59,5 +62,13 @@ impl Segment {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
         Ok(())
+    }
+
+    pub fn size_bytes(&mut self) -> Result<u64> {
+        Ok(self.file.seek(SeekFrom::End(0))?)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 }

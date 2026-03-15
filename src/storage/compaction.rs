@@ -9,6 +9,7 @@ pub fn compact_segment(
     segment: &mut Segment,
     entries: &[(String, Vec<u8>)],
     index: &mut HashMap<String, Pointer>,
+    segment_id: u64,
 ) -> Result<()> {
     segment.truncate()?;
     index.clear();
@@ -17,6 +18,7 @@ pub fn compact_segment(
         index.insert(
             key.clone(),
             Pointer {
+                segment_id,
                 offset,
                 len: stored_len,
             },

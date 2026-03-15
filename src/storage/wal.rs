@@ -16,6 +16,7 @@ pub enum WalOp {
     },
     Put {
         key: String,
+        segment_id: u64,
         segment_offset: u64,
         len: u32,
     },
@@ -179,12 +180,14 @@ fn encode(op: &WalOp) -> Vec<u8> {
         }
         WalOp::Put {
             key,
+            segment_id,
             segment_offset,
             len,
         } => {
             out.push(1);
             out.extend((key.len() as u16).to_le_bytes());
             out.extend(key.as_bytes());
+            out.extend(segment_id.to_le_bytes());
             out.extend(segment_offset.to_le_bytes());
             out.extend(len.to_le_bytes());
         }
@@ -225,6 +228,12 @@ fn decode(payload: &[u8]) -> Result<WalOp> {
             let key = String::from_utf8(payload[pos..pos + key_len].to_vec())
                 .map_err(|_| FireLiteError::Corrupt("bad wal key".into()))?;
             pos += key_len;
+            let segment_id = u64::from_le_bytes(
+                payload[pos..pos + 8]
+                    .try_into()
+                    .map_err(|_| FireLiteError::Corrupt("bad wal segment id".into()))?,
+            );
+            pos += 8;
             let offset = u64::from_le_bytes(
                 payload[pos..pos + 8]
                     .try_into()
@@ -238,6 +247,7 @@ fn decode(payload: &[u8]) -> Result<WalOp> {
             );
             Ok(WalOp::Put {
                 key,
+                segment_id,
                 segment_offset: offset,
                 len,
             })
@@ -287,6 +297,7 @@ mod tests {
         wal.append(&WalOp::BeginTx { tx_id: 1 }).expect("begin");
         wal.append(&WalOp::Put {
             key: "users:1".into(),
+            segment_id: 0,
             segment_offset: 10,
             len: 3,
         })
