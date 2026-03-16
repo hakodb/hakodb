@@ -1,5 +1,6 @@
 use crate::document::firelite_doc::FireLiteDoc;
 use crate::document::value::Value;
+use std::sync::Arc;
 
 use super::composite::definition::CompositeIndexDefinition;
 use super::composite::manager::CompositeIndexManager;
@@ -31,7 +32,8 @@ impl IndexManager {
         collection: &str,
         fields: &[String],
         values: &[Value],
-    ) -> Option<Vec<String>> {
+    // ) -> Option<Vec<String>> {
+    ) -> Option<Vec<Arc<str>>> {
         self.composite
             .exact_match_doc_ids(collection, fields, values)
     }

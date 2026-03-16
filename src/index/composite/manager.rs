@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::document::firelite_doc::FireLiteDoc;
 use crate::document::value::Value;
@@ -77,7 +78,8 @@ impl CompositeIndexManager {
         collection: &str,
         fields: &[String],
         values: &[Value],
-    ) -> Option<Vec<String>> {
+    // ) -> Option<Vec<String>> {
+    ) -> Option<Vec<Arc<str>>> {
         for idx in self.indexes_for_collection(collection) {
             let idx_fields: Vec<&str> = idx
                 .definition

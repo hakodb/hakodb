@@ -41,10 +41,12 @@ pub fn replay_log(path: &str, manager: &mut CompositeIndexManager) -> std::io::R
         if let Some(index) = manager.get_mut(index_id) {
             match op[0] {
                 INSERT => {
-                    index.tree.insert(key, doc_id);
+                    // index.tree.insert(key, doc_id);
+                    index.tree.insert(key.into(), doc_id.into());
                 }
                 DELETE => {
-                    index.tree.remove(&key);
+                    // index.tree.remove(&key);
+                    index.tree.remove(&key[..]);
                 }
                 _ => {}
             }

@@ -59,8 +59,10 @@ impl ParallelQueryExecutor {
 
         if let Some(order) = &plan.order_by {
             results.sort_by(|(_, a), (_, b)| {
-                let av = a.fields.get(&order.field);
-                let bv = b.fields.get(&order.field);
+                let av = a.get(&order.field);
+                let bv = b.get(&order.field);
+                // let av = a.fields.get(&order.field);
+                // let bv = b.fields.get(&order.field);
                 format!("{:?}", av).cmp(&format!("{:?}", bv))
             });
             if !order.ascending {

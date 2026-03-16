@@ -132,95 +132,95 @@ fn write_batch_benchmark(c: &mut Criterion) {
 // Sequential Read
 //
 
-fn read_sequential_benchmark(c: &mut Criterion) {
-    let (db, path) = prepare_db();
-    let mut idx = 0;
+// fn read_sequential_benchmark(c: &mut Criterion) {
+//     let (db, path) = prepare_db();
+//     let mut idx = 0;
 
-    c.bench_function("firelite_get_sequential", |b| {
-        b.iter(|| {
-            let key = idx.to_string();
+//     c.bench_function("firelite_get_sequential", |b| {
+//         b.iter(|| {
+//             let key = idx.to_string();
 
-            let _ = db.get("bench", &key).unwrap();
+//             let _ = db.get("bench", &key).unwrap();
 
-            idx = (idx + 1) % DATASET;
+//             idx = (idx + 1) % DATASET;
 
-            black_box(())
-        })
-    });
+//             black_box(())
+//         })
+//     });
 
-    std::fs::remove_dir_all(path).ok();
-}
+//     std::fs::remove_dir_all(path).ok();
+// }
 
-//
-// Hot-Key Read (Zipf-like workload)
-//
+// //
+// // Hot-Key Read (Zipf-like workload)
+// //
 
-fn read_hotkey_benchmark(c: &mut Criterion) {
-    let (db, path) = prepare_db();
+// fn read_hotkey_benchmark(c: &mut Criterion) {
+//     let (db, path) = prepare_db();
 
-    let mut rng = thread_rng();
-    let hot = HotKeyGen::new(DATASET);
+//     let mut rng = thread_rng();
+//     let hot = HotKeyGen::new(DATASET);
 
-    c.bench_function("firelite_get_hotkey", |b| {
-        b.iter(|| {
-            let key = hot.sample(&mut rng);
+//     c.bench_function("firelite_get_hotkey", |b| {
+//         b.iter(|| {
+//             let key = hot.sample(&mut rng);
 
-            let _ = db.get("bench", &key.to_string()).unwrap();
+//             let _ = db.get("bench", &key.to_string()).unwrap();
 
-            black_box(())
-        })
-    });
+//             black_box(())
+//         })
+//     });
 
-    std::fs::remove_dir_all(path).ok();
-}
+//     std::fs::remove_dir_all(path).ok();
+// }
 
-//
-// Parallel Read
-//
+// //
+// // Parallel Read
+// //
 
-fn read_parallel_benchmark(c: &mut Criterion) {
+// fn read_parallel_benchmark(c: &mut Criterion) {
 
-    let (db, path) = prepare_db();
-    let db = std::sync::Arc::new(db);
+//     let (db, path) = prepare_db();
+//     let db = std::sync::Arc::new(db);
 
-    // Pre-generate keys
-    let keys: Vec<String> =
-        (0..DATASET).map(|i| i.to_string()).collect();
+//     // Pre-generate keys
+//     let keys: Vec<String> =
+//         (0..DATASET).map(|i| i.to_string()).collect();
 
-    c.bench_function("firelite_get_parallel_8", |b| {
+//     c.bench_function("firelite_get_parallel_8", |b| {
 
-        b.iter(|| {
+//         b.iter(|| {
 
-            std::thread::scope(|s| {
+//             std::thread::scope(|s| {
 
-                for t in 0..READ_THREADS {
+//                 for t in 0..READ_THREADS {
 
-                    let db = db.clone();
-                    let keys = &keys;
+//                     let db = db.clone();
+//                     let keys = &keys;
 
-                    s.spawn(move || {
+//                     s.spawn(move || {
 
-                        for i in 0..1000 {
+//                         for i in 0..1000 {
 
-                            let key =
-                                &keys[(i + t * 1000) % DATASET];
+//                             let key =
+//                                 &keys[(i + t * 1000) % DATASET];
 
-                            let _ = db.get("bench", key).unwrap();
+//                             let _ = db.get("bench", key).unwrap();
 
-                        }
+//                         }
 
-                    });
+//                     });
 
-                }
+//                 }
 
-            });
+//             });
 
-        });
+//         });
 
-    });
+//     });
 
-    std::fs::remove_dir_all(path).ok();
-}
+//     std::fs::remove_dir_all(path).ok();
+// }
 
 //
 // Benchmark Group
@@ -230,9 +230,9 @@ criterion_group!(
     benches,
     write_single_benchmark,
     write_batch_benchmark,
-    read_sequential_benchmark,
-    read_hotkey_benchmark,
-    read_parallel_benchmark
+    // read_sequential_benchmark,
+    // read_hotkey_benchmark,
+    // read_parallel_benchmark
 );
 
 criterion_main!(benches);

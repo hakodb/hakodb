@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+// use std::collections::BTreeMap;
 
 use crate::document::value::Value;
 
@@ -7,12 +7,35 @@ const VERSION: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FireLiteDoc {
-    pub fields: BTreeMap<String, Value>,
+    // pub fields: BTreeMap<String, Value>,
+    pub fields: Vec<(String, Value)>,
 }
 
 impl FireLiteDoc {
+    // lookup helper
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.fields.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
+        self.fields
+            .iter_mut()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    }
+
     pub fn insert(&mut self, key: impl Into<String>, value: Value) {
-        self.fields.insert(key.into(), value);
+        // self.fields.insert(key.into(), value);
+        let key = key.into();
+
+        for (k, v) in &mut self.fields {
+            if k == &key {
+                *v = value;
+                return;
+            }
+        }
+
+        self.fields.push((key, value));
     }
 
     pub fn encode(&self) -> Vec<u8> {
