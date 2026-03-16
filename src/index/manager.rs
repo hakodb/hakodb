@@ -42,7 +42,21 @@ impl IndexManager {
         self.composite.index_document(collection, doc_id, doc);
     }
 
+    pub fn index_batch<'a, I>(&mut self, collection: &str, docs: I)
+    where
+        I: IntoIterator<Item = (&'a str, &'a FireLiteDoc)> + Clone,
+    {
+        self.composite.index_batch(collection, docs)
+    }
+
     pub fn remove_document(&mut self, collection: &str, doc_id: &str, doc: &FireLiteDoc) {
         self.composite.remove_document(collection, doc_id, doc);
+    }
+
+    pub fn remove_batch<'a, I>(&mut self, collection: &str, docs: I)
+    where
+        I: IntoIterator<Item = (&'a str, &'a FireLiteDoc)> + Clone,
+    {
+        self.composite.remove_batch(collection, docs)
     }
 }

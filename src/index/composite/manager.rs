@@ -60,6 +60,18 @@ impl CompositeIndexManager {
         }
     }
 
+    pub fn index_batch<'a, I>(&mut self, collection: &str, docs: I)
+    where
+        I: IntoIterator<Item = (&'a str, &'a FireLiteDoc)> + Clone,
+    {
+        let ids = self.by_collection.get(collection).cloned().unwrap_or_default();
+        for id in ids {
+            if let Some(index) = self.by_id.get_mut(&id) {
+                index.index_batch(docs.clone());
+            }
+        }
+    }
+
     pub fn remove_document(&mut self, collection: &str, doc_id: &str, doc: &FireLiteDoc) {
         let ids = self
             .by_collection
@@ -69,6 +81,18 @@ impl CompositeIndexManager {
         for id in ids {
             if let Some(index) = self.by_id.get_mut(&id) {
                 index.remove_document(doc_id, doc);
+            }
+        }
+    }
+
+    pub fn remove_batch<'a, I>(&mut self, collection: &str, docs: I)
+    where
+        I: IntoIterator<Item = (&'a str, &'a FireLiteDoc)> + Clone,
+    {
+        let ids = self.by_collection.get(collection).cloned().unwrap_or_default();
+        for id in ids {
+            if let Some(index) = self.by_id.get_mut(&id) {
+                index.remove_batch(docs.clone());
             }
         }
     }

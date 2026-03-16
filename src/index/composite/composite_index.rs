@@ -57,12 +57,17 @@ impl CompositeIndex {
     where
         I: IntoIterator<Item = (&'a str, &'a FireLiteDoc)>,
     {
-        for (doc_id, doc) in docs {
-            if let Some(values) = self.document_values(doc) {
-                let key = encode_composite_key(&self.definition, &values, doc_id);
-                self.tree.insert(key, Arc::from(doc_id));
-            }
-        }
+        let new_entries = docs
+            .into_iter()
+            .filter_map(|(doc_id, doc)| {
+                self.document_values(doc).map(|values| {
+                    let key = encode_composite_key(&self.definition, &values, doc_id);
+                    (key, Arc::from(doc_id))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        self.tree.extend(new_entries);
     }
 
     pub fn remove_document(&mut self, doc_id: &str, doc: &FireLiteDoc) {

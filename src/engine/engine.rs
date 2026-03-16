@@ -380,158 +380,32 @@ impl FireLite {
         self.write_batch_internal(mutations)
     }
 
-    // fn write_batch_internal(&self, mutations: Vec<BatchMutation>) -> Result<()> {
-    //     let mut storage_mutations = Vec::with_capacity(mutations.len());
-    //     // let mut removed_docs = Vec::new();
-    //     // let mut change_events = Vec::new();
-    //     let mut removed_docs = Vec::with_capacity(mutations.len());
-    //     let mut change_events = Vec::with_capacity(mutations.len());
-
-    //     {
-    //         let mut storage = self.storage.lock().expect("storage lock poisoned");
-    //         for mutation in &mutations {
-    //             match mutation {
-    //                 BatchMutation::Put {
-    //                     collection,
-    //                     doc_id,
-    //                     doc,
-    //                 } => {
-    //                     let key = doc_key(collection, doc_id);
-    //                     let encoded = doc.encode();
-    //                     storage_mutations.push(StorageMutation::Put {
-    //                         // key: doc_key(collection, doc_id),
-    //                         key: key.clone(),
-    //                         value: encoded,
-    //                     });
-    //                     change_events.push((
-    //                         collection.clone(),
-    //                         ChangeEvent {
-    //                             // path: doc_key(collection, doc_id),
-    //                             path: key.clone(),
-    //                             kind: ChangeKind::Put,
-    //                         },
-    //                     ));
-    //                 }
-    //                 BatchMutation::Delete { collection, doc_id } => {
-    //                     let key = doc_key(collection, doc_id);
-    //                     if let Some(bytes) = storage.get(&key)? {
-    //                         if let Some(old_doc) = FireLiteDoc::decode(&bytes) {
-    //                             removed_docs.push((collection.clone(), doc_id.clone(), old_doc));
-    //                         }
-    //                     }
-    //                     storage_mutations.push(StorageMutation::Delete { key: key.clone() });
-    //                     change_events.push((
-    //                         collection.clone(),
-    //                         ChangeEvent {
-    //                             path: key,
-    //                             kind: ChangeKind::Delete,
-    //                         },
-    //                     ));
-    //                 }
-    //             }
-    //         }
-
-    //         storage.apply_batch(&storage_mutations)?;
-    //     }
-
-    //     let mut indexes = self.indexes.lock().expect("indexes lock poisoned");
-    //     // for mutation in mutations.clone() {
-    //     for mutation in &mutations
-    //         match mutation {
-    //             BatchMutation::Put {
-    //                 collection,
-    //                 doc_id,
-    //                 doc,
-    //             } => indexes.index_document(&collection, &doc_id, &doc),
-    //             BatchMutation::Delete { .. } => {}
-    //         }
-    //     }
-
-    //     for (collection, doc_id, old_doc) in removed_docs {
-    //         indexes.remove_document(&collection, &doc_id, &old_doc);
-    //     }
-
-    //     self.bump_versions_for_mutations(&mutations);
-
-    //     for (collection, event) in change_events {
-    //         self.notify_watchers(&collection, event);
-    //     }
-
-    //     Ok(())
-    // }
-
     fn write_batch_internal(&self, mutations: Vec<BatchMutation>) -> Result<()> {
         let mut storage_mutations = Vec::with_capacity(mutations.len());
-        // let mut removed_docs = Vec::new();
         let mut change_events = Vec::new();
-
-        let mut indexes = self.indexes.lock().expect("indexes lock poisoned");
-        let mut index_puts = Vec::with_capacity(mutations.len());
-        let mut index_deletes = Vec::new();
-
+    
+        let mut puts_by_collection: HashMap<String, Vec<(&str, &FireLiteDoc)>> = HashMap::new();
+        let mut deletes_by_collection: HashMap<String, Vec<(&str, FireLiteDoc)>> = HashMap::new();
+    
         {
             let mut storage = self.storage.lock().expect("storage lock poisoned");
-
-            // for mutation in &mutations {
-            //     match mutation {
-            //         BatchMutation::Put { collection, doc_id, doc } => {
-            //             let key = doc_key(collection, doc_id);
-            //             let encoded = doc.encode();   // encode once
-
-            //             storage_mutations.push(StorageMutation::Put {
-            //                 key: key.clone(),
-            //                 value: encoded,
-            //             });
-
-            //             indexes.index_document(collection, doc_id, doc);
-
-            //             change_events.push((
-            //                 collection.clone(),
-            //                 ChangeEvent {
-            //                     path: key,
-            //                     kind: ChangeKind::Put,
-            //                 },
-            //             ));
-            //         }
-
-            //         BatchMutation::Delete { collection, doc_id } => {
-            //             let key = doc_key(collection, doc_id);
-
-            //             if let Some(bytes) = storage.get(&key)? {
-            //                 if let Some(old_doc) = FireLiteDoc::decode(&bytes) {
-            //                     removed_docs.push((collection.clone(), doc_id.clone(), old_doc));
-            //                 }
-            //             }
-
-            //             storage_mutations.push(StorageMutation::Delete { key: key.clone() });
-
-            //             change_events.push((
-            //                 collection.clone(),
-            //                 ChangeEvent {
-            //                     path: key,
-            //                     kind: ChangeKind::Delete,
-            //                 },
-            //             ));
-            //         }
-            //     }
-            // }
-
-
-
+    
             for mutation in &mutations {
                 match mutation {
                     BatchMutation::Put { collection, doc_id, doc } => {
-
                         let key = doc_key(collection, doc_id);
                         let encoded = doc.encode();
-
+    
                         storage_mutations.push(StorageMutation::Put {
                             key: key.clone(),
                             value: encoded,
                         });
-
-                        index_puts.push((collection.clone(), doc_id.clone(), doc.clone()));
-
+    
+                        puts_by_collection
+                            .entry(collection.clone())
+                            .or_default()
+                            .push((doc_id, doc));
+    
                         change_events.push((
                             collection.clone(),
                             ChangeEvent {
@@ -540,18 +414,21 @@ impl FireLite {
                             },
                         ));
                     }
-
+    
                     BatchMutation::Delete { collection, doc_id } => {
                         let key = doc_key(collection, doc_id);
-
+    
                         if let Some(bytes) = storage.get(&key)? {
                             if let Some(old_doc) = FireLiteDoc::decode(&bytes) {
-                                index_deletes.push((collection.clone(), doc_id.clone(), old_doc));
+                                deletes_by_collection
+                                    .entry(collection.clone())
+                                    .or_default()
+                                    .push((doc_id, old_doc));
                             }
                         }
-
+    
                         storage_mutations.push(StorageMutation::Delete { key: key.clone() });
-
+    
                         change_events.push((
                             collection.clone(),
                             ChangeEvent {
@@ -562,28 +439,26 @@ impl FireLite {
                     }
                 }
             }
-
+    
             storage.apply_batch(&storage_mutations)?;
         }
-
-        // for (collection, doc_id, old_doc) in removed_docs {
-        //     indexes.remove_document(&collection, &doc_id, &old_doc);
-        // }
-
-        for (collection, doc_id, doc) in index_puts {
-            indexes.index_document(&collection, &doc_id, &doc);
+    
+        let mut indexes = self.indexes.lock().expect("indexes lock poisoned");
+        for (collection, puts) in puts_by_collection {
+            indexes.index_batch(&collection, puts);
         }
-
-        for (collection, doc_id, old_doc) in index_deletes {
-            indexes.remove_document(&collection, &doc_id, &old_doc);
+    
+        for (collection, deletes) in deletes_by_collection {
+            let delete_refs: Vec<(&str, &FireLiteDoc)> = deletes.iter().map(|(id, doc)| (id.as_str(), doc)).collect();
+            indexes.remove_batch(&collection, delete_refs);
         }
-
+    
         self.bump_versions_for_mutations(&mutations);
-
+    
         for (collection, event) in change_events {
             self.notify_watchers(&collection, event);
         }
-
+    
         Ok(())
     }
 
