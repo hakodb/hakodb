@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+// use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::FireLiteConfig;
@@ -107,6 +108,7 @@ impl StorageEngine {
     }
 
     fn recover(&mut self) -> Result<()> {
+        self.index.reserve(1024);
         for op in self.wal.replay()? {
             match op {
                 WalOp::Put {
@@ -141,7 +143,8 @@ impl StorageEngine {
         let tx_id = self.next_tx_id;
         self.next_tx_id += 1;
 
-        let mut wal_ops = Vec::with_capacity(mutations.len() + 2);
+        // let mut wal_ops = Vec::with_capacity(mutations.len() + 2);
+        let mut wal_ops = Vec::with_capacity(mutations.len() * 2 + 2);
         wal_ops.push(WalOp::BeginTx { tx_id });
 
         let mut index_updates = Vec::with_capacity(mutations.len());
@@ -149,6 +152,7 @@ impl StorageEngine {
         for mutation in mutations {
             match mutation {
                 StorageMutation::Put { key, value } => {
+                    // let key_clone = key.clone();
                     let active = self
                         .segments
                         .get_mut(&self.active_segment_id)
@@ -161,11 +165,13 @@ impl StorageEngine {
                     };
                     wal_ops.push(WalOp::Put {
                         key: key.clone(),
+                        // key: key_clone.clone(),
                         segment_id: pointer.segment_id,
                         segment_offset: pointer.offset,
                         len: pointer.len,
                     });
                     index_updates.push((key.clone(), Some(pointer)));
+                    // index_updates.push((key_clone.clone(), Some(pointer)));
                 }
                 StorageMutation::Delete { key } => {
                     wal_ops.push(WalOp::Delete { key: key.clone() });
@@ -252,12 +258,29 @@ impl StorageEngine {
         let target_id = self.next_segment_id;
         self.next_segment_id += 1;
 
-        let mut entries = Vec::new();
-        let snapshot: Vec<(String, Pointer)> = self
-            .index
-            .iter()
-            .map(|(k, p)| (k.clone(), p.clone()))
-            .collect();
+        // let mut entries = Vec::new();
+        // let snapshot: Vec<(String, Pointer)> =
+        //     self.index.iter().map(|(k, p)| (k.clone(), p.clone())).collect();
+        // let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        // let snapshot: Vec<(String, Pointer)> = self
+        //     .index
+        //     .iter()
+        //     .map(|(k, p)| (k.clone(), p.clone()))
+        //     .collect();
+        // for (key, pointer) in snapshot {
+        // for (key, pointer) in &self.index {
+        //     if pointer.segment_id == s1 || pointer.segment_id == s2 {
+        //         if let Some(value) = self.read_pointer(&pointer)? {
+        //             // entries.push((key, value));
+        //             entries.push((key.clone(), value));
+        //         }
+        //     }
+        // }
+        let snapshot: Vec<(String, Pointer)> =
+            self.index.iter().map(|(k, p)| (k.clone(), p.clone())).collect();
+
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+
         for (key, pointer) in snapshot {
             if pointer.segment_id == s1 || pointer.segment_id == s2 {
                 if let Some(value) = self.read_pointer(&pointer)? {
@@ -298,9 +321,17 @@ impl StorageEngine {
 
     fn rewrite_wal_snapshot(&mut self) -> Result<()> {
         self.wal.reset()?;
-        for (key, pointer) in self.index.clone() {
+        // for (key, pointer) in self.index.clone() {
+        //     self.wal.append(&WalOp::Put {
+        //         key,
+        //         segment_id: pointer.segment_id,
+        //         segment_offset: pointer.offset,
+        //         len: pointer.len,
+        //     })?;
+        // }
+        for (key, pointer) in &self.index {
             self.wal.append(&WalOp::Put {
-                key,
+                key: key.clone(),
                 segment_id: pointer.segment_id,
                 segment_offset: pointer.offset,
                 len: pointer.len,
@@ -320,11 +351,46 @@ impl StorageEngine {
         self.wal.flush()
     }
 
+    // pub fn put(&mut self, key: String, value: &[u8]) -> Result<()> {
+    //     self.apply_batch(&[StorageMutation::Put {
+    //         key,
+    //         value: value.to_vec(),
+    //     }])
+    // }
     pub fn put(&mut self, key: String, value: &[u8]) -> Result<()> {
-        self.apply_batch(&[StorageMutation::Put {
-            key,
-            value: value.to_vec(),
-        }])
+
+        let tx_id = self.next_tx_id;
+        self.next_tx_id += 1;
+
+        let active = self
+            .segments
+            .get_mut(&self.active_segment_id)
+            .ok_or_else(|| FireLiteError::Corrupt("active segment missing".into()))?;
+
+        let (offset, stored_len) = active.segment.append(value)?;
+
+        let pointer = Pointer {
+            segment_id: self.active_segment_id,
+            offset,
+            len: stored_len,
+        };
+
+        self.wal.append_batch(&[
+            WalOp::BeginTx { tx_id },
+            WalOp::Put {
+                key: key.clone(),
+                segment_id: pointer.segment_id,
+                segment_offset: pointer.offset,
+                len: pointer.len,
+            },
+            WalOp::CommitTx { tx_id },
+        ])?;
+
+        self.index.insert(key, pointer);
+
+        self.maybe_rotate_active_segment()?;
+
+        Ok(())
     }
 
     pub fn get(&mut self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -354,8 +420,13 @@ impl StorageEngine {
 
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
-            if let Some(value) = self.get(&key)? {
-                out.push((key, value));
+            // if let Some(value) = self.get(&key)? {
+            //     out.push((key, value));
+            // }
+            if let Some(pointer) = self.index.get(&key).cloned() {
+                if let Some(value) = self.read_pointer(&pointer)? {
+                    out.push((key, value));
+                }
             }
         }
         Ok(out)

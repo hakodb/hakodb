@@ -34,6 +34,7 @@ pub struct Wal {
     group_commit_max_ops: usize,
     pending_ops_since_sync: usize,
     encryption: Option<EncryptionContext>,
+    write_buffer: Vec<u8>,
 }
 
 impl Wal {
@@ -44,16 +45,17 @@ impl Wal {
         encryption: Option<EncryptionContext>,
     ) -> Result<Self> {
         let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(path)?;
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)?;
         Ok(Self {
             file,
             mode,
             group_commit_max_ops: group_commit_max_ops.max(1),
             pending_ops_since_sync: 0,
             encryption,
+            write_buffer: Vec::with_capacity(64 * 1024), // 64KB WAL buffer
         })
     }
 
@@ -62,23 +64,46 @@ impl Wal {
     }
 
     pub fn append_batch(&mut self, ops: &[WalOp]) -> Result<()> {
+        let mut commit_boundary = false;
+
         for op in ops {
+            
+            if matches!(op, WalOp::CommitTx { .. }) {
+                commit_boundary = true;
+            }
+
             let mut payload = encode(op);
             if let Some(enc) = &self.encryption {
                 payload = enc.encrypt(&payload)?;
             }
+
             let mut hasher = Hasher::new();
             hasher.update(&payload);
             let crc = hasher.finalize();
-            self.file.write_all(&(payload.len() as u32).to_le_bytes())?;
-            self.file.write_all(&crc.to_le_bytes())?;
-            self.file.write_all(&payload)?;
+
+            // Assemble a single buffer to send to the OS in one go
+            let mut record = Vec::with_capacity(8 + payload.len());
+            record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            record.extend_from_slice(&crc.to_le_bytes());
+            record.extend_from_slice(&payload);
+
+            self.write_buffer.extend_from_slice(&record);
             self.pending_ops_since_sync += 1;
         }
-        self.maybe_sync(true)
+        self.maybe_sync(commit_boundary)
     }
 
     pub fn flush(&mut self) -> Result<()> {
+        // Write buffered WAL records first
+        if !self.write_buffer.is_empty() {
+            self.file.write_all(&self.write_buffer)?;
+            self.write_buffer.clear();
+        }
+        
+        // 1. Push data from BufWriter to the Operating System
+        self.file.flush()?; 
+
+        // 2. Push data from Operating System to physical Disk
         self.file.sync_data()?;
         self.pending_ops_since_sync = 0;
         Ok(())
@@ -172,7 +197,8 @@ fn filter_committed_ops(raw_ops: Vec<WalOp>) -> Vec<WalOp> {
 }
 
 fn encode(op: &WalOp) -> Vec<u8> {
-    let mut out = Vec::new();
+    // let mut out = Vec::new();
+    let mut out = Vec::with_capacity(64);
     match op {
         WalOp::BeginTx { tx_id } => {
             out.push(0);
