@@ -10,7 +10,7 @@ use super::crypto::EncryptionContext;
 use super::segment::Segment;
 use super::wal::{Wal, WalOp};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Pointer {
     pub segment_id: u64,
     pub offset: u64,
@@ -36,6 +36,7 @@ pub struct StorageEngine {
     next_segment_id: u64,
     wal: Wal,
     index: HashMap<String, Pointer>,
+    // index: HashMap<Box<str>, Pointer>,
     next_tx_id: u64,
     compaction_threshold_bytes: usize,
     encryption: Option<EncryptionContext>,
@@ -143,6 +144,16 @@ impl StorageEngine {
         let tx_id = self.next_tx_id;
         self.next_tx_id += 1;
 
+        // rotate BEFORE writing
+        self.maybe_rotate_active_segment()?;
+
+        let active_id = self.active_segment_id;
+
+        let active = self
+            .segments
+            .get_mut(&active_id)
+            .ok_or_else(|| FireLiteError::Corrupt("active segment missing".into()))?;
+
         // let mut wal_ops = Vec::with_capacity(mutations.len() + 2);
         let mut wal_ops = Vec::with_capacity(mutations.len() * 2 + 2);
         wal_ops.push(WalOp::BeginTx { tx_id });
@@ -153,10 +164,10 @@ impl StorageEngine {
             match mutation {
                 StorageMutation::Put { key, value } => {
                     // let key_clone = key.clone();
-                    let active = self
-                        .segments
-                        .get_mut(&self.active_segment_id)
-                        .ok_or_else(|| FireLiteError::Corrupt("active segment missing".into()))?;
+                    // let active = self
+                    //     .segments
+                    //     .get_mut(&self.active_segment_id)
+                    //     .ok_or_else(|| FireLiteError::Corrupt("active segment missing".into()))?;
                     let (offset, stored_len) = active.segment.append(value)?;
                     let pointer = Pointer {
                         segment_id: self.active_segment_id,
@@ -277,7 +288,7 @@ impl StorageEngine {
         //     }
         // }
         let snapshot: Vec<(String, Pointer)> =
-            self.index.iter().map(|(k, p)| (k.clone(), p.clone())).collect();
+            self.index.iter().map(|(k, p)| (k.clone(), *p)).collect();
 
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
 
@@ -329,14 +340,16 @@ impl StorageEngine {
         //         len: pointer.len,
         //     })?;
         // }
+        let mut ops = Vec::with_capacity(self.index.len());
         for (key, pointer) in &self.index {
-            self.wal.append(&WalOp::Put {
+            ops.push(WalOp::Put {
                 key: key.clone(),
                 segment_id: pointer.segment_id,
                 segment_offset: pointer.offset,
                 len: pointer.len,
-            })?;
+            });
         }
+        self.wal.append_batch(&ops)?;
         Ok(())
     }
 
@@ -359,38 +372,44 @@ impl StorageEngine {
     // }
     pub fn put(&mut self, key: String, value: &[u8]) -> Result<()> {
 
-        let tx_id = self.next_tx_id;
-        self.next_tx_id += 1;
+        // let tx_id = self.next_tx_id;
+        // self.next_tx_id += 1;
 
-        let active = self
-            .segments
-            .get_mut(&self.active_segment_id)
-            .ok_or_else(|| FireLiteError::Corrupt("active segment missing".into()))?;
+        // let active = self
+        //     .segments
+        //     .get_mut(&self.active_segment_id)
+        //     .ok_or_else(|| FireLiteError::Corrupt("active segment missing".into()))?;
 
-        let (offset, stored_len) = active.segment.append(value)?;
+        // let (offset, stored_len) = active.segment.append(value)?;
 
-        let pointer = Pointer {
-            segment_id: self.active_segment_id,
-            offset,
-            len: stored_len,
+        // let pointer = Pointer {
+        //     segment_id: self.active_segment_id,
+        //     offset,
+        //     len: stored_len,
+        // };
+
+        // self.wal.append_batch(&[
+        //     WalOp::BeginTx { tx_id },
+        //     WalOp::Put {
+        //         key: key.clone(),
+        //         segment_id: pointer.segment_id,
+        //         segment_offset: pointer.offset,
+        //         len: pointer.len,
+        //     },
+        //     WalOp::CommitTx { tx_id },
+        // ])?;
+
+        // self.index.insert(key, pointer);
+
+        // self.maybe_rotate_active_segment()?;
+
+        // Ok(())
+        let mutation = StorageMutation::Put {
+            key,
+            value: value.to_vec(),
         };
 
-        self.wal.append_batch(&[
-            WalOp::BeginTx { tx_id },
-            WalOp::Put {
-                key: key.clone(),
-                segment_id: pointer.segment_id,
-                segment_offset: pointer.offset,
-                len: pointer.len,
-            },
-            WalOp::CommitTx { tx_id },
-        ])?;
-
-        self.index.insert(key, pointer);
-
-        self.maybe_rotate_active_segment()?;
-
-        Ok(())
+        self.apply_batch(&[mutation])
     }
 
     pub fn get(&mut self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -411,24 +430,38 @@ impl StorageEngine {
     }
 
     pub fn scan_prefix(&mut self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        let keys: Vec<String> = self
+        // let keys: Vec<String> = self
+        //     .index
+        //     .keys()
+        //     .filter(|k| k.starts_with(prefix))
+        //     .cloned()
+        //     .collect();
+
+        // let mut out = Vec::with_capacity(keys.len());
+        // for key in keys {
+        //     if let Some(pointer) = self.index.get(&key).cloned() {
+        //         if let Some(value) = self.read_pointer(&pointer)? {
+        //             out.push((key, value));
+        //         }
+        //     }
+        // }
+        // Ok(out)
+
+        let snapshot: Vec<(String, Pointer)> = self
             .index
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, p)| (k.clone(), p.clone()))
             .collect();
 
-        let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            // if let Some(value) = self.get(&key)? {
-            //     out.push((key, value));
-            // }
-            if let Some(pointer) = self.index.get(&key).cloned() {
-                if let Some(value) = self.read_pointer(&pointer)? {
-                    out.push((key, value));
-                }
+        let mut out = Vec::with_capacity(snapshot.len());
+
+        for (key, pointer) in snapshot {
+            if let Some(value) = self.read_pointer(&pointer)? {
+                out.push((key, value));
             }
         }
+
         Ok(out)
     }
 
@@ -445,7 +478,11 @@ impl StorageEngine {
         }
 
         // full snapshot compaction fallback
-        let mut entries = Vec::new();
+        // let mut entries = Vec::new();
+        let snapshot: Vec<(String, Pointer)> =
+            self.index.iter().map(|(k, p)| (k.clone(), *p)).collect();
+
+        let mut entries = Vec::with_capacity(snapshot.len());
         for key in self.index.keys().cloned().collect::<Vec<_>>() {
             if let Some(value) = self.get(&key)? {
                 entries.push((key, value));

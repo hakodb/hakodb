@@ -1,19 +1,42 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+
 use firelite::config::{DurabilityMode, FireLiteConfig};
 use firelite::document::firelite_doc::FireLiteDoc;
 use firelite::document::value::Value;
 use firelite::engine::FireLite;
 
-// use rand::Rng;
-use rand_distr::{Distribution, Zipf};
-use rand::thread_rng;
-
-use std::sync::{Arc};
-use std::thread;
+use rand::{thread_rng, Rng};
 
 const DATASET: usize = 10_000;
 const BATCH_SIZE: usize = 100;
 const READ_THREADS: usize = 8;
+
+//
+// Minimal Hot-Key Generator (Zipf-like)
+//
+
+pub struct HotKeyGen {
+    size: usize,
+}
+
+impl HotKeyGen {
+    pub fn new(size: usize) -> Self {
+        Self { size }
+    }
+
+    pub fn sample<R: Rng>(&self, rng: &mut R) -> usize {
+        // 80% of accesses go to 20% of keys
+        if rng.gen::<f64>() < 0.8 {
+            rng.gen_range(0..(self.size / 5).max(1))
+        } else {
+            rng.gen_range(0..self.size)
+        }
+    }
+}
+
+//
+// Database Setup
+//
 
 fn prepare_db() -> (FireLite, std::path::PathBuf) {
     let path = std::env::temp_dir().join("firelite-bench-db");
@@ -24,7 +47,8 @@ fn prepare_db() -> (FireLite, std::path::PathBuf) {
             durability_mode: DurabilityMode::Manual,
             ..FireLiteConfig::default()
         },
-    ).expect("open");
+    )
+    .expect("open");
 
     for i in 0..DATASET {
         let mut doc = FireLiteDoc::default();
@@ -38,16 +62,15 @@ fn prepare_db() -> (FireLite, std::path::PathBuf) {
 }
 
 //
-// SINGLE WRITE
+// Single Write
 //
 
-fn write_single(c: &mut Criterion) {
+fn write_single_benchmark(c: &mut Criterion) {
     let (db, path) = prepare_db();
     let mut counter = DATASET;
 
     c.bench_function("firelite_put_single", |b| {
         b.iter(|| {
-
             let mut doc = FireLiteDoc::default();
             doc.insert("id", Value::Int(counter as i64));
 
@@ -63,46 +86,60 @@ fn write_single(c: &mut Criterion) {
 }
 
 //
-// BATCH WRITE
+// Batch Write
 //
 
-fn write_batch(c: &mut Criterion) {
+fn write_batch_benchmark(c: &mut Criterion) {
+
     let (db, path) = prepare_db();
     let mut counter = DATASET;
 
+    let mut docs = Vec::with_capacity(BATCH_SIZE);
+
     c.bench_function("firelite_put_batch_100", |b| {
+
         b.iter(|| {
 
+            docs.clear();
+
             for _ in 0..BATCH_SIZE {
+
                 let mut doc = FireLiteDoc::default();
                 doc.insert("id", Value::Int(counter as i64));
 
-                db.put("bench", &counter.to_string(), &doc).unwrap();
+                docs.push((counter.to_string(), doc));
 
                 counter += 1;
+
+            }
+
+            for (k, doc) in &docs {
+                db.put("bench", k, doc).unwrap();
             }
 
             db.flush().unwrap();
 
-            black_box(())
-        })
+            black_box(());
+
+        });
+
     });
 
     std::fs::remove_dir_all(path).ok();
 }
 
 //
-// SEQUENTIAL READ
+// Sequential Read
 //
 
-fn read_sequential(c: &mut Criterion) {
+fn read_sequential_benchmark(c: &mut Criterion) {
     let (db, path) = prepare_db();
     let mut idx = 0;
 
     c.bench_function("firelite_get_sequential", |b| {
         b.iter(|| {
-
             let key = idx.to_string();
+
             let _ = db.get("bench", &key).unwrap();
 
             idx = (idx + 1) % DATASET;
@@ -115,19 +152,18 @@ fn read_sequential(c: &mut Criterion) {
 }
 
 //
-// ZIPFIAN READ (REALISTIC CACHE HOTSPOT)
+// Hot-Key Read (Zipf-like workload)
 //
 
-fn read_zipf(c: &mut Criterion) {
+fn read_hotkey_benchmark(c: &mut Criterion) {
     let (db, path) = prepare_db();
 
     let mut rng = thread_rng();
-    let zipf = Zipf::new(DATASET as f64, 1.03).unwrap();
+    let hot = HotKeyGen::new(DATASET);
 
-    c.bench_function("firelite_get_zipf", |b| {
+    c.bench_function("firelite_get_hotkey", |b| {
         b.iter(|| {
-
-            let key = zipf.sample(&mut rng) as usize % DATASET;
+            let key = hot.sample(&mut rng);
 
             let _ = db.get("bench", &key.to_string()).unwrap();
 
@@ -139,113 +175,64 @@ fn read_zipf(c: &mut Criterion) {
 }
 
 //
-// MULTITHREAD READ
+// Parallel Read
 //
 
-fn read_parallel(c: &mut Criterion) {
+fn read_parallel_benchmark(c: &mut Criterion) {
+
     let (db, path) = prepare_db();
-    let db = Arc::new(db);
+    let db = std::sync::Arc::new(db);
+
+    // Pre-generate keys
+    let keys: Vec<String> =
+        (0..DATASET).map(|i| i.to_string()).collect();
 
     c.bench_function("firelite_get_parallel_8", |b| {
+
         b.iter(|| {
 
-            let mut handles = Vec::new();
+            std::thread::scope(|s| {
 
-            for _ in 0..READ_THREADS {
+                for t in 0..READ_THREADS {
 
-                let db = db.clone();
+                    let db = db.clone();
+                    let keys = &keys;
 
-                handles.push(thread::spawn(move || {
+                    s.spawn(move || {
 
-                    for _ in 0..2000 {
-
-                        let key =
-                            (rand::random::<usize>() % DATASET).to_string();
-
-                        let _ = db.get("bench", &key).unwrap();
-
-                    }
-
-                }));
-            }
-
-            for h in handles {
-                h.join().unwrap();
-            }
-
-            black_box(())
-        })
-    });
-
-    std::fs::remove_dir_all(path).ok();
-}
-
-//
-// MIXED WORKLOAD
-//
-
-fn mixed_workload(c: &mut Criterion) {
-    let (db, path) = prepare_db();
-
-    let db = Arc::new(db);
-
-    c.bench_function("firelite_mixed_70r_30w", |b| {
-        b.iter(|| {
-
-            let mut handles = Vec::new();
-
-            for _ in 0..READ_THREADS {
-
-                let db = db.clone();
-
-                handles.push(thread::spawn(move || {
-
-                    let mut rng = rand::thread_rng();
-
-                    for i in 0..1000 {
-
-                        if rng.gen_bool(0.7) {
+                        for i in 0..1000 {
 
                             let key =
-                                (rand::random::<usize>() % DATASET).to_string();
+                                &keys[(i + t * 1000) % DATASET];
 
-                            let _ = db.get("bench", &key).unwrap();
-
-                        } else {
-
-                            let mut doc = FireLiteDoc::default();
-                            doc.insert("id", Value::Int(i as i64));
-
-                            let key = format!("w{}", i);
-
-                            let _ = db.put("bench", &key, &doc);
+                            let _ = db.get("bench", key).unwrap();
 
                         }
 
-                    }
+                    });
 
-                }));
-            }
+                }
 
-            for h in handles {
-                h.join().unwrap();
-            }
+            });
 
-            black_box(())
-        })
+        });
+
     });
 
     std::fs::remove_dir_all(path).ok();
 }
 
+//
+// Benchmark Group
+//
+
 criterion_group!(
     benches,
-    write_single,
-    write_batch,
-    read_sequential,
-    read_zipf,
-    read_parallel,
-    mixed_workload
+    write_single_benchmark,
+    write_batch_benchmark,
+    read_sequential_benchmark,
+    read_hotkey_benchmark,
+    read_parallel_benchmark
 );
 
 criterion_main!(benches);

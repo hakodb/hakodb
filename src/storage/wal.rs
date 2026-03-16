@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use crc32fast::Hasher;
+// use crc32fast::Hasher;
 
 use crate::config::DurabilityMode;
 use crate::error::{FireLiteError, Result};
@@ -35,6 +35,7 @@ pub struct Wal {
     pending_ops_since_sync: usize,
     encryption: Option<EncryptionContext>,
     write_buffer: Vec<u8>,
+    commit_boundary: bool,
 }
 
 impl Wal {
@@ -56,41 +57,87 @@ impl Wal {
             pending_ops_since_sync: 0,
             encryption,
             write_buffer: Vec::with_capacity(64 * 1024), // 64KB WAL buffer
+            commit_boundary: false,
         })
     }
 
     pub fn append(&mut self, op: &WalOp) -> Result<()> {
-        self.append_batch(std::slice::from_ref(op))
+        // self.append_batch(std::slice::from_ref(op))
+        let payload = encode(op);
+
+        let crc = crc32fast::hash(&payload);
+
+        self.write_buffer
+            .extend_from_slice(&(payload.len() as u32).to_le_bytes());
+
+        self.write_buffer
+            .extend_from_slice(&crc.to_le_bytes());
+
+        self.write_buffer.extend_from_slice(&payload);
+
+        self.pending_ops_since_sync += 1;
+
+        if matches!(op, WalOp::CommitTx { .. }) {
+        // if crc32fast::hash(&payload) != expected {
+            self.commit_boundary = true;
+        }
+
+        self.maybe_sync(matches!(op, WalOp::CommitTx { .. }))
     }
 
     pub fn append_batch(&mut self, ops: &[WalOp]) -> Result<()> {
-        let mut commit_boundary = false;
+        // let mut commit_boundary = false;
+
+        // for op in ops {
+            
+        //     if matches!(op, WalOp::CommitTx { .. }) {
+        //         commit_boundary = true;
+        //     }
+
+        //     let mut payload = encode(op);
+        //     if let Some(enc) = &self.encryption {
+        //         payload = enc.encrypt(&payload)?;
+        //     }
+
+        //     let mut hasher = Hasher::new();
+        //     hasher.update(&payload);
+        //     let crc = hasher.finalize();
+
+        //     // Assemble a single buffer to send to the OS in one go
+        //     let mut record = Vec::with_capacity(8 + payload.len());
+        //     record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        //     record.extend_from_slice(&crc.to_le_bytes());
+        //     record.extend_from_slice(&payload);
+
+        //     self.write_buffer.extend_from_slice(&record);
+        //     self.pending_ops_since_sync += 1;
+        // }
+        // self.maybe_sync(commit_boundary)
 
         for op in ops {
-            
-            if matches!(op, WalOp::CommitTx { .. }) {
-                commit_boundary = true;
-            }
+            let payload = encode(op);
 
-            let mut payload = encode(op);
-            if let Some(enc) = &self.encryption {
-                payload = enc.encrypt(&payload)?;
-            }
+            let crc = crc32fast::hash(&payload);
 
-            let mut hasher = Hasher::new();
-            hasher.update(&payload);
-            let crc = hasher.finalize();
+            // write record header directly
+            self.write_buffer
+                .extend_from_slice(&(payload.len() as u32).to_le_bytes());
 
-            // Assemble a single buffer to send to the OS in one go
-            let mut record = Vec::with_capacity(8 + payload.len());
-            record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            record.extend_from_slice(&crc.to_le_bytes());
-            record.extend_from_slice(&payload);
+            self.write_buffer
+                .extend_from_slice(&crc.to_le_bytes());
 
-            self.write_buffer.extend_from_slice(&record);
+            // write payload
+            self.write_buffer.extend_from_slice(&payload);
+
             self.pending_ops_since_sync += 1;
+
+            if matches!(op, WalOp::CommitTx { .. }) {
+                self.commit_boundary = true;
+            }
         }
-        self.maybe_sync(commit_boundary)
+
+        self.maybe_sync(self.commit_boundary)?;
+        Ok(())
     }
 
     pub fn flush(&mut self) -> Result<()> {
@@ -110,39 +157,72 @@ impl Wal {
     }
 
     fn maybe_sync(&mut self, is_batch_boundary: bool) -> Result<()> {
-        match self.mode {
-            DurabilityMode::Always => self.flush(),
+        let should_flush = match self.mode {
+            DurabilityMode::Always => true,
+
             DurabilityMode::Interval => {
-                if self.pending_ops_since_sync >= self.group_commit_max_ops || is_batch_boundary {
-                    self.flush()
-                } else {
-                    Ok(())
-                }
+                is_batch_boundary
+                    || self.pending_ops_since_sync >= self.group_commit_max_ops
             }
-            DurabilityMode::Manual => Ok(()),
+
+            DurabilityMode::Manual => false,
+        };
+
+        if !should_flush {
+            return Ok(());
         }
+
+        if !self.write_buffer.is_empty() {
+            self.file.write_all(&self.write_buffer)?;
+            self.write_buffer.clear();
+        }
+
+        self.file.sync_data()?;
+        self.pending_ops_since_sync = 0;
+
+        Ok(())
     }
 
     pub fn replay(&mut self) -> Result<Vec<WalOp>> {
         self.file.seek(SeekFrom::Start(0))?;
         let mut raw_ops = Vec::new();
         loop {
+            // let mut len_buf = [0u8; 4];
+            // match self.file.read_exact(&mut len_buf) {
+            //     Ok(()) => {}
+            //     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            //     Err(e) => return Err(e.into()),
+            // }
+            // let len = u32::from_le_bytes(len_buf) as usize;
+            // let mut crc_buf = [0u8; 4];
+            // self.file.read_exact(&mut crc_buf)?;
+            // let expected = u32::from_le_bytes(crc_buf);
+            // let mut payload = vec![0; len];
+            // self.file.read_exact(&mut payload)?;
+
+            // let mut hasher = Hasher::new();
+            // hasher.update(&payload);
+            // if hasher.finalize() != expected {
+            //     return Err(FireLiteError::Corrupt("wal checksum mismatch".into()));
+            // }
+
             let mut len_buf = [0u8; 4];
             match self.file.read_exact(&mut len_buf) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e.into()),
             }
+
             let len = u32::from_le_bytes(len_buf) as usize;
+
             let mut crc_buf = [0u8; 4];
             self.file.read_exact(&mut crc_buf)?;
             let expected = u32::from_le_bytes(crc_buf);
+
             let mut payload = vec![0; len];
             self.file.read_exact(&mut payload)?;
 
-            let mut hasher = Hasher::new();
-            hasher.update(&payload);
-            if hasher.finalize() != expected {
+            if crc32fast::hash(&payload) != expected {
                 return Err(FireLiteError::Corrupt("wal checksum mismatch".into()));
             }
 
