@@ -276,31 +276,44 @@ Header generation is automated via `build.rs` + `cbindgen.toml`.
 
 ### Opaque Handle Types
 
-- `FL_Engine`
-- `FL_Doc`
-- `FL_Batch`
-- `FL_Query`
+- `FL_Engine`: Main database instance
+- `FL_Doc`: Document builder/result handle
+- `FL_Batch`: Atomic write-batch container
+- `FL_Query`: Query definition builder
+- `FL_Config`: Advanced configuration builder (New)
+- `FL_Watch`: Real-time subscription handle (New)
 
 ### Exposed C API (Flat)
 
 **Engine / Memory management**
-- `fl_engine_open`, `fl_engine_free`
-- `fl_last_error`, `fl_string_free`
+- `fl_engine_open`: Open with default settings
+- `fl_engine_open_encrypted`: Quick-open with encryption key
+- `fl_engine_open_with_config`: Open with advanced `FL_Config` (Recommended)
+- `fl_engine_free`: Close engine and release memory
+- `fl_last_error`: Get thread-local error message
+- `fl_string_free`: Free strings returned by query execution
+
+**Configuration Builder (Advanced Tuning)**
+- `fl_config_new`: Create a default configuration object
+- `fl_config_free`: Release configuration memory
+- `fl_config_set_durability`: Set mode (0:Always, 1:Interval, 2:Manual, 3:OnCommit)
+- `fl_config_set_encryption_key`: Set database-wide encryption secret
+- `fl_config_set_audit_log`: Enable/Disable file-backed auditing
+- `fl_config_set_query_workers`: Set thread count for parallel query execution
+- `fl_config_set_memory_limits`: Set mmap size and RAM-to-disk inlining threshold
+- `fl_config_set_storage_tuning`: Fine-tune page size and compaction thresholds
+
+**Real-time Snapshots**
+- `fl_engine_watch`: Subscribe to a collection with a C-style callback
+- `fl_watch_free`: Unsubscribe and stop the background listener thread
 
 **Document builder**
 - `fl_doc_new`, `fl_doc_free`
-- `fl_doc_insert_str`
-- `fl_doc_insert_int`
-- `fl_doc_insert_float`
-- `fl_doc_insert_bool`
-- `fl_doc_insert_null`
-- `fl_doc_insert_bin`
+- `fl_doc_insert_str`, `fl_doc_insert_int`, `fl_doc_insert_float`, `fl_doc_insert_bool`, `fl_doc_insert_null`, `fl_doc_insert_bin`
 - `fl_doc_to_json`
 
 **Firestore-style collection operations**
-- `fl_engine_insert`
-- `fl_engine_get`
-- `fl_engine_delete`
+- `fl_engine_insert`, `fl_engine_get`, `fl_engine_delete`
 
 **Atomic batch operations**
 - `fl_batch_new`, `fl_batch_free`
@@ -318,37 +331,47 @@ Header generation is automated via `build.rs` + `cbindgen.toml`.
 ## Architecture
 
 ```text
-API (FireLite + FFI + JS/TS client)
-  -> Query (planner + executor)
-    -> Index (composite manager)
-      -> Storage (encrypted WAL + encrypted segment + compaction)
-        -> Memory (mmap + page cache)
+API (FireLite + FFI + SDKs)
+  -> Query (Parallel sharded executor + projection pushdown)
+    -> Index (Async background manager + lock-free metadata)
+      -> Storage (WAL Inlining + RAM-to-Disk Checkpointing + Tiered Segments)
+        -> Hardware (Positional I/O + Atomic Sync Coordination)
 ```
 
 ---
 
-## Implementation Tables
+## Implementation Status
+
+### Performance & Durability Feature Table
+
+| Area | Status | Technical Detail |
+|---|---|---|
+| **Write Performance** | ✅ Elite | **WAL Inlining**: Small docs bypass segments. **Double-Sync Elimination**: Only 1 hardware flush per write. |
+| **Read Performance** | ✅ Elite | **Zero-Lock Reads**: Positional I/O allows infinite parallel readers without contention. |
+| **Indexing** | ✅ Async | B-Tree updates offloaded to background worker thread to keep main thread latency low. |
+| **Memory Management**| ✅ Adaptive | **Checkpointing**: Inlined RAM data automatically spills to tiered segments when thresholds are met. |
+| **Concurrency** | ✅ Atomic | Atomic versioning and async auditing remove global Mutex bottlenecks. |
+| **Durability** | ✅ ACID | Supports `OnCommit` mode mirroring Firestore `batch.commit()` semantics. |
+| **Encryption** | ✅ Optimized | ChaCha20-Poly1305 with thread-local RNG for high-frequency encrypted I/O. |
+| **Real-time** | ✅ Threaded | FFI-compatible background listener bridge with `user_data` context passing. |
 
 ### Feature status vs Firestore-style target
 
 | Area | FireLite status | Notes |
 |---|---|---|
-| Embedded engine | ✅ Implemented | In-process Rust runtime |
-| Durable WAL + recovery | ✅ Implemented | Tx markers, replay, and WAL snapshot rewrite after tier compaction |
-| Encryption at rest | ✅ Implemented | Optional WAL + segment encryption |
-| Multi-document atomic batches | ✅ Implemented | Engine + C-FFI batch commit |
-| Transactions | ✅ Implemented | Serializable conflict-aware transactions via read/write version validation |
-| Composite indexes | ✅ Implemented | Equality composite scans integrated |
-| Query filters/order/limit | ✅ Implemented | Core operators + ordering + limit + cost-aware planning heuristics |
-| Zero-copy projection pipeline | ✅ Implemented | Borrowed-view projection available in Rust engine, C-FFI, JS SDK, and Tauri gateway |
-| Real-time listeners/watch | ✅ Implemented | Local watch streams in Rust engine |
-| Subcollections | ✅ Implemented | Subdocument helpers exposed in Rust API |
-| JS/TS Firestore-style client | ✅ Implemented | `collection().doc().set/get/delete`, query builder, batch |
-| Lazarus/FPC wrapper | ✅ Implemented | Raw C-ABI unit + OO wrapper + snapshot callback bridge |
-| Tauri unified dispatcher gateway | ✅ Implemented | Single `firelite_exec`, reactive subscriptions, lifecycle controls |
-| Security policy + audit logging | ✅ Implemented | Collection-prefix rules and append audit trail |
-| Multi-segment LSM-style compaction | ✅ Implemented | Tiered segment files + background maintenance scheduler |
-| Firestore parity (full cloud API) | ❌ Not targeted yet | No remote service/auth service, distributed infra |
+| Embedded engine | ✅ Implemented | High-concurrency Rust runtime with FFI bridge |
+| Durable WAL + recovery | ✅ Implemented | Fully encrypted WAL with committed-op filter and crash recovery |
+| Encryption at rest | ✅ Implemented | ChaCha20-Poly1305 on both WAL and Segment layers |
+| Atomic batches | ✅ Implemented | Single-I/O memory buffer writes for maximum throughput |
+| Transactions | ✅ Implemented | Serializable snapshot isolation with conflict detection |
+| Composite indexes | ✅ Implemented | Background-updated B-Trees with equality scan support |
+| Query engine | ✅ Implemented | Cost-aware planner + predicate pushdown doc-view filter |
+| Zero-copy pipeline | ✅ Implemented | Direct field projection from binary views across all FFI layers |
+| Real-time listeners | ✅ Implemented | Non-blocking cross-language callback architecture |
+| Subcollections | ✅ Implemented | Prefix-based hierarchical document nesting |
+| Multi-platform FFI | ✅ Implemented | Native support for Windows (`.dll`), Linux (`.so`), and macOS (`.dylib`) |
+| Compaction | ✅ Implemented | Tiered LSM-style background merging + memory checkpointing |
+| Parity (Cloud) | ❌ Non-goal | No remote authentication or globally distributed state |
 
 ### Module implementation map
 

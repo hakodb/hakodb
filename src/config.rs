@@ -18,6 +18,7 @@ pub struct FireLiteConfig {
     pub encryption_key: Option<String>,
     pub enable_audit_log: bool,
     pub audit_log_path: Option<String>,
+    pub max_inlined_memory_bytes: usize,
 }
 
 impl Default for FireLiteConfig {
@@ -33,6 +34,7 @@ impl Default for FireLiteConfig {
             encryption_key: None,
             enable_audit_log: true,
             audit_log_path: None,
+            max_inlined_memory_bytes: 64 * 1024 * 1024, // 64MB Default
         }
     }
 }

@@ -1,7 +1,11 @@
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::ptr;
+use std::{ptr, thread};
+// use std::thread;
+use std::time::Duration;
+use std::sync::mpsc::{channel, Sender};
+// use std::sync::mpsc::TryRecvError;
 
 use crate::config::{FireLiteConfig, DurabilityMode};
 use crate::document::firelite_doc::FireLiteDoc;
@@ -29,6 +33,32 @@ pub struct FL_Batch {
 pub struct FL_Query {
     query: Query,
 }
+
+// config
+#[allow(non_camel_case_types)]
+pub struct FL_Config {
+    pub inner: FireLiteConfig,
+}
+
+
+#[allow(non_camel_case_types)]
+pub struct FL_Watch {
+    stop_tx: Sender<()>,
+    thread_handle: Option<thread::JoinHandle<()>>,
+}
+
+// 1. Fixed type naming warning with #[allow]
+#[allow(non_camel_case_types)]
+pub type FL_OnSnapshotCallback = unsafe extern "C" fn(
+    collection: *const c_char,
+    path: *const c_char,
+    kind: i32,
+    user_data: *mut std::ffi::c_void
+);
+
+// struct SendPtr(*mut std::ffi::c_void);
+// unsafe impl Send for SendPtr {}
+// unsafe impl Sync for SendPtr {} 
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
@@ -125,24 +155,225 @@ pub extern "C" fn fl_engine_open(path: *const c_char) -> *mut FL_Engine {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn fl_engine_set_durability(engine: *mut FL_Engine, mode: i32) -> i32 {
-    if engine.is_null() {
-        return set_last_error("null engine handle");
-    }
+// #[no_mangle]
+// pub extern "C" fn fl_engine_set_durability(engine: *mut FL_Engine, mode: i32) -> i32 {
+//     if engine.is_null() {
+//         return set_last_error("null engine handle");
+//     }
     
-    let d_mode = match mode {
-        1 => DurabilityMode::OnCommit,
-        2 => DurabilityMode::Interval,
-        3 => DurabilityMode::Manual,
-        _ => DurabilityMode::Always,
+//     let d_mode = match mode {
+//         1 => DurabilityMode::OnCommit,
+//         2 => DurabilityMode::Interval,
+//         3 => DurabilityMode::Manual,
+//         _ => DurabilityMode::Always,
+//     };
+
+//     let engine = unsafe { &*engine };
+//     engine.db.set_durability_mode(d_mode);
+//     clear_last_error();
+//     0
+// }
+
+// #[no_mangle]
+// pub extern "C" fn fl_engine_open_encrypted(path: *const c_char, key: *const c_char) -> *mut FL_Engine {
+//     let path = match cstr_to_string(path) {
+//         Ok(v) => v,
+//         Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
+//     };
+//     let key_str = match cstr_to_string(key) {
+//         Ok(v) => v,
+//         Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
+//     };
+
+//     let mut config = FireLiteConfig::default();
+//     if !key_str.is_empty() && key_str != "none" {
+//         config.encryption_key = Some(key_str);
+//     }
+
+//     match FireLite::open(path, config) {
+//         Ok(db) => { clear_last_error(); Box::into_raw(Box::new(FL_Engine { db })) }
+//         Err(e) => { set_last_error(e.to_string()); std::ptr::null_mut() }
+//     }
+// }
+
+#[no_mangle]
+pub extern "C" fn fl_config_new() -> *mut FL_Config {
+    Box::into_raw(Box::new(FL_Config {
+        inner: FireLiteConfig::default(),
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn fl_config_free(config: *mut FL_Config) {
+    if !config.is_null() {
+        unsafe { drop(Box::from_raw(config)) };
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_config_set_durability(config: *mut FL_Config, mode: i32) {
+    if let Some(cfg) = unsafe { config.as_mut() } {
+        cfg.inner.durability_mode = match mode {
+            1 => DurabilityMode::Interval,
+            2 => DurabilityMode::Manual,
+            3 => DurabilityMode::OnCommit,
+            _ => DurabilityMode::Always,
+        };
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_config_set_encryption_key(config: *mut FL_Config, key: *const c_char) {
+    if let Some(cfg) = unsafe { config.as_mut() } {
+        cfg.inner.encryption_key = cstr_to_string(key).ok();
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_config_set_audit_log(config: *mut FL_Config, enabled: bool, path: *const c_char) {
+    if let Some(cfg) = unsafe { config.as_mut() } {
+        cfg.inner.enable_audit_log = enabled;
+        cfg.inner.audit_log_path = cstr_to_string(path).ok();
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_config_set_query_workers(config: *mut FL_Config, count: usize) {
+    if let Some(cfg) = unsafe { config.as_mut() } {
+        cfg.inner.query_workers = count;
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_config_set_memory_limits(
+    config: *mut FL_Config, 
+    mmap_size: usize, 
+    max_inlined_bytes: usize
+) {
+    if let Some(cfg) = unsafe { config.as_mut() } {
+        cfg.inner.mmap_size = mmap_size;
+        cfg.inner.max_inlined_memory_bytes = max_inlined_bytes;
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_config_set_storage_tuning(
+    config: *mut FL_Config,
+    page_size: usize,
+    compaction_threshold: usize,
+    group_commit_max_ops: usize,
+) {
+    if let Some(cfg) = unsafe { config.as_mut() } {
+        cfg.inner.page_size = page_size;
+        cfg.inner.auto_compaction_threshold_bytes = compaction_threshold;
+        cfg.inner.group_commit_max_ops = group_commit_max_ops;
+    }
+}
+
+/// Opens the engine using a custom config. 
+/// Note: This function takes ownership of the config and will free it automatically.
+#[no_mangle]
+pub extern "C" fn fl_engine_open_with_config(path: *const c_char, config: *mut FL_Config) -> *mut FL_Engine {
+    let path_str = match cstr_to_string(path) {
+        Ok(v) => v,
+        Err(e) => {
+            set_last_error(e);
+            return std::ptr::null_mut();
+        }
     };
 
-    let engine = unsafe { &*engine };
-    engine.db.set_durability_mode(d_mode);
-    clear_last_error();
-    0
+    if config.is_null() {
+        set_last_error("Null config provided");
+        return std::ptr::null_mut();
+    }
+
+    // Take ownership of the config from the FFI caller
+    let cfg_box = unsafe { Box::from_raw(config) };
+
+    match FireLite::open(path_str, cfg_box.inner) {
+        Ok(db) => {
+            clear_last_error();
+            Box::into_raw(Box::new(FL_Engine { db }))
+        }
+        Err(e) => {
+            set_last_error(e.to_string());
+            std::ptr::null_mut()
+        }
+    }
 }
+
+// end config
+
+// emulate snapshoot
+#[no_mangle]
+pub extern "C" fn fl_engine_watch(
+    engine: *mut FL_Engine,
+    collection: *const c_char,
+    callback: FL_OnSnapshotCallback,
+    user_data_ptr: *mut std::ffi::c_void,
+) -> *mut FL_Watch {
+    if engine.is_null() { return std::ptr::null_mut(); }
+    
+    let engine_ref = unsafe { &*engine };
+    let col_name = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    // Cast pointer to usize to safely move it across thread boundaries
+    let user_data_val = user_data_ptr as usize;
+    
+    let rx = engine_ref.db.watch_collection(&col_name);
+    let (stop_tx, stop_rx) = channel::<()>();
+
+    let col_clone = col_name.clone();
+    let handle = thread::spawn(move || {
+        let thread_user_data = user_data_val as *mut std::ffi::c_void;
+        
+        // OPTIMIZATION: Create the C-compatible collection name once
+        let c_col = CString::new(col_clone).unwrap();
+
+        loop {
+            if let Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) = stop_rx.try_recv() {
+                break;
+            }
+
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(event) => {
+                    let c_path = CString::new(event.path).unwrap();
+                    let kind = match event.kind {
+                        crate::engine::ChangeKind::Put => 1,
+                        crate::engine::ChangeKind::Delete => 2,
+                    };
+                    
+                    unsafe {
+                        // Pass the stable c_col and the event-specific c_path
+                        callback(c_col.as_ptr(), c_path.as_ptr(), kind, thread_user_data);
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+    });
+
+    Box::into_raw(Box::new(FL_Watch {
+        stop_tx,
+        thread_handle: Some(handle),
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn fl_watch_free(watch: *mut FL_Watch) {
+    if !watch.is_null() {
+        let mut w = unsafe { Box::from_raw(watch) };
+        let _ = w.stop_tx.send(()); 
+        if let Some(h) = w.thread_handle.take() {
+            // The compiler now knows h is JoinHandle<()>
+            let _ = h.join();
+        }
+    }
+}
+// end of snapshoot
 
 #[no_mangle]
 pub extern "C" fn fl_engine_free(engine: *mut FL_Engine) {

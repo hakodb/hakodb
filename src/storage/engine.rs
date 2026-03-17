@@ -10,12 +10,6 @@ use super::crypto::EncryptionContext;
 use super::segment::Segment;
 use super::wal::{Wal, WalOp};
 
-// #[derive(Debug, Clone, Copy)]
-// pub struct Pointer {
-//     pub segment_id: u64,
-//     pub offset: u64,
-//     pub len: u32,
-// }
 #[derive(Debug, Clone)] // Remove Copy, as Inlined contains a Vec
 pub enum Pointer {
     Segment {
@@ -45,10 +39,11 @@ pub struct StorageEngine {
     next_segment_id: u64,
     wal: Wal,
     index: HashMap<String, Pointer>,
-    // index: HashMap<Box<str>, Pointer>,
     next_tx_id: u64,
     compaction_threshold_bytes: usize,
     encryption: Option<EncryptionContext>,
+    inlined_bytes: usize,
+    max_inlined_bytes: usize,
 }
 
 impl StorageEngine {
@@ -112,6 +107,9 @@ impl StorageEngine {
             next_tx_id: 1,
             compaction_threshold_bytes: cfg.auto_compaction_threshold_bytes,
             encryption,
+            // ADD THESE TWO LINES:
+            inlined_bytes: 0, 
+            max_inlined_bytes: cfg.max_inlined_memory_bytes,
         };
         engine.recover()?;
         Ok(engine)
@@ -122,25 +120,89 @@ impl StorageEngine {
         for op in self.wal.replay()? {
             match op {
                 WalOp::Put { key, segment_id, segment_offset, len } => {
-                    self.index.insert(
-                        key,
-                        Pointer::Segment { // FIX: Use Enum Variant
-                            segment_id,
-                            offset: segment_offset,
-                            len,
-                        },
-                    );
+                    let pointer = Pointer::Segment { 
+                        segment_id, 
+                        offset: segment_offset, 
+                        len 
+                    };
+                    self.update_index_entry(key, Some(pointer));
                 }
                 WalOp::Delete { key } => {
-                    self.index.remove(&key);
+                    // self.index.remove(&key);
+                    // This ensures that if the deleted key was Inlined, 
+                    // the inlined_bytes counter is properly reduced.
+                    self.update_index_entry(key, None);
                 }
                 WalOp::BeginTx { .. } | WalOp::CommitTx { .. } => {}
                 WalOp::PutInlined { key, value } => {
-                    self.index.insert(key, Pointer::Inlined(value));
+                    let pointer = Pointer::Inlined(value);
+                    self.update_index_entry(key, Some(pointer));
                 }
             }
         }
         Ok(())
+    }
+
+    fn update_index_entry(&mut self, key: String, new_pointer: Option<Pointer>) {
+        // 1. If there was an old entry, subtract its size if it was inlined
+        if let Some(old_p) = self.index.remove(&key) {
+            if let Pointer::Inlined(data) = old_p {
+                self.inlined_bytes = self.inlined_bytes.saturating_sub(data.len());
+            }
+        }
+
+        // 2. If we are adding a new entry, add its size if it is inlined
+        if let Some(p) = new_pointer {
+            if let Pointer::Inlined(ref data) = p {
+                self.inlined_bytes += data.len();
+            }
+            self.index.insert(key, p);
+        }
+    }
+
+    pub fn checkpoint_inlined_data(&mut self) -> Result<bool> {
+        // Only trigger if we are over the limit
+        if self.inlined_bytes < self.max_inlined_bytes {
+            return Ok(false);
+        }
+
+        // 1. Gather all inlined documents
+        let mut to_flush = Vec::new();
+        for (key, pointer) in &self.index {
+            if let Pointer::Inlined(data) = pointer {
+                to_flush.push((key.clone(), data.clone()));
+            }
+        }
+
+        if to_flush.is_empty() { return Ok(false); }
+
+        // 2. Write to a new Segment (Level 0)
+        let target_id = self.next_segment_id;
+        self.next_segment_id += 1;
+        let target_path = segment_path(&self.base_dir, 0, target_id);
+        let mut target_segment = Segment::open(target_path, self.encryption.clone())?;
+
+        let mut new_pointers = HashMap::new();
+        compact_segment(&mut target_segment, &to_flush, &mut new_pointers, target_id)?;
+        
+        target_segment.flush()?;
+
+        // 3. Update the Index (Moves Pointer::Inlined -> Pointer::Segment)
+        for (key, pointer) in new_pointers {
+            self.update_index_entry(key, Some(pointer));
+        }
+
+        // 4. Register the new segment
+        self.segments.insert(target_id, SegmentMeta {
+            id: target_id,
+            level: 0,
+            segment: target_segment,
+        });
+
+        // 5. Cleanup WAL (Remove the raw 'PutInlined' data from the log)
+        self.rewrite_wal_snapshot()?;
+
+        Ok(true)
     }
 
     pub fn apply_batch(&mut self, mutations: &[StorageMutation]) -> Result<()> {
@@ -226,13 +288,18 @@ impl StorageEngine {
         // Write everything to WAL (Standard puts and Inlined puts)
         self.wal.append_batch(&wal_ops)?;
 
-        // Update in-memory index
+        // Update the index using our new tracking helper
         for (key, pointer) in index_updates {
-            match pointer {
-                Some(p) => { self.index.insert(key, p); }
-                None => { self.index.remove(&key); }
-            }
+            self.update_index_entry(key, pointer);
         }
+
+        // Safety valve: If this batch pushed us over the RAM limit,
+        // trigger a rotation or checkpoint soon.
+        // if self.inlined_bytes > self.max_inlined_bytes {
+            // Option: You can call checkpoint_inlined_data() here 
+            // if you want "Hard Limits," or leave it to the background 
+            // thread for "Soft Limits."
+        // }
 
         Ok(())
     }
@@ -249,6 +316,8 @@ impl StorageEngine {
 
     pub fn run_background_maintenance(&mut self) -> Result<()> {
         self.maybe_rotate_active_segment()?;
+        // Check if RAM is full and spill to disk if needed
+        self.checkpoint_inlined_data()?;
         self.compact_tiers_once().map(|_| ())
     }
 
@@ -312,13 +381,6 @@ impl StorageEngine {
 
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
 
-        // for (key, pointer) in snapshot {
-        //     if pointer.segment_id == s1 || pointer.segment_id == s2 {
-        //         if let Some(value) = self.read_pointer(&pointer)? {
-        //             entries.push((key, value));
-        //         }
-        //     }
-        // }
         for (key, pointer) in snapshot {
             // Use a match arm with a guard to check the segment_id
             match &pointer {
@@ -334,10 +396,6 @@ impl StorageEngine {
         let target_path = segment_path(&self.base_dir, target_level, target_id);
         let mut target = Segment::open(target_path, self.encryption.clone())?;
 
-        // ... before removing old files or finishing compaction ...
-    
-        // Ensure all data in the target segment is physically safe before we 
-        // update the WAL snapshot
         target.flush()?; 
 
         let mut new_index = HashMap::new();
@@ -349,14 +407,14 @@ impl StorageEngine {
 
         if let Some(mut meta) = self.segments.remove(&s1) {
             let path = meta.segment.path().to_path_buf();
-            meta.segment.close(); // Explicitly drop the file handle
-            drop(meta);           // Ensure metadata is dropped
+            meta.segment.close(); 
+            drop(meta);           
             let _ = std::fs::remove_file(path);
         }
         if let Some(mut meta) = self.segments.remove(&s2) {
             let path = meta.segment.path().to_path_buf();
-            meta.segment.close(); // Explicitly drop the file handle
-            drop(meta);           // Ensure metadata is dropped
+            meta.segment.close(); 
+            drop(meta);           
             let _ = std::fs::remove_file(path);
         }
 
@@ -377,12 +435,6 @@ impl StorageEngine {
         self.wal.reset()?;
         let mut ops = Vec::with_capacity(self.index.len());
         for (key, pointer) in &self.index {
-            // ops.push(WalOp::Put {
-            //     key: key.clone(),
-            //     segment_id: pointer.segment_id,
-            //     segment_offset: pointer.offset,
-            //     len: pointer.len,
-            // });
             match pointer {
                 Pointer::Segment { segment_id, offset, len } => {
                     ops.push(WalOp::Put {
@@ -405,10 +457,6 @@ impl StorageEngine {
     }
 
     fn read_pointer(&self, pointer: &Pointer) -> Result<Option<Vec<u8>>> {
-        // let Some(segment) = self.segments.get(&pointer.segment_id) else {
-        //     return Ok(None);
-        // };
-        // Ok(Some(segment.segment.read_at(pointer.offset, pointer.len)?))
         match pointer {
             Pointer::Inlined(data) => Ok(Some(data.clone())),
             Pointer::Segment { segment_id, offset, len } => {
@@ -539,7 +587,6 @@ impl StorageEngine {
             }
         }
 
-        // self.segments.clear();
         self.segments.insert(
             target_id,
             SegmentMeta {
@@ -597,7 +644,6 @@ mod tests {
         let path = temp_path("firelite-storage-encryption");
         let cfg = FireLiteConfig {
             auto_compaction_threshold_bytes: 1,
-            // encryption_key: Some("test-secret".to_string()),
             ..FireLiteConfig::default()
         };
 

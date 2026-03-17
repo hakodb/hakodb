@@ -25,7 +25,8 @@ impl EncryptionContext {
 
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let mut nonce = [0u8; NONCE_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        // rand::rngs::OsRng.fill_bytes(&mut nonce);
+        rand::thread_rng().fill_bytes(&mut nonce);
         let ciphertext = self
             .cipher
             .encrypt(Nonce::from_slice(&nonce), plaintext)

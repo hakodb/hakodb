@@ -76,64 +76,89 @@ impl Wal {
 
     pub fn append(&mut self, op: &WalOp) -> Result<()> {
 
+        // let start = self.write_buffer.len();
+
+        // // reserve header space (len + crc)
+        // self.write_buffer.extend_from_slice(&[0u8; 8]);
+
+        // // encode payload directly
+        // let mut temp_payload = Vec::new();
+        // encode_into(&mut self.write_buffer, op);
+
+        // let payload = &self.write_buffer[start + 8..];
+
+        // let crc = crc32fast::hash(payload);
+        // let len = payload.len() as u32;
+
+        // // fill header
+        // self.write_buffer[start..start + 4]
+        //     .copy_from_slice(&len.to_le_bytes());
+
+        // self.write_buffer[start + 4..start + 8]
+        //     .copy_from_slice(&crc.to_le_bytes());
+
+        // self.pending_ops_since_sync += 1;
+
+        // let is_commit = matches!(op, WalOp::CommitTx { .. });
+
+        // self.maybe_sync(is_commit)
+
         let start = self.write_buffer.len();
 
-        // reserve header space (len + crc)
+        // 1. Reserve header space
         self.write_buffer.extend_from_slice(&[0u8; 8]);
 
-        // encode payload directly
-        encode_into(&mut self.write_buffer, op);
+        // 2. Encode to a temporary buffer first so we can encrypt the whole thing
+        let mut temp_payload = Vec::new();
+        encode_into(&mut temp_payload, op);
 
-        let payload = &self.write_buffer[start + 8..];
+        // 3. ENCRYPTION FIX: Encrypt the payload if a key is set
+        let final_payload = if let Some(enc) = &self.encryption {
+            enc.encrypt(&temp_payload)?
+        } else {
+            temp_payload
+        };
 
-        let crc = crc32fast::hash(payload);
-        let len = payload.len() as u32;
+        // 4. Calculate CRC and Length based on the (possibly encrypted) payload
+        let crc = crc32fast::hash(&final_payload);
+        let len = final_payload.len() as u32;
 
-        // fill header
-        self.write_buffer[start..start + 4]
-            .copy_from_slice(&len.to_le_bytes());
-
-        self.write_buffer[start + 4..start + 8]
-            .copy_from_slice(&crc.to_le_bytes());
+        // 5. Fill header and append payload
+        self.write_buffer[start..start + 4].copy_from_slice(&len.to_le_bytes());
+        self.write_buffer[start + 4..start + 8].copy_from_slice(&crc.to_le_bytes());
+        self.write_buffer.extend_from_slice(&final_payload);
 
         self.pending_ops_since_sync += 1;
-
         let is_commit = matches!(op, WalOp::CommitTx { .. });
-
         self.maybe_sync(is_commit)
     }
 
     pub fn append_batch(&mut self, ops: &[WalOp]) -> Result<()> {
-
-        let mut has_commit = false;
-
+        // We must update append_batch to use the same logic
         for op in ops {
-
             let start = self.write_buffer.len();
-
-            // reserve header
             self.write_buffer.extend_from_slice(&[0u8; 8]);
 
-            encode_into(&mut self.write_buffer, op);
+            let mut temp_payload = Vec::new();
+            encode_into(&mut temp_payload, op);
 
-            let payload = &self.write_buffer[start + 8..];
+            let final_payload = if let Some(enc) = &self.encryption {
+                enc.encrypt(&temp_payload)?
+            } else {
+                temp_payload
+            };
 
-            let crc = crc32fast::hash(payload);
-            let len = payload.len() as u32;
+            let crc = crc32fast::hash(&final_payload);
+            let len = final_payload.len() as u32;
 
-            self.write_buffer[start..start + 4]
-                .copy_from_slice(&len.to_le_bytes());
-
-            self.write_buffer[start + 4..start + 8]
-                .copy_from_slice(&crc.to_le_bytes());
-
+            self.write_buffer[start..start + 4].copy_from_slice(&len.to_le_bytes());
+            self.write_buffer[start + 4..start + 8].copy_from_slice(&crc.to_le_bytes());
+            self.write_buffer.extend_from_slice(&final_payload);
+            
             self.pending_ops_since_sync += 1;
-
-            if matches!(op, WalOp::CommitTx { .. }) {
-                has_commit = true;
-            }
         }
 
+        let has_commit = ops.iter().any(|op| matches!(op, WalOp::CommitTx { .. }));
         self.maybe_sync(has_commit)
     }
 

@@ -12,17 +12,56 @@ constexpr static const uintptr_t DEFAULT_PAGE_SIZE = 4096;
 
 struct FL_Batch;
 
+struct FL_Config;
+
 struct FL_Doc;
 
 struct FL_Engine;
 
 struct FL_Query;
 
+struct FL_Watch;
+
+using FL_OnSnapshotCallback = void(*)(const char *collection,
+                                      const char *path,
+                                      int32_t kind,
+                                      void *user_data);
+
 extern "C" {
 
 FL_Engine *fl_engine_open(const char *path);
 
-int32_t fl_engine_set_durability(FL_Engine *engine, int32_t mode);
+FL_Config *fl_config_new();
+
+void fl_config_free(FL_Config *config);
+
+void fl_config_set_durability(FL_Config *config, int32_t mode);
+
+void fl_config_set_encryption_key(FL_Config *config, const char *key);
+
+void fl_config_set_audit_log(FL_Config *config, bool enabled, const char *path);
+
+void fl_config_set_query_workers(FL_Config *config, uintptr_t count);
+
+void fl_config_set_memory_limits(FL_Config *config,
+                                 uintptr_t mmap_size,
+                                 uintptr_t max_inlined_bytes);
+
+void fl_config_set_storage_tuning(FL_Config *config,
+                                  uintptr_t page_size,
+                                  uintptr_t compaction_threshold,
+                                  uintptr_t group_commit_max_ops);
+
+/// Opens the engine using a custom config.
+/// Note: This function takes ownership of the config and will free it automatically.
+FL_Engine *fl_engine_open_with_config(const char *path, FL_Config *config);
+
+FL_Watch *fl_engine_watch(FL_Engine *engine,
+                          const char *collection,
+                          FL_OnSnapshotCallback callback,
+                          void *user_data_ptr);
+
+void fl_watch_free(FL_Watch *watch);
 
 void fl_engine_free(FL_Engine *engine);
 

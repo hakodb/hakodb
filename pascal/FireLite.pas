@@ -5,10 +5,19 @@ unit FireLite;
 interface
 
 uses
-  Classes, SysUtils, fpjson, jsonparser, SyncObjs, FireLiteRaw;
+  Classes, SysUtils, fpjson, jsonparser, SyncObjs, ctypes, FireLiteRaw;
 
 type
   EFireLiteError = class(Exception);
+
+  TFLDurabilityMode = (dmAlways, dmInterval, dmManual, dmOnCommit);
+
+  { Data provided to the snapshot callback }
+  TFLSnapshotEvent = record
+    Collection: string;
+    DocPath: string;
+    Kind: cint32; // 1 = Put, 2 = Delete
+  end;
 
   TOnSnapshotCallback = procedure(const JsonSnapshot: string) of object;
 
@@ -25,6 +34,24 @@ type
   TFLBatch = class;
   TFLTransaction = class;
 
+  { Advanced Configuration Builder }
+  TFLConfig = class
+  private
+    FHandle: PFL_Config;
+  public
+    constructor Create;
+    destructor Destroy; override;
+
+    function SetDurability(Mode: TFLDurabilityMode): TFLConfig;
+    function SetEncryptionKey(const Key: string): TFLConfig;
+    function SetAuditLog(Enabled: Boolean; const LogPath: string = ''): TFLConfig;
+    function SetQueryWorkers(Count: NativeUInt): TFLConfig;
+    function SetMemoryLimits(MMapSize, MaxInlinedBytes: NativeUInt): TFLConfig;
+    function SetStorageTuning(PageSize, CompactionThreshold, GroupCommitOps: NativeUInt): TFLConfig;
+
+    property Handle: PFL_Config read FHandle;
+  end;
+
   TFLDocument = class
   private
     FHandle: PFL_Doc;
@@ -39,6 +66,7 @@ type
     function InsertFloat(const Key: string; Value: Double): TFLDocument;
     function InsertBool(const Key: string; Value: Boolean): TFLDocument;
     function InsertNull(const Key: string): TFLDocument;
+    function InsertBin(const Key: string; Data: PByte; Len: NativeUInt): TFLDocument;
 
     class function FromJSON(const Obj: TJSONObject): TFLDocument;
     function ToJSON: string;
@@ -98,8 +126,9 @@ type
     function [Select](const Fields: array of string): TFLQuery;
 
     function GetJSON: string;
-    function OnSnapshot(const Callback: TOnSnapshotCallback;
-      PollIntervalMs: Cardinal = 250; QueueToMainThread: Boolean = True): IFLSubscription;
+    { Uses the new native watch API for high efficiency }
+    function OnSnapshot(const Callback: TOnSnapshotCallback; 
+      QueueToMainThread: Boolean = True): IFLSubscription;
   end;
 
   TFLDocumentRef = class
@@ -127,13 +156,16 @@ type
     function OrderBy(const Field: string; Ascending: Boolean = True): TFLQuery;
     function Limit(ACount: NativeUInt): TFLQuery;
     function [Select](const Fields: array of string): TFLQuery;
+    function OnSnapshot(const Callback: TOnSnapshotCallback; 
+      QueueToMainThread: Boolean = True): IFLSubscription;
   end;
 
   TFireLite = class
   private
     FHandle: PFL_Engine;
   public
-    constructor Create(const DBPath: string);
+    constructor Create(const DBPath: string); overload;
+    constructor Create(const DBPath: string; AConfig: TFLConfig); overload;
     destructor Destroy; override;
 
     function Collection(const Name: string): TFLCollection;
@@ -145,36 +177,86 @@ type
 
 implementation
 
+{ TFLNativeSubscription: Manages the native PFL_Watch bridge }
+
 type
-  TFLSnapshotPoller = class(TThread, IFLSubscription)
+  TFLNativeSubscription = class(TInterfacedObject, IFLSubscription)
   private
-    FLock: TCriticalSection;
-    FStopped: Boolean;
-    FQueueToMainThread: Boolean;
+    FWatchHandle: PFL_Watch;
     FQuery: TFLQuery;
     FCallback: TOnSnapshotCallback;
-    FIntervalMs: Cardinal;
-    FLastJSON: string;
+    FQueueToMainThread: Boolean;
     FPendingJSON: string;
-
     procedure Deliver;
-    function IsStopped: Boolean;
-  protected
-    procedure Execute; override;
   public
-    constructor Create(AQuery: TFLQuery; const ACallback: TOnSnapshotCallback;
-      APollIntervalMs: Cardinal; AQueueToMainThread: Boolean);
+    constructor Create(AQuery: TFLQuery; const ACallback: TOnSnapshotCallback; AQueue: Boolean);
     destructor Destroy; override;
     procedure Stop;
+    procedure Trigger;
   end;
 
+procedure NativeWatchCallback(Collection, Path: PChar; Kind: cint32; UserData: Pointer); cdecl;
+begin
+  // Route the FFI background event back to the Pascal object
+  TFLNativeSubscription(UserData).Trigger;
+end;
+
+constructor TFLNativeSubscription.Create(AQuery: TFLQuery; const ACallback: TOnSnapshotCallback; AQueue: Boolean);
+begin
+  inherited Create;
+  FQuery := AQuery;
+  FCallback := ACallback;
+  FQueueToMainThread := AQueue;
+  
+  // Initial data
+  Trigger;
+
+  // Start native watch on the query's collection
+  FWatchHandle := fl_engine_watch(FQuery.FDB.Handle, PChar(FQuery.FCollection), 
+    @NativeWatchCallback, Pointer(Self));
+end;
+
+destructor TFLNativeSubscription.Destroy;
+begin
+  Stop;
+  inherited Destroy;
+end;
+
+procedure TFLNativeSubscription.Stop;
+begin
+  if FWatchHandle <> nil then
+  begin
+    fl_watch_free(FWatchHandle);
+    FWatchHandle := nil;
+  end;
+end;
+
+procedure TFLNativeSubscription.Deliver;
+begin
+  if Assigned(FCallback) then FCallback(FPendingJSON);
+end;
+
+procedure TFLNativeSubscription.Trigger;
+begin
+  // When the native watch fires, we re-run the query to get a fresh JSON view
+  try
+    FPendingJSON := FQuery.GetJSON;
+    if FQueueToMainThread then
+      TThread.Queue(nil, @Deliver)
+    else
+      Deliver;
+  except
+    // ignore fetch errors during subscription
+  end;
+end;
+
+{ Helper Functions }
+
 function LastFireLiteError: string;
-var
-  P: PChar;
+var P: PChar;
 begin
   P := fl_last_error;
-  if P = nil then
-    Exit('unknown firelite error');
+  if P = nil then Exit('unknown firelite error');
   Result := string(P);
 end;
 
@@ -186,10 +268,61 @@ end;
 
 function ConsumeCString(P: PChar): string;
 begin
-  if P = nil then
-    Exit('');
+  if P = nil then Exit('');
   Result := string(P);
   fl_string_free(P);
+end;
+
+{ TFLConfig }
+
+constructor TFLConfig.Create;
+begin
+  inherited Create;
+  FHandle := fl_config_new;
+end;
+
+destructor TFLConfig.Destroy;
+begin
+  if FHandle <> nil then fl_config_free(FHandle);
+  inherited Destroy;
+end;
+
+function TFLConfig.SetDurability(Mode: TFLDurabilityMode): TFLConfig;
+begin
+  fl_config_set_durability(FHandle, Ord(Mode));
+  Result := Self;
+end;
+
+function TFLConfig.SetEncryptionKey(const Key: string): TFLConfig;
+begin
+  fl_config_set_encryption_key(FHandle, PChar(Key));
+  Result := Self;
+end;
+
+function TFLConfig.SetAuditLog(Enabled: Boolean; const LogPath: string): TFLConfig;
+var L: PChar;
+begin
+  if LogPath = '' then L := nil else L := PChar(LogPath);
+  fl_config_set_audit_log(FHandle, Enabled, L);
+  Result := Self;
+end;
+
+function TFLConfig.SetQueryWorkers(Count: NativeUInt): TFLConfig;
+begin
+  fl_config_set_query_workers(FHandle, Count);
+  Result := Self;
+end;
+
+function TFLConfig.SetMemoryLimits(MMapSize, MaxInlinedBytes: NativeUInt): TFLConfig;
+begin
+  fl_config_set_memory_limits(FHandle, MMapSize, MaxInlinedBytes);
+  Result := Self;
+end;
+
+function TFLConfig.SetStorageTuning(PageSize, CompactionThreshold, GroupCommitOps: NativeUInt): TFLConfig;
+begin
+  fl_config_set_storage_tuning(FHandle, PageSize, 512, CompactionThreshold, GroupCommitOps);
+  Result := Self;
 end;
 
 { TFLDocument }
@@ -199,8 +332,7 @@ begin
   inherited Create;
   FHandle := fl_doc_new;
   FOwned := True;
-  if FHandle = nil then
-    raise EFireLiteError.Create('fl_doc_new failed');
+  if FHandle = nil then raise EFireLiteError.Create('fl_doc_new failed');
 end;
 
 constructor TFLDocument.CreateFromHandle(AHandle: PFL_Doc; AOwned: Boolean);
@@ -212,8 +344,7 @@ end;
 
 destructor TFLDocument.Destroy;
 begin
-  if FOwned and (FHandle <> nil) then
-    fl_doc_free(FHandle);
+  if FOwned and (FHandle <> nil) then fl_doc_free(FHandle);
   inherited Destroy;
 end;
 
@@ -236,17 +367,20 @@ begin
 end;
 
 function TFLDocument.InsertBool(const Key: string; Value: Boolean): TFLDocument;
-var
-  B: cbool;
 begin
-  if Value then B := 1 else B := 0;
-  CheckStatus(fl_doc_insert_bool(FHandle, PChar(Key), B), 'fl_doc_insert_bool');
+  CheckStatus(fl_doc_insert_bool(FHandle, PChar(Key), Value), 'fl_doc_insert_bool');
   Result := Self;
 end;
 
 function TFLDocument.InsertNull(const Key: string): TFLDocument;
 begin
   CheckStatus(fl_doc_insert_null(FHandle, PChar(Key)), 'fl_doc_insert_null');
+  Result := Self;
+end;
+
+function TFLDocument.InsertBin(const Key: string; Data: PByte; Len: NativeUInt): TFLDocument;
+begin
+  CheckStatus(fl_doc_insert_bin(FHandle, PChar(Key), Data, Len), 'fl_doc_insert_bin');
   Result := Self;
 end;
 
@@ -265,10 +399,8 @@ begin
       jtNull: Result.InsertNull(Key);
       jtBoolean: Result.InsertBool(Key, Data.AsBoolean);
       jtNumber:
-        if Pos('.', Data.AsJSON) > 0 then
-          Result.InsertFloat(Key, Data.AsFloat)
-        else
-          Result.InsertInt(Key, Data.AsInt64);
+        if Pos('.', Data.AsJSON) > 0 then Result.InsertFloat(Key, Data.AsFloat)
+        else Result.InsertInt(Key, Data.AsInt64);
       jtString: Result.InsertStr(Key, Data.AsString);
     else
       raise EFireLiteError.CreateFmt('Unsupported JSON type for key "%s"', [Key]);
@@ -288,21 +420,18 @@ begin
   inherited Create;
   FDB := ADB;
   FHandle := fl_batch_new;
-  if FHandle = nil then
-    raise EFireLiteError.Create('fl_batch_new failed');
+  if FHandle = nil then raise EFireLiteError.Create('fl_batch_new failed');
 end;
 
 destructor TFLBatch.Destroy;
 begin
-  if (FHandle <> nil) and not FClosed then
-    fl_batch_free(FHandle);
+  if (FHandle <> nil) and not FClosed then fl_batch_free(FHandle);
   inherited Destroy;
 end;
 
 procedure TFLBatch.EnsureOpen;
 begin
-  if FClosed then
-    raise EFireLiteError.Create('batch already closed');
+  if FClosed then raise EFireLiteError.Create('batch already closed');
 end;
 
 function TFLBatch.Set(const Collection, DocID: string; const Doc: TFLDocument): TFLBatch;
@@ -323,8 +452,6 @@ procedure TFLBatch.Commit;
 begin
   EnsureOpen;
   CheckStatus(fl_batch_commit(FDB.Handle, FHandle), 'fl_batch_commit');
-  fl_batch_free(FHandle);
-  FHandle := nil;
   FClosed := True;
 end;
 
@@ -378,8 +505,7 @@ begin
 end;
 
 function TFLQuery.WhereEqStr(const Field, Value: string): TFLQuery;
-var
-  L: SizeInt;
+var L: SizeInt;
 begin
   L := Length(FWhereStr);
   SetLength(FWhereStr, L + 1);
@@ -389,8 +515,7 @@ begin
 end;
 
 function TFLQuery.WhereEqInt(const Field: string; Value: Int64): TFLQuery;
-var
-  L: SizeInt;
+var L: SizeInt;
 begin
   L := Length(FWhereInt);
   SetLength(FWhereInt, L + 1);
@@ -414,54 +539,34 @@ begin
 end;
 
 function TFLQuery.Select(const Fields: array of string): TFLQuery;
-var
-  I: Integer;
+var I: Integer;
 begin
   FSelectFields.Clear;
-  for I := Low(Fields) to High(Fields) do
-    FSelectFields.Add(Fields[I]);
+  for I := Low(Fields) to High(Fields) do FSelectFields.Add(Fields[I]);
   Result := Self;
 end;
 
 procedure TFLQuery.ApplyProjection(Q: PFL_Query);
-var
-  I: Integer;
+var I: Integer;
 begin
   for I := 0 to FSelectFields.Count - 1 do
     CheckStatus(fl_query_select_field(Q, PChar(FSelectFields[I])), 'fl_query_select_field');
 end;
 
 function TFLQuery.BuildNativeQuery: PFL_Query;
-var
-  I: Integer;
-  Asc: cbool;
+var I: Integer;
 begin
   Result := fl_query_new(PChar(FCollection));
-  if Result = nil then
-    raise EFireLiteError.Create('fl_query_new failed');
-
+  if Result = nil then raise EFireLiteError.Create('fl_query_new failed');
   try
-    for I := 0 to High(FWhereStr) do
-      CheckStatus(
-        fl_query_where_eq_str(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value)),
-        'fl_query_where_eq_str'
-      );
-
-    for I := 0 to High(FWhereInt) do
-      CheckStatus(
-        fl_query_where_eq_int(Result, PChar(FWhereInt[I].Field), FWhereInt[I].Value),
-        'fl_query_where_eq_int'
-      );
-
+    for I := Low(FWhereStr) to High(FWhereStr) do
+      CheckStatus(fl_query_where_eq_str(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value)), 'fl_query_where_eq_str');
+    for I := Low(FWhereInt) to High(FWhereInt) do
+      CheckStatus(fl_query_where_eq_int(Result, PChar(FWhereInt[I].Field), FWhereInt[I].Value), 'fl_query_where_eq_int');
     if FOrderByField <> '' then
-    begin
-      if FOrderByAsc then Asc := 1 else Asc := 0;
-      CheckStatus(fl_query_order_by(Result, PChar(FOrderByField), Asc), 'fl_query_order_by');
-    end;
-
+      CheckStatus(fl_query_order_by(Result, PChar(FOrderByField), FOrderByAsc), 'fl_query_order_by');
     if FHasLimit then
       CheckStatus(fl_query_limit(Result, FLimit), 'fl_query_limit');
-
     ApplyProjection(Result);
   except
     fl_query_free(Result);
@@ -477,18 +582,16 @@ begin
   Q := BuildNativeQuery;
   try
     OutStr := fl_query_execute(FDB.Handle, Q);
-    if OutStr = nil then
-      raise EFireLiteError.CreateFmt('fl_query_execute failed: %s', [LastFireLiteError]);
+    if OutStr = nil then raise EFireLiteError.CreateFmt('fl_query_execute failed: %s', [LastFireLiteError]);
     Result := ConsumeCString(OutStr);
   finally
     fl_query_free(Q);
   end;
 end;
 
-function TFLQuery.OnSnapshot(const Callback: TOnSnapshotCallback;
-  PollIntervalMs: Cardinal; QueueToMainThread: Boolean): IFLSubscription;
+function TFLQuery.OnSnapshot(const Callback: TOnSnapshotCallback; QueueToMainThread: Boolean): IFLSubscription;
 begin
-  Result := TFLSnapshotPoller.Create(Self, Callback, PollIntervalMs, QueueToMainThread);
+  Result := TFLNativeSubscription.Create(Self, Callback, QueueToMainThread);
 end;
 
 { TFLDocumentRef }
@@ -503,19 +606,14 @@ end;
 
 procedure TFLDocumentRef.Set(const Doc: TFLDocument);
 begin
-  CheckStatus(
-    fl_engine_insert(FDB.Handle, PChar(FCollection), PChar(FDocID), Doc.Handle),
-    'fl_engine_insert'
-  );
+  CheckStatus(fl_engine_insert(FDB.Handle, PChar(FCollection), PChar(FDocID), Doc.Handle), 'fl_engine_insert');
 end;
 
 function TFLDocumentRef.Get: TFLDocument;
-var
-  D: PFL_Doc;
+var D: PFL_Doc;
 begin
   D := fl_engine_get(FDB.Handle, PChar(FCollection), PChar(FDocID));
-  if D = nil then
-    Exit(nil);
+  if D = nil then Exit(nil);
   Result := TFLDocument.CreateFromHandle(D, True);
 end;
 
@@ -563,20 +661,32 @@ begin
   Result := TFLQuery.Create(FDB, FName).Select(Fields);
 end;
 
+function TFLCollection.OnSnapshot(const Callback: TOnSnapshotCallback; QueueToMainThread: Boolean): IFLSubscription;
+begin
+  Result := TFLQuery.Create(FDB, FName).OnSnapshot(Callback, QueueToMainThread);
+end;
+
 { TFireLite }
 
 constructor TFireLite.Create(const DBPath: string);
 begin
   inherited Create;
   FHandle := fl_engine_open(PChar(DBPath));
-  if FHandle = nil then
-    raise EFireLiteError.CreateFmt('fl_engine_open failed: %s', [LastFireLiteError]);
+  if FHandle = nil then raise EFireLiteError.CreateFmt('fl_engine_open failed: %s', [LastFireLiteError]);
+end;
+
+constructor TFireLite.Create(const DBPath: string; AConfig: TFLConfig);
+begin
+  inherited Create;
+  // Note: fl_engine_open_with_config consumes the config handle and frees it in Rust
+  FHandle := fl_engine_open_with_config(PChar(DBPath), AConfig.Handle);
+  AConfig.FHandle := nil; // Prevent double-free in Pascal destructor
+  if FHandle = nil then raise EFireLiteError.CreateFmt('fl_engine_open_with_config failed: %s', [LastFireLiteError]);
 end;
 
 destructor TFireLite.Destroy;
 begin
-  if FHandle <> nil then
-    fl_engine_free(FHandle);
+  if FHandle <> nil then fl_engine_free(FHandle);
   inherited Destroy;
 end;
 
@@ -593,81 +703,6 @@ end;
 function TFireLite.StartTransaction: TFLTransaction;
 begin
   Result := TFLTransaction.Create(Self);
-end;
-
-{ TFLSnapshotPoller }
-
-constructor TFLSnapshotPoller.Create(AQuery: TFLQuery; const ACallback: TOnSnapshotCallback;
-  APollIntervalMs: Cardinal; AQueueToMainThread: Boolean);
-begin
-  inherited Create(True);
-  FreeOnTerminate := False;
-  FLock := TCriticalSection.Create;
-  FStopped := False;
-  FQuery := AQuery;
-  FCallback := ACallback;
-  FIntervalMs := APollIntervalMs;
-  FQueueToMainThread := AQueueToMainThread;
-  Start;
-end;
-
-destructor TFLSnapshotPoller.Destroy;
-begin
-  Stop;
-  WaitFor;
-  FLock.Free;
-  inherited Destroy;
-end;
-
-function TFLSnapshotPoller.IsStopped: Boolean;
-begin
-  FLock.Acquire;
-  try
-    Result := FStopped;
-  finally
-    FLock.Release;
-  end;
-end;
-
-procedure TFLSnapshotPoller.Stop;
-begin
-  FLock.Acquire;
-  try
-    FStopped := True;
-  finally
-    FLock.Release;
-  end;
-end;
-
-procedure TFLSnapshotPoller.Deliver;
-begin
-  if Assigned(FCallback) then
-    FCallback(FPendingJSON);
-end;
-
-procedure TFLSnapshotPoller.Execute;
-var
-  Current: string;
-begin
-  while (not Terminated) and (not IsStopped) do
-  begin
-    try
-      Current := FQuery.GetJSON;
-      if Current <> FLastJSON then
-      begin
-        FLastJSON := Current;
-        FPendingJSON := Current;
-        if FQueueToMainThread then
-          TThread.Queue(nil, @Deliver)
-        else
-          Deliver;
-      end;
-    except
-      // keep polling even if a transient error occurs
-    end;
-
-    Sleep(FIntervalMs);
-  end;
 end;
 
 end.
