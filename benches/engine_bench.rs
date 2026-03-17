@@ -316,7 +316,7 @@ fn prepare_db() -> (FireLite, std::path::PathBuf) {
     let db = FireLite::open(
         &path,
         FireLiteConfig {
-            durability_mode: DurabilityMode::Manual,
+            durability_mode: DurabilityMode::OnCommit,
             ..FireLiteConfig::default()
         },
     )

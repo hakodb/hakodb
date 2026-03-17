@@ -10,11 +10,20 @@ use super::crypto::EncryptionContext;
 use super::segment::Segment;
 use super::wal::{Wal, WalOp};
 
-#[derive(Debug, Clone, Copy)]
-pub struct Pointer {
-    pub segment_id: u64,
-    pub offset: u64,
-    pub len: u32,
+// #[derive(Debug, Clone, Copy)]
+// pub struct Pointer {
+//     pub segment_id: u64,
+//     pub offset: u64,
+//     pub len: u32,
+// }
+#[derive(Debug, Clone)] // Remove Copy, as Inlined contains a Vec
+pub enum Pointer {
+    Segment {
+        segment_id: u64,
+        offset: u64,
+        len: u32,
+    },
+    Inlined(Vec<u8>),
 }
 
 #[derive(Debug, Clone)]
@@ -112,15 +121,10 @@ impl StorageEngine {
         self.index.reserve(1024);
         for op in self.wal.replay()? {
             match op {
-                WalOp::Put {
-                    key,
-                    segment_id,
-                    segment_offset,
-                    len,
-                } => {
+                WalOp::Put { key, segment_id, segment_offset, len } => {
                     self.index.insert(
                         key,
-                        Pointer {
+                        Pointer::Segment { // FIX: Use Enum Variant
                             segment_id,
                             offset: segment_offset,
                             len,
@@ -131,6 +135,9 @@ impl StorageEngine {
                     self.index.remove(&key);
                 }
                 WalOp::BeginTx { .. } | WalOp::CommitTx { .. } => {}
+                WalOp::PutInlined { key, value } => {
+                    self.index.insert(key, Pointer::Inlined(value));
+                }
             }
         }
         Ok(())
@@ -147,51 +154,31 @@ impl StorageEngine {
         // rotate BEFORE writing
         self.maybe_rotate_active_segment()?;
 
-        let active_id = self.active_segment_id;
+        // --- REMOVED THE REDUNDANT puts_to_write and append_batch BLOCK HERE ---
 
-        let active = self
-            .segments
-            .get_mut(&active_id)
-            .ok_or_else(|| FireLiteError::Corrupt("active segment missing".into()))?;
-
-        // Group puts to do a single segment bulk write
-        // let mut puts_to_write = Vec::new();
-        // --- STEP 1: Write data to Segment (OS RAM BUFFER ONLY) ---
-        let mut puts_to_write = Vec::with_capacity(mutations.len());
-        for mutation in mutations {
-            if let StorageMutation::Put { value, .. } = mutation {
-                puts_to_write.push(value.as_slice());
-            }
-        }
-
-        let mut put_offsets = if !puts_to_write.is_empty() {
-            active.segment.append_batch(&puts_to_write)?.into_iter()
-        } else {
-            Vec::new().into_iter()
-        };
-
-        // let mut wal_ops = Vec::with_capacity(mutations.len() + 2);
         let mut wal_ops = Vec::with_capacity(mutations.len() * 2 + 2);
         wal_ops.push(WalOp::BeginTx { tx_id });
 
         let mut index_updates = Vec::with_capacity(mutations.len());
+        let mut puts_to_segment = Vec::new();
+        let mut segment_mutation_indices = Vec::new();
 
-        for mutation in mutations {
+        // --- STEP 1: Decide Strategy (Inline or Segment) ---
+        for (i, mutation) in mutations.iter().enumerate() {
             match mutation {
-                StorageMutation::Put { key, .. } => {
-                    let (offset, stored_len) = put_offsets.next().expect("put offset mismatch");
-                    let pointer = Pointer {
-                        segment_id: self.active_segment_id,
-                        offset,
-                        len: stored_len,
-                    };
-                    wal_ops.push(WalOp::Put {
-                        key: key.clone(),
-                        segment_id: pointer.segment_id,
-                        segment_offset: pointer.offset,
-                        len: pointer.len,
-                    });
-                    index_updates.push((key.clone(), Some(pointer)));
+                StorageMutation::Put { key, value } => {
+                    if value.len() < 4096 { // 4KB Threshold
+                        // Strategy: Inline (Only goes to WAL and RAM Index)
+                        wal_ops.push(WalOp::PutInlined {
+                            key: key.clone(),
+                            value: value.clone(),
+                        });
+                        index_updates.push((key.clone(), Some(Pointer::Inlined(value.clone()))));
+                    } else {
+                        // Strategy: Segment (Collect for bulk write later)
+                        puts_to_segment.push(value.as_slice());
+                        segment_mutation_indices.push(i);
+                    }
                 }
                 StorageMutation::Delete { key } => {
                     wal_ops.push(WalOp::Delete { key: key.clone() });
@@ -200,43 +187,53 @@ impl StorageEngine {
             }
         }
 
-        wal_ops.push(WalOp::CommitTx { tx_id });
-
-
-        // if self.wal.durability_mode() == DurabilityMode::Always || 
-        // self.wal.durability_mode() == DurabilityMode::OnCommit {
+        // --- STEP 2: Write Large Puts to Segment ---
+        if !puts_to_segment.is_empty() {
+            let active_id = self.active_segment_id;
+            // We get mutable access to the segment only when we actually have data to write
+            let active = self.segments.get_mut(&active_id)
+                .ok_or_else(|| FireLiteError::Corrupt("active segment missing".into()))?;
             
-        //     if let Some(active) = self.segments.get_mut(&self.active_segment_id) {
-        //         // Push Segment bytes from OS RAM -> Physical Disk
-        //         active.segment.flush()?; 
-        //     }
-        // }
+            let offsets = active.segment.append_batch(&puts_to_segment)?;
 
-        // --- STEP 3: THE OPTIMIZATION ---
-        // Previously, we had code here that called active.segment.flush()? 
-        // WE HAVE REMOVED IT. 
-        // The data is now in the OS cache. If the power fails NOW, the WAL hasn't 
-        // been written yet, so the transaction is ignored anyway. Safe.
-
-        // --- STEP 4: Sync WAL (The ONLY physical disk sync) ---
-        // This call triggers Wal::maybe_sync, which performs the physical fsync.
-        // Because the WAL record is written AFTER the segment data is in the OS buffer,
-        // most modern OSs will ensure the data is safe if the WAL is safe.
-
-        self.wal.append_batch(&wal_ops)?;
-
-        for (key, pointer) in index_updates {
-            match pointer {
-                Some(p) => {
-                    self.index.insert(key, p);
-                }
-                None => {
-                    self.index.remove(&key);
+            for (offset_data, mutation_idx) in offsets.into_iter().zip(segment_mutation_indices) {
+                if let StorageMutation::Put { key, .. } = &mutations[mutation_idx] {
+                    let (offset, len) = offset_data;
+                    wal_ops.push(WalOp::Put {
+                        key: key.clone(),
+                        segment_id: active_id,
+                        segment_offset: offset,
+                        len,
+                    });
+                    index_updates.push((key.clone(), Some(Pointer::Segment { segment_id: active_id, offset, len })));
                 }
             }
         }
 
-        // self.maybe_rotate_active_segment()?;
+        wal_ops.push(WalOp::CommitTx { tx_id });
+
+        // --- STEP 3: Coordinated Sync ---
+        // Only flush the segment if we actually wrote something to it in Step 2
+        if !puts_to_segment.is_empty() && 
+        (self.wal.durability_mode() == DurabilityMode::Always || 
+            self.wal.durability_mode() == DurabilityMode::OnCommit) {
+            
+            if let Some(active) = self.segments.get_mut(&self.active_segment_id) {
+                active.segment.flush()?; 
+            }
+        }
+
+        // Write everything to WAL (Standard puts and Inlined puts)
+        self.wal.append_batch(&wal_ops)?;
+
+        // Update in-memory index
+        for (key, pointer) in index_updates {
+            match pointer {
+                Some(p) => { self.index.insert(key, p); }
+                None => { self.index.remove(&key); }
+            }
+        }
+
         Ok(())
     }
 
@@ -311,15 +308,26 @@ impl StorageEngine {
         self.next_segment_id += 1;
 
         let snapshot: Vec<(String, Pointer)> =
-            self.index.iter().map(|(k, p)| (k.clone(), *p)).collect();
+            self.index.iter().map(|(k, p)| (k.clone(), p.clone())).collect();
 
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
 
+        // for (key, pointer) in snapshot {
+        //     if pointer.segment_id == s1 || pointer.segment_id == s2 {
+        //         if let Some(value) = self.read_pointer(&pointer)? {
+        //             entries.push((key, value));
+        //         }
+        //     }
+        // }
         for (key, pointer) in snapshot {
-            if pointer.segment_id == s1 || pointer.segment_id == s2 {
-                if let Some(value) = self.read_pointer(&pointer)? {
-                    entries.push((key, value));
+            // Use a match arm with a guard to check the segment_id
+            match &pointer {
+                Pointer::Segment { segment_id, .. } if *segment_id == s1 || *segment_id == s2 => {
+                    if let Some(value) = self.read_pointer(&pointer)? {
+                        entries.push((key, value));
+                    }
                 }
+                _ => {} // Ignore Inlined data or data in other segments
             }
         }
 
@@ -369,22 +377,45 @@ impl StorageEngine {
         self.wal.reset()?;
         let mut ops = Vec::with_capacity(self.index.len());
         for (key, pointer) in &self.index {
-            ops.push(WalOp::Put {
-                key: key.clone(),
-                segment_id: pointer.segment_id,
-                segment_offset: pointer.offset,
-                len: pointer.len,
-            });
+            // ops.push(WalOp::Put {
+            //     key: key.clone(),
+            //     segment_id: pointer.segment_id,
+            //     segment_offset: pointer.offset,
+            //     len: pointer.len,
+            // });
+            match pointer {
+                Pointer::Segment { segment_id, offset, len } => {
+                    ops.push(WalOp::Put {
+                        key: key.clone(),
+                        segment_id: *segment_id,
+                        segment_offset: *offset,
+                        len: *len,
+                    });
+                }
+                Pointer::Inlined(value) => {
+                    ops.push(WalOp::PutInlined {
+                        key: key.clone(),
+                        value: value.clone(),
+                    });
+                }
+            }
         }
         self.wal.append_batch(&ops)?;
         Ok(())
     }
 
     fn read_pointer(&self, pointer: &Pointer) -> Result<Option<Vec<u8>>> {
-        let Some(segment) = self.segments.get(&pointer.segment_id) else {
-            return Ok(None);
-        };
-        Ok(Some(segment.segment.read_at(pointer.offset, pointer.len)?))
+        // let Some(segment) = self.segments.get(&pointer.segment_id) else {
+        //     return Ok(None);
+        // };
+        // Ok(Some(segment.segment.read_at(pointer.offset, pointer.len)?))
+        match pointer {
+            Pointer::Inlined(data) => Ok(Some(data.clone())),
+            Pointer::Segment { segment_id, offset, len } => {
+                let Some(meta) = self.segments.get(segment_id) else { return Ok(None); };
+                Ok(Some(meta.segment.read_at(*offset, *len)?))
+            }
+        }
     }
 
     pub fn flush_wal(&mut self) -> Result<()> {
@@ -468,11 +499,19 @@ impl StorageEngine {
         let snapshot: Vec<(String, Pointer)> = self
             .index
             .iter()
-            .filter(|(_, p)| immutable_ids.contains(&p.segment_id))
-            .map(|(k, p)| (k.clone(), *p))
+            .filter(|(_, p)| {
+                // Pattern match to check the ID only if it's a Segment pointer
+                if let Pointer::Segment { segment_id, .. } = p {
+                    immutable_ids.contains(segment_id)
+                } else {
+                    false
+                }
+            })
+            .map(|(k, p)| (k.clone(), p.clone()))
             .collect();
 
-        let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(snapshot.len());
+        // let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(snapshot.len());
+        let mut entries = Vec::new();
         for (key, pointer) in snapshot {
             if let Some(value) = self.read_pointer(&pointer)? {
                 entries.push((key, value));
@@ -512,7 +551,8 @@ impl StorageEngine {
         // Replace the index with rebuilt one
         self.index = rebuilt;
 
-        self.rewrite_wal_snapshot()
+        self.rewrite_wal_snapshot()?;
+        Ok(())
     }
 
     pub fn set_durability_mode(&mut self, mode: DurabilityMode) {

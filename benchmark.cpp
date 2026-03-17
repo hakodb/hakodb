@@ -13,7 +13,7 @@ int main() {
     }
 
     // 0 = Always, 1 = OnCommit, 2 = Interval, 3 = Manual
-    fl_engine_set_durability(db, 1);
+    fl_engine_set_durability(db, 3);
 
 
     int iterations = 1000;

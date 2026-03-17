@@ -25,6 +25,10 @@ pub enum WalOp {
     CommitTx {
         tx_id: u64,
     },
+    PutInlined {
+        key: String,
+        value: Vec<u8>,
+    },
 }
 
 pub struct Wal {
@@ -258,7 +262,7 @@ fn filter_committed_ops(raw_ops: Vec<WalOp>) -> Vec<WalOp> {
                 current_tx = None;
                 tx_ops.clear();
             }
-            WalOp::Put { .. } | WalOp::Delete { .. } => {
+            WalOp::Put { .. } | WalOp::Delete { .. } | WalOp::PutInlined { .. } => {
                 if current_tx.is_some() {
                     tx_ops.push(op);
                 } else {
@@ -304,6 +308,14 @@ fn encode_into(buf: &mut Vec<u8>, op: &WalOp) {
         WalOp::CommitTx { tx_id } => {
             buf.push(3);
             buf.extend_from_slice(&tx_id.to_le_bytes());
+        }
+
+        WalOp::PutInlined { key, value } => {
+            buf.push(4); // New Tag
+            buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            buf.extend_from_slice(value);
         }
     }
 }
@@ -374,6 +386,16 @@ fn decode(payload: &[u8]) -> Result<WalOp> {
                     .map_err(|_| FireLiteError::Corrupt("bad commit tx id".into()))?,
             );
             Ok(WalOp::CommitTx { tx_id })
+        }
+        4 => { // NEW
+            let key_len = u16::from_le_bytes(payload[pos..pos+2].try_into().unwrap()) as usize;
+            pos += 2;
+            let key = String::from_utf8(payload[pos..pos+key_len].to_vec()).map_err(|_| FireLiteError::Corrupt("bad key".into()))?;
+            pos += key_len;
+            let val_len = u32::from_le_bytes(payload[pos..pos+4].try_into().unwrap()) as usize;
+            pos += 4;
+            let value = payload[pos..pos+val_len].to_vec();
+            Ok(WalOp::PutInlined { key, value })
         }
         _ => Err(FireLiteError::Corrupt("unknown wal op".into())),
     }

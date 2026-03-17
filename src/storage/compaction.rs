@@ -19,7 +19,7 @@ pub fn compact_segment(
     for ((key, _), (offset, stored_len)) in entries.iter().zip(offsets) {
         index.insert(
             key.clone(),
-            Pointer {
+            Pointer::Segment { // FIX: Use Enum Variant
                 segment_id,
                 offset,
                 len: stored_len,
