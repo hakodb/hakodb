@@ -64,7 +64,7 @@ impl Wal {
             group_commit_max_ops: group_commit_max_ops.max(1),
             pending_ops_since_sync: 0,
             encryption,
-            write_buffer: Vec::with_capacity(512 * 1024), // 512KB WAL buffer
+            write_buffer: Vec::with_capacity(1024 * 1024), // 1MB WAL buffer
             last_sync: Instant::now(),
             group_commit_interval: Duration::from_millis(2),
         })
