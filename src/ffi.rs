@@ -3,7 +3,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
 
-use crate::config::FireLiteConfig;
+use crate::config::{FireLiteConfig, DurabilityMode};
 use crate::document::firelite_doc::FireLiteDoc;
 use crate::document::value::Value;
 use crate::engine::{BatchMutation, FireLite};
@@ -123,6 +123,25 @@ pub extern "C" fn fl_engine_open(path: *const c_char) -> *mut FL_Engine {
             ptr::null_mut()
         }
     }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_engine_set_durability(engine: *mut FL_Engine, mode: i32) -> i32 {
+    if engine.is_null() {
+        return set_last_error("null engine handle");
+    }
+    
+    let d_mode = match mode {
+        1 => DurabilityMode::OnCommit,
+        2 => DurabilityMode::Interval,
+        3 => DurabilityMode::Manual,
+        _ => DurabilityMode::Always,
+    };
+
+    let engine = unsafe { &*engine };
+    engine.db.set_durability_mode(d_mode);
+    clear_last_error();
+    0
 }
 
 #[no_mangle]

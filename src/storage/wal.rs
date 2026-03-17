@@ -234,6 +234,10 @@ impl Wal {
     pub fn durability_mode(&self) -> DurabilityMode {
         self.mode
     }
+
+    pub fn set_durability_mode(&mut self, mode: DurabilityMode) {
+        self.mode = mode;
+    }
 }
 
 fn filter_committed_ops(raw_ops: Vec<WalOp>) -> Vec<WalOp> {

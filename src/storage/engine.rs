@@ -494,6 +494,10 @@ impl StorageEngine {
 
         self.rewrite_wal_snapshot()
     }
+
+    pub fn set_durability_mode(&mut self, mode: DurabilityMode) {
+        self.wal.set_durability_mode(mode);
+    }
 }
 
 fn segment_path(base: &Path, level: u32, id: u64) -> PathBuf {

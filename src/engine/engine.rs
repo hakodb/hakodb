@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 // use rayon::prelude::*;
 
-use crate::config::FireLiteConfig;
+use crate::config::{FireLiteConfig, DurabilityMode};
 use crate::document::firelite_doc::FireLiteDoc;
 use crate::error::{FireLiteError, Result};
 use crate::index::composite::definition::{CompositeIndexDefinition, SortDirection};
@@ -734,6 +734,11 @@ impl FireLite {
 
     pub fn flush(&self) -> Result<()> {
         self.storage.write().unwrap().flush_all()
+    }
+
+    pub fn set_durability_mode(&self, mode: DurabilityMode) {
+        let mut storage = self.storage.write().unwrap();
+        storage.set_durability_mode(mode);
     }
 }
 
