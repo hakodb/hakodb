@@ -449,7 +449,7 @@ impl FireLite {
         }
     
         for (collection, deletes) in deletes_by_collection {
-            let delete_refs: Vec<(&str, &FireLiteDoc)> = deletes.iter().map(|(id, doc)| (id.as_str(), doc)).collect();
+            let delete_refs: Vec<(&str, &FireLiteDoc)> = deletes.iter().map(|(id, doc)| (&**id, doc)).collect();
             indexes.remove_batch(&collection, delete_refs);
         }
     

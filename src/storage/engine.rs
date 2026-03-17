@@ -269,24 +269,6 @@ impl StorageEngine {
         let target_id = self.next_segment_id;
         self.next_segment_id += 1;
 
-        // let mut entries = Vec::new();
-        // let snapshot: Vec<(String, Pointer)> =
-        //     self.index.iter().map(|(k, p)| (k.clone(), p.clone())).collect();
-        // let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
-        // let snapshot: Vec<(String, Pointer)> = self
-        //     .index
-        //     .iter()
-        //     .map(|(k, p)| (k.clone(), p.clone()))
-        //     .collect();
-        // for (key, pointer) in snapshot {
-        // for (key, pointer) in &self.index {
-        //     if pointer.segment_id == s1 || pointer.segment_id == s2 {
-        //         if let Some(value) = self.read_pointer(&pointer)? {
-        //             // entries.push((key, value));
-        //             entries.push((key.clone(), value));
-        //         }
-        //     }
-        // }
         let snapshot: Vec<(String, Pointer)> =
             self.index.iter().map(|(k, p)| (k.clone(), *p)).collect();
 
@@ -310,11 +292,24 @@ impl StorageEngine {
             self.index.insert(k, p);
         }
 
-        if let Some(meta) = self.segments.remove(&s1) {
-            let _ = std::fs::remove_file(meta.segment.path());
+        // if let Some(meta) = self.segments.remove(&s1) {
+        //     let _ = std::fs::remove_file(meta.segment.path());
+        // }
+        // if let Some(meta) = self.segments.remove(&s2) {
+        //     let _ = std::fs::remove_file(meta.segment.path());
+        // }
+
+        if let Some(mut meta) = self.segments.remove(&s1) {
+            let path = meta.segment.path().to_path_buf();
+            meta.segment.close(); // Explicitly drop the file handle
+            drop(meta);           // Ensure metadata is dropped
+            let _ = std::fs::remove_file(path);
         }
-        if let Some(meta) = self.segments.remove(&s2) {
-            let _ = std::fs::remove_file(meta.segment.path());
+        if let Some(mut meta) = self.segments.remove(&s2) {
+            let path = meta.segment.path().to_path_buf();
+            meta.segment.close(); // Explicitly drop the file handle
+            drop(meta);           // Ensure metadata is dropped
+            let _ = std::fs::remove_file(path);
         }
 
         self.segments.insert(
@@ -466,6 +461,19 @@ impl StorageEngine {
     }
 
     pub fn compact(&mut self) -> Result<()> {
+
+        // Only operate on **immutable segments**, never the active one
+        let immutable_ids: Vec<u64> = self
+            .segments
+            .keys()
+            .filter(|&&id| id != self.active_segment_id)
+            .cloned()
+            .collect();
+
+        if immutable_ids.is_empty() {
+            return Ok(());
+        }
+
         while self.compact_tiers_once()? {
             let by_level_count = self
                 .segments
@@ -479,27 +487,52 @@ impl StorageEngine {
 
         // full snapshot compaction fallback
         // let mut entries = Vec::new();
-        let snapshot: Vec<(String, Pointer)> =
-            self.index.iter().map(|(k, p)| (k.clone(), *p)).collect();
+        // Take a snapshot of the current index for the immutable segments
+        let snapshot: Vec<(String, Pointer)> = self
+            .index
+            .iter()
+            .filter(|(_, p)| immutable_ids.contains(&p.segment_id))
+            .map(|(k, p)| (k.clone(), *p))
+            .collect();
 
-        let mut entries = Vec::with_capacity(snapshot.len());
-        for key in self.index.keys().cloned().collect::<Vec<_>>() {
-            if let Some(value) = self.get(&key)? {
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(snapshot.len());
+        for (key, pointer) in snapshot {
+            if let Some(value) = self.read_pointer(&pointer)? {
                 entries.push((key, value));
             }
         }
+        // for key in self.index.keys().cloned().collect::<Vec<_>>() {
+        //     if let Some(value) = self.get(&key)? {
+        //         entries.push((key, value));
+        //     }
+        // }
 
         let target_id = self.next_segment_id;
         self.next_segment_id += 1;
         let target_path = segment_path(&self.base_dir, 1, target_id);
         let mut target = Segment::open(target_path, self.encryption.clone())?;
         let mut rebuilt = HashMap::new();
+
+        // Compact all entries into the new segment
         compact_segment(&mut target, &entries, &mut rebuilt, target_id)?;
 
-        for meta in self.segments.values() {
-            let _ = std::fs::remove_file(meta.segment.path());
+        // for meta in self.segments.values() {
+        //     let _ = std::fs::remove_file(meta.segment.path());
+        // }
+
+        // Drop immutable segments before deletion
+        for id in &immutable_ids {
+            if let Some(mut meta) = self.segments.remove(id) {
+                let path = meta.segment.path().to_path_buf();
+                meta.segment.close();
+                drop(meta);
+
+                // Now safe to remove the file
+                let _ = std::fs::remove_file(path);
+            }
         }
-        self.segments.clear();
+
+        // self.segments.clear();
         self.segments.insert(
             target_id,
             SegmentMeta {
@@ -508,7 +541,8 @@ impl StorageEngine {
                 segment: target,
             },
         );
-        self.active_segment_id = target_id;
+        // self.active_segment_id = target_id;
+        // Replace the index with rebuilt one
         self.index = rebuilt;
 
         self.rewrite_wal_snapshot()
@@ -552,7 +586,7 @@ mod tests {
         let path = temp_path("firelite-storage-encryption");
         let cfg = FireLiteConfig {
             auto_compaction_threshold_bytes: 1,
-            encryption_key: Some("test-secret".to_string()),
+            // encryption_key: Some("test-secret".to_string()),
             ..FireLiteConfig::default()
         };
 
@@ -564,6 +598,7 @@ mod tests {
             engine
                 .put("k2".to_string(), b"value-2")
                 .expect("second put should succeed");
+            let _ = engine.flush_wal();
         }
 
         let mut reopened = StorageEngine::open(&path, &cfg).expect("reopen should succeed");

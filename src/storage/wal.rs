@@ -50,8 +50,16 @@ impl Wal {
         let file = OpenOptions::new()
         .create(true)
         .read(true)
+        .write(true)
         .append(true)
         .open(path)?;
+   
+        // Print encryption info safely
+        match &encryption {
+            Some(_) => println!("Encryption is enabled for WAL"),
+            None => println!("Encryption is disabled for WAL"),
+        }
+
         Ok(Self {
             file,
             mode,
