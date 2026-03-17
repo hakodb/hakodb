@@ -57,10 +57,10 @@ impl Wal {
         .open(path)?;
    
         // Print encryption info safely
-        match &encryption {
-            Some(_) => println!("Encryption is enabled for WAL"),
-            None => println!("Encryption is disabled for WAL"),
-        }
+        // match &encryption {
+        //     Some(_) => println!("Encryption is enabled for WAL"),
+        //     None => println!("Encryption is disabled for WAL"),
+        // }
 
         Ok(Self {
             file,

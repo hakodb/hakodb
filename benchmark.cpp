@@ -2,9 +2,25 @@
 #include <time.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h> // for atoi
 
-int main() {
-    // FIX: Only 1 argument per your header file
+int main(int argc, char* argv[]) {
+    // --- Durability Config (CLI) ---
+    // 0 = Always, 1 = OnCommit, 2 = Interval, 3 = Manual (default)
+    int durability = 3;
+
+    if (argc > 1) {
+        durability = atoi(argv[1]);
+
+        if (durability < 0 || durability > 3) {
+            printf("Invalid durability value. Use 0–3.\n");
+            return 1;
+        }
+    }
+
+    printf("Using durability mode: %d\n", durability);
+
+    // Open DB
     struct FL_Engine* db = fl_engine_open("./bench_c.db");
 
     if (!db) {
@@ -12,9 +28,7 @@ int main() {
         return 1;
     }
 
-    // 0 = Always, 1 = OnCommit, 2 = Interval, 3 = Manual
-    fl_engine_set_durability(db, 3);
-
+    fl_engine_set_durability(db, durability);
 
     int iterations = 1000;
     char id_str[32];
@@ -55,7 +69,7 @@ int main() {
             sprintf(id_str, "batch_%d_%d", b, i);
             fl_batch_set(batch, "bench", id_str, doc);
             
-            fl_doc_free(doc); // Clean up the doc builder after adding to batch
+            fl_doc_free(doc);
         }
         
         fl_batch_commit(db, batch);

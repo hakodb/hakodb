@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -160,11 +161,15 @@ pub struct FireLite {
     executor: ParallelQueryExecutor,
     tx_lock: Mutex<()>,
     listeners: Mutex<HashMap<String, Vec<Sender<ChangeEvent>>>>,
-    doc_versions: Mutex<HashMap<String, u64>>,
-    global_version: Mutex<u64>,
-    security_rules: Mutex<Vec<SecurityRule>>,
-    audit: Mutex<Vec<AuditEntry>>,
-    audit_file: Mutex<Option<std::fs::File>>,
+
+    // --- NON-BLOCKING METADATA ---
+    doc_versions: RwLock<HashMap<String, u64>>, // Mutex -> RwLock
+    global_version: AtomicU64,                   // Mutex<u64> -> AtomicU64
+    security_rules: RwLock<Vec<SecurityRule>>,   // Mutex -> RwLock
+    
+    // --- ASYNC AUDITING ---
+    audit_tx: Sender<AuditEntry>,                // Non-blocking channel
+    audit_data: Arc<RwLock<Vec<AuditEntry>>>,    // Shared for reading history
 
     index_tx: Sender<IndexOp>,
     maintenance_stop: Mutex<Option<Sender<()>>>,
@@ -174,21 +179,16 @@ pub struct FireLite {
 impl FireLite {
     pub fn open(path: impl AsRef<Path>, config: FireLiteConfig) -> Result<Self> {
         std::fs::create_dir_all(path.as_ref())?;
-        let mut audit_file = None;
-        if config.enable_audit_log {
-            let log_path = config.audit_log_path.clone().unwrap_or_else(|| {
-                path.as_ref()
-                    .join("audit.log")
-                    .to_string_lossy()
-                    .to_string()
-            });
-            audit_file = Some(
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(log_path)?,
-            );
-        }
+        
+        // 1. Setup Audit File
+        let log_path = config.audit_log_path.clone().unwrap_or_else(|| {
+            path.as_ref().join("audit.log").to_string_lossy().to_string()
+        });
+        let mut audit_file = if config.enable_audit_log {
+            Some(std::fs::OpenOptions::new().create(true).append(true).open(log_path)?)
+        } else {
+            None
+        };
 
         let storage = Arc::new(RwLock::new(StorageEngine::open(path, &config)?));
         let indexes = Arc::new(RwLock::new(IndexManager::default()));
@@ -215,17 +215,34 @@ impl FireLite {
             }
         });
 
+        // 3. Initialize Background Audit Worker (FIXED INITIALIZATION)
+        let (audit_tx, audit_rx) = channel::<AuditEntry>();
+        let audit_data = Arc::new(RwLock::new(Vec::new()));
+        let audit_data_clone = Arc::clone(&audit_data);
+        
+        thread::spawn(move || {
+            while let Ok(entry) = audit_rx.recv() {
+                if let Ok(mut history) = audit_data_clone.write() {
+                    history.push(entry.clone());
+                }
+                if let Some(file) = audit_file.as_mut() {
+                    let _ = writeln!(file, "op={:?} col={} doc={:?} ok={}", 
+                        entry.op, entry.collection, entry.doc_id, entry.ok);
+                }
+            }
+        });
+
         let db = Self {
             storage,
             indexes,
             executor: ParallelQueryExecutor::new(config.query_workers),
             tx_lock: Mutex::new(()),
             listeners: Mutex::new(HashMap::new()),
-            doc_versions: Mutex::new(HashMap::new()),
-            global_version: Mutex::new(1),
-            security_rules: Mutex::new(Vec::new()),
-            audit: Mutex::new(Vec::new()),
-            audit_file: Mutex::new(audit_file),
+            doc_versions: RwLock::new(HashMap::new()),
+            global_version: AtomicU64::new(1),
+            security_rules: RwLock::new(Vec::new()),
+            audit_tx,
+            audit_data,
             index_tx,
             maintenance_stop: Mutex::new(None),
             maintenance_handle: Mutex::new(None),
@@ -233,23 +250,19 @@ impl FireLite {
 
         db.rebuild_indexes_from_storage()?;
 
+        // 4. Background Maintenance Thread
         let (stop_tx, stop_rx) = channel::<()>();
         let storage_bg = Arc::clone(&db.storage);
         let handle = thread::spawn(move || loop {
-            if stop_rx.try_recv().is_ok() {
-                break;
-            }
-            if let Ok(mut storage) = storage_bg.write() {
+            if stop_rx.try_recv().is_ok() { break; }
+            if let Ok(mut storage) = storage_bg.write() { // MUST BE .write()
                 let _ = storage.run_background_maintenance();
             }
             thread::sleep(Duration::from_millis(500));
         });
-        *db.maintenance_stop
-            .lock()
-            .expect("maintenance stop lock poisoned") = Some(stop_tx);
-        *db.maintenance_handle
-            .lock()
-            .expect("maintenance handle lock poisoned") = Some(handle);
+        
+        *db.maintenance_stop.lock().unwrap() = Some(stop_tx);
+        *db.maintenance_handle.lock().unwrap() = Some(handle);
 
         Ok(db)
     }
@@ -268,11 +281,12 @@ impl FireLite {
     }
 
     pub fn set_security_rules(&self, rules: Vec<SecurityRule>) {
-        *self.security_rules.lock().expect("rules lock poisoned") = rules;
+        *self.security_rules.write().unwrap() = rules;
     }
 
     pub fn audit_entries(&self) -> Vec<AuditEntry> {
-        self.audit.lock().expect("audit lock poisoned").clone()
+        // self.audit.lock().expect("audit lock poisoned").clone()
+        self.audit_data.read().unwrap().clone()
     }
 
     pub fn create_composite_index(
@@ -309,7 +323,8 @@ impl FireLite {
     }
 
     fn allowed(&self, collection: &str, op: AccessOp) -> bool {
-        let rules = self.security_rules.lock().expect("rules lock poisoned");
+        let rules = self.security_rules.read().unwrap(); // Read lock
+        // let rules = self.security_rules.lock().expect("rules lock poisoned");
         if rules.is_empty() {
             return true;
         }
@@ -324,73 +339,78 @@ impl FireLite {
     }
 
     fn record_audit(&self, entry: AuditEntry) {
-        self.audit
-            .lock()
-            .expect("audit lock poisoned")
-            .push(entry.clone());
-        if let Some(file) = self
-            .audit_file
-            .lock()
-            .expect("audit file lock poisoned")
-            .as_mut()
-        {
-            let _ = writeln!(
-                file,
-                "op={:?} collection={} doc_id={} ok={}",
-                entry.op,
-                entry.collection,
-                entry.doc_id.clone().unwrap_or_default(),
-                entry.ok
-            );
-        }
+        let _ = self.audit_tx.send(entry);
+        // self.audit
+        //     .lock()
+        //     .expect("audit lock poisoned")
+        //     .push(entry.clone());
+        // if let Some(file) = self
+        //     .audit_file
+        //     .lock()
+        //     .expect("audit file lock poisoned")
+        //     .as_mut()
+        // {
+        //     let _ = writeln!(
+        //         file,
+        //         "op={:?} collection={} doc_id={} ok={}",
+        //         entry.op,
+        //         entry.collection,
+        //         entry.doc_id.clone().unwrap_or_default(),
+        //         entry.ok
+        //     );
+        // }
     }
 
     fn current_version(&self, key: &str) -> Option<u64> {
-        self.doc_versions
-            .lock()
-            .expect("versions lock poisoned")
-            .get(key)
-            .cloned()
+        // self.doc_versions
+        //     .lock()
+        //     .expect("versions lock poisoned")
+        //     .get(key)
+        //     .cloned()
+        self.doc_versions.read().unwrap().get(key).cloned()
     }
 
     fn bump_versions_for_mutations(&self, mutations: &[BatchMutation]) {
-        let mut global = self
-            .global_version
-            .lock()
-            .expect("global version lock poisoned");
-        let mut versions = self.doc_versions.lock().expect("versions lock poisoned");
+        // let mut global = self
+        //     .global_version
+        //     .lock()
+        //     .expect("global version lock poisoned");
+        // let mut versions = self.doc_versions.lock().expect("versions lock poisoned");
+        // for m in mutations {
+        //     let key = match m {
+        //         BatchMutation::Put {
+        //             collection, doc_id, ..
+        //         } => doc_key(collection, doc_id),
+        //         BatchMutation::Delete { collection, doc_id } => doc_key(collection, doc_id),
+        //     };
+        //     *global += 1;
+        //     versions.insert(key, *global);
+        // }
+        let mut versions = self.doc_versions.write().unwrap();
         for m in mutations {
             let key = match m {
-                BatchMutation::Put {
-                    collection, doc_id, ..
-                } => doc_key(collection, doc_id),
+                BatchMutation::Put { collection, doc_id, .. } => doc_key(collection, doc_id),
                 BatchMutation::Delete { collection, doc_id } => doc_key(collection, doc_id),
             };
-            *global += 1;
-            versions.insert(key, *global);
+            // Atomic increment (No Mutex!)
+            let new_v = self.global_version.fetch_add(1, Ordering::SeqCst);
+            versions.insert(key, new_v);
         }
     }
 
     fn rebuild_indexes_from_storage(&self) -> Result<()> {
-        let entries = self
-            .storage
-            .read()
-            .unwrap()
-            .scan_prefix("")?;
+        let entries = self.storage.read().unwrap().scan_prefix("")?;
 
         let mut indexes = self.indexes.write().unwrap();
-        let mut versions = self.doc_versions.lock().unwrap();
-        let mut gv = self
-            .global_version
-            .lock()
-            .expect("global version lock poisoned");
-
+        let mut versions = self.doc_versions.write().unwrap(); // FIXED: Mutex -> RwLock
+        
         for (key, bytes) in entries {
             if let Some((collection, doc_id)) = key.split_once(':') {
                 if let Some(doc) = FireLiteDoc::decode(&bytes) {
                     indexes.index_document(collection, doc_id, &doc);
-                    *gv += 1;
-                    versions.insert(key, *gv);
+                    // FIXED: global_version is AtomicU64
+                    let gv = self.global_version.fetch_add(1, Ordering::SeqCst);
+                    versions.insert(key, gv);
                 }
             }
         }
@@ -680,7 +700,8 @@ impl FireLite {
         query: Query,
         fields: &[String],
     ) -> Result<Vec<(String, Vec<(String, crate::document::value::Value)>)>> {
-        let storage = self.storage.write().unwrap();
+        // FIXED: Changed .write() to .read() for better concurrency
+        let storage = self.storage.read().unwrap();
         let docs = storage.scan_prefix(&format!("{}:", query.collection))?;
         let mut out = Vec::new();
 
