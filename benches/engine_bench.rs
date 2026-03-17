@@ -5,11 +5,12 @@ use firelite::document::firelite_doc::FireLiteDoc;
 use firelite::document::value::Value;
 use firelite::engine::FireLite;
 
-use rand::{thread_rng, Rng};
+// use rand::{thread_rng, Rng};
+use rand::Rng;
 
 const DATASET: usize = 10_000;
 const BATCH_SIZE: usize = 100;
-const READ_THREADS: usize = 8;
+// const READ_THREADS: usize = 8;
 
 //
 // Minimal Hot-Key Generator (Zipf-like)

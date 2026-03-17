@@ -20,7 +20,7 @@ impl Segment {
                 .create(true)
                 .read(true)
                 .write(true)
-                .append(true)
+                // .append(true)
                 .open(&path_buf)?),
             path: path_buf,
             encryption,
@@ -28,19 +28,56 @@ impl Segment {
     }
 
     pub fn append(&mut self, value: &[u8]) -> Result<(u64, u32)> {
-        let payload = if let Some(enc) = &self.encryption {
-            enc.encrypt(value)?
-        } else {
-            value.to_vec()
-        };
+        // let payload = if let Some(enc) = &self.encryption {
+        //     enc.encrypt(value)?
+        // } else {
+        //     value.to_vec()
+        // };
+
+        // let afile = self.file.as_mut().unwrap();
+
+        // let offset = afile.seek(SeekFrom::End(0))?;
+        // afile.write_all(&(payload.len() as u32).to_le_bytes())?;
+        // afile.write_all(&payload)?;
+        // afile.sync_data()?;
+        // Ok((offset, payload.len() as u32))
+        Ok(self.append_batch(&[value])?[0])
+    }
+
+    pub fn append_batch(&mut self, values: &[&[u8]]) -> Result<Vec<(u64, u32)>> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let afile = self.file.as_mut().unwrap();
+        let mut current_offset = afile.seek(SeekFrom::End(0))?;
+        
+        // Pre-calculate rough buffer size to minimize allocations
+        let estimated_size = values.iter().map(|v| 4 + v.len()).sum();
+        let mut buffer = Vec::with_capacity(estimated_size);
+        let mut results = Vec::with_capacity(values.len());
 
-        let offset = afile.seek(SeekFrom::End(0))?;
-        afile.write_all(&(payload.len() as u32).to_le_bytes())?;
-        afile.write_all(&payload)?;
+        for value in values {
+            if let Some(enc) = &self.encryption {
+                let payload = enc.encrypt(value)?;
+                buffer.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                buffer.extend_from_slice(&payload);
+                results.push((current_offset, payload.len() as u32));
+                current_offset += 4 + payload.len() as u64;
+            } else {
+                buffer.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                buffer.extend_from_slice(value);
+                results.push((current_offset, value.len() as u32));
+                current_offset += 4 + value.len() as u64;
+            }
+        }
+
+        afile.write_all(&buffer)?;
+        
+        // Single disk sync per batch
         afile.sync_data()?;
-        Ok((offset, payload.len() as u32))
+
+        Ok(results)
     }
 
     pub fn read_at(&mut self, offset: u64, stored_len: u32) -> Result<Vec<u8>> {

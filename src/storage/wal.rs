@@ -51,7 +51,7 @@ impl Wal {
         .create(true)
         .read(true)
         .write(true)
-        .append(true)
+        // .append(true)
         .open(path)?;
    
         // Print encryption info safely

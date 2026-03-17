@@ -154,6 +154,60 @@ impl StorageEngine {
             .get_mut(&active_id)
             .ok_or_else(|| FireLiteError::Corrupt("active segment missing".into()))?;
 
+        // // let mut wal_ops = Vec::with_capacity(mutations.len() + 2);
+        // let mut wal_ops = Vec::with_capacity(mutations.len() * 2 + 2);
+        // wal_ops.push(WalOp::BeginTx { tx_id });
+
+        // let mut index_updates = Vec::with_capacity(mutations.len());
+
+        // for mutation in mutations {
+        //     match mutation {
+        //         StorageMutation::Put { key, value } => {
+        //             // let key_clone = key.clone();
+        //             // let active = self
+        //             //     .segments
+        //             //     .get_mut(&self.active_segment_id)
+        //             //     .ok_or_else(|| FireLiteError::Corrupt("active segment missing".into()))?;
+        //             let (offset, stored_len) = active.segment.append(value)?;
+        //             let pointer = Pointer {
+        //                 segment_id: self.active_segment_id,
+        //                 offset,
+        //                 len: stored_len,
+        //             };
+        //             wal_ops.push(WalOp::Put {
+        //                 key: key.clone(),
+        //                 // key: key_clone.clone(),
+        //                 segment_id: pointer.segment_id,
+        //                 segment_offset: pointer.offset,
+        //                 len: pointer.len,
+        //             });
+        //             index_updates.push((key.clone(), Some(pointer)));
+        //             // index_updates.push((key_clone.clone(), Some(pointer)));
+        //         }
+        //         StorageMutation::Delete { key } => {
+        //             wal_ops.push(WalOp::Delete { key: key.clone() });
+        //             index_updates.push((key.clone(), None));
+        //         }
+        //     }
+        // }
+
+        // wal_ops.push(WalOp::CommitTx { tx_id });
+        // self.wal.append_batch(&wal_ops)?;
+
+        // Group puts to do a single segment bulk write
+        let mut puts_to_write = Vec::new();
+        for mutation in mutations {
+            if let StorageMutation::Put { value, .. } = mutation {
+                puts_to_write.push(value.as_slice());
+            }
+        }
+
+        let mut put_offsets = if !puts_to_write.is_empty() {
+            active.segment.append_batch(&puts_to_write)?.into_iter()
+        } else {
+            Vec::new().into_iter()
+        };
+
         // let mut wal_ops = Vec::with_capacity(mutations.len() + 2);
         let mut wal_ops = Vec::with_capacity(mutations.len() * 2 + 2);
         wal_ops.push(WalOp::BeginTx { tx_id });
@@ -162,13 +216,8 @@ impl StorageEngine {
 
         for mutation in mutations {
             match mutation {
-                StorageMutation::Put { key, value } => {
-                    // let key_clone = key.clone();
-                    // let active = self
-                    //     .segments
-                    //     .get_mut(&self.active_segment_id)
-                    //     .ok_or_else(|| FireLiteError::Corrupt("active segment missing".into()))?;
-                    let (offset, stored_len) = active.segment.append(value)?;
+                StorageMutation::Put { key, .. } => {
+                    let (offset, stored_len) = put_offsets.next().expect("put offset mismatch");
                     let pointer = Pointer {
                         segment_id: self.active_segment_id,
                         offset,
@@ -176,13 +225,11 @@ impl StorageEngine {
                     };
                     wal_ops.push(WalOp::Put {
                         key: key.clone(),
-                        // key: key_clone.clone(),
                         segment_id: pointer.segment_id,
                         segment_offset: pointer.offset,
                         len: pointer.len,
                     });
                     index_updates.push((key.clone(), Some(pointer)));
-                    // index_updates.push((key_clone.clone(), Some(pointer)));
                 }
                 StorageMutation::Delete { key } => {
                     wal_ops.push(WalOp::Delete { key: key.clone() });

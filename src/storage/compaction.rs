@@ -14,8 +14,22 @@ pub fn compact_segment(
 ) -> Result<()> {
     segment.truncate()?;
     index.clear();
-    for (key, value) in entries {
-        let (offset, stored_len) = segment.append(value)?;
+    // for (key, value) in entries {
+    //     let (offset, stored_len) = segment.append(value)?;
+    //     index.insert(
+    //         key.clone(),
+    //         Pointer {
+    //             segment_id,
+    //             offset,
+    //             len: stored_len,
+    //         },
+    //     );
+    // }
+    // Ok(())
+    let values: Vec<&[u8]> = entries.iter().map(|(_, v)| v.as_slice()).collect();
+    let offsets = segment.append_batch(&values)?;
+
+    for ((key, _), (offset, stored_len)) in entries.iter().zip(offsets) {
         index.insert(
             key.clone(),
             Pointer {
