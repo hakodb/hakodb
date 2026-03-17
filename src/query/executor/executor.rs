@@ -23,7 +23,7 @@ impl ParallelQueryExecutor {
 
     pub fn execute(
         &self,
-        storage: &mut StorageEngine,
+        storage: &StorageEngine,
         indexes: &IndexManager,
         plan: QueryPlan,
     ) -> Result<Vec<(String, FireLiteDoc)>> {

@@ -3,6 +3,7 @@ pub enum DurabilityMode {
     Always,
     Interval,
     Manual,
+    OnCommit,
 }
 
 #[derive(Debug, Clone)]

@@ -2,7 +2,7 @@
 use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::FireLiteConfig;
+use crate::config::{FireLiteConfig, DurabilityMode};
 use crate::error::{FireLiteError, Result};
 
 use super::compaction::compact_segment;
@@ -154,46 +154,6 @@ impl StorageEngine {
             .get_mut(&active_id)
             .ok_or_else(|| FireLiteError::Corrupt("active segment missing".into()))?;
 
-        // // let mut wal_ops = Vec::with_capacity(mutations.len() + 2);
-        // let mut wal_ops = Vec::with_capacity(mutations.len() * 2 + 2);
-        // wal_ops.push(WalOp::BeginTx { tx_id });
-
-        // let mut index_updates = Vec::with_capacity(mutations.len());
-
-        // for mutation in mutations {
-        //     match mutation {
-        //         StorageMutation::Put { key, value } => {
-        //             // let key_clone = key.clone();
-        //             // let active = self
-        //             //     .segments
-        //             //     .get_mut(&self.active_segment_id)
-        //             //     .ok_or_else(|| FireLiteError::Corrupt("active segment missing".into()))?;
-        //             let (offset, stored_len) = active.segment.append(value)?;
-        //             let pointer = Pointer {
-        //                 segment_id: self.active_segment_id,
-        //                 offset,
-        //                 len: stored_len,
-        //             };
-        //             wal_ops.push(WalOp::Put {
-        //                 key: key.clone(),
-        //                 // key: key_clone.clone(),
-        //                 segment_id: pointer.segment_id,
-        //                 segment_offset: pointer.offset,
-        //                 len: pointer.len,
-        //             });
-        //             index_updates.push((key.clone(), Some(pointer)));
-        //             // index_updates.push((key_clone.clone(), Some(pointer)));
-        //         }
-        //         StorageMutation::Delete { key } => {
-        //             wal_ops.push(WalOp::Delete { key: key.clone() });
-        //             index_updates.push((key.clone(), None));
-        //         }
-        //     }
-        // }
-
-        // wal_ops.push(WalOp::CommitTx { tx_id });
-        // self.wal.append_batch(&wal_ops)?;
-
         // Group puts to do a single segment bulk write
         let mut puts_to_write = Vec::new();
         for mutation in mutations {
@@ -239,6 +199,17 @@ impl StorageEngine {
         }
 
         wal_ops.push(WalOp::CommitTx { tx_id });
+
+
+        if self.wal.durability_mode() == DurabilityMode::Always || 
+        self.wal.durability_mode() == DurabilityMode::OnCommit {
+            
+            if let Some(active) = self.segments.get_mut(&self.active_segment_id) {
+                // Push Segment bytes from OS RAM -> Physical Disk
+                active.segment.flush()?; 
+            }
+        }
+
         self.wal.append_batch(&wal_ops)?;
 
         for (key, pointer) in index_updates {
@@ -254,6 +225,15 @@ impl StorageEngine {
 
         self.maybe_rotate_active_segment()?;
         Ok(())
+    }
+
+    pub fn flush_all(&mut self) -> Result<()> {
+        // First flush the data segment
+        if let Some(meta) = self.segments.get_mut(&self.active_segment_id) {
+            meta.segment.flush()?;
+        }
+        // Then flush the WAL
+        self.wal.flush()
     }
 
     pub fn run_background_maintenance(&mut self) -> Result<()> {
@@ -339,13 +319,6 @@ impl StorageEngine {
             self.index.insert(k, p);
         }
 
-        // if let Some(meta) = self.segments.remove(&s1) {
-        //     let _ = std::fs::remove_file(meta.segment.path());
-        // }
-        // if let Some(meta) = self.segments.remove(&s2) {
-        //     let _ = std::fs::remove_file(meta.segment.path());
-        // }
-
         if let Some(mut meta) = self.segments.remove(&s1) {
             let path = meta.segment.path().to_path_buf();
             meta.segment.close(); // Explicitly drop the file handle
@@ -374,14 +347,6 @@ impl StorageEngine {
 
     fn rewrite_wal_snapshot(&mut self) -> Result<()> {
         self.wal.reset()?;
-        // for (key, pointer) in self.index.clone() {
-        //     self.wal.append(&WalOp::Put {
-        //         key,
-        //         segment_id: pointer.segment_id,
-        //         segment_offset: pointer.offset,
-        //         len: pointer.len,
-        //     })?;
-        // }
         let mut ops = Vec::with_capacity(self.index.len());
         for (key, pointer) in &self.index {
             ops.push(WalOp::Put {
@@ -395,8 +360,8 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn read_pointer(&mut self, pointer: &Pointer) -> Result<Option<Vec<u8>>> {
-        let Some(segment) = self.segments.get_mut(&pointer.segment_id) else {
+    fn read_pointer(&self, pointer: &Pointer) -> Result<Option<Vec<u8>>> {
+        let Some(segment) = self.segments.get(&pointer.segment_id) else {
             return Ok(None);
         };
         Ok(Some(segment.segment.read_at(pointer.offset, pointer.len)?))
@@ -406,46 +371,7 @@ impl StorageEngine {
         self.wal.flush()
     }
 
-    // pub fn put(&mut self, key: String, value: &[u8]) -> Result<()> {
-    //     self.apply_batch(&[StorageMutation::Put {
-    //         key,
-    //         value: value.to_vec(),
-    //     }])
-    // }
     pub fn put(&mut self, key: String, value: &[u8]) -> Result<()> {
-
-        // let tx_id = self.next_tx_id;
-        // self.next_tx_id += 1;
-
-        // let active = self
-        //     .segments
-        //     .get_mut(&self.active_segment_id)
-        //     .ok_or_else(|| FireLiteError::Corrupt("active segment missing".into()))?;
-
-        // let (offset, stored_len) = active.segment.append(value)?;
-
-        // let pointer = Pointer {
-        //     segment_id: self.active_segment_id,
-        //     offset,
-        //     len: stored_len,
-        // };
-
-        // self.wal.append_batch(&[
-        //     WalOp::BeginTx { tx_id },
-        //     WalOp::Put {
-        //         key: key.clone(),
-        //         segment_id: pointer.segment_id,
-        //         segment_offset: pointer.offset,
-        //         len: pointer.len,
-        //     },
-        //     WalOp::CommitTx { tx_id },
-        // ])?;
-
-        // self.index.insert(key, pointer);
-
-        // self.maybe_rotate_active_segment()?;
-
-        // Ok(())
         let mutation = StorageMutation::Put {
             key,
             value: value.to_vec(),
@@ -454,7 +380,7 @@ impl StorageEngine {
         self.apply_batch(&[mutation])
     }
 
-    pub fn get(&mut self, key: &str) -> Result<Option<Vec<u8>>> {
+    pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let Some(pointer) = self.index.get(key).cloned() else {
             return Ok(None);
         };
@@ -471,23 +397,7 @@ impl StorageEngine {
         self.index.keys().filter(|k| k.starts_with(prefix)).count()
     }
 
-    pub fn scan_prefix(&mut self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        // let keys: Vec<String> = self
-        //     .index
-        //     .keys()
-        //     .filter(|k| k.starts_with(prefix))
-        //     .cloned()
-        //     .collect();
-
-        // let mut out = Vec::with_capacity(keys.len());
-        // for key in keys {
-        //     if let Some(pointer) = self.index.get(&key).cloned() {
-        //         if let Some(value) = self.read_pointer(&pointer)? {
-        //             out.push((key, value));
-        //         }
-        //     }
-        // }
-        // Ok(out)
+    pub fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
 
         let snapshot: Vec<(String, Pointer)> = self
             .index
@@ -548,11 +458,6 @@ impl StorageEngine {
                 entries.push((key, value));
             }
         }
-        // for key in self.index.keys().cloned().collect::<Vec<_>>() {
-        //     if let Some(value) = self.get(&key)? {
-        //         entries.push((key, value));
-        //     }
-        // }
 
         let target_id = self.next_segment_id;
         self.next_segment_id += 1;
@@ -562,10 +467,6 @@ impl StorageEngine {
 
         // Compact all entries into the new segment
         compact_segment(&mut target, &entries, &mut rebuilt, target_id)?;
-
-        // for meta in self.segments.values() {
-        //     let _ = std::fs::remove_file(meta.segment.path());
-        // }
 
         // Drop immutable segments before deletion
         for id in &immutable_ids {
@@ -588,7 +489,6 @@ impl StorageEngine {
                 segment: target,
             },
         );
-        // self.active_segment_id = target_id;
         // Replace the index with rebuilt one
         self.index = rebuilt;
 

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 // use rayon::prelude::*;
@@ -145,9 +145,18 @@ impl SerializableTransaction {
     }
 }
 
+// New: Messages for the background index worker
+enum IndexOp {
+    Update {
+        collection: String,
+        puts: Vec<(String, FireLiteDoc)>,
+        deletes: Vec<(String, FireLiteDoc)>,
+    },
+}
+
 pub struct FireLite {
-    storage: Arc<Mutex<StorageEngine>>,
-    indexes: Mutex<IndexManager>,
+    storage: Arc<RwLock<StorageEngine>>,
+    indexes: Arc<RwLock<IndexManager>>,
     executor: ParallelQueryExecutor,
     tx_lock: Mutex<()>,
     listeners: Mutex<HashMap<String, Vec<Sender<ChangeEvent>>>>,
@@ -156,6 +165,8 @@ pub struct FireLite {
     security_rules: Mutex<Vec<SecurityRule>>,
     audit: Mutex<Vec<AuditEntry>>,
     audit_file: Mutex<Option<std::fs::File>>,
+
+    index_tx: Sender<IndexOp>,
     maintenance_stop: Mutex<Option<Sender<()>>>,
     maintenance_handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
@@ -179,9 +190,34 @@ impl FireLite {
             );
         }
 
+        let storage = Arc::new(RwLock::new(StorageEngine::open(path, &config)?));
+        let indexes = Arc::new(RwLock::new(IndexManager::default()));
+        
+        // Initialize Background Index Worker
+        let (index_tx, index_rx) = channel::<IndexOp>();
+        let indexes_for_worker = Arc::clone(&indexes);
+        thread::spawn(move || {
+            while let Ok(op) = index_rx.recv() {
+                match op {
+                    IndexOp::Update { collection, puts, deletes } => {
+                        let mut idx = indexes_for_worker.write().unwrap();
+                        if !puts.is_empty() {
+                            // Convert Vec<(String, FireLiteDoc)> to required iterator format
+                            let put_refs: Vec<(&str, &FireLiteDoc)> = puts.iter().map(|(id, doc)| (id.as_str(), doc)).collect();
+                            idx.index_batch(&collection, put_refs);
+                        }
+                        if !deletes.is_empty() {
+                            let del_refs: Vec<(&str, &FireLiteDoc)> = deletes.iter().map(|(id, doc)| (id.as_str(), doc)).collect();
+                            idx.remove_batch(&collection, del_refs);
+                        }
+                    }
+                }
+            }
+        });
+
         let db = Self {
-            storage: Arc::new(Mutex::new(StorageEngine::open(path, &config)?)),
-            indexes: Mutex::new(IndexManager::default()),
+            storage,
+            indexes,
             executor: ParallelQueryExecutor::new(config.query_workers),
             tx_lock: Mutex::new(()),
             listeners: Mutex::new(HashMap::new()),
@@ -190,6 +226,7 @@ impl FireLite {
             security_rules: Mutex::new(Vec::new()),
             audit: Mutex::new(Vec::new()),
             audit_file: Mutex::new(audit_file),
+            index_tx,
             maintenance_stop: Mutex::new(None),
             maintenance_handle: Mutex::new(None),
         };
@@ -202,7 +239,7 @@ impl FireLite {
             if stop_rx.try_recv().is_ok() {
                 break;
             }
-            if let Ok(mut storage) = storage_bg.lock() {
+            if let Ok(mut storage) = storage_bg.write() {
                 let _ = storage.run_background_maintenance();
             }
             thread::sleep(Duration::from_millis(500));
@@ -244,8 +281,8 @@ impl FireLite {
         fields: Vec<(String, SortDirection)>,
     ) -> u32 {
         self.indexes
-            .lock()
-            .expect("indexes lock poisoned")
+            .write()
+            .unwrap()
             .create_index(CompositeIndexDefinition::new(collection).with_fields(fields))
     }
 
@@ -337,12 +374,12 @@ impl FireLite {
     fn rebuild_indexes_from_storage(&self) -> Result<()> {
         let entries = self
             .storage
-            .lock()
-            .expect("storage lock poisoned")
+            .read()
+            .unwrap()
             .scan_prefix("")?;
 
-        let mut indexes = self.indexes.lock().expect("indexes lock poisoned");
-        let mut versions = self.doc_versions.lock().expect("versions lock poisoned");
+        let mut indexes = self.indexes.write().unwrap();
+        let mut versions = self.doc_versions.lock().unwrap();
         let mut gv = self
             .global_version
             .lock()
@@ -384,77 +421,56 @@ impl FireLite {
         let mut storage_mutations = Vec::with_capacity(mutations.len());
         let mut change_events = Vec::new();
     
-        let mut puts_by_collection: HashMap<String, Vec<(&str, &FireLiteDoc)>> = HashMap::new();
-        let mut deletes_by_collection: HashMap<String, Vec<(&str, FireLiteDoc)>> = HashMap::new();
-    
+        // Group for background indexing
+        let mut puts_by_col: HashMap<String, Vec<(String, FireLiteDoc)>> = HashMap::new();
+        let mut dels_by_col: HashMap<String, Vec<(String, FireLiteDoc)>> = HashMap::new();
+
         {
-            let mut storage = self.storage.lock().expect("storage lock poisoned");
+            // let mut storage = self.storage.lock().expect("storage lock poisoned");
+            let mut storage = self.storage.write().unwrap();
     
             for mutation in &mutations {
                 match mutation {
                     BatchMutation::Put { collection, doc_id, doc } => {
                         let key = doc_key(collection, doc_id);
-                        let encoded = doc.encode();
-    
                         storage_mutations.push(StorageMutation::Put {
                             key: key.clone(),
-                            value: encoded,
+                            value: doc.encode(),
                         });
+                        
+                        puts_by_col.entry(collection.clone()).or_default()
+                            .push((doc_id.clone(), doc.clone()));
     
-                        puts_by_collection
-                            .entry(collection.clone())
-                            .or_default()
-                            .push((doc_id, doc));
-    
-                        change_events.push((
-                            collection.clone(),
-                            ChangeEvent {
-                                path: key,
-                                kind: ChangeKind::Put,
-                            },
-                        ));
+                        change_events.push((collection.clone(), ChangeEvent { path: key, kind: ChangeKind::Put }));
                     }
     
                     BatchMutation::Delete { collection, doc_id } => {
                         let key = doc_key(collection, doc_id);
-    
                         if let Some(bytes) = storage.get(&key)? {
                             if let Some(old_doc) = FireLiteDoc::decode(&bytes) {
-                                deletes_by_collection
-                                    .entry(collection.clone())
-                                    .or_default()
-                                    .push((doc_id, old_doc));
+                                dels_by_col.entry(collection.clone()).or_default()
+                                    .push((doc_id.clone(), old_doc));
                             }
                         }
-    
                         storage_mutations.push(StorageMutation::Delete { key: key.clone() });
-    
-                        change_events.push((
-                            collection.clone(),
-                            ChangeEvent {
-                                path: key,
-                                kind: ChangeKind::Delete,
-                            },
-                        ));
+                        change_events.push((collection.clone(), ChangeEvent { path: key, kind: ChangeKind::Delete }));
                     }
                 }
             }
-    
             storage.apply_batch(&storage_mutations)?;
         }
-    
-        let mut indexes = self.indexes.lock().expect("indexes lock poisoned");
-        for (collection, puts) in puts_by_collection {
-            indexes.index_batch(&collection, puts);
+
+        // ASYNC INDEXING: Offload to worker thread
+        for (collection, puts) in puts_by_col {
+            let deletes = dels_by_col.remove(&collection).unwrap_or_default();
+            let _ = self.index_tx.send(IndexOp::Update { collection, puts, deletes });
         }
-    
-        for (collection, deletes) in deletes_by_collection {
-            let delete_refs: Vec<(&str, &FireLiteDoc)> = deletes.iter().map(|(id, doc)| (&**id, doc)).collect();
-            indexes.remove_batch(&collection, delete_refs);
+        // Handle remaining deletes that didn't have associated puts in the same collection
+        for (collection, deletes) in dels_by_col {
+            let _ = self.index_tx.send(IndexOp::Update { collection, puts: Vec::new(), deletes });
         }
     
         self.bump_versions_for_mutations(&mutations);
-    
         for (collection, event) in change_events {
             self.notify_watchers(&collection, event);
         }
@@ -551,8 +567,10 @@ impl FireLite {
         let key = doc_key(collection, doc_id);
         let res = self
             .storage
-            .lock()
-            .expect("storage lock poisoned")
+            // .lock()
+            // .expect("storage lock poisoned")
+            .read()
+            .unwrap()
             .get(&key)?
             .and_then(|v| FireLiteDoc::decode(&v));
 
@@ -632,16 +650,20 @@ impl FireLite {
             ));
         }
 
-        let mut storage = self.storage.lock().expect("storage lock poisoned");
-        let collection_rows = storage.count_prefix(&format!("{}:", query.collection));
+        let result = {
+            let (plan, _collection_rows) = {
+                let storage = self.storage.read().unwrap();
+                let indexes = self.indexes.read().unwrap();
+                let rows = storage.count_prefix(&format!("{}:", query.collection));
+                (QueryPlanner::plan(&query, &indexes, rows), rows)
+            };
 
-        let plan = {
-            let indexes = self.indexes.lock().expect("indexes lock poisoned");
-            QueryPlanner::plan(&query, &indexes, collection_rows)
+            let storage = self.storage.read().unwrap();
+            let indexes = self.indexes.read().unwrap();
+            
+            // Execute and store the result
+            self.executor.execute(&storage, &indexes, plan)
         };
-
-        let indexes = self.indexes.lock().expect("indexes lock poisoned");
-        let result = self.executor.execute(&mut storage, &indexes, plan);
 
         self.record_audit(AuditEntry {
             op: AccessOp::Query,
@@ -658,7 +680,7 @@ impl FireLite {
         query: Query,
         fields: &[String],
     ) -> Result<Vec<(String, Vec<(String, crate::document::value::Value)>)>> {
-        let mut storage = self.storage.lock().expect("storage lock poisoned");
+        let storage = self.storage.write().unwrap();
         let docs = storage.scan_prefix(&format!("{}:", query.collection))?;
         let mut out = Vec::new();
 
@@ -705,16 +727,13 @@ impl FireLite {
 
     pub fn compact(&self) -> Result<()> {
         self.storage
-            .lock()
-            .expect("storage lock poisoned")
+            .write()
+            .unwrap()
             .compact()
     }
 
     pub fn flush(&self) -> Result<()> {
-        self.storage
-            .lock()
-            .expect("storage lock poisoned")
-            .flush_wal()
+        self.storage.write().unwrap().flush_all()
     }
 }
 

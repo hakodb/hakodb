@@ -1,4 +1,3 @@
-// use std::collections::HashMap;
 use hashbrown::HashMap;
 
 use crate::error::Result;
@@ -14,18 +13,6 @@ pub fn compact_segment(
 ) -> Result<()> {
     segment.truncate()?;
     index.clear();
-    // for (key, value) in entries {
-    //     let (offset, stored_len) = segment.append(value)?;
-    //     index.insert(
-    //         key.clone(),
-    //         Pointer {
-    //             segment_id,
-    //             offset,
-    //             len: stored_len,
-    //         },
-    //     );
-    // }
-    // Ok(())
     let values: Vec<&[u8]> = entries.iter().map(|(_, v)| v.as_slice()).collect();
     let offsets = segment.append_batch(&values)?;
 

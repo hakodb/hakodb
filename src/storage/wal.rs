@@ -3,8 +3,6 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-// use crc32fast::Hasher;
-
 use crate::config::DurabilityMode;
 use crate::error::{FireLiteError, Result};
 
@@ -72,26 +70,6 @@ impl Wal {
         })
     }
 
-    // pub fn append(&mut self, op: &WalOp) -> Result<()> {
-    //     // self.append_batch(std::slice::from_ref(op))
-    //     let payload = encode(op);
-
-    //     let crc = crc32fast::hash(&payload);
-
-    //     self.write_buffer
-    //         .extend_from_slice(&(payload.len() as u32).to_le_bytes());
-
-    //     self.write_buffer
-    //         .extend_from_slice(&crc.to_le_bytes());
-
-    //     self.write_buffer.extend_from_slice(&payload);
-
-    //     self.pending_ops_since_sync += 1;
-
-    //     let is_commit = matches!(op, WalOp::CommitTx { .. });
-    //     self.maybe_sync(is_commit)
-    // }
-
     pub fn append(&mut self, op: &WalOp) -> Result<()> {
 
         let start = self.write_buffer.len();
@@ -120,31 +98,6 @@ impl Wal {
 
         self.maybe_sync(is_commit)
     }
-
-    // pub fn append_batch(&mut self, ops: &[WalOp]) -> Result<()> {
-    //     let mut has_commit = false;
-
-    //     for op in ops {
-    //         let payload = encode(op);
-    //         let crc = crc32fast::hash(&payload);
-
-    //         self.write_buffer
-    //             .extend_from_slice(&(payload.len() as u32).to_le_bytes());
-
-    //         self.write_buffer
-    //             .extend_from_slice(&crc.to_le_bytes());
-
-    //         self.write_buffer.extend_from_slice(&payload);
-
-    //         self.pending_ops_since_sync += 1;
-
-    //         if matches!(op, WalOp::CommitTx { .. }) {
-    //             has_commit = true;
-    //         }
-    //     }
-
-    //     self.maybe_sync(has_commit)
-    // }
 
     pub fn append_batch(&mut self, ops: &[WalOp]) -> Result<()> {
 
@@ -202,6 +155,8 @@ impl Wal {
         let should_flush = match self.mode {
 
             DurabilityMode::Always => true,
+
+            DurabilityMode::OnCommit => is_commit, 
 
             DurabilityMode::Interval => {
 
@@ -275,6 +230,10 @@ impl Wal {
         self.pending_ops_since_sync = 0;
         Ok(())
     }
+
+    pub fn durability_mode(&self) -> DurabilityMode {
+        self.mode
+    }
 }
 
 fn filter_committed_ops(raw_ops: Vec<WalOp>) -> Vec<WalOp> {
@@ -307,40 +266,6 @@ fn filter_committed_ops(raw_ops: Vec<WalOp>) -> Vec<WalOp> {
 
     output
 }
-
-// fn encode(op: &WalOp) -> Vec<u8> {
-//     // let mut out = Vec::new();
-//     let mut out = Vec::with_capacity(64);
-//     match op {
-//         WalOp::BeginTx { tx_id } => {
-//             out.push(0);
-//             out.extend(tx_id.to_le_bytes());
-//         }
-//         WalOp::Put {
-//             key,
-//             segment_id,
-//             segment_offset,
-//             len,
-//         } => {
-//             out.push(1);
-//             out.extend((key.len() as u16).to_le_bytes());
-//             out.extend(key.as_bytes());
-//             out.extend(segment_id.to_le_bytes());
-//             out.extend(segment_offset.to_le_bytes());
-//             out.extend(len.to_le_bytes());
-//         }
-//         WalOp::Delete { key } => {
-//             out.push(2);
-//             out.extend((key.len() as u16).to_le_bytes());
-//             out.extend(key.as_bytes());
-//         }
-//         WalOp::CommitTx { tx_id } => {
-//             out.push(3);
-//             out.extend(tx_id.to_le_bytes());
-//         }
-//     }
-//     out
-// }
 
 fn encode_into(buf: &mut Vec<u8>, op: &WalOp) {
     match op {
