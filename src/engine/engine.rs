@@ -1,15 +1,16 @@
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::Duration;
-// use rayon::prelude::*;
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
+
+use hashbrown::HashMap; 
 
 use crate::config::{FireLiteConfig, DurabilityMode};
 use crate::document::firelite_doc::FireLiteDoc;
+use crate::document::value::Value; 
 use crate::error::{FireLiteError, Result};
 use crate::index::composite::definition::{CompositeIndexDefinition, SortDirection};
 use crate::index::manager::IndexManager;
@@ -340,52 +341,13 @@ impl FireLite {
 
     fn record_audit(&self, entry: AuditEntry) {
         let _ = self.audit_tx.send(entry);
-        // self.audit
-        //     .lock()
-        //     .expect("audit lock poisoned")
-        //     .push(entry.clone());
-        // if let Some(file) = self
-        //     .audit_file
-        //     .lock()
-        //     .expect("audit file lock poisoned")
-        //     .as_mut()
-        // {
-        //     let _ = writeln!(
-        //         file,
-        //         "op={:?} collection={} doc_id={} ok={}",
-        //         entry.op,
-        //         entry.collection,
-        //         entry.doc_id.clone().unwrap_or_default(),
-        //         entry.ok
-        //     );
-        // }
     }
 
     fn current_version(&self, key: &str) -> Option<u64> {
-        // self.doc_versions
-        //     .lock()
-        //     .expect("versions lock poisoned")
-        //     .get(key)
-        //     .cloned()
         self.doc_versions.read().unwrap().get(key).cloned()
     }
 
     fn bump_versions_for_mutations(&self, mutations: &[BatchMutation]) {
-        // let mut global = self
-        //     .global_version
-        //     .lock()
-        //     .expect("global version lock poisoned");
-        // let mut versions = self.doc_versions.lock().expect("versions lock poisoned");
-        // for m in mutations {
-        //     let key = match m {
-        //         BatchMutation::Put {
-        //             collection, doc_id, ..
-        //         } => doc_key(collection, doc_id),
-        //         BatchMutation::Delete { collection, doc_id } => doc_key(collection, doc_id),
-        //     };
-        //     *global += 1;
-        //     versions.insert(key, *global);
-        // }
         let mut versions = self.doc_versions.write().unwrap();
         for m in mutations {
             let key = match m {
@@ -437,14 +399,30 @@ impl FireLite {
         self.write_batch_internal(mutations)
     }
 
-    fn write_batch_internal(&self, mutations: Vec<BatchMutation>) -> Result<()> {
+    fn write_batch_internal(&self, mut mutations: Vec<BatchMutation>) -> Result<()> {
         let mut storage_mutations = Vec::with_capacity(mutations.len());
         let mut change_events = Vec::new();
-    
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        
+        for m in &mut mutations {
+            if let BatchMutation::Put { doc, .. } = m {
+                // Look for ServerTimestamp placeholders and replace with real time
+                for (_, val) in &mut doc.fields {
+                    if matches!(val, Value::ServerTimestamp) {
+                        *val = Value::Timestamp(now);
+                    }
+                }
+            }
+        }
+
         // Group for background indexing
         let mut puts_by_col: HashMap<String, Vec<(String, FireLiteDoc)>> = HashMap::new();
         let mut dels_by_col: HashMap<String, Vec<(String, FireLiteDoc)>> = HashMap::new();
-
+        
         {
             // let mut storage = self.storage.lock().expect("storage lock poisoned");
             let mut storage = self.storage.write().unwrap();
@@ -760,6 +738,48 @@ impl FireLite {
     pub fn set_durability_mode(&self, mode: DurabilityMode) {
         let mut storage = self.storage.write().unwrap();
         storage.set_durability_mode(mode);
+    }
+
+    pub fn execute_aggregation(&self, query: Query) -> Result<HashMap<String, f64>> {
+        let storage = self.storage.read().map_err(|_| FireLiteError::Corrupt("storage lock poisoned".into()))?;
+        let indexes = self.indexes.read().map_err(|_| FireLiteError::Corrupt("indexes lock poisoned".into()))?;
+        
+        let rows = storage.count_prefix(&format!("{}:", query.collection));
+        let plan = QueryPlanner::plan(&query, &indexes, rows);
+        
+        // This now returns hashbrown::HashMap, matching the updated signature
+        self.executor.execute_aggregation(&storage, &indexes, plan, &query.aggregations)
+    }
+
+        /// Online Backup: Flushes RAM to disk and copies files to a new location
+    pub fn backup(&self, destination_path: impl AsRef<Path>) -> Result<()> {
+        let mut storage = self.storage.write().unwrap();
+        storage.checkpoint_inlined_data()?;
+        storage.flush_all()?;
+
+        std::fs::create_dir_all(destination_path.as_ref())?;
+
+        // FIX: Use the new public getter instead of private field
+        // let base = storage.base_dir().to_path_buf(); 
+        for entry in std::fs::read_dir(storage.base_dir())? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+            
+            // Only backup data and logs, ignore audit.log (usually managed separately)
+            if name_str.ends_with(".dat") || name_str == "wal.log" {
+                let dest = destination_path.as_ref().join(file_name);
+                std::fs::copy(entry.path(), dest)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn list_collections(&self) -> Result<Vec<String>> {
+        // No more scanning the whole index! 
+        // Just read the pre-calculated map.
+        let storage = self.storage.read().unwrap();
+        storage.list_collections()
     }
 }
 

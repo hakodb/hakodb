@@ -49,7 +49,7 @@ impl Wal {
         group_commit_max_ops: usize,
         encryption: Option<EncryptionContext>,
     ) -> Result<Self> {
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
@@ -61,6 +61,7 @@ impl Wal {
         //     Some(_) => println!("Encryption is enabled for WAL"),
         //     None => println!("Encryption is disabled for WAL"),
         // }
+        file.seek(SeekFrom::End(0))?;
 
         Ok(Self {
             file,
@@ -266,6 +267,14 @@ impl Wal {
 
     pub fn set_durability_mode(&mut self, mode: DurabilityMode) {
         self.mode = mode;
+    }
+    
+}
+
+impl Drop for Wal {
+    fn drop(&mut self) {
+        // Final attempt to save data when the database handle is closed
+        let _ = self.flush();
     }
 }
 

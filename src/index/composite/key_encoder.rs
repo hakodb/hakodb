@@ -160,6 +160,22 @@ fn encode_value(
             out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
             out.extend_from_slice(&bytes);
         }
+
+        Value::Timestamp(v) => {
+            out.push(6); // Tag for Timestamp
+            let mut bytes = v.to_be_bytes(); // Use big-endian for correct sorting
+            maybe_flip(direction, &mut bytes);
+            out.extend_from_slice(&bytes);
+        }
+
+        Value::Map(_) => {
+            out.push(8); // Tag for Map
+            // For now, we don't support sorting by the entire Map structure
+        }
+
+        Value::ServerTimestamp => {
+            out.push(0); // Treat as Null if it somehow hits the index
+        }
     }
 }
 

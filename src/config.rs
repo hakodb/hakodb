@@ -19,6 +19,8 @@ pub struct FireLiteConfig {
     pub enable_audit_log: bool,
     pub audit_log_path: Option<String>,
     pub max_inlined_memory_bytes: usize,
+    pub use_compression: bool,
+    pub compression_level: i32,
 }
 
 impl Default for FireLiteConfig {
@@ -35,6 +37,8 @@ impl Default for FireLiteConfig {
             enable_audit_log: true,
             audit_log_path: None,
             max_inlined_memory_bytes: 64 * 1024 * 1024, // 64MB Default
+            use_compression: false, // Disabled by default
+            compression_level: 3,
         }
     }
 }

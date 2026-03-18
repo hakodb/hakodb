@@ -125,6 +125,10 @@ type
     function Limit(ACount: NativeUInt): TFLQuery;
     function [Select](const Fields: array of string): TFLQuery;
 
+    function Count: Int64;
+    function Sum(const Field: string): Double;
+    function Avg(const Field: string): Double;
+
     function GetJSON: string;
     { Uses the new native watch API for high efficiency }
     function OnSnapshot(const Callback: TOnSnapshotCallback; 
@@ -171,6 +175,7 @@ type
     function Collection(const Name: string): TFLCollection;
     function StartBatch: TFLBatch;
     function StartTransaction: TFLTransaction;
+    function ListCollections: TStringList;
 
     property Handle: PFL_Engine read FHandle;
   end;
@@ -546,6 +551,60 @@ begin
   Result := Self;
 end;
 
+function TFLQuery.Count: Int64;
+var
+  JSON: string;
+  Data: TJSONObject;
+  Parser: TJSONParser;
+begin
+  CheckStatus(fl_query_aggregate_count(BuildNativeQuery), 'fl_query_aggregate_count');
+  JSON := ConsumeCString(fl_query_execute_aggregation(FDB.Handle, BuildNativeQuery));
+  Parser := TJSONParser.Create(JSON);
+  try
+    Data := TJSONObject(Parser.Parse);
+    Result := Data.Get('count', 0);
+  finally
+    Data.Free;
+    Parser.Free;
+  end;
+end;
+
+function TFLQuery.Sum(const Field: string): Double;
+var
+  JSON: string;
+  Data: TJSONObject;
+  Parser: TJSONParser;
+begin
+  CheckStatus(fl_query_aggregate_sum(BuildNativeQuery, PChar(Field)), 'fl_query_aggregate_sum');
+  JSON := ConsumeCString(fl_query_execute_aggregation(FDB.Handle, BuildNativeQuery));
+  Parser := TJSONParser.Create(JSON);
+  try
+    Data := TJSONObject(Parser.Parse);
+    Result := Data.Get('sum_' + Field, 0.0);
+  finally
+    Data.Free;
+    Parser.Free;
+  end;
+end;
+
+function TFLQuery.Avg(const Field: string): Double;
+var
+  JSON: string;
+  Data: TJSONObject;
+  Parser: TJSONParser;
+begin
+  CheckStatus(fl_query_aggregate_avg(BuildNativeQuery, PChar(Field)), 'fl_query_aggregate_avg');
+  JSON := ConsumeCString(fl_query_execute_aggregation(FDB.Handle, BuildNativeQuery));
+  Parser := TJSONParser.Create(JSON);
+  try
+    Data := TJSONObject(Parser.Parse);
+    Result := Data.Get('avg_' + Field, 0.0);
+  finally
+    Data.Free;
+    Parser.Free;
+  end;
+end;
+
 procedure TFLQuery.ApplyProjection(Q: PFL_Query);
 var I: Integer;
 begin
@@ -693,6 +752,27 @@ end;
 function TFireLite.Collection(const Name: string): TFLCollection;
 begin
   Result := TFLCollection.Create(Self, Name);
+end;
+
+function TFireLite.ListCollections: TStringList;
+var
+  JSON: string;
+  Parser: TJSONParser;
+  Arr: TJSONArray;
+  I: Integer;
+begin
+  Result := TStringList.Create;
+  JSON := ConsumeCString(fl_engine_list_collections(FHandle));
+  if JSON = '' then Exit;
+
+  Parser := TJSONParser.Create(JSON);
+  try
+    Arr := TJSONArray(Parser.Parse);
+    for I := 0 to Arr.Count - 1 do
+      Result.Add(Arr.Strings[I]);
+  finally
+    Parser.Free;
+  end;
 end;
 
 function TFireLite.StartBatch: TFLBatch;

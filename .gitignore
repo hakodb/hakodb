@@ -1,3 +1,7 @@
 /target
+*/target
 benchmark.obj
-benchmark.exe
+*.exe
+*.dll
+/benc*
+/backup*

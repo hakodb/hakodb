@@ -23,15 +23,6 @@ impl CompositeIndex {
         }
     }
 
-    // pub fn document_values(&self, doc: &FireLiteDoc) -> Option<Vec<Value>> {
-    //     self.definition
-    //         .fields
-    //         .iter()
-    //         // .map(|f| doc.fields.get(&f.field).cloned())
-    //         .map(|f| doc.get(&f.field).cloned())
-    //         .collect()
-    // }
-
     pub fn document_values(&self, doc: &FireLiteDoc) -> Option<Vec<Value>> {
         let mut values = Vec::with_capacity(self.definition.fields.len());
 

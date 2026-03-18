@@ -125,4 +125,26 @@ const char *fl_last_error();
 
 void fl_string_free(char *value);
 
+int32_t fl_query_aggregate_count(FL_Query *query);
+
+int32_t fl_query_aggregate_sum(FL_Query *query, const char *field);
+
+int32_t fl_query_aggregate_avg(FL_Query *query, const char *field);
+
+char *fl_query_execute_aggregation(FL_Engine *engine, const FL_Query *query);
+
+int32_t fl_doc_insert_timestamp(FL_Doc *doc, const char *key, int64_t micros);
+
+int32_t fl_doc_insert_server_timestamp(FL_Doc *doc, const char *key);
+
+int32_t fl_engine_backup(FL_Engine *engine, const char *path);
+
+int32_t fl_query_where_match(FL_Query *query, const char *field, const char *value);
+
+int32_t fl_query_where_contains(FL_Query *query, const char *field, const char *value);
+
+int32_t fl_query_where_starts_with(FL_Query *query, const char *field, const char *value);
+
+char *fl_engine_list_collections(FL_Engine *engine);
+
 }  // extern "C"

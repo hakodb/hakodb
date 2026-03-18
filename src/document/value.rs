@@ -7,4 +7,7 @@ pub enum Value {
     Float(f64),
     String(String),
     Binary(Vec<u8>),
+    Timestamp(i64), 
+    ServerTimestamp,
+    Map(Vec<(String, Value)>),
 }

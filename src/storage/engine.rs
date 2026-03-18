@@ -44,6 +44,8 @@ pub struct StorageEngine {
     encryption: Option<EncryptionContext>,
     inlined_bytes: usize,
     max_inlined_bytes: usize,
+    // collection_counts: HashMap<String, usize>, 
+    pub(crate) collection_counts: HashMap<String, usize>,
 }
 
 impl StorageEngine {
@@ -110,6 +112,7 @@ impl StorageEngine {
             // ADD THESE TWO LINES:
             inlined_bytes: 0, 
             max_inlined_bytes: cfg.max_inlined_memory_bytes,
+            collection_counts: HashMap::new(),
         };
         engine.recover()?;
         Ok(engine)
@@ -128,9 +131,6 @@ impl StorageEngine {
                     self.update_index_entry(key, Some(pointer));
                 }
                 WalOp::Delete { key } => {
-                    // self.index.remove(&key);
-                    // This ensures that if the deleted key was Inlined, 
-                    // the inlined_bytes counter is properly reduced.
                     self.update_index_entry(key, None);
                 }
                 WalOp::BeginTx { .. } | WalOp::CommitTx { .. } => {}
@@ -144,10 +144,23 @@ impl StorageEngine {
     }
 
     fn update_index_entry(&mut self, key: String, new_pointer: Option<Pointer>) {
+
+        let collection_name = key.split_once(':').map(|(c, _)| c.to_string());
+
         // 1. If there was an old entry, subtract its size if it was inlined
         if let Some(old_p) = self.index.remove(&key) {
             if let Pointer::Inlined(data) = old_p {
                 self.inlined_bytes = self.inlined_bytes.saturating_sub(data.len());
+            }
+
+            // DECREMENT count for this collection
+            if let Some(ref col) = collection_name {
+                if let Some(count) = self.collection_counts.get_mut(col) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.collection_counts.remove(col); // Collection officially "dies"
+                    }
+                }
             }
         }
 
@@ -156,6 +169,12 @@ impl StorageEngine {
             if let Pointer::Inlined(ref data) = p {
                 self.inlined_bytes += data.len();
             }
+
+            // INCREMENT count for this collection
+            if let Some(ref col) = collection_name {
+                *self.collection_counts.entry(col.clone()).or_insert(0) += 1;
+            }
+
             self.index.insert(key, p);
         }
     }
@@ -203,6 +222,13 @@ impl StorageEngine {
         self.rewrite_wal_snapshot()?;
 
         Ok(true)
+    }
+
+    /// Now this becomes Instant (O(1)) and accurate!
+    pub fn list_collections(&self) -> Result<Vec<String>> {
+        let mut cols: Vec<String> = self.collection_counts.keys().cloned().collect();
+        cols.sort();
+        Ok(cols)
     }
 
     pub fn apply_batch(&mut self, mutations: &[StorageMutation]) -> Result<()> {
@@ -292,14 +318,6 @@ impl StorageEngine {
         for (key, pointer) in index_updates {
             self.update_index_entry(key, pointer);
         }
-
-        // Safety valve: If this batch pushed us over the RAM limit,
-        // trigger a rotation or checkpoint soon.
-        // if self.inlined_bytes > self.max_inlined_bytes {
-            // Option: You can call checkpoint_inlined_data() here 
-            // if you want "Hard Limits," or leave it to the background 
-            // thread for "Soft Limits."
-        // }
 
         Ok(())
     }
@@ -604,6 +622,17 @@ impl StorageEngine {
 
     pub fn set_durability_mode(&mut self, mode: DurabilityMode) {
         self.wal.set_durability_mode(mode);
+    }
+
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
+    }
+}
+
+impl Drop for StorageEngine {
+    fn drop(&mut self) {
+        // Ensure segments are flushed and then the WAL is flushed
+        let _ = self.flush_all();
     }
 }
 

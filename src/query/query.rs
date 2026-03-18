@@ -1,4 +1,4 @@
-use crate::document::value::Value;
+use crate::document::value::Value; // Fixed typo 'cuse'
 
 use super::filter::{Filter, Operator};
 use super::order::OrderBy;
@@ -10,6 +10,14 @@ pub struct Query {
     pub order_by: Option<OrderBy>,
     pub limit: Option<usize>,
     pub projection: Vec<String>,
+    pub aggregations: Vec<AggregateOp>, // Added this field
+}
+
+#[derive(Debug, Clone)]
+pub enum AggregateOp {
+    Count,
+    Sum(String), 
+    Avg(String),
 }
 
 impl Query {
@@ -20,6 +28,7 @@ impl Query {
             order_by: None,
             limit: None,
             projection: Vec::new(),
+            aggregations: Vec::new(), // Initialize
         }
     }
 
@@ -61,5 +70,10 @@ impl Query {
 
     pub fn composite_fields(&self) -> Vec<String> {
         self.filters.iter().map(|f| f.field.clone()).collect()
+    }
+
+    pub fn aggregate(mut self, op: AggregateOp) -> Self {
+        self.aggregations.push(op);
+        self
     }
 }

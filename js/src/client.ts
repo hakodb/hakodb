@@ -1,7 +1,10 @@
 import { loadNativeBindings, type NativeBindings, type WatchCallback } from './native';
 
-export type Primitive = string | number | boolean | null | Uint8Array;
+export type Primitive = string | number | boolean | null | Uint8Array | Date;
 export type FireLiteDocData = Record<string, Primitive>;
+
+// Sentinel value for server-side timestamps
+const SERVER_TIMESTAMP_SENTINEL = "__FL_SERVER_TIMESTAMP__";
 
 export enum DurabilityMode {
   Always = 0,
@@ -13,12 +16,12 @@ export enum DurabilityMode {
 export interface FireLiteClientOptions {
   libraryPath?: string;
   native?: NativeBindings;
-  config?: FireLiteConfig; // New: support passing a config object
+  config?: FireLiteConfig;
 }
 
 export interface QueryConstraint {
   field: string;
-  op: '==';
+  op: '==' | 'match' | 'contains' | 'startsWith';
   value: string | number;
 }
 
@@ -66,8 +69,8 @@ export class FireLiteConfig {
     return this;
   }
 
-  setStorageTuning(pageSize: number, compactionThreshold: number, groupCommitMaxOps: number): this {
-    this._native.configSetStorageTuning(this._handle, pageSize, compactionThreshold, groupCommitMaxOps);
+  setStorageTuning(pageSize: number, pageCache: number, threshold: number, groupCommitMaxOps: number): this {
+    this._native.configSetStorageTuning(this._handle, pageSize, pageCache, threshold, groupCommitMaxOps);
     return this;
   }
 
@@ -94,6 +97,18 @@ function parseQueryRows(json: string | null): FireLiteDocData[] {
 }
 
 function insertField(native: NativeBindings, handle: unknown, key: string, value: Primitive): void {
+  // Handle Server Timestamp Sentinel
+  if (value === SERVER_TIMESTAMP_SENTINEL) {
+    ensureOk(native.docInsertServerTimestamp(handle, key), native, `docInsertServerTimestamp(${key})`);
+    return;
+  }
+
+  if (value instanceof Date) {
+    const micros = BigInt(value.getTime()) * 1000n;
+    ensureOk(native.docInsertTimestamp(handle, key, micros), native, `docInsertTimestamp(${key})`);
+    return;
+  }
+
   if (typeof value === 'string') {
     ensureOk(native.docInsertStr(handle, key, value), native, `docInsertStr(${key})`);
   } else if (typeof value === 'number') {
@@ -154,10 +169,8 @@ export class FireLiteClient {
     
     let engine: unknown;
     if (options?.config) {
-      // Open with advanced config builder
       engine = native.engineOpenWithConfig(path, options.config.getHandle());
     } else {
-      // Default open
       engine = native.engineOpen(path);
     }
 
@@ -167,7 +180,11 @@ export class FireLiteClient {
     return new FireLiteClient(native, engine);
   }
 
-  /** Create a config builder instance */
+  /** Static sentinel for server-generated timestamps */
+  static serverTimestamp(): any {
+    return SERVER_TIMESTAMP_SENTINEL;
+  }
+
   static async createConfig(libraryPath?: string): Promise<FireLiteConfig> {
     const native = await loadNativeBindings(libraryPath);
     return new FireLiteConfig(native);
@@ -181,6 +198,17 @@ export class FireLiteClient {
   batch(): WriteBatch {
     this.assertOpen();
     return new WriteBatch(this);
+  }
+
+  async listCollections(): Promise<string[]> {
+    this.assertOpen();
+    const json = this.native.engineListCollections(this.engine);
+    return json ? JSON.parse(json) : [];
+  }
+
+  async backup(destinationPath: string): Promise<void> {
+    this.assertOpen();
+    ensureOk(this.native.engineBackup(this.engine, destinationPath), this.native, 'engineBackup');
   }
 
   async close(): Promise<void> {
@@ -216,35 +244,6 @@ export class FireLiteClient {
     ensureOk(this.native.engineDelete(this.engine, collection, docId), this.native, 'engineDelete');
   }
 
-  async runQuery(
-    collection: string,
-    filters: QueryConstraint[],
-    order?: QueryOrder,
-    queryLimit?: number,
-    projection: string[] = []
-  ): Promise<FireLiteDocData[]> {
-    this.assertOpen();
-    const query = this.native.queryNew(collection);
-    if (!query) throw new Error(`queryNew failed: ${this.native.lastError()}`);
-
-    try {
-      for (const filter of filters) {
-        if (typeof filter.value === 'string') {
-          ensureOk(this.native.queryWhereEqStr(query, filter.field, filter.value), this.native, 'queryWhereEqStr');
-        } else {
-          ensureOk(this.native.queryWhereEqInt(query, filter.field, filter.value), this.native, 'queryWhereEqInt');
-        }
-      }
-      if (order) ensureOk(this.native.queryOrderBy(query, order.field, order.ascending), this.native, 'queryOrderBy');
-      if (queryLimit !== undefined) ensureOk(this.native.queryLimit(query, queryLimit), this.native, 'queryLimit');
-      for (const field of projection) ensureOk(this.native.querySelectField(query, field), this.native, 'querySelectField');
-
-      return parseQueryRows(this.native.queryExecute(this.engine, query));
-    } finally {
-      this.native.queryFree(query);
-    }
-  }
-
   nativeBindings(): NativeBindings { return this.native; }
   engineHandle(): unknown { return this.engine; }
 
@@ -260,27 +259,12 @@ export class CollectionReference {
     return new DocumentReference(this.client, this.name, id);
   }
 
-  /** Reactive real-time listener */
   onSnapshot(callback: (snapshot: FireLiteDocData[]) => void): Unsubscribe {
-    const native = this.client.nativeBindings();
-    
-    // Internal callback that re-runs the query when the collection changes
-    const internalWatcher: WatchCallback = async () => {
-      const data = await this.get();
-      callback(data);
-    };
-
-    const watchHandle = native.engineWatch(this.client.engineHandle(), this.name, internalWatcher);
-    
-    // Initial data trigger
-    this.get().then(callback);
-
-    return async () => {
-      native.watchFree(watchHandle);
-    };
+    const query = new Query(this.client, this.name);
+    return query.onSnapshot(callback);
   }
 
-  where(field: string, op: '==', value: string | number): Query {
+  where(field: string, op: '==' | 'match' | 'contains' | 'startsWith', value: string | number): Query {
     return new Query(this.client, this.name).where(field, op, value);
   }
 
@@ -297,7 +281,11 @@ export class CollectionReference {
   }
 
   async get(): Promise<FireLiteDocData[]> {
-    return this.client.runQuery(this.name, []);
+    return new Query(this.client, this.name).get();
+  }
+
+  async count(): Promise<number> {
+    return new Query(this.client, this.name).count();
   }
 }
 
@@ -329,26 +317,7 @@ export class Query {
 
   constructor(private readonly client: FireLiteClient, private readonly collection: string) {}
 
-  /** Reactive real-time listener for filtered query */
-  onSnapshot(callback: (snapshot: FireLiteDocData[]) => void): Unsubscribe {
-    const native = this.client.nativeBindings();
-    
-    const internalWatcher: WatchCallback = async () => {
-      const data = await this.get();
-      callback(data);
-    };
-
-    const watchHandle = native.engineWatch(this.client.engineHandle(), this.collection, internalWatcher);
-    
-    // Initial fetch
-    this.get().then(callback);
-
-    return async () => {
-      native.watchFree(watchHandle);
-    };
-  }
-
-  where(field: string, op: '==', value: string | number): Query {
+  where(field: string, op: '==' | 'match' | 'contains' | 'startsWith', value: string | number): Query {
     this.filters.push({ field, op, value });
     return this;
   }
@@ -368,8 +337,97 @@ export class Query {
     return this;
   }
 
+  private prepareNativeQuery(): unknown {
+    const native = this.client.nativeBindings();
+    const handle = native.queryNew(this.collection);
+    if (!handle) throw new Error(`queryNew failed: ${native.lastError()}`);
+
+    try {
+      for (const filter of this.filters) {
+        switch (filter.op) {
+          case '==':
+            if (typeof filter.value === 'string') {
+              ensureOk(native.queryWhereEqStr(handle, filter.field, filter.value), native, 'queryWhereEqStr');
+            } else {
+              ensureOk(native.queryWhereEqInt(handle, filter.field, filter.value), native, 'queryWhereEqInt');
+            }
+            break;
+          case 'match':
+            ensureOk(native.queryWhereMatch(handle, filter.field, String(filter.value)), native, 'queryWhereMatch');
+            break;
+          case 'contains':
+            ensureOk(native.queryWhereContains(handle, filter.field, String(filter.value)), native, 'queryWhereContains');
+            break;
+          case 'startsWith':
+            ensureOk(native.queryWhereStartsWith(handle, filter.field, String(filter.value)), native, 'queryWhereStartsWith');
+            break;
+        }
+      }
+      if (this.order) ensureOk(native.queryOrderBy(handle, this.order.field, this.order.ascending), native, 'queryOrderBy');
+      if (this.queryLimit !== undefined) ensureOk(native.queryLimit(handle, this.queryLimit), native, 'queryLimit');
+      for (const field of this.projection) ensureOk(native.querySelectField(handle, field), native, 'querySelectField');
+      return handle;
+    } catch (err) {
+      native.queryFree(handle);
+      throw err;
+    }
+  }
+
   async get(): Promise<FireLiteDocData[]> {
-    return this.client.runQuery(this.collection, this.filters, this.order, this.queryLimit, this.projection);
+    const native = this.client.nativeBindings();
+    const handle = this.prepareNativeQuery();
+    try {
+      return parseQueryRows(native.queryExecute(this.client.engineHandle(), handle));
+    } finally {
+      native.queryFree(handle);
+    }
+  }
+
+  async count(): Promise<number> {
+    const native = this.client.nativeBindings();
+    const handle = this.prepareNativeQuery();
+    try {
+      ensureOk(native.queryAggregateCount(handle), native, 'queryAggregateCount');
+      const json = native.queryExecuteAggregation(this.client.engineHandle(), handle);
+      return json ? (JSON.parse(json).count || 0) : 0;
+    } finally {
+      native.queryFree(handle);
+    }
+  }
+
+  async sum(field: string): Promise<number> {
+    const native = this.client.nativeBindings();
+    const handle = this.prepareNativeQuery();
+    try {
+      ensureOk(native.queryAggregateSum(handle, field), native, 'queryAggregateSum');
+      const json = native.queryExecuteAggregation(this.client.engineHandle(), handle);
+      return json ? (JSON.parse(json)[`sum_${field}`] || 0) : 0;
+    } finally {
+      native.queryFree(handle);
+    }
+  }
+
+  async avg(field: string): Promise<number> {
+    const native = this.client.nativeBindings();
+    const handle = this.prepareNativeQuery();
+    try {
+      ensureOk(native.queryAggregateAvg(handle, field), native, 'queryAggregateAvg');
+      const json = native.queryExecuteAggregation(this.client.engineHandle(), handle);
+      return json ? (JSON.parse(json)[`avg_${field}`] || 0) : 0;
+    } finally {
+      native.queryFree(handle);
+    }
+  }
+
+  onSnapshot(callback: (snapshot: FireLiteDocData[]) => void): Unsubscribe {
+    const native = this.client.nativeBindings();
+    const internalWatcher: WatchCallback = async () => {
+      const data = await this.get();
+      callback(data);
+    };
+    const watchHandle = native.engineWatch(this.client.engineHandle(), this.collection, internalWatcher);
+    this.get().then(callback);
+    return async () => { native.watchFree(watchHandle); };
   }
 }
 

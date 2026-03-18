@@ -5,14 +5,16 @@ use std::{ptr, thread};
 // use std::thread;
 use std::time::Duration;
 use std::sync::mpsc::{channel, Sender};
-// use std::sync::mpsc::TryRecvError;
+
+use hashbrown::HashMap; 
 
 use crate::config::{FireLiteConfig, DurabilityMode};
 use crate::document::firelite_doc::FireLiteDoc;
 use crate::document::value::Value;
 use crate::engine::{BatchMutation, FireLite};
 use crate::query::filter::Operator;
-use crate::query::query::Query;
+use crate::query::query::{Query, AggregateOp};
+// use crate::query::planner::QueryPlanner;
 
 #[allow(non_camel_case_types)]
 pub struct FL_Engine {
@@ -89,24 +91,34 @@ fn cstr_to_string(ptr: *const c_char) -> Result<String, String> {
         .map_err(|_| "invalid utf8".into())
 }
 
+fn value_to_json(v: &Value) -> serde_json::Value {
+    match v {
+        Value::Null => serde_json::Value::Null,
+        Value::Bool(v) => serde_json::Value::Bool(*v),
+        Value::Int(v) => serde_json::Value::Number((*v).into()),
+        Value::Float(v) => serde_json::Number::from_f64(*v)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::String(v) => serde_json::Value::String(v.clone()),
+        Value::Binary(v) => serde_json::Value::Array(
+            v.iter().map(|b| serde_json::Value::Number((*b as u64).into())).collect()
+        ),
+        Value::Timestamp(v) => serde_json::Value::Number((*v).into()),
+        Value::ServerTimestamp => serde_json::Value::Null,
+        Value::Map(fields) => {
+            let mut map = serde_json::Map::new();
+            for (k, sv) in fields {
+                map.insert(k.clone(), value_to_json(sv));
+            }
+            serde_json::Value::Object(map)
+        }
+    }
+}
+
 fn doc_to_json(doc: &FireLiteDoc) -> Result<String, String> {
     let mut map = serde_json::Map::new();
     for (k, v) in &doc.fields {
-        let jv = match v {
-            Value::Null => serde_json::Value::Null,
-            Value::Bool(v) => serde_json::Value::Bool(*v),
-            Value::Int(v) => serde_json::Value::Number((*v).into()),
-            Value::Float(v) => serde_json::Number::from_f64(*v)
-                .map(serde_json::Value::Number)
-                .ok_or_else(|| "invalid float".to_string())?,
-            Value::String(v) => serde_json::Value::String(v.clone()),
-            Value::Binary(v) => serde_json::Value::Array(
-                v.iter()
-                    .map(|b| serde_json::Value::Number((*b as u64).into()))
-                    .collect(),
-            ),
-        };
-        map.insert(k.clone(), jv);
+        map.insert(k.clone(), value_to_json(v));
     }
     serde_json::to_string(&serde_json::Value::Object(map)).map_err(|e| e.to_string())
 }
@@ -114,21 +126,7 @@ fn doc_to_json(doc: &FireLiteDoc) -> Result<String, String> {
 fn projection_to_json(fields: Vec<(String, Value)>) -> Result<serde_json::Value, String> {
     let mut map = serde_json::Map::new();
     for (k, v) in fields {
-        let jv = match v {
-            Value::Null => serde_json::Value::Null,
-            Value::Bool(v) => serde_json::Value::Bool(v),
-            Value::Int(v) => serde_json::Value::Number(v.into()),
-            Value::Float(v) => serde_json::Number::from_f64(v)
-                .map(serde_json::Value::Number)
-                .ok_or_else(|| "invalid float".to_string())?,
-            Value::String(v) => serde_json::Value::String(v),
-            Value::Binary(v) => serde_json::Value::Array(
-                v.into_iter()
-                    .map(|b| serde_json::Value::Number((b as u64).into()))
-                    .collect(),
-            ),
-        };
-        map.insert(k, jv);
+        map.insert(k, value_to_json(&v));
     }
     Ok(serde_json::Value::Object(map))
 }
@@ -154,47 +152,6 @@ pub extern "C" fn fl_engine_open(path: *const c_char) -> *mut FL_Engine {
         }
     }
 }
-
-// #[no_mangle]
-// pub extern "C" fn fl_engine_set_durability(engine: *mut FL_Engine, mode: i32) -> i32 {
-//     if engine.is_null() {
-//         return set_last_error("null engine handle");
-//     }
-    
-//     let d_mode = match mode {
-//         1 => DurabilityMode::OnCommit,
-//         2 => DurabilityMode::Interval,
-//         3 => DurabilityMode::Manual,
-//         _ => DurabilityMode::Always,
-//     };
-
-//     let engine = unsafe { &*engine };
-//     engine.db.set_durability_mode(d_mode);
-//     clear_last_error();
-//     0
-// }
-
-// #[no_mangle]
-// pub extern "C" fn fl_engine_open_encrypted(path: *const c_char, key: *const c_char) -> *mut FL_Engine {
-//     let path = match cstr_to_string(path) {
-//         Ok(v) => v,
-//         Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
-//     };
-//     let key_str = match cstr_to_string(key) {
-//         Ok(v) => v,
-//         Err(e) => { set_last_error(e); return std::ptr::null_mut(); }
-//     };
-
-//     let mut config = FireLiteConfig::default();
-//     if !key_str.is_empty() && key_str != "none" {
-//         config.encryption_key = Some(key_str);
-//     }
-
-//     match FireLite::open(path, config) {
-//         Ok(db) => { clear_last_error(); Box::into_raw(Box::new(FL_Engine { db })) }
-//         Err(e) => { set_last_error(e.to_string()); std::ptr::null_mut() }
-//     }
-// }
 
 #[no_mangle]
 pub extern "C" fn fl_config_new() -> *mut FL_Config {
@@ -897,6 +854,169 @@ pub extern "C" fn fl_string_free(value: *mut c_char) {
     if !value.is_null() {
         unsafe {
             let _ = CString::from_raw(value);
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_query_aggregate_count(query: *mut FL_Query) -> i32 {
+    if query.is_null() { return set_last_error("null query handle"); }
+    let q = unsafe { &mut *query };
+    q.query.aggregations.push(AggregateOp::Count);
+    clear_last_error();
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn fl_query_aggregate_sum(query: *mut FL_Query, field: *const c_char) -> i32 {
+    if query.is_null() { return set_last_error("null query handle"); }
+    let field = match cstr_to_string(field) {
+        Ok(s) => s,
+        Err(e) => return set_last_error(e),
+    };
+    let q = unsafe { &mut *query };
+    q.query.aggregations.push(AggregateOp::Sum(field));
+    clear_last_error();
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn fl_query_aggregate_avg(query: *mut FL_Query, field: *const c_char) -> i32 {
+    if query.is_null() { return set_last_error("null query handle"); }
+    let field = match cstr_to_string(field) {
+        Ok(s) => s,
+        Err(e) => return set_last_error(e),
+    };
+    let q = unsafe { &mut *query };
+    q.query.aggregations.push(AggregateOp::Avg(field));
+    clear_last_error();
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn fl_query_execute_aggregation(
+    engine: *mut FL_Engine,
+    query: *const FL_Query
+) -> *mut c_char {
+    if engine.is_null() || query.is_null() {
+        set_last_error("null engine or query handle");
+        return std::ptr::null_mut();
+    }
+
+    let engine = unsafe { &*engine };
+    let query_wrapper = unsafe { &*query };
+
+    // Call the public method on FireLite. 
+    // This performs planning and parallel execution inside the Rust core.
+    match engine.db.execute_aggregation(query_wrapper.query.clone()) {
+        Ok(result) => {
+            let res_map: HashMap<String, f64> = result;
+            
+            match serde_json::to_string(&res_map) {
+                Ok(json) => {
+                    match CString::new(json) {
+                        Ok(c_str) => {
+                            clear_last_error();
+                            c_str.into_raw()
+                        }
+                        Err(e) => {
+                            set_last_error(e.to_string());
+                            std::ptr::null_mut()
+                        }
+                    }
+                }
+                Err(e) => {
+                    set_last_error(e.to_string());
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        Err(e) => {
+            set_last_error(e.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_doc_insert_timestamp(doc: *mut FL_Doc, key: *const c_char, micros: i64) -> i32 {
+    if doc.is_null() { return set_last_error("null doc"); }
+    let key = match cstr_to_string(key) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    let doc = unsafe { &mut *doc };
+    doc.doc.insert(key, Value::Timestamp(micros));
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn fl_doc_insert_server_timestamp(doc: *mut FL_Doc, key: *const c_char) -> i32 {
+    if doc.is_null() { return set_last_error("null doc"); }
+    let key = match cstr_to_string(key) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    let doc = unsafe { &mut *doc };
+    doc.doc.insert(key, Value::ServerTimestamp);
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn fl_engine_backup(engine: *mut FL_Engine, path: *const c_char) -> i32 {
+    if engine.is_null() { return set_last_error("null engine"); }
+    let engine = unsafe { &*engine };
+    let path = match cstr_to_string(path) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    match engine.db.backup(path) {
+        Ok(_) => 0,
+        Err(e) => set_last_error(e.to_string()),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_query_where_match(query: *mut FL_Query, field: *const c_char, value: *const c_char) -> i32 {
+    let f = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    let v = match cstr_to_string(value) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    let q = unsafe { &mut *query };
+    q.query = q.query.clone().where_filter(&f, Operator::Match, Value::String(v));
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn fl_query_where_contains(query: *mut FL_Query, field: *const c_char, value: *const c_char) -> i32 {
+    let f = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    let v = match cstr_to_string(value) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    let q = unsafe { &mut *query };
+    q.query = q.query.clone().where_filter(&f, Operator::Contains, Value::String(v));
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn fl_query_where_starts_with(query: *mut FL_Query, field: *const c_char, value: *const c_char) -> i32 {
+    let f = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    let v = match cstr_to_string(value) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    let q = unsafe { &mut *query };
+    q.query = q.query.clone().where_filter(&f, Operator::StartsWith, Value::String(v));
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn fl_engine_list_collections(engine: *mut FL_Engine) -> *mut c_char {
+    if engine.is_null() {
+        set_last_error("null engine handle");
+        return std::ptr::null_mut();
+    }
+
+    let engine = unsafe { &*engine };
+    match engine.db.list_collections() {
+        Ok(cols) => {
+            // Serialize the Vec<String> to a JSON array: ["users", "posts"]
+            let json = serde_json::to_string(&cols).unwrap_or_else(|_| "[]".to_string());
+            match CString::new(json) {
+                Ok(c_str) => {
+                    clear_last_error();
+                    c_str.into_raw()
+                }
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+        Err(e) => {
+            set_last_error(e.to_string());
+            std::ptr::null_mut()
         }
     }
 }

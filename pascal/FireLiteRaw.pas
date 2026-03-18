@@ -86,9 +86,18 @@ function fl_query_limit(query: PFL_Query; limit: SizeUInt): cint32; cdecl; exter
 function fl_query_select_field(query: PFL_Query; field: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_execute(engine: PFL_Engine; query: PFL_Query): PChar; cdecl; external FIRELITE_LIB;
 
+{ Aggregates }
+function fl_query_aggregate_count(query: PFL_Query): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_aggregate_sum(query: PFL_Query; field: PChar): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_aggregate_avg(query: PFL_Query; field: PChar): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_execute_aggregation(engine: PFL_Engine; query: PFL_Query): PChar; cdecl; external FIRELITE_LIB;
+
 { Errors and Helpers }
 function fl_last_error: PChar; cdecl; external FIRELITE_LIB;
 procedure fl_string_free(value: PChar); cdecl; external FIRELITE_LIB;
+
+{ collection list }
+function fl_engine_list_collections(engine: PFL_Engine): PChar; cdecl; external FIRELITE_LIB;
 
 implementation
 
