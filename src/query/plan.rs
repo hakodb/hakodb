@@ -19,4 +19,5 @@ pub struct QueryPlan {
     pub filters: Vec<Filter>,
     pub order_by: Option<OrderBy>,
     pub limit: Option<usize>,
+    pub projection: Vec<String>,
 }

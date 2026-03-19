@@ -65,7 +65,8 @@ impl ParallelQueryExecutor {
             results.sort_by(|(_, a), (_, b)| {
                 let av = a.get(&order.field);
                 let bv = b.get(&order.field);
-                format!("{:?}", av).cmp(&format!("{:?}", bv))
+                // format!("{:?}", av).cmp(&format!("{:?}", bv))
+                av.cmp(&bv)
             });
             if !order.ascending {
                 results.reverse();

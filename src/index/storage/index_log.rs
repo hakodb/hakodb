@@ -23,6 +23,11 @@ impl IndexLog {
         self.writer.write_all(key)?;
         self.writer.write_all(&(doc.len() as u16).to_be_bytes())?;
         self.writer.write_all(doc.as_bytes())?;
+        // self.writer.flush()?;
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> std::io::Result<()> {
         self.writer.flush()
     }
 }

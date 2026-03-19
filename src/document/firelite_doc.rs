@@ -60,6 +60,26 @@ impl FireLiteDoc {
         }
         Some(doc)
     }
+
+    pub fn decode_projected(bytes: &[u8], projection: &[String]) -> Option<Self> {
+        let view = FireLiteDocView::new(bytes)?;
+        let mut doc = FireLiteDoc::default();
+        
+        // If no projection is specified, perform a standard full decode
+        if projection.is_empty() {
+            for (k, v) in view.iter() {
+                doc.insert(k.to_string(), v.to_owned_value()?);
+            }
+        } else {
+            // Cherry-pick only the fields requested in the projection
+            for (k, v) in view.iter() {
+                if projection.iter().any(|p| p == k) {
+                    doc.insert(k.to_string(), v.to_owned_value()?);
+                }
+            }
+        }
+        Some(doc)
+    }
 }
 
 pub struct FireLiteDocView<'a> {

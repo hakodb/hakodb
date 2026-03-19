@@ -5,9 +5,14 @@ use super::task::QueryTask;
 
 pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
     let mut out = Vec::new();
+    let projection = &task.plan.projection; 
     for (id, bytes) in task.docs {
         if matches_filters_view(&bytes, &task.plan.filters) {
-            if let Some(doc) = FireLiteDoc::decode(&bytes) {
+            // if let Some(doc) = FireLiteDoc::decode(&bytes) {
+            //     out.push((id, doc));
+            // }
+            // OPTIMIZATION: Use decode_projected instead of decode
+            if let Some(doc) = FireLiteDoc::decode_projected(&bytes, projection) {
                 out.push((id, doc));
             }
         }
