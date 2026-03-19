@@ -173,6 +173,15 @@ fn encode_value(
             // For now, we don't support sorting by the entire Map structure
         }
 
+        Value::Array(_) => { // <--- ADD THIS
+            out.push(9); // Tag for Array
+        }
+
+        Value::Reference { .. } => {
+            out.push(10); // Tag 10
+            // We don't support range sorting by the reference contents yet
+        }
+
         Value::ServerTimestamp => {
             out.push(0); // Treat as Null if it somehow hits the index
         }

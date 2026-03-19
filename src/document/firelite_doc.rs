@@ -174,6 +174,25 @@ fn encode_value(v: &Value) -> (u8, Vec<u8>) {
                 out.extend(bytes);
             }
             (8, out) // Tag 8 for Map
+        },
+        Value::Array(items) => {
+            let mut out = vec![];
+            out.extend((items.len() as u32).to_le_bytes()); // Element count
+            for item in items {
+                let (tag, bytes) = encode_value(item); // RECURSION
+                out.push(tag);
+                out.extend((bytes.len() as u32).to_le_bytes());
+                out.extend(bytes);
+            }
+            (9, out) // Tag 9 for Array
+        },
+        Value::Reference { collection, doc_id } => {
+            let mut out = vec![];
+            out.push(collection.len() as u8);
+            out.extend(collection.as_bytes());
+            out.push(doc_id.len() as u8);
+            out.extend(doc_id.as_bytes());
+            (10, out) // Tag 10
         }
     }
 }
@@ -207,6 +226,33 @@ fn decode_value(tag: u8, bytes: &[u8]) -> Option<Value> {
                 fields.push((key, val));
             }
             Some(Value::Map(fields))
+        },
+        9 => {
+            let mut pos = 0;
+            let count = u32::from_le_bytes(bytes.get(pos..pos+4)?.try_into().ok()?) as usize;
+            pos += 4;
+            let mut items = Vec::with_capacity(count);
+            for _ in 0..count {
+                let tag = *bytes.get(pos)?;
+                pos += 1;
+                let len = u32::from_le_bytes(bytes.get(pos..pos+4)?.try_into().ok()?) as usize;
+                pos += 4;
+                let val = decode_value(tag, bytes.get(pos..pos+len)?)?;
+                pos += len;
+                items.push(val);
+            }
+            Some(Value::Array(items))
+        },
+        10 => {
+            let mut pos = 0;
+            let col_len = *bytes.get(pos)? as usize;
+            pos += 1;
+            let collection = std::str::from_utf8(bytes.get(pos..pos+col_len)?).ok()?.to_string();
+            pos += col_len;
+            let id_len = *bytes.get(pos)? as usize;
+            pos += 1;
+            let doc_id = std::str::from_utf8(bytes.get(pos..pos+id_len)?).ok()?.to_string();
+            Some(Value::Reference { collection, doc_id })
         },
         _ => Some(Value::Null),
     }

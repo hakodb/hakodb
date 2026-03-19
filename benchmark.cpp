@@ -229,6 +229,131 @@ void bench_watch_latency(FL_Engine* db) {
     fl_watch_free(w);
 }
 
+void bench_pagination(FL_Engine* db) {
+    printf(">> firelite_query_pagination (Offset 5000, Limit 10)...\n");
+    double start = get_time();
+    
+    FL_Query* q = fl_query_new("bench");
+    fl_query_offset(q, 5000);
+    fl_query_limit(q, 10);
+    
+    char* results = fl_query_execute(db, q);
+    double end = get_time();
+    
+    printf("   Result Length: %zu bytes (Time: %.4fs)\n", strlen(results), (end - start));
+    fl_string_free(results);
+    fl_query_free(q);
+}
+
+void bench_complex_docs(FL_Engine* db) {
+    printf(">> firelite_complex_nested_docs (Map + Array)...\n");
+    double start = get_time();
+    
+    for (int i = 0; i < 100; i++) {
+        // 1. Build an Array
+        FL_Array* tags = fl_array_new();
+        fl_array_append_str(tags, "bench");
+        fl_array_append_str(tags, "v0.3");
+        fl_array_append_int(tags, i);
+
+        // 2. Build a Nested Doc (Map)
+        FL_Doc* meta = fl_doc_new();
+        fl_doc_insert_str(meta, "author", "C++_Client");
+        fl_doc_insert_int(meta, "version", 3);
+
+        // 3. Main Doc
+        FL_Doc* main = fl_doc_new();
+        fl_doc_insert_doc(main, "metadata", meta);
+        fl_doc_insert_array(main, "tags", tags); // Takes ownership of tags
+        
+        char id[32]; sprintf(id, "complex_%d", i);
+        fl_engine_insert(db, "complex", id, main);
+
+        fl_doc_free(meta);
+        fl_doc_free(main);
+    }
+    double end = get_time();
+    printf("   Result: %.2f complex docs/sec\n", 100.0 / (end - start));
+}
+
+void bench_reference_resolution(FL_Engine* db) {
+    printf(">> firelite_reference_follow (Resolving 100 links)...\n");
+    
+    // Setup: Create a target and a source pointing to it
+    FL_Doc* target = fl_doc_new();
+    fl_doc_insert_str(target, "name", "I am the target");
+    fl_engine_insert(db, "users", "u1", target);
+    fl_doc_free(target);
+
+    FL_Doc* source = fl_doc_new();
+    fl_doc_insert_reference(source, "link", "users", "u1");
+    fl_engine_insert(db, "links", "l1", source);
+    fl_doc_free(source);
+
+    // Measure resolution
+    FL_Doc* link_doc = fl_engine_get(db, "links", "l1");
+    
+    double start = get_time();
+    for(int i=0; i<100; i++) {
+        FL_Doc* resolved = fl_engine_get_by_ref(db, link_doc, "link");
+        if(resolved) fl_doc_free(resolved);
+    }
+    double end = get_time();
+    
+    printf("   Follow-Link Speed: %.2f resolutions/sec\n", 100.0 / (end - start));
+    fl_doc_free(link_doc);
+}
+
+void bench_transaction_logic(FL_Engine* db) {
+    printf(">> firelite_serializable_transaction (Read-Modify-Write)...\n");
+    
+    // Seed counter
+    FL_Doc* d = fl_doc_new(); fl_doc_insert_int(d, "count", 0);
+    fl_engine_insert(db, "tx_test", "counter", d);
+    fl_doc_free(d);
+
+    double start = get_time();
+    int commits = 0;
+    for (int i = 0; i < 50; i++) {
+        FL_Transaction* tx = fl_transaction_begin(db);
+        
+        // Read
+        FL_Doc* current = fl_transaction_get(db, tx, "tx_test", "counter");
+        if (current) {
+            // Modify
+            FL_Doc* next = fl_doc_new();
+            fl_doc_insert_int(next, "count", i);
+            fl_transaction_set(tx, "tx_test", "counter", next);
+            
+            // Commit
+            if (fl_transaction_commit(db, tx) == 0) commits++;
+            
+            fl_doc_free(current);
+            fl_doc_free(next);
+        } else {
+            fl_transaction_free(tx);
+        }
+    }
+    double end = get_time();
+    printf("   Result: %d successful commits in %.4fs\n", commits, (end - start));
+}
+
+void bench_aggregations(FL_Engine* db) {
+    printf(">> firelite_native_aggregation (Sum + Avg on 'id')...\n");
+    double start = get_time();
+    
+    FL_Query* q = fl_query_new("bench");
+    fl_query_aggregate_sum(q, "id");
+    fl_query_aggregate_avg(q, "id");
+    
+    char* agg_json = fl_query_execute_aggregation(db, q);
+    double end = get_time();
+    
+    printf("   Agg Result: %s (Time: %.4fs)\n", agg_json, (end - start));
+    fl_string_free(agg_json);
+    fl_query_free(q);
+}
+
 // --- MAIN ---
 
 int main(int argc, char* argv[]) {
@@ -294,6 +419,23 @@ int main(int argc, char* argv[]) {
     bench_read_parallel(db, threads);
     printf("\n");
     bench_watch_latency(db);
+
+    printf("\n--- v0.3 Advanced Features ---\n");
+    // New Phase 2 & 3 Tests
+    bench_pagination(db);
+    printf("\n");
+    bench_complex_docs(db);
+    printf("\n");
+    bench_aggregations(db);
+    printf("\n");
+    bench_reference_resolution(db);
+    printf("\n");
+    bench_transaction_logic(db);
+    
+    // System Diagnostics
+    char* stats = fl_engine_get_stats(db);
+    printf("\n>> Engine Stats: %s\n", stats);
+    fl_string_free(stats);
 
     fl_engine_free(db);
     printf("-----------------------------------------\n");

@@ -65,20 +65,33 @@ impl ParallelQueryExecutor {
             results.sort_by(|(_, a), (_, b)| {
                 let av = a.get(&order.field);
                 let bv = b.get(&order.field);
-                // format!("{:?}", av).cmp(&format!("{:?}", bv))
-                av.cmp(&bv)
+                let cmp = av.cmp(&bv);
+                if order.ascending { cmp } else { cmp.reverse() }
             });
-            if !order.ascending {
-                results.reverse();
-            }
+            // if !order.ascending {
+            //     results.reverse();
+            // }
         }
+
+
+        // 2. Apply OFFSET (Skip N records)
+        let results = if let Some(offset) = plan.offset {
+            if offset >= results.len() {
+                Vec::new() // Offset is larger than result set
+            } else {
+                results.into_iter().skip(offset).collect()
+            }
+        } else {
+            results
+        };
 
         // Apply Limit
+        let mut final_results = results;
         if let Some(limit) = plan.limit {
-            results.truncate(limit);
+            final_results.truncate(limit);
         }
 
-        Ok(results)
+        Ok(final_results)
     }
 
     /// Aggregation execution logic

@@ -9,6 +9,7 @@ pub struct Query {
     pub filters: Vec<Filter>,
     pub order_by: Option<OrderBy>,
     pub limit: Option<usize>,
+    pub offset: Option<usize>,
     pub projection: Vec<String>,
     pub aggregations: Vec<AggregateOp>, // Added this field
 }
@@ -27,6 +28,7 @@ impl Query {
             filters: Vec::new(),
             order_by: None,
             limit: None,
+            offset: None, 
             projection: Vec::new(),
             aggregations: Vec::new(), // Initialize
         }
@@ -55,6 +57,11 @@ impl Query {
 
     pub fn limit(mut self, n: usize) -> Self {
         self.limit = Some(n);
+        self
+    }
+
+    pub fn offset(mut self, offset: usize) -> Self { // <--- Fluent API
+        self.offset = Some(offset);
         self
     }
 

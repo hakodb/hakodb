@@ -9,33 +9,48 @@ pub enum Value {
     Float(f64),
     String(String),
     Binary(Vec<u8>),
+    Reference { collection: String, doc_id: String },
     Timestamp(i64), 
     ServerTimestamp,
     Map(Vec<(String, Value)>),
+    Array(Vec<Value>),
 }
 
 impl Value {
-    /// Returns a weight for the type to allow cross-type sorting.
-    /// This ensures that Nulls always come first, followed by Bools, Numbers, etc.
+    /// Internal weight to allow sorting different types against each other.
     fn type_weight(&self) -> u8 {
         match self {
             Value::Null => 0,
             Value::Bool(_) => 1,
-            Value::Int(_) => 2,   // Numbers (Int and Float) share the same weight
-            Value::Float(_) => 2, // to allow inter-type numeric comparison.
+            Value::Int(_) | Value::Float(_) => 2, // Numbers sort together
             Value::Timestamp(_) => 3,
             Value::String(_) => 4,
             Value::Binary(_) => 5,
-            Value::Map(_) => 6,
-            Value::ServerTimestamp => 7,
+            Value::Reference { .. } => 6,
+            Value::Array(_) => 7,
+            Value::Map(_) => 8,
+            Value::ServerTimestamp => 9,
         }
     }
 }
 
-// Manual implementation of PartialEq to handle numeric cross-comparison (Int == Float)
+// Ensure PartialEq matches the logic in Ord
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
+        match (self, other) {
+            (Value::Null, Value::Null) => true,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
+            (Value::Int(a), Value::Float(b)) => (*a as f64) == *b,
+            (Value::Float(a), Value::Int(b)) => *a == (*b as f64),
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::Binary(a), Value::Binary(b)) => a == b,
+            (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
+            (Value::Map(a), Value::Map(b)) => a == b,
+            (Value::ServerTimestamp, Value::ServerTimestamp) => true,
+            _ => false,
+        }
     }
 }
 
@@ -56,33 +71,47 @@ impl Ord for Value {
             return w1.cmp(&w2);
         }
 
-        // Weights are the same, compare internal data
         match (self, other) {
             (Value::Null, Value::Null) => Ordering::Equal,
             (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
             
-            // Numeric Unification: Compare Ints and Floats together
+            // Numeric comparison (cross-type support)
             (Value::Int(a), Value::Int(b)) => a.cmp(b),
             (Value::Float(a), Value::Float(b)) => a.total_cmp(b),
             (Value::Int(a), Value::Float(b)) => (*a as f64).total_cmp(b),
             (Value::Float(a), Value::Int(b)) => a.total_cmp(&(*b as f64)),
 
-            (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
             (Value::String(a), Value::String(b)) => a.cmp(b),
             (Value::Binary(a), Value::Binary(b)) => a.cmp(b),
+            (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+            
+            (Value::Reference { collection: c1, doc_id: i1 }, Value::Reference { collection: c2, doc_id: i2 }) => {
+                c1.cmp(c2).then(i1.cmp(i2))
+            }
             
             (Value::Map(a), Value::Map(b)) => {
-                // Compare by length first, then lexicographically by fields
-                let res = a.len().cmp(&b.len());
-                if res != Ordering::Equal {
-                    return res;
+                // Compare Map lengths, then lexicographically by fields
+                let len_cmp = a.len().cmp(&b.len());
+                if len_cmp != Ordering::Equal {
+                    return len_cmp;
                 }
-                a.cmp(b)
+                // Recursively compare key-value pairs
+                for ((k1, v1), (k2, v2)) in a.iter().zip(b.iter()) {
+                    let k_cmp = k1.cmp(k2);
+                    if k_cmp != Ordering::Equal { return k_cmp; }
+                    let v_cmp = v1.cmp(v2);
+                    if v_cmp != Ordering::Equal { return v_cmp; }
+                }
+                Ordering::Equal
+            }
+
+            (Value::Array(a), Value::Array(b)) => {
+                let res = a.len().cmp(&b.len());
+                if res != Ordering::Equal { return res; }
+                a.cmp(b) // Lexicographical comparison of elements
             }
             
             (Value::ServerTimestamp, Value::ServerTimestamp) => Ordering::Equal,
-            
-            // Fallback for theoretically unreachable cases due to weight check
             _ => Ordering::Equal,
         }
     }

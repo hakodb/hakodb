@@ -14,6 +14,7 @@ use crate::document::value::Value;
 use crate::engine::{BatchMutation, FireLite};
 use crate::query::filter::Operator;
 use crate::query::query::{Query, AggregateOp};
+use crate::index::composite::definition::SortDirection;
 // use crate::query::planner::QueryPlanner;
 
 #[allow(non_camel_case_types)]
@@ -57,6 +58,16 @@ pub type FL_OnSnapshotCallback = unsafe extern "C" fn(
     kind: i32,
     user_data: *mut std::ffi::c_void
 );
+
+#[allow(non_camel_case_types)]
+pub struct FL_Array {
+    pub items: Vec<Value>,
+}
+
+#[allow(non_camel_case_types)]
+pub struct FL_Transaction {
+    pub tx: crate::engine::SerializableTransaction,
+}
 
 // struct SendPtr(*mut std::ffi::c_void);
 // unsafe impl Send for SendPtr {}
@@ -104,14 +115,22 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             v.iter().map(|b| serde_json::Value::Number((*b as u64).into())).collect()
         ),
         Value::Timestamp(v) => serde_json::Value::Number((*v).into()),
-        Value::ServerTimestamp => serde_json::Value::Null,
         Value::Map(fields) => {
             let mut map = serde_json::Map::new();
             for (k, sv) in fields {
                 map.insert(k.clone(), value_to_json(sv));
             }
             serde_json::Value::Object(map)
-        }
+        },
+        Value::Array(items) => { // <--- ADD THIS
+            serde_json::Value::Array(items.iter().map(value_to_json).collect())
+        },
+        Value::Reference { collection, doc_id } => {
+            let mut map = serde_json::Map::new();
+            map.insert("__ref__".to_string(), serde_json::Value::String(format!("{}/{}", collection, doc_id)));
+            serde_json::Value::Object(map)
+        },
+        Value::ServerTimestamp => serde_json::Value::Null,
     }
 }
 
@@ -736,14 +755,30 @@ pub extern "C" fn fl_query_order_by(
     0
 }
 
+// #[no_mangle]
+// pub extern "C" fn fl_query_limit(query: *mut FL_Query, limit: usize) -> i32 {
+//     if query.is_null() {
+//         return set_last_error("null query handle");
+//     }
+//     let query = unsafe { &mut *query };
+//     query.query = query.query.clone().limit(limit);
+//     clear_last_error();
+//     0
+// }
+
 #[no_mangle]
 pub extern "C" fn fl_query_limit(query: *mut FL_Query, limit: usize) -> i32 {
-    if query.is_null() {
-        return set_last_error("null query handle");
-    }
+    if query.is_null() { return -1; }
     let query = unsafe { &mut *query };
-    query.query = query.query.clone().limit(limit);
-    clear_last_error();
+    query.query.limit = Some(limit);
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn fl_query_offset(query: *mut FL_Query, offset: usize) -> i32 { // <--- NEW FFI
+    if query.is_null() { return -1; }
+    let query = unsafe { &mut *query };
+    query.query.offset = Some(offset);
     0
 }
 
@@ -1017,6 +1052,265 @@ pub extern "C" fn fl_engine_list_collections(engine: *mut FL_Engine) -> *mut c_c
         Err(e) => {
             set_last_error(e.to_string());
             std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_array_new() -> *mut FL_Array {
+    Box::into_raw(Box::new(FL_Array { items: Vec::new() }))
+}
+
+#[no_mangle]
+pub extern "C" fn fl_array_free(array: *mut FL_Array) {
+    if !array.is_null() { unsafe { drop(Box::from_raw(array)) }; }
+}
+
+// --- ARRAY PUSH METHODS ---
+#[no_mangle]
+pub extern "C" fn fl_array_append_str(array: *mut FL_Array, value: *const c_char) -> i32 {
+    let s = match cstr_to_string(value) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    unsafe { (*array).items.push(Value::String(s)); }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn fl_array_append_int(array: *mut FL_Array, value: i64) -> i32 {
+    unsafe { (*array).items.push(Value::Int(value)); }
+    0
+}
+
+// --- DOCUMENT NESTING METHODS ---
+
+/// Takes the contents of 'child' and inserts it as a Map into 'parent'
+#[no_mangle]
+pub extern "C" fn fl_doc_insert_doc(parent: *mut FL_Doc, key: *const c_char, child: *const FL_Doc) -> i32 {
+    let key = match cstr_to_string(key) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    let parent_doc = unsafe { &mut *parent };
+    let child_doc = unsafe { &*child };
+    
+    // Convert the child document's fields into a Value::Map
+    parent_doc.doc.insert(key, Value::Map(child_doc.doc.fields.clone()));
+    0
+}
+
+/// Takes the contents of 'array' and inserts it into the document
+#[no_mangle]
+pub extern "C" fn fl_doc_insert_array(doc: *mut FL_Doc, key: *const c_char, array: *mut FL_Array) -> i32 {
+    let key = match cstr_to_string(key) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    let doc = unsafe { &mut *doc };
+    let array_inner = unsafe { Box::from_raw(array) }; // Take ownership and free FL_Array
+    
+    doc.doc.insert(key, Value::Array(array_inner.items));
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn fl_engine_patch(
+    engine: *mut FL_Engine,
+    collection: *const c_char,
+    doc_id: *const c_char,
+    updates: *const FL_Doc,
+) -> i32 {
+    if engine.is_null() || updates.is_null() { return -1; }
+    let engine = unsafe { &*engine };
+    let col = match cstr_to_string(collection) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    let id = match cstr_to_string(doc_id) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    let update_doc = unsafe { &*updates };
+
+    // FIX: Access .db and ensure set_last_error returns correctly
+    match engine.db.patch(&col, &id, update_doc.doc.fields.clone()) {
+        Ok(_) => 0,
+        Err(e) => set_last_error(e.to_string()), 
+    }
+}
+
+// --- 1. INDEX MANAGEMENT ---
+
+/// Creates a composite index from C++. 
+/// fields_json should be like: [{"field": "age", "desc": false}]
+#[no_mangle]
+pub extern "C" fn fl_engine_create_index(
+    engine: *mut FL_Engine,
+    collection: *const c_char,
+    fields_json: *const c_char,
+) -> u32 {
+    let engine = unsafe { &*engine };
+    let col = match cstr_to_string(collection) { Ok(v) => v, Err(_) => return 0 };
+    let json_str = match cstr_to_string(fields_json) { Ok(v) => v, Err(_) => return 0 };
+    
+    // Parse the JSON into the SortDirection vector
+    let Ok(fields_raw): std::result::Result<Vec<serde_json::Value>, _> = serde_json::from_str(&json_str) else { return 0 };
+    
+    let mut fields = Vec::new();
+    for item in fields_raw {
+        let f = item["field"].as_str().unwrap_or("").to_string();
+        let desc = item["desc"].as_bool().unwrap_or(false);
+        let dir = if desc { SortDirection::Desc } else { SortDirection::Asc };
+        fields.push((f, dir));
+    }
+
+    engine.db.create_composite_index(&col, fields)
+}
+
+// --- 2. SERIALIZABLE TRANSACTIONS (Read-Modify-Write) ---
+
+#[no_mangle]
+pub extern "C" fn fl_transaction_begin(engine: *mut FL_Engine) -> *mut FL_Transaction {
+    let engine = unsafe { &*engine };
+    Box::into_raw(Box::new(FL_Transaction {
+        tx: engine.db.begin_serializable_transaction(),
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn fl_transaction_get(
+    engine: *mut FL_Engine,
+    tx: *mut FL_Transaction,
+    collection: *const c_char,
+    doc_id: *const c_char,
+) -> *mut FL_Doc {
+    let engine = unsafe { &*engine };
+    let tx = unsafe { &mut *tx };
+    let col = match cstr_to_string(collection) { Ok(v) => v, Err(_) => return ptr::null_mut() };
+    let id = match cstr_to_string(doc_id) { Ok(v) => v, Err(_) => return ptr::null_mut() };
+
+    match tx.tx.get(&engine.db, &col, &id) {
+        Ok(Some(doc)) => Box::into_raw(Box::new(FL_Doc { doc })),
+        _ => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_transaction_set(
+    tx: *mut FL_Transaction,
+    collection: *const c_char,
+    doc_id: *const c_char,
+    doc: *const FL_Doc,
+) -> i32 {
+    let tx = unsafe { &mut *tx };
+    let col = match cstr_to_string(collection) { Ok(v) => v, Err(_) => return -1 };
+    let id = match cstr_to_string(doc_id) { Ok(v) => v, Err(_) => return -1 };
+    let doc = unsafe { &*doc };
+    
+    tx.tx.put(&col, &id, doc.doc.clone());
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn fl_transaction_commit(engine: *mut FL_Engine, tx: *mut FL_Transaction) -> i32 {
+    let engine = unsafe { &*engine };
+    let tx_box = unsafe { Box::from_raw(tx) }; // Take ownership to free memory
+    
+    match tx_box.tx.commit(&engine.db) {
+        Ok(_) => 0,
+        Err(e) => set_last_error(e.to_string()),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_transaction_free(tx: *mut FL_Transaction) {
+    if !tx.is_null() { unsafe { drop(Box::from_raw(tx)) }; }
+}
+
+// --- 3. SUBCOLLECTION HELPERS ---
+
+#[no_mangle]
+pub extern "C" fn fl_engine_insert_subdoc(
+    engine: *mut FL_Engine,
+    col: *const c_char,
+    id: *const c_char,
+    sub_col: *const c_char,
+    sub_id: *const c_char,
+    doc: *const FL_Doc,
+) -> i32 {
+    let engine = unsafe { &*engine };
+    let c = match cstr_to_string(col) { Ok(v) => v, Err(_) => return -1 };
+    let i = match cstr_to_string(id) { Ok(v) => v, Err(_) => return -1 };
+    let sc = match cstr_to_string(sub_col) { Ok(v) => v, Err(_) => return -1 };
+    let si = match cstr_to_string(sub_id) { Ok(v) => v, Err(_) => return -1 };
+    let d = unsafe { &*doc };
+
+    match engine.db.put_subdocument(&c, &i, &sc, &si, &d.doc) {
+        Ok(_) => 0,
+        Err(e) => set_last_error(e.to_string()),
+    }
+}
+
+// --- 4. DIAGNOSTICS & MAINTENANCE ---
+
+#[no_mangle]
+pub extern "C" fn fl_engine_compact(engine: *mut FL_Engine) -> i32 {
+    let engine = unsafe { &*engine };
+    match engine.db.compact() {
+        Ok(_) => 0,
+        Err(e) => set_last_error(e.to_string()),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_engine_get_stats(engine: *mut FL_Engine) -> *mut c_char {
+    let engine = unsafe { &*engine };
+    let stats = engine.db.get_stats();
+    
+    let json = serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string());
+    match CString::new(json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_doc_insert_reference(
+    doc: *mut FL_Doc,
+    key: *const c_char,
+    target_collection: *const c_char,
+    target_id: *const c_char,
+) -> i32 {
+    if doc.is_null() { return -1; }
+    let key_str = match cstr_to_string(key) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    let col = match cstr_to_string(target_collection) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    let id = match cstr_to_string(target_id) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    
+    let doc_ptr = unsafe { &mut *doc };
+    doc_ptr.doc.insert(key_str, Value::Reference { collection: col, doc_id: id });
+    0
+}
+
+/// Given a document and a field name containing a Reference, fetch the target document.
+/// Returns a new FL_Doc handle, or null if the field is not a reference or target not found.
+#[no_mangle]
+pub extern "C" fn fl_engine_get_by_ref(
+    engine: *mut FL_Engine,
+    doc: *const FL_Doc,
+    field_key: *const c_char,
+) -> *mut FL_Doc {
+    if engine.is_null() || doc.is_null() || field_key.is_null() {
+        return ptr::null_mut();
+    }
+
+    let engine = unsafe { &*engine };
+    let doc_ptr = unsafe { &*doc };
+    let key = match cstr_to_string(field_key) { 
+        Ok(k) => k, 
+        Err(e) => { set_last_error(e); return ptr::null_mut(); } 
+    };
+
+    // 1. Find the value in the provided document
+    let Some(val) = doc_ptr.doc.get(&key) else {
+        set_last_error("Field not found in document");
+        return ptr::null_mut();
+    };
+
+    // 2. Resolve the reference using the engine
+    match engine.db.get_by_reference(val) {
+        Ok(Some(target_doc)) => {
+            Box::into_raw(Box::new(FL_Doc { doc: target_doc }))
+        }
+        Ok(None) => ptr::null_mut(), // Document doesn't exist (Dangling reference)
+        Err(e) => {
+            set_last_error(e.to_string());
+            ptr::null_mut()
         }
     }
 }

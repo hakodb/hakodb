@@ -10,6 +10,8 @@ constexpr static const uint8_t DELETE = 2;
 
 constexpr static const uintptr_t DEFAULT_PAGE_SIZE = 4096;
 
+struct FL_Array;
+
 struct FL_Batch;
 
 struct FL_Config;
@@ -19,6 +21,8 @@ struct FL_Doc;
 struct FL_Engine;
 
 struct FL_Query;
+
+struct FL_Transaction;
 
 struct FL_Watch;
 
@@ -115,6 +119,8 @@ int32_t fl_query_order_by(FL_Query *query, const char *field, bool ascending);
 
 int32_t fl_query_limit(FL_Query *query, uintptr_t limit);
 
+int32_t fl_query_offset(FL_Query *query, uintptr_t offset);
+
 int32_t fl_query_select_field(FL_Query *query, const char *field);
 
 char *fl_query_execute(FL_Engine *engine, const FL_Query *query);
@@ -146,5 +152,64 @@ int32_t fl_query_where_contains(FL_Query *query, const char *field, const char *
 int32_t fl_query_where_starts_with(FL_Query *query, const char *field, const char *value);
 
 char *fl_engine_list_collections(FL_Engine *engine);
+
+FL_Array *fl_array_new();
+
+void fl_array_free(FL_Array *array);
+
+int32_t fl_array_append_str(FL_Array *array, const char *value);
+
+int32_t fl_array_append_int(FL_Array *array, int64_t value);
+
+/// Takes the contents of 'child' and inserts it as a Map into 'parent'
+int32_t fl_doc_insert_doc(FL_Doc *parent, const char *key, const FL_Doc *child);
+
+/// Takes the contents of 'array' and inserts it into the document
+int32_t fl_doc_insert_array(FL_Doc *doc, const char *key, FL_Array *array);
+
+int32_t fl_engine_patch(FL_Engine *engine,
+                        const char *collection,
+                        const char *doc_id,
+                        const FL_Doc *updates);
+
+/// Creates a composite index from C++.
+/// fields_json should be like: [{"field": "age", "desc": false}]
+uint32_t fl_engine_create_index(FL_Engine *engine, const char *collection, const char *fields_json);
+
+FL_Transaction *fl_transaction_begin(FL_Engine *engine);
+
+FL_Doc *fl_transaction_get(FL_Engine *engine,
+                           FL_Transaction *tx,
+                           const char *collection,
+                           const char *doc_id);
+
+int32_t fl_transaction_set(FL_Transaction *tx,
+                           const char *collection,
+                           const char *doc_id,
+                           const FL_Doc *doc);
+
+int32_t fl_transaction_commit(FL_Engine *engine, FL_Transaction *tx);
+
+void fl_transaction_free(FL_Transaction *tx);
+
+int32_t fl_engine_insert_subdoc(FL_Engine *engine,
+                                const char *col,
+                                const char *id,
+                                const char *sub_col,
+                                const char *sub_id,
+                                const FL_Doc *doc);
+
+int32_t fl_engine_compact(FL_Engine *engine);
+
+char *fl_engine_get_stats(FL_Engine *engine);
+
+int32_t fl_doc_insert_reference(FL_Doc *doc,
+                                const char *key,
+                                const char *target_collection,
+                                const char *target_id);
+
+/// Given a document and a field name containing a Reference, fetch the target document.
+/// Returns a new FL_Doc handle, or null if the field is not a reference or target not found.
+FL_Doc *fl_engine_get_by_ref(FL_Engine *engine, const FL_Doc *doc, const char *field_key);
 
 }  // extern "C"

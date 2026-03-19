@@ -781,6 +781,35 @@ impl FireLite {
         let storage = self.storage.read().unwrap();
         storage.list_collections()
     }
+
+    pub fn get_stats(&self) -> HashMap<String, usize> {
+        let storage = self.storage.read().unwrap();
+        storage.collection_counts.clone()
+    }
+
+    pub fn patch(&self, collection: &str, doc_id: &str, updates: Vec<(String, Value)>) -> Result<()> {
+        // 1. Read existing
+        let mut doc = self.get(collection, doc_id)?
+            .ok_or_else(|| FireLiteError::Corrupt("Document not found".into()))?;
+
+        // 2. Apply updates
+        for (k, v) in updates {
+            doc.insert(k, v);
+        }
+
+        // 3. Write back
+        self.put(collection, doc_id, &doc)
+    }
+
+    pub fn get_by_reference(&self, reference: &Value) -> Result<Option<FireLiteDoc>> {
+        match reference {
+            Value::Reference { collection, doc_id } => {
+                // Reuse the existing security-checked 'get' method
+                self.get(collection, doc_id)
+            }
+            _ => Err(FireLiteError::Corrupt("Provided value is not a Document Reference".into())),
+        }
+    }
 }
 
 fn doc_key(collection: &str, doc_id: &str) -> String {
