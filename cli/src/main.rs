@@ -4,7 +4,6 @@ use firelite::document::firelite_doc::FireLiteDoc;
 use firelite::document::value::Value;
 use firelite::query::query::Query;
 use serde_json::{json, Map, Value as JsonValue};
-// use std::collections::HashSet;
 use std::env;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

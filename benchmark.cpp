@@ -1,164 +1,3 @@
-// #include "include/firelite.h"
-// #include <chrono>
-// #include <stdio.h>
-// #include <string.h>
-// #include <stdlib.h>
-// #include <thread>
-// #include <vector>
-// #include <iostream>
-
-// using namespace std;
-
-// // Helper for high-res timing
-// double get_time() {
-//     auto now = chrono::high_resolution_clock::now();
-//     auto duration = chrono::duration_cast<chrono::nanoseconds>(now.time_since_epoch());
-//     return duration.count() / 1e9;
-// }
-
-// // C-style callback for snapshots
-// void on_snapshot_change(const char* collection, const char* path, int32_t kind, void* user_data) {
-//     // This runs on a background Rust thread
-//     // printf("[WATCH] %s inside %s changed (kind: %d)\n", path, collection, kind);
-// }
-
-// void read_worker(struct FL_Engine* db, int start_idx, int count) {
-//     char id_str[32];
-//     for (int i = 0; i < count; i++) {
-//         sprintf(id_str, "single_%d", (start_idx + i) % 1000);
-//         struct FL_Doc* doc = fl_engine_get(db, "bench", id_str);
-//         if (doc) {
-//             fl_doc_free(doc);
-//         }
-//     }
-// }
-
-// int main(int argc, char* argv[]) {
-//     // Usage: ./benchmark [durability 0-3] [key] [threads]
-//     int durability = (argc > 1) ? atoi(argv[1]) : 3; // Default OnCommit
-//     const char* key = (argc > 2) ? argv[2] : "none";
-//     int thread_count = (argc > 3) ? atoi(argv[3]) : 8;
-
-//     // Cleanup previous run to ensure fresh encryption state
-//     #ifdef _WIN32
-//         system("rd /s /q bench_c.db 2>nul");
-//     #else
-//         system("rm -rf bench_c.db");
-//     #endif
-
-//     printf("--- FireLite Advanced Benchmark ---\n");
-//     printf("Durability Mode: %d (0:Always, 1:Interval, 2:Manual, 3:OnCommit)\n", durability);
-//     printf("Encryption Key:  %s\n", key);
-//     printf("Parallel Threads: %d\n", thread_count);
-
-//     // 1. Build Configuration
-//     FL_Config* config = fl_config_new();
-//     fl_config_set_durability(config, durability);
-    
-//     if (strcmp(key, "none") != 0) {
-//         fl_config_set_encryption_key(config, key);
-//     }
-
-//     // Set a 10MB RAM limit for inlined docs to test checkpointing
-//     fl_config_set_memory_limits(config, 64 * 1024 * 1024, 50 * 1024);
-    
-//     // 2. Open Engine with Config
-//     struct FL_Engine* db = fl_engine_open_with_config("./bench_c.db", config);
-
-//     if (!db) {
-//         printf("Failed to open database: %s\n", fl_last_error());
-//         return 1;
-//     }
-
-//     // 3. Setup a Real-time Watcher
-//     FL_Watch* watch = fl_engine_watch(db, "bench", on_snapshot_change, nullptr);
-
-//     int iterations = 1000;
-//     char id_str[32];
-
-//     // --- Benchmark 1: Single Writes (with Server Timestamps) ---
-//     printf("\nBenchmarking Single Writes (%d ops)...\n", iterations);
-//     double start = get_time();
-//     for (int i = 0; i < iterations; i++) {
-//         struct FL_Doc* doc = fl_doc_new();
-//         fl_doc_insert_int(doc, "val", i);
-//         fl_doc_insert_str(doc, "tag", "c_bench_test_match");
-//         fl_doc_insert_server_timestamp(doc, "createdAt"); // Test server timestamps
-        
-//         sprintf(id_str, "single_%d", i);
-//         fl_engine_insert(db, "bench", id_str, doc);
-//         fl_doc_free(doc);
-//     }
-//     double end = get_time();
-//     printf("Single Write: %.2f ops/sec\n", iterations / (end - start));
-
-//     // --- Benchmark 2: Batch Writes ---
-//     printf("Benchmarking Batch Writes (%d docs)...\n", iterations);
-//     start = get_time();
-//     for (int b = 0; b < 10; b++) {
-//         struct FL_Batch* batch = fl_batch_new();
-//         for (int i = 0; i < 100; i++) {
-//             struct FL_Doc* doc = fl_doc_new();
-//             fl_doc_insert_int(doc, "val", i);
-//             sprintf(id_str, "batch_%d_%d", b, i);
-//             fl_batch_set(batch, "bench", id_str, doc);
-//             fl_doc_free(doc);
-//         }
-//         fl_batch_commit(db, batch);
-//         fl_batch_free(batch);
-//     }
-//     end = get_time();
-//     printf("Batch Write:  %.2f ops/sec\n", iterations / (end - start));
-
-//     // --- Benchmark 3: Native Aggregations (Count/Sum) ---
-//     printf("\nTesting Native Aggregations...\n");
-//     FL_Query* q_agg = fl_query_new("bench");
-//     fl_query_aggregate_count(q_agg);
-//     fl_query_aggregate_sum(q_agg, "val");
-    
-//     char* agg_json = fl_query_execute_aggregation(db, q_agg);
-//     printf("Aggregation Result: %s\n", agg_json);
-//     fl_string_free(agg_json);
-//     fl_query_free(q_agg);
-
-//     // --- Benchmark 4: Full-Text Search ---
-//     printf("Testing Full-Text Search (Match)...\n");
-//     FL_Query* q_fts = fl_query_new("bench");
-//     fl_query_where_match(q_fts, "tag", "bench test"); // Should match "c_bench_test_match"
-//     char* fts_results = fl_query_execute(db, q_fts);
-//     // printf("FTS Result Count: %s\n", fts_results);
-//     fl_string_free(fts_results);
-//     fl_query_free(q_fts);
-
-//     // --- Benchmark 5: Multi-Threaded Reads ---
-//     printf("\nBenchmarking Parallel Reads (%d threads, %d ops total)...\n", thread_count, thread_count * 100);
-//     vector<thread> threads;
-//     start = get_time();
-//     for (int t = 0; t < thread_count; t++) {
-//         threads.emplace_back(read_worker, db, t * 100, 100);
-//     }
-//     for (auto& th : threads) {
-//         th.join();
-//     }
-//     end = get_time();
-//     printf("Parallel Read: %.2f ops/sec\n", (thread_count * 100) / (end - start));
-
-//     // --- Benchmark 6: Online Backup ---
-//     printf("\nPerforming Online Backup to './backup_data'...\n");
-//     start = get_time();
-//     int backup_res = fl_engine_backup(db, "./backup_data");
-//     end = get_time();
-//     if (backup_res == 0) {
-//         printf("Backup Success! (Time: %.4fs)\n", (end - start));
-//     } else {
-//         printf("Backup Failed: %s\n", fl_last_error());
-//     }
-
-//     fl_watch_free(watch);
-//     fl_engine_free(db);
-//     printf("\nBenchmark Finished.\n");
-//     return 0;
-// }
 #include "include/firelite.h"
 #include <chrono>
 #include <stdio.h>
@@ -167,83 +6,296 @@
 #include <thread>
 #include <vector>
 #include <iostream>
-#include <sys/stat.h>
+#include <atomic>
+#include <string>
+#include <sstream>
+#include <algorithm>
+#include <random>
 
 using namespace std;
 
-// Helper to get high-res timing
+// --- Constants & Global State ---
+const int SEED_COUNT = 10000;
+const int BATCH_SIZE = 100;
+std::atomic<int> snapshot_received_count{0};
+
+struct CustomKV {
+    string key;
+    string value;
+};
+vector<CustomKV> user_payload;
+
+// --- Helpers ---
 double get_time() {
     auto now = chrono::high_resolution_clock::now();
-    auto duration = chrono::duration_cast<chrono::nanoseconds>(now.time_since_epoch());
-    return duration.count() / 1e9;
+    return chrono::duration_cast<chrono::nanoseconds>(now.time_since_epoch()).count() / 1e9;
 }
 
-// Helper to get file size for verification
-long get_file_size(const char* filename) {
-    struct stat stat_buf;
-    int rc = stat(filename, &stat_buf);
-    return rc == 0 ? stat_buf.st_size : -1;
+string make_blob(size_t size) {
+    return string(size, 'x');
 }
 
-int main(int argc, char* argv[]) {
-    int durability = (argc > 1) ? atoi(argv[1]) : 3; 
-    const char* key = (argc > 2) ? argv[2] : "none";
-    
-    // PERSISTENCE SIMULATION:
-    // We generate a unique prefix for this run so the database grows
-    long long run_id = chrono::system_clock::to_time_t(chrono::system_clock::now());
-
-    printf("--- FireLite Persistence Benchmark ---\n");
-    printf("Durability Mode: %d\n", durability);
-    printf("Session Run ID:  %lld\n", run_id);
-
-    // 1. Build Configuration
-    FL_Config* config = fl_config_new();
-    fl_config_set_durability(config, durability);
-    if (strcmp(key, "none") != 0) fl_config_set_encryption_key(config, key);
-
-    // Set a small 50KB RAM limit so we can see the .dat files grow quickly
-    fl_config_set_memory_limits(config, 64 * 1024 * 1024, 50 * 1024);
-    
-    // 2. Open Engine (Folder is NOT deleted anymore)
-    struct FL_Engine* db = fl_engine_open_with_config("./bench_c.db", config);
-    if (!db) {
-        printf("Failed to open database: %s\n", fl_last_error());
-        return 1;
+int get_hot_key(int range) {
+    static std::mt19937 gen(1337);
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    if (dist(gen) < 0.8) {
+        std::uniform_int_distribution<int> hot(0, std::max(1, range / 5));
+        return hot(gen);
+    } else {
+        std::uniform_int_distribution<int> cold(0, range - 1);
+        return cold(gen);
     }
+}
 
-    int iterations = 1000;
-    char id_str[64];
+void parse_user_data(string input) {
+    if (input.empty()) return;
+    string clean = input;
+    const char* chars_to_remove = "{}/\"\'";
+    for (int i = 0; i < 5; ++i) 
+        clean.erase(std::remove(clean.begin(), clean.end(), chars_to_remove[i]), clean.end());
+    
+    stringstream ss(clean);
+    string item;
+    while (getline(ss, item, ',')) {
+        size_t colon = item.find(':');
+        if (colon != string::npos) {
+            string k = item.substr(0, colon), v = item.substr(colon + 1);
+            k.erase(0, k.find_first_not_of(" ")); k.erase(k.find_last_not_of(" ") + 1);
+            v.erase(0, v.find_first_not_of(" ")); v.erase(v.find_last_not_of(" ") + 1);
+            user_payload.push_back({k, v});
+        }
+    }
+}
 
-    // --- Benchmark: Writing ---
-    printf("Writing %d new records...\n", iterations);
+void populate_doc(FL_Doc* doc, int id_val) {
+    if (user_payload.empty()) {
+        fl_doc_insert_int(doc, "id", id_val);
+        fl_doc_insert_str(doc, "tag", "mirror_bench");
+    } else {
+        for (auto& kv : user_payload) fl_doc_insert_str(doc, kv.key.c_str(), kv.value.c_str());
+        fl_doc_insert_int(doc, "id_idx", id_val);
+    }
+    fl_doc_insert_server_timestamp(doc, "ts");
+}
+
+void on_snapshot_change(const char* col, const char* path, int32_t kind, void* ud) {
+    snapshot_received_count++;
+}
+
+// --- BENCHMARK SUITES ---
+
+void bench_write_single(FL_Engine* db, int ops) {
+    printf(">> firelite_put_single (%d ops)...\n", ops);
     double start = get_time();
-    for (int i = 0; i < iterations; i++) {
-        struct FL_Doc* doc = fl_doc_new();
-        fl_doc_insert_int(doc, "val", i);
-        fl_doc_insert_server_timestamp(doc, "ts");
-        
-        // Use the Run ID in the key to ensure the DB grows
-        sprintf(id_str, "run_%lld_id_%d", run_id, i);
-        fl_engine_insert(db, "bench", id_str, doc);
+    for (int i = 0; i < ops; i++) {
+        FL_Doc* doc = fl_doc_new();
+        populate_doc(doc, SEED_COUNT + i);
+        char id[32]; sprintf(id, "s_%d", SEED_COUNT + i);
+        fl_engine_insert(db, "bench", id, doc);
         fl_doc_free(doc);
     }
     double end = get_time();
-    printf("Write Performance: %.2f ops/sec\n", iterations / (end - start));
+    printf("   Result: %.2f ops/sec\n", ops / (end - start));
+}
 
-    // 3. Close the engine properly to trigger flushes
+void bench_write_batch(FL_Engine* db, int num_batches) {
+    printf(">> firelite_put_batch_100 (%d docs)...\n", num_batches * BATCH_SIZE);
+    double start = get_time();
+    for (int b = 0; b < num_batches; b++) {
+        FL_Batch* batch = fl_batch_new();
+        for (int i = 0; i < BATCH_SIZE; i++) {
+            FL_Doc* doc = fl_doc_new();
+            int id_val = SEED_COUNT + 5000 + (b * BATCH_SIZE) + i;
+            populate_doc(doc, id_val);
+            char id[64]; sprintf(id, "b_%d", id_val);
+            fl_batch_set(batch, "bench", id, doc);
+            fl_doc_free(doc);
+        }
+        fl_batch_commit(db, batch);
+        fl_batch_free(batch);
+    }
+    double end = get_time();
+    printf("   Result: %.2f docs/sec\n", (num_batches * BATCH_SIZE) / (end - start));
+}
+
+// --- VARIANT SINGLE WRITE (1 sync per doc in Mode 3) ---
+void bench_variant_single(FL_Engine* db) {
+    printf(">> firelite_variant_SINGLE_write (Pre-allocated, 50 docs/size)...\n");
+    int sizes[] = { 128, 1024, 4096, 10240, 20480, 51200 };
+    const int count = 50;
+
+    for (int sz : sizes) {
+        string blob = make_blob(sz);
+        vector<FL_Doc*> docs;
+        vector<string> ids;
+
+        // PRE-ALLOCATE: Outside the timer
+        for (int i = 0; i < count; i++) {
+            FL_Doc* doc = fl_doc_new();
+            fl_doc_insert_str(doc, "payload", blob.c_str());
+            docs.push_back(doc);
+            ids.push_back("v_s_" + to_string(sz) + "_" + to_string(i));
+        }
+
+        // MEASURE: Only the engine insertion
+        double start = get_time();
+        for (int i = 0; i < count; i++) {
+            fl_engine_insert(db, "var_single", ids[i].c_str(), docs[i]);
+        }
+        double end = get_time();
+
+        double duration = end - start;
+        printf("   Size %5d bytes: %10.2f ops/sec | %7.2f MB/s\n", 
+                sz, count / duration, (double)(sz * count) / (1024.0 * 1024.0) / duration);
+
+        // CLEANUP: Outside the timer
+        for (auto d : docs) fl_doc_free(d);
+    }
+}
+
+// --- VARIANT BATCH WRITE (1 sync per batch in Mode 3) ---
+void bench_variant_batch(FL_Engine* db) {
+    printf(">> firelite_variant_BATCH_write (Pre-allocated, 50 docs/size)...\n");
+    int sizes[] = { 128, 1024, 4096, 10240, 20480, 51200 };
+    const int count = 50;
+
+    for (int sz : sizes) {
+        string blob = make_blob(sz);
+        vector<FL_Doc*> docs;
+        FL_Batch* batch = fl_batch_new();
+
+        // PRE-ALLOCATE: Outside the timer
+        for (int i = 0; i < count; i++) {
+            FL_Doc* doc = fl_doc_new();
+            fl_doc_insert_str(doc, "payload", blob.c_str());
+            string id = "v_b_" + to_string(sz) + "_" + to_string(i);
+            fl_batch_set(batch, "var_batch", id.c_str(), doc);
+            docs.push_back(doc);
+        }
+
+        // MEASURE: Only the batch commit
+        double start = get_time();
+        fl_batch_commit(db, batch);
+        double end = get_time();
+
+        double duration = end - start;
+        printf("   Size %5d bytes: %10.2f docs/sec | %7.2f MB/s\n", 
+                sz, count / duration, (double)(sz * count) / (1024.0 * 1024.0) / duration);
+
+        // CLEANUP: Outside the timer
+        fl_batch_free(batch);
+        for (auto d : docs) fl_doc_free(d);
+    }
+}
+
+void bench_read_parallel(FL_Engine* db, int thread_count) {
+    printf(">> firelite_read_parallel_%d (each 200 reads)...\n", thread_count);
+    vector<thread> workers;
+    double start = get_time();
+    for (int t = 0; t < thread_count; t++) {
+        workers.push_back(thread([db, t]() {
+            for (int i = 0; i < 200; i++) {
+                int key_id = (i + t * 200) % SEED_COUNT;
+                char id[32]; sprintf(id, "%d", key_id);
+                FL_Doc* d = fl_engine_get(db, "bench", id);
+                if (d) fl_doc_free(d);
+            }
+        }));
+    }
+    for (auto& w : workers) w.join();
+    double end = get_time();
+    printf("   Finished in: %.4fs\n", (end - start));
+}
+
+void bench_watch_latency(FL_Engine* db) {
+    printf(">> firelite_watch_latency (Round-trip FFI)...\n");
+    snapshot_received_count = 0;
+    FL_Watch* w = fl_engine_watch(db, "bench", on_snapshot_change, nullptr);
+    
+    int ops = 500;
+    double start = get_time();
+    for (int i = 0; i < ops; i++) {
+        int expected = snapshot_received_count.load() + 1;
+        FL_Doc* d = fl_doc_new(); fl_doc_insert_int(d, "i", i);
+        fl_engine_insert(db, "bench", "watch_key", d);
+        fl_doc_free(d);
+
+        while (snapshot_received_count.load() < expected) {
+            std::this_thread::yield(); 
+        }
+    }
+    double end = get_time();
+    printf("   Avg Latency: %.4f ms/op\n", ((end - start) / ops) * 1000.0);
+    fl_watch_free(w);
+}
+
+// --- MAIN ---
+
+int main(int argc, char* argv[]) {
+    int durability = 3, threads = 8;
+    const char* key = "none";
+    string data_raw = "";
+
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--dur=", 6) == 0) durability = atoi(argv[i] + 6);
+        else if (strncmp(argv[i], "--thr=", 6) == 0) threads = atoi(argv[i] + 6);
+        else if (strncmp(argv[i], "--key=", 6) == 0) key = argv[i] + 6;
+        else if (strncmp(argv[i], "--data=", 7) == 0) data_raw = argv[i] + 7;
+    }
+
+    if (!data_raw.empty()) parse_user_data(data_raw);
+
+    printf("--- FireLite C++/FFI Mirror Benchmark ---\n");
+    printf("Durability: %d | Threads: %d | Key: %s\n", durability, threads, key);
+    printf("-----------------------------------------\n");
+
+    FL_Config* config = fl_config_new();
+    fl_config_set_durability(config, durability);
+    fl_config_set_query_workers(config, (uintptr_t)threads);
+    if (strcmp(key, "none") != 0) fl_config_set_encryption_key(config, key);
+
+    // Increase memory limits slightly to handle 50KB variant tests comfortably
+    fl_config_set_memory_limits(config, 256 * 1024 * 1024, 64 * 1024);
+
+    #ifdef _WIN32
+        system("rd /s /q bench_data 2>nul");
+    #else
+        system("rm -rf bench_data");
+    #endif
+
+    FL_Engine* db = fl_engine_open_with_config("./bench_data", config);
+    if (!db) return 1;
+
+    // Seeding 10k
+    printf("Seeding %d docs...\n", SEED_COUNT);
+    FL_Batch* b = fl_batch_new();
+    for (int i = 0; i < SEED_COUNT; i++) {
+        FL_Doc* d = fl_doc_new(); fl_doc_insert_int(d, "id", i);
+        char id[32]; sprintf(id, "%d", i);
+        fl_batch_set(b, "bench", id, d);
+        fl_doc_free(d);
+        if (i % 1000 == 0 && i > 0) {
+            fl_batch_commit(db, b); fl_batch_free(b); b = fl_batch_new();
+        }
+    }
+    fl_batch_commit(db, b); fl_batch_free(b);
+
+    // Benchmarks
+    bench_write_single(db, 2000);
+    printf("\n");
+    bench_write_batch(db, 20);
+    printf("\n");
+
+    bench_variant_single(db);
+    printf("\n");
+    bench_variant_batch(db);
+    
+    printf("\n");
+    bench_read_parallel(db, threads);
+    printf("\n");
+    bench_watch_latency(db);
+
     fl_engine_free(db);
-
-    // --- Verification: Check File Sizes ---
-    printf("\n--- Disk Usage Report ---\n");
-    printf("WAL Log Size:     %ld bytes\n", get_file_size("./bench_c.db/wal.log"));
-    
-    // Note: The segment ID might change based on compaction, checking the first one
-    long seg_size = get_file_size("./bench_c.db/segment-l0-0.dat");
-    if (seg_size == -1) seg_size = get_file_size("./bench_c.db/segment-l0-1.dat");
-    
-    printf("Data Segment Size: %ld bytes\n", seg_size);
-    printf("--------------------------\n");
-
+    printf("-----------------------------------------\n");
     return 0;
 }
