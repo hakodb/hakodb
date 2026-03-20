@@ -46,6 +46,29 @@ impl ParallelQueryExecutor {
                 } else {
                     storage.scan_prefix(&format!("{}:", plan.collection))?
                 }
+            },
+            ScanType::CursorIndex { start_key } => {
+                let mut out = Vec::new();
+                // We jump to the exact spot in the B-Tree index
+                // This is O(log N) instead of O(N)
+                for idx in indexes.indexes_for_collection(&plan.collection) {
+                    // Find the index that matches this scan
+                    let end_key = { let mut e = start_key.clone(); e.push(0xFF); e };
+                    let doc_ids: Vec<std::sync::Arc<str>> = idx.range_scan(&start_key, &end_key);
+                    
+                    for doc_id in doc_ids {
+                        let key = format!("{}:{}", plan.collection, doc_id);
+                        if let Some(raw) = storage.get(&key)? {
+                            out.push((key, raw));
+                        }
+                        // Optimization: If no filters, we can stop once limit is reached
+                        if plan.filters.is_empty() && plan.limit.map_or(false, |l| out.len() >= l) {
+                            break;
+                        }
+                    }
+                    if !out.is_empty() { break; }
+                }
+                out
             }
         };
 

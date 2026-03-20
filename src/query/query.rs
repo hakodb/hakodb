@@ -7,11 +7,13 @@ use super::order::OrderBy;
 pub struct Query {
     pub collection: String,
     pub filters: Vec<Filter>,
+    pub or_groups: Vec<Vec<crate::query::filter::Filter>>,
     pub order_by: Option<OrderBy>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub projection: Vec<String>,
     pub aggregations: Vec<AggregateOp>, // Added this field
+    pub start_after: Option<Vec<Value>>, 
 }
 
 #[derive(Debug, Clone)]
@@ -26,11 +28,13 @@ impl Query {
         Self {
             collection: collection.to_string(),
             filters: Vec::new(),
+            or_groups: Vec::new(),
             order_by: None,
             limit: None,
             offset: None, 
             projection: Vec::new(),
             aggregations: Vec::new(), // Initialize
+            start_after: None,
         }
     }
 
@@ -81,6 +85,21 @@ impl Query {
 
     pub fn aggregate(mut self, op: AggregateOp) -> Self {
         self.aggregations.push(op);
+        self
+    }
+
+    pub fn start_after(mut self, values: Vec<Value>) -> Self {
+        self.start_after = Some(values);
+        self
+    }
+
+    pub fn or_where(mut self, field: &str, op: Operator, value: Value) -> Self {
+        // Simple logic: add to the last group or start a new one
+        self.or_groups.push(vec![crate::query::filter::Filter {
+            field: field.to_string(),
+            op,
+            value,
+        }]);
         self
     }
 }

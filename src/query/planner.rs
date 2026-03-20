@@ -1,5 +1,5 @@
 use crate::index::manager::IndexManager;
-
+use crate::index::composite::range_builder::build_cursor_range;
 use super::filter::Operator;
 use super::plan::{QueryPlan, ScanType};
 use super::query::Query;
@@ -8,6 +8,27 @@ pub struct QueryPlanner;
 
 impl QueryPlanner {
     pub fn plan(query: &Query, indexes: &IndexManager, collection_rows: usize) -> QueryPlan {
+
+        // If we have an OrderBy and a Cursor, try to jump!
+        if let (Some(order), Some(cursor)) = (&query.order_by, &query.start_after) {
+            // Find an index that starts with our Sort field
+            for idx in indexes.indexes_for_collection(&query.collection) {
+                if idx.definition.fields[0].field == order.field {
+                    let start_key = build_cursor_range(&idx.definition, cursor, true);
+                    return QueryPlan {
+                        collection: query.collection.clone(),
+                        scan: ScanType::CursorIndex { start_key },
+                        filters: query.filters.clone(),
+                        or_groups: query.or_groups.clone(), // <--- ADD THIS
+                        order_by: query.order_by.clone(),
+                        limit: query.limit,
+                        offset: None, // Cursor replaces Offset!
+                        projection: query.projection.clone(),
+                    };
+                }
+            }
+        }
+
         let fields = query.composite_fields();
         
         // NEW LOGIC: Support Eq, Gt, Gte, Lt, Lte for index scanning
@@ -39,6 +60,7 @@ impl QueryPlanner {
             collection: query.collection.clone(),
             scan,
             filters: query.filters.clone(),
+            or_groups: query.or_groups.clone(), // <--- ADD THIS
             order_by: query.order_by.clone(),
             limit: query.limit,
             offset: query.offset,  

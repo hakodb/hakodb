@@ -354,6 +354,87 @@ void bench_aggregations(FL_Engine* db) {
     fl_query_free(q);
 }
 
+// --- NEW v0.4 Cursor Benchmark ---
+
+void bench_cursor_vs_offset(FL_Engine* db) {
+    printf(">> firelite_pagination_DUEL (Offset vs Cursor)...\n");
+    
+    // 1. Setup Index for 'id' (Required for O(log N) cursor)
+    fl_engine_create_index(db, "bench", "[{\"field\": \"id\", \"desc\": false}]");
+
+    const int target_depth = 8000;
+    const int page_size = 10;
+
+    // --- TEST A: Offset (The slow way) ---
+    double start_off = get_time();
+    FL_Query* q_off = fl_query_new("bench");
+    fl_query_order_by(q_off, "id", true);
+    fl_query_offset(q_off, target_depth);
+    fl_query_limit(q_off, page_size);
+    char* res_off = fl_query_execute(db, q_off);
+    double end_off = get_time();
+    printf("   [OFFSET] Skipped %d docs: %.4fs\n", target_depth, (end_off - start_off));
+
+    // --- TEST B: Cursor (The fast way) ---
+    // First, get the 'Anchor' document (the one at index 8000)
+    char anchor_id[32]; sprintf(anchor_id, "%d", target_depth);
+    FL_Doc* anchor = fl_engine_get(db, "bench", anchor_id);
+
+    if (anchor) {
+        double start_cur = get_time();
+        FL_Query* q_cur = fl_query_new("bench");
+        fl_query_order_by(q_cur, "id", true);
+        fl_query_start_after(q_cur, anchor); // JUMP directly after anchor doc
+        fl_query_limit(q_cur, page_size);
+        char* res_cur = fl_query_execute(db, q_cur);
+        double end_cur = get_time();
+        
+        printf("   [CURSOR] Jumped to %d:    %.4fs\n", target_depth, (end_cur - start_cur));
+        
+        fl_string_free(res_cur);
+        fl_query_free(q_cur);
+        fl_doc_free(anchor);
+    }
+
+    fl_string_free(res_off);
+    fl_query_free(q_off);
+}
+
+void bench_patch_efficiency(FL_Engine* db) {
+    printf(">> firelite_patch_vs_put (50KB document optimization)...\n");
+
+    // 1. Prepare a large 50KB document
+    string big_blob = make_blob(51200);
+    FL_Doc* doc = fl_doc_new();
+    fl_doc_insert_str(doc, "payload", big_blob.c_str());
+    fl_doc_insert_int(doc, "version", 1);
+    fl_engine_insert(db, "patch_test", "doc1", doc);
+
+    // --- TEST A: Full Rewrite (The slow way) ---
+    double start_put = get_time();
+    for(int i=0; i<100; i++) {
+        fl_doc_insert_int(doc, "version", i);
+        fl_engine_insert(db, "patch_test", "doc1", doc);
+    }
+    double end_put = get_time();
+    printf("   [FULL PUT]   100 rewrites of 50KB: %.4fs\n", (end_put - start_put));
+
+    // --- TEST B: In-place Patch (The fast way) ---
+    // We only send the field we want to change
+    FL_Doc* update = fl_doc_new();
+    double start_patch = get_time();
+    for(int i=0; i<100; i++) {
+        fl_doc_insert_int(update, "version", i);
+        fl_engine_patch(db, "patch_test", "doc1", update);
+    }
+    double end_patch = get_time();
+    printf("   [PATCH]      100 updates of 8 bytes: %.4fs\n", (end_patch - start_patch));
+
+    fl_doc_free(doc);
+    fl_doc_free(update);
+}
+
+
 // --- MAIN ---
 
 int main(int argc, char* argv[]) {
@@ -432,12 +513,26 @@ int main(int argc, char* argv[]) {
     printf("\n");
     bench_transaction_logic(db);
     
+    printf("\n--- v0.4 New Performance features ---\n");
+    bench_cursor_vs_offset(db);
+    printf("\n");
+    bench_patch_efficiency(db);
+    
     // System Diagnostics
     char* stats = fl_engine_get_stats(db);
     printf("\n>> Engine Stats: %s\n", stats);
     fl_string_free(stats);
 
+    if (durability != 3) {
+        printf("\n>> Sleeping 3 second, giving time flushing to work..");
+        std::this_thread::sleep_for(3000ms);
+    }
+
+    printf("\n>> Flushing..");
+    double start_time = get_time();
     fl_engine_free(db);
+    double end_time = get_time();
+    printf("\n>>   Complete -  %.4fs\n", (end_time - start_time));
     printf("-----------------------------------------\n");
     return 0;
 }

@@ -4,13 +4,20 @@ use std::sync::Arc;
 
 use super::composite::definition::CompositeIndexDefinition;
 use super::composite::manager::CompositeIndexManager;
+// use crate::index::composite::manager::CompositeIndexManager;
+use crate::index::composite::composite_index::CompositeIndex;
 
 #[derive(Default)]
 pub struct IndexManager {
-    composite: CompositeIndexManager,
+    pub composite: CompositeIndexManager,
 }
 
 impl IndexManager {
+
+    pub fn indexes_for_collection(&self, collection: &str) -> impl Iterator<Item = &CompositeIndex> {
+        self.composite.indexes_for_collection(collection)
+    }
+
     pub fn create_index(&mut self, definition: CompositeIndexDefinition) -> u32 {
         self.composite.create_index(definition)
     }

@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::HashSet; // Added for cleaner FTS logic
 use crate::document::value::Value;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Operator {
     Eq,
     Ne,
@@ -15,7 +15,19 @@ pub enum Operator {
     StartsWith, // Prefix matching
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum FilterLogic {
+    And,
+    Or,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FilterGroup {
+    pub logic: FilterLogic,
+    pub filters: Vec<Filter>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Filter {
     pub field: String,
     pub op: Operator,

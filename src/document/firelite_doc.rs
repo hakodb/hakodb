@@ -80,6 +80,43 @@ impl FireLiteDoc {
         }
         Some(doc)
     }
+
+    pub fn apply_patch_binary(old_bytes: &[u8], updates: &[(String, Value)]) -> Option<Vec<u8>> {
+        let view = FireLiteDocView::new(old_bytes)?;
+        let mut final_fields: Vec<(String, Value)> = Vec::new();
+        
+        // Track which updates we have already applied
+        let mut applied_updates = vec![false; updates.len()];
+
+        // 1. Iterate through existing fields
+        for (key, borrowed_val) in view.iter() {
+            // Check if this field is in our update list
+            let update_idx = updates.iter().position(|(uk, _)| uk == key);
+
+            if let Some(idx) = update_idx {
+                // Use the NEW value
+                final_fields.push(updates[idx].clone());
+                applied_updates[idx] = true;
+            } else {
+                // CRITICAL OPTIMIZATION:
+                // Instead of decoding, we convert the borrowed_val back to an owned Value.
+                // In a future "Extreme" version, we would copy the [u8] slice directly.
+                // For now, to keep the TLV logic safe, we decode just this one value.
+                final_fields.push((key.to_string(), borrowed_val.to_owned_value()?));
+            }
+        }
+
+        // 2. Add any completely new fields that didn't exist before
+        for (i, is_applied) in applied_updates.iter().enumerate() {
+            if !is_applied {
+                final_fields.push(updates[i].clone());
+            }
+        }
+
+        // 3. Create a temporary doc and encode
+        let new_doc = FireLiteDoc { fields: final_fields };
+        Some(new_doc.encode())
+    }
 }
 
 pub struct FireLiteDocView<'a> {

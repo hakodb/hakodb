@@ -627,6 +627,33 @@ impl StorageEngine {
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
     }
+
+    pub fn backup(&mut self, destination_path: impl AsRef<Path>) -> Result<()> {
+        // 1. Move all inlined data from RAM into segment files on Disk.
+        // This ensures the backup is complete.
+        self.checkpoint_inlined_data()?;
+        
+        // 2. Perform a physical sync of all files.
+        self.flush_all()?;
+
+        // 3. Create destination directory.
+        std::fs::create_dir_all(destination_path.as_ref())?;
+
+        // 4. Copy only relevant data and log files.
+        for entry in std::fs::read_dir(&self.base_dir)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+            
+            // We only back up data segments and the WAL.
+            if name_str.ends_with(".dat") || name_str == "wal.log" {
+                let dest = destination_path.as_ref().join(file_name);
+                std::fs::copy(entry.path(), dest)?;
+            }
+        }
+        Ok(())
+    }
+
 }
 
 impl Drop for StorageEngine {

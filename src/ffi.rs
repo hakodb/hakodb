@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::{ptr, thread};
-// use std::thread;
 use std::time::Duration;
 use std::sync::mpsc::{channel, Sender};
 
@@ -115,15 +114,15 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             v.iter().map(|b| serde_json::Value::Number((*b as u64).into())).collect()
         ),
         Value::Timestamp(v) => serde_json::Value::Number((*v).into()),
+        Value::Array(items) => { // <--- ADD THIS
+            serde_json::Value::Array(items.iter().map(value_to_json).collect())
+        },
         Value::Map(fields) => {
             let mut map = serde_json::Map::new();
             for (k, sv) in fields {
                 map.insert(k.clone(), value_to_json(sv));
             }
             serde_json::Value::Object(map)
-        },
-        Value::Array(items) => { // <--- ADD THIS
-            serde_json::Value::Array(items.iter().map(value_to_json).collect())
         },
         Value::Reference { collection, doc_id } => {
             let mut map = serde_json::Map::new();
@@ -509,7 +508,10 @@ pub extern "C" fn fl_engine_insert(
             clear_last_error();
             0
         }
-        Err(e) => set_last_error(e.to_string()),
+        Err(e) => {
+    set_last_error(e.to_string());
+    -1 // or ptr::null_mut() depending on function return type
+},
     }
 }
 
@@ -576,7 +578,10 @@ pub extern "C" fn fl_engine_delete(
             clear_last_error();
             0
         }
-        Err(e) => set_last_error(e.to_string()),
+        Err(e) => {
+    set_last_error(e.to_string());
+    -1 // or ptr::null_mut() depending on function return type
+},
     }
 }
 
@@ -661,7 +666,10 @@ pub extern "C" fn fl_batch_commit(engine: *mut FL_Engine, batch: *mut FL_Batch) 
             clear_last_error();
             0
         }
-        Err(e) => set_last_error(e.to_string()),
+        Err(e) => {
+    set_last_error(e.to_string());
+    -1 // or ptr::null_mut() depending on function return type
+},
     }
 }
 
@@ -998,7 +1006,10 @@ pub extern "C" fn fl_engine_backup(engine: *mut FL_Engine, path: *const c_char) 
     let path = match cstr_to_string(path) { Ok(v) => v, Err(e) => return set_last_error(e) };
     match engine.db.backup(path) {
         Ok(_) => 0,
-        Err(e) => set_last_error(e.to_string()),
+        Err(e) => {
+    set_last_error(e.to_string());
+    -1 // or ptr::null_mut() depending on function return type
+},
     }
 }
 
@@ -1121,7 +1132,10 @@ pub extern "C" fn fl_engine_patch(
     // FIX: Access .db and ensure set_last_error returns correctly
     match engine.db.patch(&col, &id, update_doc.doc.fields.clone()) {
         Ok(_) => 0,
-        Err(e) => set_last_error(e.to_string()), 
+        Err(e) => {
+            set_last_error(e.to_string());
+            -1
+        }
     }
 }
 
@@ -1204,7 +1218,10 @@ pub extern "C" fn fl_transaction_commit(engine: *mut FL_Engine, tx: *mut FL_Tran
     
     match tx_box.tx.commit(&engine.db) {
         Ok(_) => 0,
-        Err(e) => set_last_error(e.to_string()),
+        Err(e) => {
+    set_last_error(e.to_string());
+    -1 // or ptr::null_mut() depending on function return type
+},
     }
 }
 
@@ -1233,7 +1250,10 @@ pub extern "C" fn fl_engine_insert_subdoc(
 
     match engine.db.put_subdocument(&c, &i, &sc, &si, &d.doc) {
         Ok(_) => 0,
-        Err(e) => set_last_error(e.to_string()),
+        Err(e) => {
+    set_last_error(e.to_string());
+    -1 // or ptr::null_mut() depending on function return type
+},
     }
 }
 
@@ -1244,7 +1264,10 @@ pub extern "C" fn fl_engine_compact(engine: *mut FL_Engine) -> i32 {
     let engine = unsafe { &*engine };
     match engine.db.compact() {
         Ok(_) => 0,
-        Err(e) => set_last_error(e.to_string()),
+        Err(e) => {
+    set_last_error(e.to_string());
+    -1 // or ptr::null_mut() depending on function return type
+},
     }
 }
 
@@ -1312,5 +1335,61 @@ pub extern "C" fn fl_engine_get_by_ref(
             set_last_error(e.to_string());
             ptr::null_mut()
         }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_query_start_after(
+    query: *mut FL_Query,
+    anchor_doc: *const FL_Doc,
+) -> i32 {
+    if query.is_null() || anchor_doc.is_null() { return -1; }
+    let q = unsafe { &mut *query };
+    let doc = unsafe { &*anchor_doc };
+    
+    // Logic: Look at what the query is sorting by, 
+    // and extract those values from the anchor document.
+    if let Some(order) = &q.query.order_by {
+        if let Some(val) = doc.doc.get(&order.field) {
+            q.query.start_after = Some(vec![val.clone()]);
+            return 0;
+        }
+    }
+    set_last_error("Anchor document missing sort field");
+    -1
+}
+
+#[no_mangle]
+pub extern "C" fn fl_query_where_or_str(
+    query: *mut FL_Query,
+    field: *const c_char,
+    value: *const c_char,
+) -> i32 {
+    let q = unsafe { &mut *query };
+    let f = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    let v = match cstr_to_string(value) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    
+    q.query.or_groups.push(vec![crate::query::filter::Filter {
+        field: f,
+        op: Operator::Eq,
+        value: Value::String(v),
+    }]);
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn fl_engine_get_audit_log(engine: *mut FL_Engine) -> *mut c_char {
+    if engine.is_null() { return std::ptr::null_mut(); }
+    let engine = unsafe { &*engine };
+    
+    let entries = engine.db.audit_entries();
+    
+    // Convert to JSON
+    // Note: Ensure AuditEntry and AccessOp derive serde::Serialize
+    let json = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
+    
+    match CString::new(json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
     }
 }

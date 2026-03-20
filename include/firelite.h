@@ -212,4 +212,10 @@ int32_t fl_doc_insert_reference(FL_Doc *doc,
 /// Returns a new FL_Doc handle, or null if the field is not a reference or target not found.
 FL_Doc *fl_engine_get_by_ref(FL_Engine *engine, const FL_Doc *doc, const char *field_key);
 
+int32_t fl_query_start_after(FL_Query *query, const FL_Doc *anchor_doc);
+
+int32_t fl_query_where_or_str(FL_Query *query, const char *field, const char *value);
+
+char *fl_engine_get_audit_log(FL_Engine *engine);
+
 }  // extern "C"
