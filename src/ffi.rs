@@ -1167,6 +1167,24 @@ pub extern "C" fn fl_engine_create_index(
     engine.db.create_composite_index(&col, fields)
 }
 
+/// Simplified indexer: Create an index for a single field.
+#[no_mangle]
+pub extern "C" fn fl_engine_create_simple_index(
+    engine: *mut FL_Engine,
+    collection: *const c_char,
+    field: *const c_char,
+) -> i32 {
+    if engine.is_null() { return -1; }
+    let engine = unsafe { &*engine };
+    let col = match cstr_to_string(collection) { Ok(v) => v, Err(_e) => return -1 };
+    let fld = match cstr_to_string(field) { Ok(v) => v, Err(_e) => return -1 };
+
+    match engine.db.create_index(&col, &fld) {
+        Ok(_) => 0,
+        Err(_) => -1,
+    }
+}
+
 // --- 2. SERIALIZABLE TRANSACTIONS (Read-Modify-Write) ---
 
 #[no_mangle]
@@ -1360,24 +1378,6 @@ pub extern "C" fn fl_query_start_after(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_or_str(
-    query: *mut FL_Query,
-    field: *const c_char,
-    value: *const c_char,
-) -> i32 {
-    let q = unsafe { &mut *query };
-    let f = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e) };
-    let v = match cstr_to_string(value) { Ok(v) => v, Err(e) => return set_last_error(e) };
-    
-    q.query.or_groups.push(vec![crate::query::filter::Filter {
-        field: f,
-        op: Operator::Eq,
-        value: Value::String(v),
-    }]);
-    0
-}
-
-#[no_mangle]
 pub extern "C" fn fl_engine_get_audit_log(engine: *mut FL_Engine) -> *mut c_char {
     if engine.is_null() { return std::ptr::null_mut(); }
     let engine = unsafe { &*engine };
@@ -1391,5 +1391,82 @@ pub extern "C" fn fl_engine_get_audit_log(engine: *mut FL_Engine) -> *mut c_char
     match CString::new(json) {
         Ok(s) => s.into_raw(),
         Err(_) => std::ptr::null_mut(),
+    }
+}
+
+// --- OR LOGIC ---
+
+#[no_mangle]
+pub extern "C" fn fl_query_where_or_str(
+    query: *mut FL_Query,
+    field: *const c_char,
+    value: *const c_char,
+) -> i32 {
+    let q = unsafe { &mut *query };
+    let f = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    let v = match cstr_to_string(value) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    
+    // Each call to fl_query_where_or creates a new standalone OR group
+    q.query.or_groups.push(vec![crate::query::filter::Filter {
+        field: f,
+        op: Operator::Eq,
+        value: Value::String(v),
+    }]);
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn fl_query_where_or_int(
+    query: *mut FL_Query,
+    field: *const c_char,
+    value: i64,
+) -> i32 {
+    let q = unsafe { &mut *query };
+    let f = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    
+    q.query.or_groups.push(vec![crate::query::filter::Filter {
+        field: f,
+        op: Operator::Eq,
+        value: Value::Int(value),
+    }]);
+    0
+}
+
+// --- IN LOGIC ---
+
+/// Adds an IN filter: field IN [array_items]
+/// This takes ownership of the FL_Array and frees it.
+#[no_mangle]
+pub extern "C" fn fl_query_where_in(
+    query: *mut FL_Query,
+    field: *const c_char,
+    array: *mut FL_Array,
+) -> i32 {
+    if query.is_null() || array.is_null() { return -1; }
+    let q = unsafe { &mut *query };
+    let f = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    
+    // Take the items from the FFI array and destroy the handle
+    let array_inner = unsafe { Box::from_raw(array) };
+    
+    q.query.filters.push(crate::query::filter::Filter {
+        field: f,
+        op: Operator::In,
+        value: Value::Array(array_inner.items),
+    });
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn fl_engine_snapshot_indices(engine: *mut FL_Engine) -> i32 {
+    if engine.is_null() { return -1; }
+    let engine = unsafe { &*engine };
+    
+    match engine.db.save_index_snapshots() {
+        Ok(_) => 0,
+        Err(e) => {
+            set_last_error(e.to_string());
+            -1
+        }
     }
 }

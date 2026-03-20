@@ -14,6 +14,7 @@ use crate::document::value::Value;
 use crate::error::{FireLiteError, Result};
 use crate::index::composite::definition::{CompositeIndexDefinition, SortDirection};
 use crate::index::manager::IndexManager;
+use crate::index::storage::index_storage::IndexStorage;
 use crate::query::executor::executor::ParallelQueryExecutor;
 use crate::query::planner::QueryPlanner;
 use crate::query::query::Query;
@@ -85,6 +86,8 @@ pub struct FireLite {
     config: FireLiteConfig,
     shards: Arc<RwLock<HashMap<String, Arc<RwLock<StorageEngine>>>>>, // The only storage
     
+    index_storage: Arc<Mutex<IndexStorage>>,
+
     indexes: Arc<RwLock<IndexManager>>,
     executor: ParallelQueryExecutor,
     tx_lock: Mutex<()>,
@@ -95,6 +98,10 @@ pub struct FireLite {
     audit_tx: Sender<AuditEntry>,
     audit_data: Arc<RwLock<Vec<AuditEntry>>>,
     index_tx: Sender<IndexOp>,
+
+    audit_stop: Mutex<Option<Sender<()>>>,
+    audit_handle: Mutex<Option<thread::JoinHandle<()>>>,
+    
     maintenance_stop: Mutex<Option<Sender<()>>>,
     maintenance_handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
@@ -104,48 +111,100 @@ impl FireLite {
         let root_path = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&root_path)?;
         
+        // 1. Initialize Global Shared State & Channels (ONCE)
         let indexes = Arc::new(RwLock::new(IndexManager::default()));
         let (index_tx, index_rx) = channel::<IndexOp>();
         let (audit_tx, audit_rx) = channel::<AuditEntry>();
         let audit_data = Arc::new(RwLock::new(Vec::new()));
+        let (audit_stop_tx, audit_stop_rx) = channel::<()>(); 
 
-        // 1. Audit Worker Implementation
-        let log_path = config.audit_log_path.clone().unwrap_or_else(|| root_path.join("audit.log").to_string_lossy().to_string());
-        let mut audit_file = if config.enable_audit_log {
-            Some(std::fs::OpenOptions::new().create(true).append(true).open(log_path)?)
-        } else { None };
+        // 2. Initialize Index Persistence
+        let index_dir = root_path.join("_indices");
+        let index_log_path = index_dir.join("index.log").to_string_lossy().to_string();
+        let snapshot_dir = index_dir.join("snapshots").to_string_lossy().to_string();
+        
+        let index_storage = Arc::new(Mutex::new(
+            IndexStorage::open(&index_log_path, &snapshot_dir)
+                .map_err(|e| FireLiteError::Io(e))?
+        ));
 
-        let audit_data_clone = Arc::clone(&audit_data);
-        thread::spawn(move || {
-            while let Ok(entry) = audit_rx.recv() {
-                if let Ok(mut history) = audit_data_clone.write() { history.push(entry.clone()); }
-                if let Some(file) = audit_file.as_mut() {
-                    let _ = writeln!(file, "[{:?}] op={:?} col={} doc={:?} ok={}", 
-                        SystemTime::now(), entry.op, entry.collection, entry.doc_id.as_deref().unwrap_or("<none>"), entry.ok);
-                }
-            }
-        });
-
-        // 2. Index Worker Implementation
+        // 3. Spawn Persistent Index Worker
+        // This handles both memory updates AND physical logging
         let idx_clone = Arc::clone(&indexes);
+        let storage_persist = Arc::clone(&index_storage);
+        
         thread::spawn(move || {
             while let Ok(op) = index_rx.recv() {
                 match op {
                     IndexOp::Update { collection, puts, deletes } => {
                         let mut mgr = idx_clone.write().unwrap();
-                        let put_refs: Vec<(&str, &FireLiteDoc)> = puts.iter().map(|(id, d)| (id.as_str(), d)).collect();
-                        mgr.index_batch(&collection, put_refs);
-                        let del_refs: Vec<(&str, &FireLiteDoc)> = deletes.iter().map(|(id, d)| (id.as_str(), d)).collect();
-                        mgr.remove_batch(&collection, del_refs);
+                        let mut persist = storage_persist.lock().unwrap();
+
+                        for (id, doc) in puts {
+                            mgr.index_document(&collection, &id, &doc);
+                            
+                            // 2. NEW: Update Secondary Indexes (Single Field)
+                            if let Some(sec_map) = mgr.secondary.get_mut(&collection) {
+                                for (field, index) in sec_map.iter_mut() {
+                                    if let Some(val) = doc.get(field) {
+                                        let key = crate::index::index_key::encode_scalar(val);
+                                        // Use id.clone() here so 'id' stays alive for the next call
+                                        index.insert(key, id.clone()); 
+                                    }
+                                }
+                            }
+                            
+                            // Log to Disk (Survivability)
+                            let _ = persist.insert(1, doc.encode(), id);
+                        }
+
+                        for (id, doc) in deletes {
+                            mgr.remove_document(&collection, &id, &doc);
+                            // Log to Disk (Survivability)
+                            let _ = persist.delete(1, doc.encode(), id);
+                        }
                     }
                 }
             }
         });
 
+        // 4. Spawn Audit Worker Implementation
+        let log_path = config.audit_log_path.clone().unwrap_or_else(|| {
+            root_path.join("audit.log").to_string_lossy().to_string()
+        });
+        let mut audit_file = if config.enable_audit_log {
+            Some(std::fs::OpenOptions::new().create(true).append(true).open(log_path)?)
+        } else {
+            None
+        };
+
+        let audit_data_clone = Arc::clone(&audit_data);
+        let audit_handle_inner = thread::spawn(move || {
+            loop {
+                // Use recv_timeout so the thread can check the stop signal frequently
+                match audit_rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(entry) => {
+                        if let Ok(mut history) = audit_data_clone.write() { history.push(entry.clone()); }
+                        if let Some(file) = audit_file.as_mut() {
+                            let _ = writeln!(file, "[{:?}] op={:?} col={} doc={:?} ok={}", 
+                                SystemTime::now(), entry.op, entry.collection, entry.doc_id.as_deref().unwrap_or("<none>"), entry.ok);
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        // Check if we were told to stop
+                        if audit_stop_rx.try_recv().is_ok() { break; }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        });
+
+        // 5. Assemble the Engine Instance
         let db = Self {
             root_path,
             config: config.clone(),
             shards: Arc::new(RwLock::new(HashMap::new())),
+            index_storage,
             indexes,
             executor: ParallelQueryExecutor::new(config.query_workers),
             tx_lock: Mutex::new(()),
@@ -155,24 +214,41 @@ impl FireLite {
             security_rules: RwLock::new(Vec::new()),
             audit_tx,
             audit_data,
+            audit_stop: Mutex::new(Some(audit_stop_tx)), // <--- INITIALIZE
+            audit_handle: Mutex::new(Some(audit_handle_inner)), // <--- INITIALIZE
             index_tx,
             maintenance_stop: Mutex::new(None),
             maintenance_handle: Mutex::new(None),
         };
 
+        // 6. Recovery & Sync
         db.recover_existing_shards()?;
-        db.rebuild_indexes_from_shards()?;
+        db.sync_indexes_with_persistence()?; 
 
-        // 3. Maintenance Thread
         let (stop_tx, stop_rx) = channel::<()>();
         let shards_ptr = Arc::clone(&db.shards);
+        let index_storage_ptr = Arc::clone(&db.index_storage);
+
         let handle = thread::spawn(move || loop {
-            if stop_rx.try_recv().is_ok() { break; }
-            let active_shards: Vec<Arc<RwLock<StorageEngine>>> = shards_ptr.read().unwrap().values().cloned().collect();
-            for s in active_shards { if let Ok(mut storage) = s.write() { let _ = storage.run_background_maintenance(); } }
-            thread::sleep(Duration::from_secs(5));
+            // Wait for 5 seconds OR a stop signal
+            match stop_rx.recv_timeout(Duration::from_secs(5)) {
+                // If we get a signal (Ok) or the sender dropped (Err Disconnected), exit NOW
+                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                
+                // If 5 seconds passed without a signal, do the work
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let active_shards: Vec<_> = shards_ptr.read().unwrap().values().cloned().collect();
+                    for s in active_shards { 
+                        if let Ok(mut storage) = s.write() { let _ = storage.run_background_maintenance(); } 
+                    }
+                    
+                    if let Ok(mut persist) = index_storage_ptr.lock() {
+                        if let Ok(_) = persist.snapshot(1) { let _ = persist.reset_log(); }
+                    }
+                }
+            }
         });
-        
+
         *db.maintenance_stop.lock().unwrap() = Some(stop_tx);
         *db.maintenance_handle.lock().unwrap() = Some(handle);
 
@@ -218,24 +294,6 @@ impl FireLite {
             Arc::new(RwLock::new(StorageEngine::open(path, &self.config).expect("Shard fail")))
         }).clone()
     }
-
-    // /// MASTER WRITE PATH: The public gateway that checks security and audit.
-    // pub fn write_batch(&self, mutations: Vec<BatchMutation>) -> Result<()> {
-    //     // Acquire lock once at the entry point
-    //     let _guard = self.tx_lock.lock().unwrap();
-        
-    //     // Security check
-    //     if !mutations.iter().all(|m| self.allowed(self.get_col(m), AccessOp::Batch)) {
-    //         self.record_audit(AuditEntry { op: AccessOp::Batch, collection: "<sharded>".into(), doc_id: None, ok: false });
-    //         return Err(FireLiteError::Corrupt("Denied".into()));
-    //     }
-
-    //     // Call the internal implementation that DOES NOT lock
-    //     let res = self.write_batch_internal(mutations);
-        
-    //     self.record_audit(AuditEntry { op: AccessOp::Batch, collection: "<sharded>".into(), doc_id: None, ok: res.is_ok() });
-    //     res
-    // }
 
     pub fn write_batch(&self, mutations: Vec<BatchMutation>) -> Result<()> {
         // 1. SECURITY & AUDIT (Read-only check, no lock needed)
@@ -288,8 +346,8 @@ impl FireLite {
         for m in &mut mutations {
             match m {
                 BatchMutation::Put { collection, doc_id, doc } => {
-                    for (_, val) in &mut doc.fields { 
-                        if matches!(val, Value::ServerTimestamp) { *val = Value::Timestamp(now); } 
+                    for (_, v) in &mut doc.fields { 
+                        if matches!(v, Value::ServerTimestamp) { *v = Value::Timestamp(now); } 
                     }
                     let key = doc_key(collection, doc_id);
                     shard_groups.entry(collection.clone()).or_default().push(StorageMutation::Put {
@@ -313,12 +371,6 @@ impl FireLite {
                 }
             }
         }
-
-        // 1. APPLY TO SHARDS (DURABILITY)
-        // for (col_name, ops) in shard_groups {
-        //     let shard = self.get_shard(&col_name);
-        //     shard.write().unwrap().apply_batch(&ops)?; 
-        // }
 
         // 2. DETERMINISTIC LOCKING: Prevents Deadlocks between threads
         let mut sorted_shards: Vec<_> = shard_groups.keys().cloned().collect();
@@ -350,65 +402,10 @@ impl FireLite {
         Ok(())
     }
 
-    // fn write_batch_internal(&self, mut mutations: Vec<BatchMutation>) -> Result<()> {
-    //     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
-        
-    //     let mut storage_groups: HashMap<String, Vec<StorageMutation>> = HashMap::new();
-    //     let mut index_puts: HashMap<String, Vec<(String, FireLiteDoc)>> = HashMap::new();
-    //     let mut index_dels: HashMap<String, Vec<(String, FireLiteDoc)>> = HashMap::new();
-    //     let mut change_events: Vec<(String, ChangeEvent)> = Vec::new();
-
-    //     for m in &mut mutations {
-    //         match m {
-    //             BatchMutation::Put { collection, doc_id, doc } => {
-    //                 for (_, val) in &mut doc.fields { 
-    //                     if matches!(val, Value::ServerTimestamp) { *val = Value::Timestamp(now); } 
-    //                 }
-    //                 let key = doc_key(collection, doc_id);
-    //                 storage_groups.entry(collection.clone()).or_default().push(StorageMutation::Put {
-    //                     key: key.clone(),
-    //                     value: doc.encode(),
-    //                 });
-    //                 index_puts.entry(collection.clone()).or_default().push((doc_id.clone(), doc.clone()));
-    //                 change_events.push((collection.clone(), ChangeEvent { path: key, kind: ChangeKind::Put }));
-    //             }
-    //             BatchMutation::Delete { collection, doc_id } => {
-    //                 let key = doc_key(collection, doc_id);
-    //                 let shard = self.get_shard(collection); // FIX: Look in specific shard
-    //                 if let Some(bytes) = shard.read().unwrap().get(&key)? {
-    //                     if let Some(old_doc) = FireLiteDoc::decode(&bytes) {
-    //                         index_dels.entry(collection.clone()).or_default().push((doc_id.clone(), old_doc));
-    //                     }
-    //                 }
-    //                 storage_groups.entry(collection.clone()).or_default().push(StorageMutation::Delete { key: key.clone() });
-    //                 change_events.push((collection.clone(), ChangeEvent { path: key, kind: ChangeKind::Delete }));
-    //             }
-    //         }
-    //     }
-
-    //     // Apply to physical shards
-    //     for (col_name, ops) in storage_groups {
-    //         let shard = self.get_shard(&col_name);
-    //         shard.write().unwrap().apply_batch(&ops)?; // Targets collection folder
-    //     }
-
-    //     // Background workers and metadata updates...
-    //     self.bump_versions_for_mutations(&mutations);
-    //     // ... (Send to index_tx and notify_watchers)
-    //     Ok(())
-    // }
-
     pub fn put(&self, col: &str, id: &str, doc: &FireLiteDoc) -> Result<()> {
         self.write_batch(vec![BatchMutation::Put { collection: col.into(), doc_id: id.into(), doc: doc.clone() }])
     }
 
-    // pub fn get(&self, collection: &str, doc_id: &str) -> Result<Option<FireLiteDoc>> {
-    //     if !self.allowed(collection, AccessOp::Get) { return Err(FireLiteError::Corrupt("Denied".into())); }
-    //     let shard = self.get_shard(collection);
-    //     let key = doc_key(collection, doc_id);
-    //     let bytes = shard.read().unwrap().get(&key)?;
-    //     Ok(bytes.and_then(|b| FireLiteDoc::decode(&b)))
-    // }
     pub fn get(&self, collection: &str, doc_id: &str) -> Result<Option<FireLiteDoc>> {
         if !self.allowed(collection, AccessOp::Get) { 
             self.record_audit(AuditEntry { op: AccessOp::Get, collection: collection.into(), doc_id: Some(doc_id.into()), ok: false });
@@ -582,39 +579,106 @@ impl FireLite {
     fn record_audit(&self, entry: AuditEntry) {
         let _ = self.audit_tx.send(entry);
     }
+
+    fn sync_indexes_with_persistence(&self) -> Result<()> {
+        // 1. Load from Persistent Storage (Fast)
+        {
+            let mut mgr = self.indexes.write().unwrap();
+            let mut persist = self.index_storage.lock().unwrap();
+            mgr.composite = std::mem::take(&mut persist.manager);
+        }
+
+        // 2. Check if the index is actually empty
+        // (This happens on a fresh install or if snapshots are missing)
+        let is_empty = {
+            let mgr = self.indexes.read().unwrap();
+            // Check if there are any IDs in any collection in the B-Tree
+            // Using an empty scan to check for any existence
+            mgr.composite.get(1).map_or(true, |idx| idx.tree.is_empty())
+        };
+
+        if is_empty {
+            // FALLBACK: If no snapshot was found, do the full scan once.
+            // This resolves the "dead_code" warning for this method.
+            self.rebuild_indexes_from_shards()?;
+        } else {
+            // CATCH-UP: Only scan shards for documents added since the last snapshot
+            let shards = self.shards.read().unwrap();
+            let mut mgr = self.indexes.write().unwrap();
+            for (col_name, shard) in shards.iter() {
+                let storage = shard.read().unwrap();
+                let physical_count = storage.count_prefix("");
+                let indexed_count = mgr.composite.exact_match_doc_ids(col_name, &[], &[]).map_or(0, |v| v.len());
+                
+                if physical_count > indexed_count {
+                    // Shard has new data: scan and update index
+                    for (key, bytes) in storage.scan_prefix("")? {
+                        if let Some((_, doc_id)) = key.split_once(':') {
+                            if let Some(doc) = FireLiteDoc::decode(&bytes) {
+                                mgr.composite.index_document(col_name, doc_id, &doc);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+        /// simplified FFI helper to index a single field
+    pub fn create_index(&self, collection: &str, field: &str) -> Result<()> {
+        let mut mgr = self.indexes.write().unwrap();
+        mgr.create_secondary_index(collection, field);
+        
+        // Trigger a background task to populate this new index from existing data
+        // For v0.6 simplicity, we'll rely on the next 'put' or a manual 'rebuild'
+        Ok(())
+    }
+
+    /// Explicitly trigger a snapshot (called by Maintenance Thread or FFI)
+    pub fn save_index_snapshots(&self) -> Result<()> {
+        let persist = self.index_storage.lock().unwrap();
+        // Snapshot the primary composite index (ID 1)
+        persist.snapshot(1).map_err(|e| FireLiteError::Io(e))?;
+        Ok(())
+    }
 }
 
 
 impl Drop for FireLite {
     fn drop(&mut self) {
-        // 1. Signal background workers to stop immediately
+        // 1. Signal workers to stop. They will wake up instantly due to recv_timeout.
         if let Some(tx) = self.maintenance_stop.lock().unwrap().take() {
             let _ = tx.send(());
         }
-
-        // 2. Shut down shards in parallel (Optional but faster)
-        // By taking the shards map, we ensure they start dropping.
-        // StorageEngine's own Drop trait will handle the individual flushes.
-        let mut shards = self.shards.write().unwrap();
-        shards.clear(); 
-        drop(shards);
-
-        // 3. Finally, wait for the maintenance thread to exit
-        // We do this LAST to ensure it doesn't block the shard cleanup
-        if let Some(handle) = self.maintenance_handle.lock().unwrap().take() {
-            // Use a timeout or just join. 
-            // If it's stuck, it's usually because it's waiting on a shard lock 
-            // that we just released above.
-            let _ = handle.join();
+        if let Some(tx) = self.audit_stop.lock().unwrap().take() {
+            let _: std::result::Result<(), std::sync::mpsc::SendError<()>> = tx.send(());
         }
+
+        // 2. PARALLEL SHARD FLUSHING
+        // We move the shards out of the map to ensure we own them during the flush
+        let shards_to_flush: Vec<Arc<RwLock<StorageEngine>>> = {
+            let mut shards_map = self.shards.write().unwrap();
+            shards_map.drain().map(|(_, shard)| shard).collect()
+        };
+
+        let flush_handles: Vec<_> = shards_to_flush.into_iter().map(|shard| {
+            thread::spawn(move || {
+                if let Ok(mut storage) = shard.write() {
+                    let _ = storage.checkpoint_inlined_data();
+                    let _ = storage.flush_all();
+                }
+            })
+        }).collect();
+
+        // 3. Wait for shard flushes
+        for h in flush_handles { let _ = h.join(); }
+
+        // 4. Join the controller threads (Now near-instant because they woke up in step 1)
+        if let Some(h) = self.maintenance_handle.lock().unwrap().take() { let _ = h.join(); }
+        if let Some(h) = self.audit_handle.lock().unwrap().take() { let _ = h.join(); }
     }
 }
-// impl Drop for FireLite {
-//     fn drop(&mut self) {
-//         if let Some(tx) = self.maintenance_stop.lock().unwrap().take() { let _ = tx.send(()); }
-//         if let Some(handle) = self.maintenance_handle.lock().unwrap().take() { let _ = handle.join(); }
-//     }
-// }
 
 // --- Internal Helper Functions ---
 

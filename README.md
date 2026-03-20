@@ -6,9 +6,9 @@ It runs in-process (no external service), stores typed binary documents, and pro
 
 ---
 
-## Current Status (Latest)
+## Current Status (v0.5.3 - High Velocity)
 
-FireLite is in **advanced foundation stage**: core architecture and major vertical slices are implemented, while production hardening is still in progress.
+FireLite has evolved from a foundation stage into a **Production-Candidate** engine. The core architecture now supports physical data sharding and near-instant recovery.
 
 ### Implemented Today
 

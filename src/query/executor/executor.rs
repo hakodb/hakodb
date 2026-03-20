@@ -69,6 +69,22 @@ impl ParallelQueryExecutor {
                     if !out.is_empty() { break; }
                 }
                 out
+            },
+            ScanType::SecondaryIndex { field, value } => {
+                let mut out = Vec::new();
+                if let Some(sec_map) = indexes.secondary.get(&plan.collection) {
+                    if let Some(index) = sec_map.get(field) {
+                        // Secondary indexes return Vec<String> (Doc IDs)
+                        let doc_ids = index.range_scan(value, value);
+                        for doc_id in doc_ids {
+                            let key = format!("{}:{}", plan.collection, doc_id);
+                            if let Some(raw) = storage.get(&key)? {
+                                out.push((key, raw));
+                            }
+                        }
+                    }
+                }
+                out
             }
         };
 

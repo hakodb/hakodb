@@ -29,6 +29,31 @@ impl QueryPlanner {
             }
         }
 
+        // NEW: Check Secondary Indexes
+        for filter in &query.filters {
+            if matches!(filter.op, Operator::Eq) {
+                if indexes.secondary.get(&query.collection)
+                    .map_or(false, |m| m.contains_key(&filter.field)) 
+                {
+                    // Found a single-field index!
+                    let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
+                    return QueryPlan {
+                        collection: query.collection.clone(),
+                        scan: ScanType::SecondaryIndex { 
+                            field: filter.field.clone(), 
+                            value: val_bytes 
+                        },
+                        filters: query.filters.clone(),
+                        or_groups: query.or_groups.clone(), // <--- ADD THIS
+                        order_by: query.order_by.clone(),
+                        limit: query.limit,
+                        offset: None, // Cursor replaces Offset!
+                        projection: query.projection.clone(),
+                    };
+                }
+            }
+        }
+
         let fields = query.composite_fields();
         
         // NEW LOGIC: Support Eq, Gt, Gte, Lt, Lte for index scanning

@@ -23,23 +23,32 @@ pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
 fn matches_filters_view(bytes: &[u8], plan: &crate::query::plan::QueryPlan) -> bool {
     let Some(view) = FireLiteDocView::new(bytes) else { return false; };
 
-    // 1. Check main AND filters
-    let and_match = plan.filters.iter().all(|f| {
-        check_single_filter(&view, f)
+    // 1. Check main AND filters (The Base Group)
+    // If these match, we return true immediately (OR short-circuit)
+    if !plan.filters.is_empty() {
+        let and_match = plan.filters.iter().all(|f| check_single_filter(&view, f));
+        if and_match {
+            return true;
+        }
+    }
+
+    // 2. Check OR groups
+    // If any group matches, the whole document matches
+    let or_match = plan.or_groups.iter().any(|group| {
+        // Each group is an AND-block
+        group.iter().all(|f| check_single_filter(&view, f))
     });
 
-    if !and_match && !plan.filters.is_empty() {
-        return false;
+    if or_match {
+        return true;
     }
 
-    // 2. Check OR groups (If any group matches, the whole thing matches)
-    if plan.or_groups.is_empty() {
-        return and_match;
+    // 3. Fallback: If there are NO filters at all, it's a "Select All"
+    if plan.filters.is_empty() && plan.or_groups.is_empty() {
+        return true;
     }
 
-    plan.or_groups.iter().any(|group: &Vec<crate::query::filter::Filter>| { // Added explicit type hint
-        group.iter().all(|f| check_single_filter(&view, f))
-    })
+    false
 }
 
 fn check_single_filter(view: &FireLiteDocView, f: &Filter) -> bool {

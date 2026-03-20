@@ -47,4 +47,10 @@ impl IndexStorage {
         }
         Ok(())
     }
+
+    /// Clears the index log. Usually called after a successful snapshot.
+    pub fn reset_log(&mut self) -> std::io::Result<()> {
+        self.log.reset()
+    }
+
 }

@@ -13,6 +13,7 @@ pub enum Operator {
     Match,      // Full word matching
     Contains,   // Substring matching
     StartsWith, // Prefix matching
+    In,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -35,6 +36,15 @@ pub struct Filter {
 }
 
 pub fn compare_values(a: &Value, op: &Operator, b: &Value) -> bool {
+    // Handle the 'In' operator first because it breaks the standard (a, b) pairing logic
+    // (a is the field value, b is the array of allowed values)
+    if matches!(op, Operator::In) {
+        return if let Value::Array(allowed_values) = b {
+            allowed_values.contains(a)
+        } else {
+            false
+        };
+    }
     match (a, b) {
         // String-specific logic for FTS and standard comparisons
         (Value::String(d), Value::String(f)) => match op {
@@ -66,9 +76,16 @@ pub fn compare_values(a: &Value, op: &Operator, b: &Value) -> bool {
             } else {
                 false
             }
-        }
-        
+        },
+
         (Value::Null, Value::Null) => eval_ordering(Ordering::Equal, op),
+        (Value::Int(a_val), Value::Float(b_val)) => eval_ordering((*a_val as f64).total_cmp(b_val), op),
+        (Value::Float(a_val), Value::Int(b_val)) => eval_ordering(a_val.total_cmp(&(*b_val as f64)), op),
+        
+        // Reference comparison
+        (Value::Reference { collection: c1, doc_id: i1 }, Value::Reference { collection: c2, doc_id: i2 }) => {
+            eval_ordering(c1.cmp(c2).then(i1.cmp(i2)), op)
+        }
 
         // Cross-type comparisons or comparisons involving ServerTimestamp placeholders
         // In Firestore-style engines, comparing different types usually returns false.
@@ -86,6 +103,6 @@ fn eval_ordering(ord: Ordering, op: &Operator) -> bool {
         Operator::Lt => ord == Ordering::Less,
         Operator::Lte => ord == Ordering::Less || ord == Ordering::Equal,
         // String-only operators return false if used on non-string types
-        Operator::Match | Operator::Contains | Operator::StartsWith => false,
+        Operator::Match | Operator::Contains | Operator::StartsWith | Operator::In => false,
     }
 }

@@ -13,6 +13,7 @@ pub enum ScanType {
         values: Vec<Value>,
     },
     CursorIndex { start_key: SmallVec<[u8; 32]> },
+    SecondaryIndex { field: String, value: Vec<u8> },
 }
 
 #[derive(Debug, Clone)]

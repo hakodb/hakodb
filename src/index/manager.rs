@@ -1,15 +1,17 @@
 use crate::document::firelite_doc::FireLiteDoc;
 use crate::document::value::Value;
 use std::sync::Arc;
+use std::collections::HashMap;
 
 use super::composite::definition::CompositeIndexDefinition;
 use super::composite::manager::CompositeIndexManager;
-// use crate::index::composite::manager::CompositeIndexManager;
 use crate::index::composite::composite_index::CompositeIndex;
+use crate::index::secondary_index::SecondaryIndex;
 
 #[derive(Default)]
 pub struct IndexManager {
     pub composite: CompositeIndexManager,
+    pub secondary: HashMap<String, HashMap<String, SecondaryIndex>>,
 }
 
 impl IndexManager {
@@ -65,5 +67,21 @@ impl IndexManager {
         I: IntoIterator<Item = (&'a str, &'a FireLiteDoc)> + Clone,
     {
         self.composite.remove_batch(collection, docs)
+    }
+
+        /// Registers a new single-field index
+    pub fn create_secondary_index(&mut self, collection: &str, field: &str) {
+        self.secondary
+            .entry(collection.to_string())
+            .or_default()
+            .insert(field.to_string(), SecondaryIndex::default());
+    }
+
+    /// Optimized lookup: Check secondary indexes if no composite exists
+    pub fn lookup_secondary(&self, collection: &str, field: &str, value: &[u8]) -> Option<Vec<String>> {
+        self.secondary.get(collection)?
+            .get(field)?
+            .range_scan(value, value) // Exact match scan
+            .into()
     }
 }

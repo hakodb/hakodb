@@ -176,6 +176,9 @@ int32_t fl_engine_patch(FL_Engine *engine,
 /// fields_json should be like: [{"field": "age", "desc": false}]
 uint32_t fl_engine_create_index(FL_Engine *engine, const char *collection, const char *fields_json);
 
+/// Simplified indexer: Create an index for a single field.
+int32_t fl_engine_create_simple_index(FL_Engine *engine, const char *collection, const char *field);
+
 FL_Transaction *fl_transaction_begin(FL_Engine *engine);
 
 FL_Doc *fl_transaction_get(FL_Engine *engine,
@@ -214,8 +217,16 @@ FL_Doc *fl_engine_get_by_ref(FL_Engine *engine, const FL_Doc *doc, const char *f
 
 int32_t fl_query_start_after(FL_Query *query, const FL_Doc *anchor_doc);
 
+char *fl_engine_get_audit_log(FL_Engine *engine);
+
 int32_t fl_query_where_or_str(FL_Query *query, const char *field, const char *value);
 
-char *fl_engine_get_audit_log(FL_Engine *engine);
+int32_t fl_query_where_or_int(FL_Query *query, const char *field, int64_t value);
+
+/// Adds an IN filter: field IN [array_items]
+/// This takes ownership of the FL_Array and frees it.
+int32_t fl_query_where_in(FL_Query *query, const char *field, FL_Array *array);
+
+int32_t fl_engine_snapshot_indices(FL_Engine *engine);
 
 }  // extern "C"

@@ -434,6 +434,73 @@ void bench_patch_efficiency(FL_Engine* db) {
     fl_doc_free(update);
 }
 
+void bench_logical_logic(FL_Engine* db) {
+    printf(">> firelite_logical_OR_and_IN (Filtering stress)...\n");
+
+    // 1. Test OR: (id == 1) OR (id == 2)
+    FL_Query* q_or = fl_query_new("bench");
+    fl_query_where_eq_int(q_or, "id", 1);
+    fl_query_where_or_int(q_or, "id", 2);
+    
+    char* res_or = fl_query_execute(db, q_or);
+    printf("   OR Result: %s\n", res_or); // Should contain docs 1 and 2
+    fl_string_free(res_or);
+    fl_query_free(q_or);
+
+    // 2. Test IN: id IN [10, 20, 30]
+    FL_Array* arr = fl_array_new();
+    fl_array_append_int(arr, 10);
+    fl_array_append_int(arr, 20);
+    fl_array_append_int(arr, 30);
+
+    FL_Query* q_in = fl_query_new("bench");
+    fl_query_where_in(q_in, "id", arr); // Takes ownership of arr
+    
+    char* res_in = fl_query_execute(db, q_in);
+    printf("   IN Result: %s\n", res_in); // Should contain docs 10, 20, 30
+    fl_string_free(res_in);
+    fl_query_free(q_in);
+}
+
+// --- NEW v0.5 Shard Parallelism Test ---
+void bench_shard_parallel_write(FL_Engine* db, int thread_count) {
+    printf(">> firelite_shard_parallel_write (%d threads, different collections)...\n", thread_count);
+    vector<thread> workers;
+    string collections[] = {"shard_a", "shard_b", "shard_c", "shard_d"};
+    
+    double start = get_time();
+    for (int t = 0; t < thread_count; t++) {
+        workers.push_back(thread([db, t, &collections]() {
+            string my_col = collections[t % 4];
+            for (int i = 0; i < 200; i++) {
+                FL_Doc* d = fl_doc_new();
+                fl_doc_insert_int(d, "val", i);
+                char id[32]; sprintf(id, "t%d_%d", t, i);
+                fl_engine_insert(db, my_col.c_str(), id, d);
+                fl_doc_free(d);
+            }
+        }));
+    }
+    for (auto& w : workers) w.join();
+    double end = get_time();
+    printf("   Result: %.2f total ops/sec across 4 shards\n", (thread_count * 200) / (end - start));
+}
+
+// --- NEW v0.5.1 Audit Viewer ---
+void display_audit_tail(FL_Engine* db) {
+    printf(">> firelite_audit_log_verification (Recent History)...\n");
+    char* log_json = fl_engine_get_audit_log(db);
+    if (log_json) {
+        // We just print the length to show it captured data, or first 100 chars
+        printf("   Capture: %zu bytes of log data.\n", strlen(log_json));
+        if (strlen(log_json) > 100) {
+            string sample(log_json);
+            printf("   Latest Entry: ...%s\n", sample.substr(sample.length() - 80).c_str());
+        }
+        fl_string_free(log_json);
+    }
+}
+
 
 // --- MAIN ---
 
@@ -466,14 +533,16 @@ int main(int argc, char* argv[]) {
     #ifdef _WIN32
         system("rd /s /q bench_data 2>nul");
     #else
-        system("rm -rf bench_data");
+        system("rm -rf ./bench_data");
     #endif
 
+    double boot_start = get_time();
     FL_Engine* db = fl_engine_open_with_config("./bench_data", config);
     if (!db) return 1;
+    printf("\n>> Engine Open: %.4fs\n\n", (get_time() - boot_start));
 
     // Seeding 10k
-    printf("Seeding %d docs...\n", SEED_COUNT);
+    printf("Seeding %d docs...\n\n", SEED_COUNT);
     FL_Batch* b = fl_batch_new();
     for (int i = 0; i < SEED_COUNT; i++) {
         FL_Doc* d = fl_doc_new(); fl_doc_insert_int(d, "id", i);
@@ -517,16 +586,29 @@ int main(int argc, char* argv[]) {
     bench_cursor_vs_offset(db);
     printf("\n");
     bench_patch_efficiency(db);
+    printf("\n");
+    bench_logical_logic(db);
+    
+    // 1. Shard Parallelism (The new v0.5 feature)
+    printf("\n");
+    bench_shard_parallel_write(db, threads);
+    printf("\n");
+    // 4. Persistence Verification
+    printf("\n>> Manual Index Snapshotting...\n");
+    fl_engine_snapshot_indices(db);
+    
+    printf("\n");
+    display_audit_tail(db);
     
     // System Diagnostics
     char* stats = fl_engine_get_stats(db);
     printf("\n>> Engine Stats: %s\n", stats);
     fl_string_free(stats);
 
-    if (durability != 3) {
-        printf("\n>> Sleeping 3 second, giving time flushing to work..");
-        std::this_thread::sleep_for(3000ms);
-    }
+    // if (durability != 3) {
+    //     printf("\n>> Sleeping 3 second, giving time flushing to work..");
+    //     std::this_thread::sleep_for(3000ms);
+    // }
 
     printf("\n>> Flushing..");
     double start_time = get_time();
