@@ -27,7 +27,7 @@ pub enum StorageMutation {
 }
 
 struct SegmentMeta {
-    id: u64,
+    // id: u64,
     level: u32,
     segment: Segment,
 }
@@ -44,6 +44,7 @@ pub struct StorageEngine {
     encryption: Option<EncryptionContext>,
     inlined_bytes: usize,
     max_inlined_bytes: usize,
+    use_compression: bool, 
     // collection_counts: HashMap<String, usize>, 
     pub(crate) collection_counts: HashMap<String, usize>,
 }
@@ -74,7 +75,12 @@ impl StorageEngine {
             let name = name.to_string_lossy();
             if let Some((level, id)) = parse_segment_name(&name) {
                 let segment = Segment::open(entry.path(), encryption.clone())?;
-                segments.insert(id, SegmentMeta { id, level, segment });
+                segments.insert(
+                    id, SegmentMeta { 
+                        // id, 
+                        level, 
+                        segment 
+                    });
                 if id > max_id {
                     max_id = id;
                 }
@@ -90,7 +96,7 @@ impl StorageEngine {
             segments.insert(
                 0,
                 SegmentMeta {
-                    id: 0,
+                    // id: 0,
                     level: 0,
                     segment,
                 },
@@ -109,6 +115,7 @@ impl StorageEngine {
             next_tx_id: 1,
             compaction_threshold_bytes: cfg.auto_compaction_threshold_bytes,
             encryption,
+            use_compression: cfg.use_compression,
             // ADD THESE TWO LINES:
             inlined_bytes: 0, 
             max_inlined_bytes: cfg.max_inlined_memory_bytes,
@@ -202,7 +209,13 @@ impl StorageEngine {
         let mut target_segment = Segment::open(target_path, self.encryption.clone())?;
 
         let mut new_pointers = HashMap::new();
-        compact_segment(&mut target_segment, &to_flush, &mut new_pointers, target_id)?;
+        compact_segment(
+            &mut target_segment, 
+            &to_flush, 
+            &mut new_pointers, 
+            target_id,
+            self.use_compression
+        )?;
         
         target_segment.flush()?;
 
@@ -213,7 +226,7 @@ impl StorageEngine {
 
         // 4. Register the new segment
         self.segments.insert(target_id, SegmentMeta {
-            id: target_id,
+            // id: target_id,
             level: 0,
             segment: target_segment,
         });
@@ -359,7 +372,7 @@ impl StorageEngine {
         self.segments.insert(
             new_id,
             SegmentMeta {
-                id: new_id,
+                // id: new_id,
                 level: 0,
                 segment,
             },
@@ -369,12 +382,10 @@ impl StorageEngine {
     }
 
     fn compact_tiers_once(&mut self) -> Result<bool> {
-        // find two immutable segments on same level
+        // 1. Find two immutable segments on the same level
         let mut by_level: HashMap<u32, Vec<u64>> = HashMap::new();
         for (id, meta) in &self.segments {
-            if *id == self.active_segment_id {
-                continue;
-            }
+            if *id == self.active_segment_id { continue; }
             by_level.entry(meta.level).or_default().push(*id);
         }
 
@@ -386,66 +397,52 @@ impl StorageEngine {
             }
         }
 
-        let Some((level, s1, s2)) = candidate else {
-            return Ok(false);
-        };
+        let Some((level, s1, s2)) = candidate else { return Ok(false); };
 
+        // 2. Prepare merge
         let target_level = level + 1;
         let target_id = self.next_segment_id;
         self.next_segment_id += 1;
 
-        let snapshot: Vec<(String, Pointer)> =
-            self.index.iter().map(|(k, p)| (k.clone(), p.clone())).collect();
-
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
-
-        for (key, pointer) in snapshot {
-            // Use a match arm with a guard to check the segment_id
-            match &pointer {
-                Pointer::Segment { segment_id, .. } if *segment_id == s1 || *segment_id == s2 => {
-                    if let Some(value) = self.read_pointer(&pointer)? {
-                        entries.push((key, value));
+        for (key, pointer) in &self.index {
+            if let Pointer::Segment { segment_id, .. } = pointer {
+                if *segment_id == s1 || *segment_id == s2 {
+                    if let Some(value) = self.read_pointer(pointer)? {
+                        entries.push((key.clone(), value));
                     }
                 }
-                _ => {} // Ignore Inlined data or data in other segments
             }
         }
 
+        // 3. Perform merge with Compression support
         let target_path = segment_path(&self.base_dir, target_level, target_id);
         let mut target = Segment::open(target_path, self.encryption.clone())?;
+        let mut new_index_subset = HashMap::new();
 
-        target.flush()?; 
+        // FIX: Pass self.use_compression here!
+        compact_segment(&mut target, &entries, &mut new_index_subset, target_id, self.use_compression)?;
 
-        let mut new_index = HashMap::new();
-        compact_segment(&mut target, &entries, &mut new_index, target_id)?;
-
-        for (k, p) in new_index {
-            self.index.insert(k, p);
+        // 4. Cleanup old files
+        for id in &[s1, s2] {
+            if let Some(mut meta) = self.segments.remove(id) {
+                let path = meta.segment.path().to_path_buf();
+                meta.segment.close();
+                let _ = std::fs::remove_file(path);
+            }
         }
 
-        if let Some(mut meta) = self.segments.remove(&s1) {
-            let path = meta.segment.path().to_path_buf();
-            meta.segment.close(); 
-            drop(meta);           
-            let _ = std::fs::remove_file(path);
-        }
-        if let Some(mut meta) = self.segments.remove(&s2) {
-            let path = meta.segment.path().to_path_buf();
-            meta.segment.close(); 
-            drop(meta);           
-            let _ = std::fs::remove_file(path);
-        }
-
+        // 5. Update master index
+        for (k, p) in new_index_subset { self.index.insert(k, p); }
         self.segments.insert(
-            target_id,
-            SegmentMeta {
-                id: target_id,
-                level: target_level,
-                segment: target,
-            },
-        );
-
+            target_id, 
+            SegmentMeta { 
+                // id: target_id, 
+                level: target_level, 
+                segment: target 
+            });
         self.rewrite_wal_snapshot()?;
+
         Ok(true)
     }
 
@@ -535,98 +532,76 @@ impl StorageEngine {
     }
 
     pub fn compact(&mut self) -> Result<()> {
+        // 1. FORCED ROTATION: Ensure current data is eligible for compaction
+        if self.segments.get(&self.active_segment_id)
+            .map_or(false, |m| m.segment.size_bytes().unwrap_or(0) > 0) 
+        {
+            let new_id = self.next_segment_id;
+            self.next_segment_id += 1;
+            let path = segment_path(&self.base_dir, 0, new_id);
+            let segment = Segment::open(path, self.encryption.clone())?;
+            self.segments.insert(
+                new_id, 
+                SegmentMeta { 
+                    // id: new_id, 
+                    level: 0, 
+                    segment 
+                });
+            self.active_segment_id = new_id;
+        }
 
-        // Only operate on **immutable segments**, never the active one
-        let immutable_ids: Vec<u64> = self
-            .segments
-            .keys()
+        let immutable_ids: Vec<u64> = self.segments.keys()
             .filter(|&&id| id != self.active_segment_id)
-            .cloned()
-            .collect();
+            .cloned().collect();
 
-        if immutable_ids.is_empty() {
-            return Ok(());
-        }
+        if immutable_ids.is_empty() { return Ok(()); }
 
-        while self.compact_tiers_once()? {
-            let by_level_count = self
-                .segments
-                .values()
-                .filter(|m| m.id != self.active_segment_id)
-                .count();
-            if by_level_count < 2 {
-                break;
-            }
-        }
-
-        // full snapshot compaction fallback
-        // let mut entries = Vec::new();
-        // Take a snapshot of the current index for the immutable segments
-        let snapshot: Vec<(String, Pointer)> = self
-            .index
-            .iter()
-            .filter(|(_, p)| {
-                // Pattern match to check the ID only if it's a Segment pointer
-                if let Pointer::Segment { segment_id, .. } = p {
-                    immutable_ids.contains(segment_id)
-                } else {
-                    false
-                }
-            })
-            .map(|(k, p)| (k.clone(), p.clone()))
-            .collect();
-
-        // let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(snapshot.len());
+        // 2. GLOBAL MERGE: Collect ALL data from ALL immutable segments
         let mut entries = Vec::new();
-        for (key, pointer) in snapshot {
-            if let Some(value) = self.read_pointer(&pointer)? {
-                entries.push((key, value));
+        for (key, pointer) in &self.index {
+            if let Pointer::Segment { segment_id, .. } = pointer {
+                if immutable_ids.contains(segment_id) {
+                    if let Some(value) = self.read_pointer(pointer)? {
+                        entries.push((key.clone(), value));
+                    }
+                }
             }
         }
 
+        // 3. Write to ONE highly-optimized, compressed segment
         let target_id = self.next_segment_id;
         self.next_segment_id += 1;
         let target_path = segment_path(&self.base_dir, 1, target_id);
         let mut target = Segment::open(target_path, self.encryption.clone())?;
-        let mut rebuilt = HashMap::new();
+        let mut rebuilt_index_subset = HashMap::new();
 
-        // Compact all entries into the new segment
-        compact_segment(&mut target, &entries, &mut rebuilt, target_id)?;
+        compact_segment(&mut target, &entries, &mut rebuilt_index_subset, target_id, self.use_compression)?;
 
-        // Drop immutable segments before deletion
+        // 4. Atomic Swap
         for id in &immutable_ids {
             if let Some(mut meta) = self.segments.remove(id) {
                 let path = meta.segment.path().to_path_buf();
                 meta.segment.close();
-                drop(meta);
-
-                // Now safe to remove the file
                 let _ = std::fs::remove_file(path);
             }
         }
 
         self.segments.insert(
-            target_id,
-            SegmentMeta {
-                id: target_id,
-                level: 1,
-                segment: target,
-            },
-        );
-        // Replace the index with rebuilt one
-        self.index = rebuilt;
-
+            target_id, 
+            SegmentMeta { 
+                // id: target_id, 
+                level: 1, 
+                segment: target 
+            });
+        for (k, p) in rebuilt_index_subset { self.index.insert(k, p); }
+        
         self.rewrite_wal_snapshot()?;
         Ok(())
     }
 
-    pub fn set_durability_mode(&mut self, mode: DurabilityMode) {
-        self.wal.set_durability_mode(mode);
-    }
+    pub fn set_durability_mode(&mut self, mode: DurabilityMode) { self.wal.set_durability_mode(mode); }
 
-    pub fn base_dir(&self) -> &Path {
-        &self.base_dir
-    }
+    pub fn base_dir(&self) -> &Path { &self.base_dir }
 
     pub fn backup(&mut self, destination_path: impl AsRef<Path>) -> Result<()> {
         // 1. Move all inlined data from RAM into segment files on Disk.
@@ -656,16 +631,9 @@ impl StorageEngine {
 
 }
 
-impl Drop for StorageEngine {
-    fn drop(&mut self) {
-        // Ensure segments are flushed and then the WAL is flushed
-        let _ = self.flush_all();
-    }
-}
+impl Drop for StorageEngine { fn drop(&mut self) { let _ = self.flush_all(); } }
 
-fn segment_path(base: &Path, level: u32, id: u64) -> PathBuf {
-    base.join(format!("segment-l{}-{}.dat", level, id))
-}
+fn segment_path(base: &Path, level: u32, id: u64) -> PathBuf { base.join(format!("segment-l{}-{}.dat", level, id)) }
 
 fn parse_segment_name(name: &str) -> Option<(u32, u64)> {
     if !name.starts_with("segment-l") || !name.ends_with(".dat") {
@@ -747,7 +715,7 @@ mod tests {
         engine.segments.insert(
             extra_id,
             SegmentMeta {
-                id: extra_id,
+                // id: extra_id,
                 level: 1,
                 segment: extra_segment,
             },

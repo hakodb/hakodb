@@ -4,6 +4,7 @@ use std::os::raw::c_char;
 use std::{ptr, thread};
 use std::time::Duration;
 use std::sync::mpsc::{channel, Sender};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use hashbrown::HashMap; 
 
@@ -15,6 +16,20 @@ use crate::query::filter::Operator;
 use crate::query::query::{Query, AggregateOp};
 use crate::index::composite::definition::SortDirection;
 // use crate::query::planner::QueryPlanner;
+
+
+macro_rules! safety_shield {
+    ($fallback:expr, $block:block) => {
+        match catch_unwind(AssertUnwindSafe(|| $block)) {
+            Ok(val) => val,
+            Err(_) => {
+                // Set the thread-local error so C++ can see it
+                crate::ffi::set_last_error("CRITICAL: Internal Engine Panic. The operation was aborted to prevent a process crash.");
+                $fallback
+            }
+        }
+    };
+}
 
 #[allow(non_camel_case_types)]
 pub struct FL_Engine {
@@ -134,11 +149,14 @@ fn value_to_json(v: &Value) -> serde_json::Value {
 }
 
 fn doc_to_json(doc: &FireLiteDoc) -> Result<String, String> {
-    let mut map = serde_json::Map::new();
-    for (k, v) in &doc.fields {
-        map.insert(k.clone(), value_to_json(v));
-    }
-    serde_json::to_string(&serde_json::Value::Object(map)).map_err(|e| e.to_string())
+    safety_shield!(Err("Internal Panic".into()), {
+
+        let mut map = serde_json::Map::new();
+        for (k, v) in &doc.fields {
+            map.insert(k.clone(), value_to_json(v));
+        }
+        serde_json::to_string(&serde_json::Value::Object(map)).map_err(|e| e.to_string())
+    })
 }
 
 fn projection_to_json(fields: Vec<(String, Value)>) -> Result<serde_json::Value, String> {
@@ -148,6 +166,8 @@ fn projection_to_json(fields: Vec<(String, Value)>) -> Result<serde_json::Value,
     }
     Ok(serde_json::Value::Object(map))
 }
+
+
 
 #[no_mangle]
 pub extern "C" fn fl_engine_open(path: *const c_char) -> *mut FL_Engine {
@@ -249,32 +269,35 @@ pub extern "C" fn fl_config_set_storage_tuning(
 /// Note: This function takes ownership of the config and will free it automatically.
 #[no_mangle]
 pub extern "C" fn fl_engine_open_with_config(path: *const c_char, config: *mut FL_Config) -> *mut FL_Engine {
-    let path_str = match cstr_to_string(path) {
-        Ok(v) => v,
-        Err(e) => {
-            set_last_error(e);
+    safety_shield!(std::ptr::null_mut(), {
+
+        let path_str = match cstr_to_string(path) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(e);
+                return std::ptr::null_mut();
+            }
+        };
+    
+        if config.is_null() {
+            set_last_error("Null config provided");
             return std::ptr::null_mut();
         }
-    };
-
-    if config.is_null() {
-        set_last_error("Null config provided");
-        return std::ptr::null_mut();
-    }
-
-    // Take ownership of the config from the FFI caller
-    let cfg_box = unsafe { Box::from_raw(config) };
-
-    match FireLite::open(path_str, cfg_box.inner) {
-        Ok(db) => {
-            clear_last_error();
-            Box::into_raw(Box::new(FL_Engine { db }))
+    
+        // Take ownership of the config from the FFI caller
+        let cfg_box = unsafe { Box::from_raw(config) };
+    
+        match FireLite::open(path_str, cfg_box.inner) {
+            Ok(db) => {
+                clear_last_error();
+                Box::into_raw(Box::new(FL_Engine { db }))
+            }
+            Err(e) => {
+                set_last_error(e.to_string());
+                std::ptr::null_mut()
+            }
         }
-        Err(e) => {
-            set_last_error(e.to_string());
-            std::ptr::null_mut()
-        }
-    }
+    })
 }
 
 // end config
@@ -352,9 +375,11 @@ pub extern "C" fn fl_watch_free(watch: *mut FL_Watch) {
 
 #[no_mangle]
 pub extern "C" fn fl_engine_free(engine: *mut FL_Engine) {
-    if !engine.is_null() {
-        unsafe { drop(Box::from_raw(engine)) };
-    }
+    safety_shield!((), {
+        if !engine.is_null() {
+            unsafe { drop(Box::from_raw(engine)) };
+        }
+    })
 }
 
 #[no_mangle]
@@ -482,6 +507,38 @@ pub extern "C" fn fl_doc_insert_bin(
     0
 }
 
+// #[no_mangle]
+// pub extern "C" fn fl_engine_insert(
+//     engine: *mut FL_Engine,
+//     collection: *const c_char,
+//     doc_id: *const c_char,
+//     doc: *const FL_Doc,
+// ) -> i32 {
+//     if engine.is_null() || doc.is_null() {
+//         return set_last_error("null engine/doc handle");
+//     }
+//     let collection = match cstr_to_string(collection) {
+//         Ok(v) => v,
+//         Err(e) => return set_last_error(e),
+//     };
+//     let doc_id = match cstr_to_string(doc_id) {
+//         Ok(v) => v,
+//         Err(e) => return set_last_error(e),
+//     };
+
+//     let engine = unsafe { &mut *engine };
+//     let doc = unsafe { &*doc };
+//     match engine.db.put(&collection, &doc_id, &doc.doc) {
+//         Ok(_) => {
+//             clear_last_error();
+//             0
+//         }
+//         Err(e) => {
+//     set_last_error(e.to_string());
+//     -1 // or ptr::null_mut() depending on function return type
+// },
+//     }
+// }
 #[no_mangle]
 pub extern "C" fn fl_engine_insert(
     engine: *mut FL_Engine,
@@ -489,30 +546,26 @@ pub extern "C" fn fl_engine_insert(
     doc_id: *const c_char,
     doc: *const FL_Doc,
 ) -> i32 {
-    if engine.is_null() || doc.is_null() {
-        return set_last_error("null engine/doc handle");
-    }
-    let collection = match cstr_to_string(collection) {
-        Ok(v) => v,
-        Err(e) => return set_last_error(e),
-    };
-    let doc_id = match cstr_to_string(doc_id) {
-        Ok(v) => v,
-        Err(e) => return set_last_error(e),
-    };
-
-    let engine = unsafe { &mut *engine };
-    let doc = unsafe { &*doc };
-    match engine.db.put(&collection, &doc_id, &doc.doc) {
-        Ok(_) => {
-            clear_last_error();
-            0
+    safety_shield!(-1, { // Returns -1 if Rust panics
+        if engine.is_null() || doc.is_null() {
+            return set_last_error("null engine/doc handle");
         }
-        Err(e) => {
-    set_last_error(e.to_string());
-    -1 // or ptr::null_mut() depending on function return type
-},
-    }
+        let collection = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => return set_last_error(e),
+        };
+        let doc_id = match cstr_to_string(doc_id) {
+            Ok(v) => v,
+            Err(e) => return set_last_error(e),
+        };
+
+        let engine = unsafe { &mut *engine };
+        let doc = unsafe { &*doc };
+        match engine.db.put(&collection, &doc_id, &doc.doc) {
+            Ok(_) => 0,
+            Err(e) => set_last_error(e.to_string()),
+        }
+    })
 }
 
 #[no_mangle]
@@ -521,37 +574,45 @@ pub extern "C" fn fl_engine_get(
     collection: *const c_char,
     doc_id: *const c_char,
 ) -> *mut FL_Doc {
-    if engine.is_null() {
-        set_last_error("null engine handle");
-        return ptr::null_mut();
-    }
-    let collection = match cstr_to_string(collection) {
-        Ok(v) => v,
-        Err(e) => {
-            set_last_error(e);
-            return ptr::null_mut();
-        }
-    };
-    let doc_id = match cstr_to_string(doc_id) {
-        Ok(v) => v,
-        Err(e) => {
-            set_last_error(e);
-            return ptr::null_mut();
-        }
-    };
+    safety_shield!(std::ptr::null_mut(), {
 
-    let engine = unsafe { &mut *engine };
-    match engine.db.get(&collection, &doc_id) {
-        Ok(Some(doc)) => {
-            clear_last_error();
-            Box::into_raw(Box::new(FL_Doc { doc }))
+        if engine.is_null() {
+            set_last_error("null engine handle");
+            return ptr::null_mut();
         }
-        Ok(None) => ptr::null_mut(),
-        Err(e) => {
-            set_last_error(e.to_string());
-            ptr::null_mut()
+        let collection = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(e);
+                return ptr::null_mut();
+            }
+        };
+        let doc_id = match cstr_to_string(doc_id) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(e);
+                return ptr::null_mut();
+            }
+        };
+        // let engine = unsafe { &mut *engine };
+        // match engine.db.get(&collection, &doc_id) {
+        //     Ok(Some(doc)) => {
+        //         clear_last_error();
+        //         Box::into_raw(Box::new(FL_Doc { doc }))
+        //     }
+        //     Ok(None) => ptr::null_mut(),
+        //     Err(e) => {
+        //         set_last_error(e.to_string());
+        //         ptr::null_mut()
+        //     }
+        // }
+        let engine = unsafe { &mut *engine };
+        match engine.db.get(&collection, &doc_id) {
+            Ok(Some(doc)) => Box::into_raw(Box::new(FL_Doc { doc })),
+            _ => std::ptr::null_mut(),
         }
-    }
+    })
+
 }
 
 #[no_mangle]
@@ -653,24 +714,27 @@ pub extern "C" fn fl_batch_delete(
 
 #[no_mangle]
 pub extern "C" fn fl_batch_commit(engine: *mut FL_Engine, batch: *mut FL_Batch) -> i32 {
-    if engine.is_null() || batch.is_null() {
-        return set_last_error("null engine/batch handle");
-    }
-
-    let engine = unsafe { &mut *engine };
-    let batch = unsafe { &mut *batch };
-    let ops = std::mem::take(&mut batch.ops);
-
-    match engine.db.write_batch(ops) {
-        Ok(_) => {
-            clear_last_error();
-            0
+    safety_shield!(-1, {
+        if engine.is_null() || batch.is_null() {
+            return set_last_error("null engine/batch handle");
         }
-        Err(e) => {
-    set_last_error(e.to_string());
-    -1 // or ptr::null_mut() depending on function return type
-},
-    }
+    
+        let engine = unsafe { &mut *engine };
+        let batch = unsafe { &mut *batch };
+        let ops = std::mem::take(&mut batch.ops);
+    
+        match engine.db.write_batch(ops) {
+            Ok(_) => {
+                clear_last_error();
+                0
+            }
+            Err(e) => {
+        set_last_error(e.to_string());
+        -1 // or ptr::null_mut() depending on function return type
+        },
+        }
+        
+    })
 }
 
 #[no_mangle]
@@ -807,59 +871,62 @@ pub extern "C" fn fl_query_select_field(query: *mut FL_Query, field: *const c_ch
 
 #[no_mangle]
 pub extern "C" fn fl_query_execute(engine: *mut FL_Engine, query: *const FL_Query) -> *mut c_char {
-    if engine.is_null() || query.is_null() {
-        set_last_error("null engine/query handle");
-        return ptr::null_mut();
-    }
+    safety_shield!(std::ptr::null_mut(), {
 
-    let engine = unsafe { &mut *engine };
-    let query = unsafe { &*query };
-
-    let query_obj = query.query.clone();
-    let rows_res: Result<Vec<serde_json::Value>, String> = if query_obj.projection.is_empty() {
-        engine
-            .db
-            .query(query_obj)
-            .map_err(|e| e.to_string())
-            .and_then(|rows| {
-                rows.into_iter()
-                    .map(|(_, doc)| {
-                        doc_to_json(&doc).and_then(|s| {
-                            serde_json::from_str::<serde_json::Value>(&s).map_err(|e| e.to_string())
+        if engine.is_null() || query.is_null() {
+            set_last_error("null engine/query handle");
+            return ptr::null_mut();
+        }
+    
+        let engine = unsafe { &mut *engine };
+        let query = unsafe { &*query };
+    
+        let query_obj = query.query.clone();
+        let rows_res: Result<Vec<serde_json::Value>, String> = if query_obj.projection.is_empty() {
+            engine
+                .db
+                .query(query_obj)
+                .map_err(|e| e.to_string())
+                .and_then(|rows| {
+                    rows.into_iter()
+                        .map(|(_, doc)| {
+                            doc_to_json(&doc).and_then(|s| {
+                                serde_json::from_str::<serde_json::Value>(&s).map_err(|e| e.to_string())
+                            })
                         })
-                    })
-                    .collect()
-            })
-    } else {
-        engine
-            .db
-            .query_projected_zero_copy(query_obj.clone(), &query_obj.projection)
-            .map_err(|e| e.to_string())
-            .and_then(|rows| {
-                rows.into_iter()
-                    .map(|(_, fields)| projection_to_json(fields))
-                    .collect()
-            })
-    };
-
-    match rows_res {
-        Ok(arr) => {
-            match CString::new(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())) {
-                Ok(s) => {
-                    clear_last_error();
-                    s.into_raw()
-                }
-                Err(e) => {
-                    set_last_error(e.to_string());
-                    ptr::null_mut()
+                        .collect()
+                })
+        } else {
+            engine
+                .db
+                .query_projected_zero_copy(query_obj.clone(), &query_obj.projection)
+                .map_err(|e| e.to_string())
+                .and_then(|rows| {
+                    rows.into_iter()
+                        .map(|(_, fields)| projection_to_json(fields))
+                        .collect()
+                })
+        };
+    
+        match rows_res {
+            Ok(arr) => {
+                match CString::new(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())) {
+                    Ok(s) => {
+                        clear_last_error();
+                        s.into_raw()
+                    }
+                    Err(e) => {
+                        set_last_error(e.to_string());
+                        ptr::null_mut()
+                    }
                 }
             }
+            Err(e) => {
+                set_last_error(e);
+                ptr::null_mut()
+            }
         }
-        Err(e) => {
-            set_last_error(e);
-            ptr::null_mut()
-        }
-    }
+    })
 }
 
 #[no_mangle]
@@ -941,44 +1008,47 @@ pub extern "C" fn fl_query_execute_aggregation(
     engine: *mut FL_Engine,
     query: *const FL_Query
 ) -> *mut c_char {
-    if engine.is_null() || query.is_null() {
-        set_last_error("null engine or query handle");
-        return std::ptr::null_mut();
-    }
+    safety_shield!(std::ptr::null_mut(), {
 
-    let engine = unsafe { &*engine };
-    let query_wrapper = unsafe { &*query };
-
-    // Call the public method on FireLite. 
-    // This performs planning and parallel execution inside the Rust core.
-    match engine.db.execute_aggregation(query_wrapper.query.clone()) {
-        Ok(result) => {
-            let res_map: HashMap<String, f64> = result;
-            
-            match serde_json::to_string(&res_map) {
-                Ok(json) => {
-                    match CString::new(json) {
-                        Ok(c_str) => {
-                            clear_last_error();
-                            c_str.into_raw()
-                        }
-                        Err(e) => {
-                            set_last_error(e.to_string());
-                            std::ptr::null_mut()
+        if engine.is_null() || query.is_null() {
+            set_last_error("null engine or query handle");
+            return std::ptr::null_mut();
+        }
+    
+        let engine = unsafe { &*engine };
+        let query_wrapper = unsafe { &*query };
+    
+        // Call the public method on FireLite. 
+        // This performs planning and parallel execution inside the Rust core.
+        match engine.db.execute_aggregation(query_wrapper.query.clone()) {
+            Ok(result) => {
+                let res_map: HashMap<String, f64> = result;
+                
+                match serde_json::to_string(&res_map) {
+                    Ok(json) => {
+                        match CString::new(json) {
+                            Ok(c_str) => {
+                                clear_last_error();
+                                c_str.into_raw()
+                            }
+                            Err(e) => {
+                                set_last_error(e.to_string());
+                                std::ptr::null_mut()
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    set_last_error(e.to_string());
-                    std::ptr::null_mut()
+                    Err(e) => {
+                        set_last_error(e.to_string());
+                        std::ptr::null_mut()
+                    }
                 }
             }
+            Err(e) => {
+                set_last_error(e.to_string());
+                std::ptr::null_mut()
+            }
         }
-        Err(e) => {
-            set_last_error(e.to_string());
-            std::ptr::null_mut()
-        }
-    }
+    })
 }
 
 #[no_mangle]
@@ -1001,16 +1071,18 @@ pub extern "C" fn fl_doc_insert_server_timestamp(doc: *mut FL_Doc, key: *const c
 
 #[no_mangle]
 pub extern "C" fn fl_engine_backup(engine: *mut FL_Engine, path: *const c_char) -> i32 {
-    if engine.is_null() { return set_last_error("null engine"); }
-    let engine = unsafe { &*engine };
-    let path = match cstr_to_string(path) { Ok(v) => v, Err(e) => return set_last_error(e) };
-    match engine.db.backup(path) {
-        Ok(_) => 0,
-        Err(e) => {
-    set_last_error(e.to_string());
-    -1 // or ptr::null_mut() depending on function return type
-},
-    }
+    safety_shield!(-1, {
+        if engine.is_null() { return set_last_error("null engine"); }
+        let engine = unsafe { &*engine };
+        let path = match cstr_to_string(path) { Ok(v) => v, Err(e) => return set_last_error(e) };
+        match engine.db.backup(path) {
+            Ok(_) => 0,
+            Err(e) => {
+        set_last_error(e.to_string());
+        -1 // or ptr::null_mut() depending on function return type
+        },
+        }
+    })
 }
 
 #[no_mangle]
@@ -1042,29 +1114,32 @@ pub extern "C" fn fl_query_where_starts_with(query: *mut FL_Query, field: *const
 
 #[no_mangle]
 pub extern "C" fn fl_engine_list_collections(engine: *mut FL_Engine) -> *mut c_char {
-    if engine.is_null() {
-        set_last_error("null engine handle");
-        return std::ptr::null_mut();
-    }
-
-    let engine = unsafe { &*engine };
-    match engine.db.list_collections() {
-        Ok(cols) => {
-            // Serialize the Vec<String> to a JSON array: ["users", "posts"]
-            let json = serde_json::to_string(&cols).unwrap_or_else(|_| "[]".to_string());
-            match CString::new(json) {
-                Ok(c_str) => {
-                    clear_last_error();
-                    c_str.into_raw()
+    safety_shield!(std::ptr::null_mut(), {
+        
+        if engine.is_null() {
+            set_last_error("null engine handle");
+            return std::ptr::null_mut();
+        }
+    
+        let engine = unsafe { &*engine };
+        match engine.db.list_collections() {
+            Ok(cols) => {
+                // Serialize the Vec<String> to a JSON array: ["users", "posts"]
+                let json = serde_json::to_string(&cols).unwrap_or_else(|_| "[]".to_string());
+                match CString::new(json) {
+                    Ok(c_str) => {
+                        clear_last_error();
+                        c_str.into_raw()
+                    }
+                    Err(_) => std::ptr::null_mut(),
                 }
-                Err(_) => std::ptr::null_mut(),
+            }
+            Err(e) => {
+                set_last_error(e.to_string());
+                std::ptr::null_mut()
             }
         }
-        Err(e) => {
-            set_last_error(e.to_string());
-            std::ptr::null_mut()
-        }
-    }
+    })
 }
 
 #[no_mangle]
@@ -1096,24 +1171,31 @@ pub extern "C" fn fl_array_append_int(array: *mut FL_Array, value: i64) -> i32 {
 /// Takes the contents of 'child' and inserts it as a Map into 'parent'
 #[no_mangle]
 pub extern "C" fn fl_doc_insert_doc(parent: *mut FL_Doc, key: *const c_char, child: *const FL_Doc) -> i32 {
-    let key = match cstr_to_string(key) { Ok(v) => v, Err(e) => return set_last_error(e) };
-    let parent_doc = unsafe { &mut *parent };
-    let child_doc = unsafe { &*child };
-    
-    // Convert the child document's fields into a Value::Map
-    parent_doc.doc.insert(key, Value::Map(child_doc.doc.fields.clone()));
-    0
+    safety_shield!(-1, {
+
+        let key = match cstr_to_string(key) { Ok(v) => v, Err(e) => return set_last_error(e) };
+        let parent_doc = unsafe { &mut *parent };
+        let child_doc = unsafe { &*child };
+        
+        // Convert the child document's fields into a Value::Map
+        parent_doc.doc.insert(key, Value::Map(child_doc.doc.fields.clone()));
+        0
+    })
+
 }
 
 /// Takes the contents of 'array' and inserts it into the document
 #[no_mangle]
 pub extern "C" fn fl_doc_insert_array(doc: *mut FL_Doc, key: *const c_char, array: *mut FL_Array) -> i32 {
-    let key = match cstr_to_string(key) { Ok(v) => v, Err(e) => return set_last_error(e) };
-    let doc = unsafe { &mut *doc };
-    let array_inner = unsafe { Box::from_raw(array) }; // Take ownership and free FL_Array
-    
-    doc.doc.insert(key, Value::Array(array_inner.items));
-    0
+    safety_shield!(-1, {
+        
+        let key = match cstr_to_string(key) { Ok(v) => v, Err(e) => return set_last_error(e) };
+        let doc = unsafe { &mut *doc };
+        let array_inner = unsafe { Box::from_raw(array) }; // Take ownership and free FL_Array
+        
+        doc.doc.insert(key, Value::Array(array_inner.items));
+        0
+    })
 }
 
 #[no_mangle]
@@ -1123,20 +1205,23 @@ pub extern "C" fn fl_engine_patch(
     doc_id: *const c_char,
     updates: *const FL_Doc,
 ) -> i32 {
-    if engine.is_null() || updates.is_null() { return -1; }
-    let engine = unsafe { &*engine };
-    let col = match cstr_to_string(collection) { Ok(v) => v, Err(e) => return set_last_error(e) };
-    let id = match cstr_to_string(doc_id) { Ok(v) => v, Err(e) => return set_last_error(e) };
-    let update_doc = unsafe { &*updates };
+    safety_shield!(-1, {
 
-    // FIX: Access .db and ensure set_last_error returns correctly
-    match engine.db.patch(&col, &id, update_doc.doc.fields.clone()) {
-        Ok(_) => 0,
-        Err(e) => {
-            set_last_error(e.to_string());
-            -1
+        if engine.is_null() || updates.is_null() { return -1; }
+        let engine = unsafe { &*engine };
+        let col = match cstr_to_string(collection) { Ok(v) => v, Err(e) => return set_last_error(e) };
+        let id = match cstr_to_string(doc_id) { Ok(v) => v, Err(e) => return set_last_error(e) };
+        let update_doc = unsafe { &*updates };
+    
+        // FIX: Access .db and ensure set_last_error returns correctly
+        match engine.db.patch(&col, &id, update_doc.doc.fields.clone()) {
+            Ok(_) => 0,
+            Err(e) => {
+                set_last_error(e.to_string());
+                -1
+            }
         }
-    }
+    })
 }
 
 // --- 1. INDEX MANAGEMENT ---
@@ -1189,10 +1274,12 @@ pub extern "C" fn fl_engine_create_simple_index(
 
 #[no_mangle]
 pub extern "C" fn fl_transaction_begin(engine: *mut FL_Engine) -> *mut FL_Transaction {
-    let engine = unsafe { &*engine };
-    Box::into_raw(Box::new(FL_Transaction {
-        tx: engine.db.begin_serializable_transaction(),
-    }))
+    safety_shield!(ptr::null_mut(), {
+        let engine = unsafe { &*engine };
+        Box::into_raw(Box::new(FL_Transaction {
+            tx: engine.db.begin_serializable_transaction(),
+        }))
+    })
 }
 
 #[no_mangle]
@@ -1231,16 +1318,19 @@ pub extern "C" fn fl_transaction_set(
 
 #[no_mangle]
 pub extern "C" fn fl_transaction_commit(engine: *mut FL_Engine, tx: *mut FL_Transaction) -> i32 {
-    let engine = unsafe { &*engine };
-    let tx_box = unsafe { Box::from_raw(tx) }; // Take ownership to free memory
-    
-    match tx_box.tx.commit(&engine.db) {
-        Ok(_) => 0,
-        Err(e) => {
-    set_last_error(e.to_string());
-    -1 // or ptr::null_mut() depending on function return type
-},
-    }
+    safety_shield!(-1, {
+        let engine = unsafe { &*engine };
+        let tx_box = unsafe { Box::from_raw(tx) }; // Take ownership to free memory
+        
+        match tx_box.tx.commit(&engine.db) {
+            Ok(_) => 0,
+            Err(e) => {
+        set_last_error(e.to_string());
+        -1 // or ptr::null_mut() depending on function return type
+        },
+        }
+
+    })
 }
 
 #[no_mangle]
@@ -1279,26 +1369,32 @@ pub extern "C" fn fl_engine_insert_subdoc(
 
 #[no_mangle]
 pub extern "C" fn fl_engine_compact(engine: *mut FL_Engine) -> i32 {
-    let engine = unsafe { &*engine };
-    match engine.db.compact() {
-        Ok(_) => 0,
-        Err(e) => {
-    set_last_error(e.to_string());
-    -1 // or ptr::null_mut() depending on function return type
-},
-    }
+    safety_shield!(-1, {
+
+        let engine = unsafe { &*engine };
+        match engine.db.compact() {
+            Ok(_) => 0,
+            Err(e) => {
+        set_last_error(e.to_string());
+        -1 // or ptr::null_mut() depending on function return type
+        },
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn fl_engine_get_stats(engine: *mut FL_Engine) -> *mut c_char {
-    let engine = unsafe { &*engine };
-    let stats = engine.db.get_stats();
-    
-    let json = serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string());
-    match CString::new(json) {
-        Ok(s) => s.into_raw(),
-        Err(_) => ptr::null_mut(),
-    }
+    safety_shield!(std::ptr::null_mut(), {
+        let engine = unsafe { &*engine };
+        let stats = engine.db.get_stats();
+        
+        let json = serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string());
+        match CString::new(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => ptr::null_mut(),
+        }
+
+    })
 }
 
 #[no_mangle]
@@ -1326,34 +1422,37 @@ pub extern "C" fn fl_engine_get_by_ref(
     doc: *const FL_Doc,
     field_key: *const c_char,
 ) -> *mut FL_Doc {
-    if engine.is_null() || doc.is_null() || field_key.is_null() {
-        return ptr::null_mut();
-    }
+    safety_shield!(std::ptr::null_mut(), {
 
-    let engine = unsafe { &*engine };
-    let doc_ptr = unsafe { &*doc };
-    let key = match cstr_to_string(field_key) { 
-        Ok(k) => k, 
-        Err(e) => { set_last_error(e); return ptr::null_mut(); } 
-    };
-
-    // 1. Find the value in the provided document
-    let Some(val) = doc_ptr.doc.get(&key) else {
-        set_last_error("Field not found in document");
-        return ptr::null_mut();
-    };
-
-    // 2. Resolve the reference using the engine
-    match engine.db.get_by_reference(val) {
-        Ok(Some(target_doc)) => {
-            Box::into_raw(Box::new(FL_Doc { doc: target_doc }))
+        if engine.is_null() || doc.is_null() || field_key.is_null() {
+            return ptr::null_mut();
         }
-        Ok(None) => ptr::null_mut(), // Document doesn't exist (Dangling reference)
-        Err(e) => {
-            set_last_error(e.to_string());
-            ptr::null_mut()
+    
+        let engine = unsafe { &*engine };
+        let doc_ptr = unsafe { &*doc };
+        let key = match cstr_to_string(field_key) { 
+            Ok(k) => k, 
+            Err(e) => { set_last_error(e); return ptr::null_mut(); } 
+        };
+    
+        // 1. Find the value in the provided document
+        let Some(val) = doc_ptr.doc.get(&key) else {
+            set_last_error("Field not found in document");
+            return ptr::null_mut();
+        };
+    
+        // 2. Resolve the reference using the engine
+        match engine.db.get_by_reference(val) {
+            Ok(Some(target_doc)) => {
+                Box::into_raw(Box::new(FL_Doc { doc: target_doc }))
+            }
+            Ok(None) => ptr::null_mut(), // Document doesn't exist (Dangling reference)
+            Err(e) => {
+                set_last_error(e.to_string());
+                ptr::null_mut()
+            }
         }
-    }
+    })
 }
 
 #[no_mangle]
@@ -1379,19 +1478,22 @@ pub extern "C" fn fl_query_start_after(
 
 #[no_mangle]
 pub extern "C" fn fl_engine_get_audit_log(engine: *mut FL_Engine) -> *mut c_char {
-    if engine.is_null() { return std::ptr::null_mut(); }
-    let engine = unsafe { &*engine };
-    
-    let entries = engine.db.audit_entries();
-    
-    // Convert to JSON
-    // Note: Ensure AuditEntry and AccessOp derive serde::Serialize
-    let json = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
-    
-    match CString::new(json) {
-        Ok(s) => s.into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() { return std::ptr::null_mut(); }
+        let engine = unsafe { &*engine };
+        
+        let entries = engine.db.audit_entries();
+        
+        // Convert to JSON
+        // Note: Ensure AuditEntry and AccessOp derive serde::Serialize
+        let json = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
+        
+        match CString::new(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+        
+    })
 }
 
 // --- OR LOGIC ---
@@ -1468,5 +1570,13 @@ pub extern "C" fn fl_engine_snapshot_indices(engine: *mut FL_Engine) -> i32 {
             set_last_error(e.to_string());
             -1
         }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_config_set_compression(config: *mut FL_Config, enabled: bool, level: i32) {
+    if let Some(cfg) = unsafe { config.as_mut() } {
+        cfg.inner.use_compression = enabled;
+        cfg.inner.compression_level = level;
     }
 }

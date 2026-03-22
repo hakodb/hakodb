@@ -153,7 +153,7 @@ impl FireLite {
                                     }
                                 }
                             }
-                            
+
                             // Log to Disk (Survivability)
                             let _ = persist.insert(1, doc.encode(), id);
                         }
@@ -625,13 +625,65 @@ impl FireLite {
         Ok(())
     }
 
-        /// simplified FFI helper to index a single field
     pub fn create_index(&self, collection: &str, field: &str) -> Result<()> {
-        let mut mgr = self.indexes.write().unwrap();
-        mgr.create_secondary_index(collection, field);
-        
-        // Trigger a background task to populate this new index from existing data
-        // For v0.6 simplicity, we'll rely on the next 'put' or a manual 'rebuild'
+        // 1. Check if the index already exists to avoid double-work
+        {
+            let mgr = self.indexes.read().unwrap();
+            if mgr.secondary.get(collection).map_or(false, |m| m.contains_key(field)) {
+                return Ok(());
+            }
+        }
+
+        // 2. Register the empty index in the manager
+        {
+            let mut mgr = self.indexes.write().unwrap();
+            mgr.create_secondary_index(collection, field);
+        }
+
+        // 3. Spawn background thread for backfilling
+        let shard = self.get_shard(collection);
+        let idx_mgr = Arc::clone(&self.indexes);
+        let col_name = collection.to_string();
+        let field_name = field.to_string();
+
+        thread::spawn(move || {
+            // A. Scan the shard (Read lock is held only during the scan)
+            let entries = {
+                if let Ok(storage) = shard.read() {
+                    storage.scan_prefix("").unwrap_or_default()
+                } else {
+                    return; 
+                }
+            };
+
+            if entries.is_empty() { return; }
+
+            // B. Process in chunks to keep the system responsive
+            for chunk in entries.chunks(500) {
+                // Acquire write lock only for the duration of this chunk
+                let mut mgr = idx_mgr.write().unwrap();
+                
+                if let Some(sec_map) = mgr.secondary.get_mut(&col_name) {
+                    if let Some(index) = sec_map.get_mut(&field_name) {
+                        for (full_key, bytes) in chunk {
+                            if let Some(doc) = FireLiteDoc::decode(bytes) {
+                                if let Some(val) = doc.get(&field_name) {
+                                    let idx_key = crate::index::index_key::encode_scalar(val);
+                                    
+                                    // Map "col:id" -> "id"
+                                    if let Some((_, doc_id)) = full_key.split_once(':') {
+                                        index.insert(idx_key, doc_id.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Lock 'mgr' is automatically dropped here when the scope ends,
+                // allowing query threads to "sneak in" between chunks.
+            }
+        });
+
         Ok(())
     }
 

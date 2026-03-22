@@ -24,6 +24,7 @@ libc = "0.2"
 tauri = { version = "2", optional = true }
 hashbrown = { version = "0.14", features = ["serde"] }
 smallvec = "1"
+zstd = "0.13"
 
 [dev-dependencies]
 criterion = "0.5"

@@ -11,610 +11,585 @@
 #include <sstream>
 #include <algorithm>
 #include <random>
+#include <filesystem>
 
+namespace fs = std::filesystem;
 using namespace std;
 
-// --- Constants & Global State ---
-const int SEED_COUNT = 10000;
+// ============================================================
+// CONFIG
+// ============================================================
+const int DOCS_PER_SHARD = 5000;
 const int BATCH_SIZE = 100;
-std::atomic<int> snapshot_received_count{0};
 
-struct CustomKV {
-    string key;
-    string value;
+struct ShardDef {
+    string name;
+    size_t payload_size;
 };
-vector<CustomKV> user_payload;
 
-// --- Helpers ---
-double get_time() {
+vector<ShardDef> SHARDS = {
+    {"shard_128b", 128},
+    {"shard_4k", 4096},
+    {"shard_20k", 20480},
+    {"shard_50k", 51200}
+};
+
+// ============================================================
+// HELPERS
+// ============================================================
+double now_sec() {
     auto now = chrono::high_resolution_clock::now();
     return chrono::duration_cast<chrono::nanoseconds>(now.time_since_epoch()).count() / 1e9;
 }
 
 string make_blob(size_t size) {
-    return string(size, 'x');
+    string pattern = "FIRELITE_BLOCK_0123456789_";
+    string out;
+    while (out.size() < size) out += pattern;
+    return out.substr(0, size);
 }
 
-int get_hot_key(int range) {
-    static std::mt19937 gen(1337);
-    std::uniform_real_distribution<double> dist(0.0, 1.0);
-    if (dist(gen) < 0.8) {
-        std::uniform_int_distribution<int> hot(0, std::max(1, range / 5));
-        return hot(gen);
-    } else {
-        std::uniform_int_distribution<int> cold(0, range - 1);
-        return cold(gen);
-    }
-}
-
-void parse_user_data(string input) {
-    if (input.empty()) return;
-    string clean = input;
-    const char* chars_to_remove = "{}/\"\'";
-    for (int i = 0; i < 5; ++i) 
-        clean.erase(std::remove(clean.begin(), clean.end(), chars_to_remove[i]), clean.end());
-    
-    stringstream ss(clean);
-    string item;
-    while (getline(ss, item, ',')) {
-        size_t colon = item.find(':');
-        if (colon != string::npos) {
-            string k = item.substr(0, colon), v = item.substr(colon + 1);
-            k.erase(0, k.find_first_not_of(" ")); k.erase(k.find_last_not_of(" ") + 1);
-            v.erase(0, v.find_first_not_of(" ")); v.erase(v.find_last_not_of(" ") + 1);
-            user_payload.push_back({k, v});
-        }
-    }
-}
-
-void populate_doc(FL_Doc* doc, int id_val) {
-    if (user_payload.empty()) {
-        fl_doc_insert_int(doc, "id", id_val);
-        fl_doc_insert_str(doc, "tag", "mirror_bench");
-    } else {
-        for (auto& kv : user_payload) fl_doc_insert_str(doc, kv.key.c_str(), kv.value.c_str());
-        fl_doc_insert_int(doc, "id_idx", id_val);
-    }
-    fl_doc_insert_server_timestamp(doc, "ts");
-}
-
-void on_snapshot_change(const char* col, const char* path, int32_t kind, void* ud) {
-    snapshot_received_count++;
-}
-
-// --- BENCHMARK SUITES ---
-
-void bench_write_single(FL_Engine* db, int ops) {
-    printf(">> firelite_put_single (%d ops)...\n", ops);
-    double start = get_time();
-    for (int i = 0; i < ops; i++) {
-        FL_Doc* doc = fl_doc_new();
-        populate_doc(doc, SEED_COUNT + i);
-        char id[32]; sprintf(id, "s_%d", SEED_COUNT + i);
-        fl_engine_insert(db, "bench", id, doc);
-        fl_doc_free(doc);
-    }
-    double end = get_time();
-    printf("   Result: %.2f ops/sec\n", ops / (end - start));
-}
-
-void bench_write_batch(FL_Engine* db, int num_batches) {
-    printf(">> firelite_put_batch_100 (%d docs)...\n", num_batches * BATCH_SIZE);
-    double start = get_time();
-    for (int b = 0; b < num_batches; b++) {
-        FL_Batch* batch = fl_batch_new();
-        for (int i = 0; i < BATCH_SIZE; i++) {
-            FL_Doc* doc = fl_doc_new();
-            int id_val = SEED_COUNT + 5000 + (b * BATCH_SIZE) + i;
-            populate_doc(doc, id_val);
-            char id[64]; sprintf(id, "b_%d", id_val);
-            fl_batch_set(batch, "bench", id, doc);
-            fl_doc_free(doc);
-        }
-        fl_batch_commit(db, batch);
-        fl_batch_free(batch);
-    }
-    double end = get_time();
-    printf("   Result: %.2f docs/sec\n", (num_batches * BATCH_SIZE) / (end - start));
-}
-
-// --- VARIANT SINGLE WRITE (1 sync per doc in Mode 3) ---
-void bench_variant_single(FL_Engine* db) {
-    printf(">> firelite_variant_SINGLE_write (Pre-allocated, 50 docs/size)...\n");
-    int sizes[] = { 128, 1024, 4096, 10240, 20480, 51200 };
-    const int count = 50;
-
-    for (int sz : sizes) {
-        string blob = make_blob(sz);
-        vector<FL_Doc*> docs;
-        vector<string> ids;
-
-        // PRE-ALLOCATE: Outside the timer
-        for (int i = 0; i < count; i++) {
-            FL_Doc* doc = fl_doc_new();
-            fl_doc_insert_str(doc, "payload", blob.c_str());
-            docs.push_back(doc);
-            ids.push_back("v_s_" + to_string(sz) + "_" + to_string(i));
-        }
-
-        // MEASURE: Only the engine insertion
-        double start = get_time();
-        for (int i = 0; i < count; i++) {
-            fl_engine_insert(db, "var_single", ids[i].c_str(), docs[i]);
-        }
-        double end = get_time();
-
-        double duration = end - start;
-        printf("   Size %5d bytes: %10.2f ops/sec | %7.2f MB/s\n", 
-                sz, count / duration, (double)(sz * count) / (1024.0 * 1024.0) / duration);
-
-        // CLEANUP: Outside the timer
-        for (auto d : docs) fl_doc_free(d);
-    }
-}
-
-// --- VARIANT BATCH WRITE (1 sync per batch in Mode 3) ---
-void bench_variant_batch(FL_Engine* db) {
-    printf(">> firelite_variant_BATCH_write (Pre-allocated, 50 docs/size)...\n");
-    int sizes[] = { 128, 1024, 4096, 10240, 20480, 51200 };
-    const int count = 50;
-
-    for (int sz : sizes) {
-        string blob = make_blob(sz);
-        vector<FL_Doc*> docs;
-        FL_Batch* batch = fl_batch_new();
-
-        // PRE-ALLOCATE: Outside the timer
-        for (int i = 0; i < count; i++) {
-            FL_Doc* doc = fl_doc_new();
-            fl_doc_insert_str(doc, "payload", blob.c_str());
-            string id = "v_b_" + to_string(sz) + "_" + to_string(i);
-            fl_batch_set(batch, "var_batch", id.c_str(), doc);
-            docs.push_back(doc);
-        }
-
-        // MEASURE: Only the batch commit
-        double start = get_time();
-        fl_batch_commit(db, batch);
-        double end = get_time();
-
-        double duration = end - start;
-        printf("   Size %5d bytes: %10.2f docs/sec | %7.2f MB/s\n", 
-                sz, count / duration, (double)(sz * count) / (1024.0 * 1024.0) / duration);
-
-        // CLEANUP: Outside the timer
-        fl_batch_free(batch);
-        for (auto d : docs) fl_doc_free(d);
-    }
-}
-
-void bench_read_parallel(FL_Engine* db, int thread_count) {
-    printf(">> firelite_read_parallel_%d (each 200 reads)...\n", thread_count);
-    vector<thread> workers;
-    double start = get_time();
-    for (int t = 0; t < thread_count; t++) {
-        workers.push_back(thread([db, t]() {
-            for (int i = 0; i < 200; i++) {
-                int key_id = (i + t * 200) % SEED_COUNT;
-                char id[32]; sprintf(id, "%d", key_id);
-                FL_Doc* d = fl_engine_get(db, "bench", id);
-                if (d) fl_doc_free(d);
+uintmax_t dir_size(const string& path) {
+    uintmax_t size = 0;
+    try {
+        if (fs::exists(path)) {
+            for (auto& p : fs::recursive_directory_iterator(path)) {
+                if (fs::is_regular_file(p)) size += fs::file_size(p);
             }
-        }));
-    }
-    for (auto& w : workers) w.join();
-    double end = get_time();
-    printf("   Finished in: %.4fs\n", (end - start));
-}
-
-void bench_watch_latency(FL_Engine* db) {
-    printf(">> firelite_watch_latency (Round-trip FFI)...\n");
-    snapshot_received_count = 0;
-    FL_Watch* w = fl_engine_watch(db, "bench", on_snapshot_change, nullptr);
-    
-    int ops = 500;
-    double start = get_time();
-    for (int i = 0; i < ops; i++) {
-        int expected = snapshot_received_count.load() + 1;
-        FL_Doc* d = fl_doc_new(); fl_doc_insert_int(d, "i", i);
-        fl_engine_insert(db, "bench", "watch_key", d);
-        fl_doc_free(d);
-
-        while (snapshot_received_count.load() < expected) {
-            std::this_thread::yield(); 
         }
-    }
-    double end = get_time();
-    printf("   Avg Latency: %.4f ms/op\n", ((end - start) / ops) * 1000.0);
-    fl_watch_free(w);
+    } catch (...) {}
+    return size;
 }
 
-void bench_pagination(FL_Engine* db) {
-    printf(">> firelite_query_pagination (Offset 5000, Limit 10)...\n");
-    double start = get_time();
-    
-    FL_Query* q = fl_query_new("bench");
-    fl_query_offset(q, 5000);
-    fl_query_limit(q, 10);
-    
-    char* results = fl_query_execute(db, q);
-    double end = get_time();
-    
-    printf("   Result Length: %zu bytes (Time: %.4fs)\n", strlen(results), (end - start));
-    fl_string_free(results);
+static std::string truncate_str(const std::string& s, size_t max_len = 80) {
+    if (s.size() <= max_len) return s;
+
+    size_t head = max_len / 2;
+    size_t tail = max_len - head;
+
+    return s.substr(0, head) + "..." + s.substr(s.size() - tail);
+}
+
+static std::string compact_payloads(const std::string& json) {
+    std::string out = json;
+
+    const std::string key = "\"payload\":\"";
+    size_t pos = 0;
+
+    while ((pos = out.find(key, pos)) != std::string::npos) {
+        size_t start = pos + key.size();
+        size_t end = out.find("\"", start);
+        if (end == std::string::npos) break;
+
+        std::string original = out.substr(start, end - start);
+        std::string shortened = truncate_str(original, 80);
+
+        out.replace(start, end - start, shortened);
+
+        pos = start + shortened.size();
+    }
+
+    return out;
+}
+
+
+// TOP BAR
+void print_config(int durability, int threads, bool zip) {
+    printf("====================================================\n");
+    printf(" FireLite Benchmark v2\n");
+    printf("----------------------------------------------------\n");
+    printf(" Durability   : %d\n", durability);
+    printf(" Threads      : %d\n", threads);
+    printf(" Compression  : %s\n", zip ? "ON (Zstd)" : "OFF");
+    printf(" Shards       : %zu\n", SHARDS.size());
+    printf(" Docs/Shard   : %d\n", DOCS_PER_SHARD);
+    printf(" Total Docs   : %d\n", DOCS_PER_SHARD * (int)SHARDS.size());
+    printf(" Batch Size   : %d\n", BATCH_SIZE);
+    printf("====================================================\n\n");
+}
+
+
+// ============================================================
+// LATENCY TRACKER
+// ============================================================
+struct LatencyStats {
+    vector<double> samples;
+    void add(double v) { samples.push_back(v); }
+
+    void merge(const LatencyStats& other) {
+        samples.insert(samples.end(), other.samples.begin(), other.samples.end());
+    }
+
+    void report(const string& name) {
+        if (samples.empty()) return;
+        sort(samples.begin(), samples.end());
+
+        auto pct = [&](double p) {
+            size_t idx = (size_t)(p * samples.size());
+            if (idx >= samples.size()) idx = samples.size() - 1;
+            return samples[idx];
+        };
+
+        printf("   [%s] p50=%.4f ms | p95=%.4f ms | p99=%.4f ms\n",
+            name.c_str(),
+            pct(0.50)*1000,
+            pct(0.95)*1000,
+            pct(0.99)*1000
+        );
+    }
+};
+
+// ============================================================
+// UNIFIED DOC FACTORY
+// ============================================================
+FL_Doc* create_doc(int id, const string& blob) {
+    FL_Doc* doc = fl_doc_new();
+
+    fl_doc_insert_int(doc, "id", id);
+    fl_doc_insert_str(doc, "status", (id % 2 == 0) ? "active" : "pending");
+
+    FL_Doc* meta = fl_doc_new();
+    fl_doc_insert_int(meta, "v", 1);
+    fl_doc_insert_doc(doc, "meta", meta);
+    fl_doc_free(meta);
+
+    FL_Array* tags = fl_array_new();
+    fl_array_append_str(tags, "bench");
+    fl_array_append_int(tags, id % 5);
+    fl_doc_insert_array(doc, "tags", tags);
+
+    char ref_id[32];
+    sprintf(ref_id, "doc_%d", id % DOCS_PER_SHARD);
+    fl_doc_insert_reference(doc, "owner", "shard_128b", ref_id);
+
+    if (!blob.empty()) fl_doc_insert_str(doc, "payload", blob.c_str());
+
+    fl_doc_insert_server_timestamp(doc, "ts");
+    return doc;
+}
+
+// ============================================================
+// SEEDING
+// ============================================================
+void seed_all(FL_Engine* db) {
+    printf(">> Seeding unified dataset...\n");
+
+    vector<thread> workers;
+    double start = now_sec();
+
+    for (auto& s : SHARDS) {
+        workers.emplace_back([&, s]() {
+            string blob = make_blob(s.payload_size);
+            FL_Batch* batch = fl_batch_new();
+
+            for (int i = 0; i < DOCS_PER_SHARD; i++) {
+                FL_Doc* doc = create_doc(i, blob);
+
+                char id[32];
+                sprintf(id, "doc_%d", i);
+
+                if (i % 5 == 0) {
+                    fl_engine_insert(db, s.name.c_str(), id, doc);
+                } else {
+                    fl_batch_set(batch, s.name.c_str(), id, doc);
+                    if (i % BATCH_SIZE == 0) {
+                        fl_batch_commit(db, batch);
+                        fl_batch_free(batch);
+                        batch = fl_batch_new();
+                    }
+                }
+
+                fl_doc_free(doc);
+            }
+
+            fl_batch_commit(db, batch);
+            fl_batch_free(batch);
+        });
+    }
+
+    for (auto& t : workers) t.join();
+    printf("   Done in %.3fs\n", now_sec() - start);
+}
+
+// ============================================================
+// WRITE BENCH
+// ============================================================
+void bench_write(FL_Engine* db) {
+    printf("\n>> WRITE BENCH (latency aware)\n");
+
+    LatencyStats single_lat, batch_lat;
+
+    // SINGLE
+    for (int i = 0; i < 300; i++) {
+        FL_Doc* d = create_doc(i, "");
+        double t = now_sec();
+        char id[32];
+        sprintf(id, "single_%d", i);
+        fl_engine_insert(db, "bench", id, d);
+        // fl_engine_insert(db, "bench", "single", d);
+        single_lat.add(now_sec() - t);
+        fl_doc_free(d);
+    }
+
+    // BATCH
+    for (int i = 0; i < 50; i++) {
+        FL_Batch* b = fl_batch_new();
+        for (int j = 0; j < 20; j++) {
+            FL_Doc* d = create_doc(j, "");
+            fl_batch_set(b, "bench", "batch", d);
+            fl_doc_free(d);
+        }
+        double t = now_sec();
+        fl_batch_commit(db, b);
+        batch_lat.add(now_sec() - t);
+        fl_batch_free(b);
+    }
+
+    single_lat.report("single_insert");
+    batch_lat.report("batch_commit");
+}
+
+// PATCH vs PUT
+void bench_patch_vs_put(FL_Engine* db) {
+    printf("\n>> PATCH vs PUT (50KB doc)\n");
+
+    string blob = make_blob(51200);
+
+    FL_Doc* doc = fl_doc_new();
+    fl_doc_insert_str(doc, "payload", blob.c_str());
+    fl_engine_insert(db, "patch", "doc1", doc);
+
+    // FULL PUT
+    double t1 = now_sec();
+    for (int i = 0; i < 100; i++) {
+        fl_doc_insert_int(doc, "v", i);
+        fl_engine_insert(db, "patch", "doc1", doc);
+    }
+    double d1 = now_sec() - t1;
+
+    // PATCH
+    FL_Doc* upd = fl_doc_new();
+    double t2 = now_sec();
+    for (int i = 0; i < 100; i++) {
+        fl_doc_insert_int(upd, "v", i);
+        fl_engine_patch(db, "patch", "doc1", upd);
+    }
+    double d2 = now_sec() - t2;
+
+    printf("   PUT: %.4fs | PATCH: %.4fs (%.2fx faster)\n", d1, d2, d1/d2);
+
+    fl_doc_free(doc);
+    fl_doc_free(upd);
+}
+
+// ============================================================
+// READ BENCH
+// ============================================================
+void bench_read(FL_Engine* db, int threads) {
+    printf("\n>> READ BENCH (parallel + latency)\n");
+
+    vector<thread> workers;
+    vector<LatencyStats> local_stats(threads);
+
+    for (int t = 0; t < threads; t++) {
+        workers.emplace_back([&, t]() {
+            for (int i = 0; i < 200; i++) {
+                char id[32];
+                sprintf(id, "doc_%d", (i + t*100) % DOCS_PER_SHARD);
+
+                double ts = now_sec();
+                FL_Doc* d = fl_engine_get(db, "shard_4k", id);
+                if (d) fl_doc_free(d);
+
+                local_stats[t].add(now_sec() - ts);
+            }
+        });
+    }
+
+    for (auto& w : workers) w.join();
+
+    // MERGE
+    LatencyStats global;
+    for (auto& s : local_stats) global.merge(s);
+
+    global.report("parallel_read");
+}
+
+// ============================================================
+// QUERY BENCH
+// ============================================================
+void bench_query(FL_Engine* db) {
+    printf("\n>> QUERY BENCH (offset vs cursor)\n");
+
+    fl_engine_create_simple_index(db, "shard_50k", "id");
+    this_thread::sleep_for(chrono::milliseconds(300));
+
+    // OFFSET
+    FL_Query* q1 = fl_query_new("shard_50k");
+    fl_query_order_by(q1, "id", true);
+    fl_query_offset(q1, 2000);
+    fl_query_limit(q1, 5);
+
+    double t1 = now_sec();
+    char* r1 = fl_query_execute(db, q1);
+    double d1 = now_sec() - t1;
+
+    // CURSOR
+    FL_Doc* anchor = fl_engine_get(db, "shard_50k", "doc_2000");
+
+    FL_Query* q2 = fl_query_new("shard_50k");
+    fl_query_order_by(q2, "id", true);
+    fl_query_start_after(q2, anchor);
+    fl_query_limit(q2, 5);
+
+    double t2 = now_sec();
+    char* r2 = fl_query_execute(db, q2);
+    double d2 = now_sec() - t2;
+
+    printf("   OFFSET: %.4fs | CURSOR: %.4fs (%.2fx faster)\n", d1, d2, d1/d2);
+
+    fl_doc_free(anchor);
+    fl_string_free(r1);
+    fl_string_free(r2);
+    fl_query_free(q1);
+    fl_query_free(q2);
+}
+
+
+// AGREGATION
+void bench_aggregation(FL_Engine* db) {
+    printf("\n>> AGGREGATION (COUNT + AVG)\n");
+
+    FL_Query* q = fl_query_new("shard_4k");
+    fl_query_aggregate_count(q);
+    fl_query_aggregate_avg(q, "id");
+
+    double t = now_sec();
+    char* res = fl_query_execute_aggregation(db, q);
+    printf("   Result: %s (%.4fs)\n", res, now_sec() - t);
+
+    fl_string_free(res);
     fl_query_free(q);
 }
 
-void bench_complex_docs(FL_Engine* db) {
-    printf(">> firelite_complex_nested_docs (Map + Array)...\n");
-    double start = get_time();
-    
-    for (int i = 0; i < 100; i++) {
-        // 1. Build an Array
-        FL_Array* tags = fl_array_new();
-        fl_array_append_str(tags, "bench");
-        fl_array_append_str(tags, "v0.3");
-        fl_array_append_int(tags, i);
+// ============================================================
+// COMPRESSION
+// ============================================================
+void bench_compression(FL_Engine* db) {
+    printf("\n>> COMPRESSION CHECK\n");
 
-        // 2. Build a Nested Doc (Map)
-        FL_Doc* meta = fl_doc_new();
-        fl_doc_insert_str(meta, "author", "C++_Client");
-        fl_doc_insert_int(meta, "version", 3);
+    double start = now_sec();
+    fl_engine_compact(db);
+    printf("   Compaction: %.3fs\n", now_sec() - start);
 
-        // 3. Main Doc
-        FL_Doc* main = fl_doc_new();
-        fl_doc_insert_doc(main, "metadata", meta);
-        fl_doc_insert_array(main, "tags", tags); // Takes ownership of tags
-        
-        char id[32]; sprintf(id, "complex_%d", i);
-        fl_engine_insert(db, "complex", id, main);
-
-        fl_doc_free(meta);
-        fl_doc_free(main);
+    for (auto& s : SHARDS) {
+        double mb = (double)dir_size("./bench_data/" + s.name) / 1e6;
+        printf("   [%s] %.2f MB\n", s.name.c_str(), mb);
     }
-    double end = get_time();
-    printf("   Result: %.2f complex docs/sec\n", 100.0 / (end - start));
 }
 
-void bench_reference_resolution(FL_Engine* db) {
-    printf(">> firelite_reference_follow (Resolving 100 links)...\n");
-    
-    // Setup: Create a target and a source pointing to it
-    FL_Doc* target = fl_doc_new();
-    fl_doc_insert_str(target, "name", "I am the target");
-    fl_engine_insert(db, "users", "u1", target);
-    fl_doc_free(target);
 
-    FL_Doc* source = fl_doc_new();
-    fl_doc_insert_reference(source, "link", "users", "u1");
-    fl_engine_insert(db, "links", "l1", source);
-    fl_doc_free(source);
+// QUERY LOGIC OR IN
+void bench_logic(FL_Engine* db) {
+    printf("\n>> LOGICAL QUERY (OR + IN)\n");
 
-    // Measure resolution
-    FL_Doc* link_doc = fl_engine_get(db, "links", "l1");
-    
-    double start = get_time();
-    for(int i=0; i<100; i++) {
-        FL_Doc* resolved = fl_engine_get_by_ref(db, link_doc, "link");
-        if(resolved) fl_doc_free(resolved);
-    }
-    double end = get_time();
-    
-    printf("   Follow-Link Speed: %.2f resolutions/sec\n", 100.0 / (end - start));
-    fl_doc_free(link_doc);
+    // OR
+    FL_Query* q1 = fl_query_new("shard_128b");
+    fl_query_where_eq_int(q1, "id", 1);
+    fl_query_where_or_int(q1, "id", 2);
+
+    char* r1 = fl_query_execute(db, q1);
+
+    std::string or_raw = r1 ? std::string(r1) : "";
+    std::string or_compact = compact_payloads(or_raw);
+    printf("   OR: %s\n", or_compact.c_str());
+    // printf("   OR: %s\n", r1);
+
+    // IN
+    FL_Array* arr = fl_array_new();
+    fl_array_append_int(arr, 10);
+    fl_array_append_int(arr, 20);
+
+    FL_Query* q2 = fl_query_new("shard_128b");
+    fl_query_where_in(q2, "id", arr);
+
+    char* r2 = fl_query_execute(db, q2);
+    std::string in_raw = r2 ? std::string(r2) : "";
+    std::string in_compact = compact_payloads(in_raw);
+    printf("   IN: %s\n", in_compact.c_str());
+    // printf("   IN: %s\n", r2);
+
+    fl_string_free(r1);
+    fl_string_free(r2);
+    fl_query_free(q1);
+    fl_query_free(q2);
 }
 
-void bench_transaction_logic(FL_Engine* db) {
-    printf(">> firelite_serializable_transaction (Read-Modify-Write)...\n");
-    
-    // Seed counter
-    FL_Doc* d = fl_doc_new(); fl_doc_insert_int(d, "count", 0);
-    fl_engine_insert(db, "tx_test", "counter", d);
+// TRANSACTION
+void bench_tx(FL_Engine* db) {
+    printf("\n>> TRANSACTION (RMW)\n");
+
+    FL_Doc* d = fl_doc_new();
+    fl_doc_insert_int(d, "count", 0);
+    fl_engine_insert(db, "tx", "counter", d);
     fl_doc_free(d);
 
-    double start = get_time();
-    int commits = 0;
+    int ok = 0;
+    double start = now_sec();
+
     for (int i = 0; i < 50; i++) {
         FL_Transaction* tx = fl_transaction_begin(db);
-        
-        // Read
-        FL_Doc* current = fl_transaction_get(db, tx, "tx_test", "counter");
-        if (current) {
-            // Modify
+
+        FL_Doc* cur = fl_transaction_get(db, tx, "tx", "counter");
+        if (cur) {
             FL_Doc* next = fl_doc_new();
             fl_doc_insert_int(next, "count", i);
-            fl_transaction_set(tx, "tx_test", "counter", next);
-            
-            // Commit
-            if (fl_transaction_commit(db, tx) == 0) commits++;
-            
-            fl_doc_free(current);
+
+            fl_transaction_set(tx, "tx", "counter", next);
+
+            if (fl_transaction_commit(db, tx) == 0) ok++;
+
+            fl_doc_free(cur);
             fl_doc_free(next);
         } else {
             fl_transaction_free(tx);
         }
     }
-    double end = get_time();
-    printf("   Result: %d successful commits in %.4fs\n", commits, (end - start));
+
+    printf("   %d commits in %.4fs\n", ok, now_sec() - start);
 }
 
-void bench_aggregations(FL_Engine* db) {
-    printf(">> firelite_native_aggregation (Sum + Avg on 'id')...\n");
-    double start = get_time();
-    
-    FL_Query* q = fl_query_new("bench");
-    fl_query_aggregate_sum(q, "id");
-    fl_query_aggregate_avg(q, "id");
-    
-    char* agg_json = fl_query_execute_aggregation(db, q);
-    double end = get_time();
-    
-    printf("   Agg Result: %s (Time: %.4fs)\n", agg_json, (end - start));
-    fl_string_free(agg_json);
+// ============================================================
+// REF BENCH
+// ============================================================
+void bench_refs(FL_Engine* db) {
+    printf("\n>> CROSS-SHARD REFS\n");
+
+    FL_Doc* src = fl_engine_get(db, "shard_50k", "doc_100");
+
+    double start = now_sec();
+    for (int i = 0; i < 200; i++) {
+        FL_Doc* ref = fl_engine_get_by_ref(db, src, "owner");
+        if (ref) fl_doc_free(ref);
+    }
+
+    printf("   %.2f refs/sec\n", 200 / (now_sec() - start));
+    fl_doc_free(src);
+}
+
+// WATCH LATENCY
+std::atomic<int> watch_count{0};
+
+void on_watch(const char*, const char*, int32_t, void*) {
+    watch_count++;
+}
+
+void bench_watch(FL_Engine* db) {
+    printf("\n>> WATCH LATENCY\n");
+
+    watch_count = 0;
+    FL_Watch* w = fl_engine_watch(db, "bench", on_watch, nullptr);
+
+    int ops = 100;
+    double start = now_sec();
+
+    for (int i = 0; i < ops; i++) {
+        int expected = watch_count + 1;
+
+        FL_Doc* d = fl_doc_new();
+        fl_doc_insert_int(d, "i", i);
+
+        fl_engine_insert(db, "bench", "watch", d);
+        fl_doc_free(d);
+
+        while (watch_count < expected) std::this_thread::yield();
+    }
+
+    printf("   %.4f ms/op\n", ((now_sec() - start) / ops) * 1000);
+
+    fl_watch_free(w);
+}
+
+// INDEX BACKFILL
+void bench_index_backfill(FL_Engine* db) {
+    printf("\n>> INDEX BACKFILL\n");
+
+    fl_engine_create_simple_index(db, "shard_4k", "id");
+
+    this_thread::sleep_for(chrono::milliseconds(500));
+
+    FL_Query* q = fl_query_new("shard_4k");
+    fl_query_where_eq_int(q, "id", 100);
+
+    double t = now_sec();
+    char* res = fl_query_execute(db, q);
+
+    double elapsed = now_sec() - t;
+
+    std::string raw = res ? std::string(res) : "";
+    std::string compact = compact_payloads(raw);
+
+    printf("   Lookup: %.6fs | Found: %s\n", elapsed, compact.c_str());
+
+    fl_string_free(res);
     fl_query_free(q);
 }
 
-// --- NEW v0.4 Cursor Benchmark ---
-
-void bench_cursor_vs_offset(FL_Engine* db) {
-    printf(">> firelite_pagination_DUEL (Offset vs Cursor)...\n");
-    
-    // 1. Setup Index for 'id' (Required for O(log N) cursor)
-    fl_engine_create_index(db, "bench", "[{\"field\": \"id\", \"desc\": false}]");
-
-    const int target_depth = 8000;
-    const int page_size = 10;
-
-    // --- TEST A: Offset (The slow way) ---
-    double start_off = get_time();
-    FL_Query* q_off = fl_query_new("bench");
-    fl_query_order_by(q_off, "id", true);
-    fl_query_offset(q_off, target_depth);
-    fl_query_limit(q_off, page_size);
-    char* res_off = fl_query_execute(db, q_off);
-    double end_off = get_time();
-    printf("   [OFFSET] Skipped %d docs: %.4fs\n", target_depth, (end_off - start_off));
-
-    // --- TEST B: Cursor (The fast way) ---
-    // First, get the 'Anchor' document (the one at index 8000)
-    char anchor_id[32]; sprintf(anchor_id, "%d", target_depth);
-    FL_Doc* anchor = fl_engine_get(db, "bench", anchor_id);
-
-    if (anchor) {
-        double start_cur = get_time();
-        FL_Query* q_cur = fl_query_new("bench");
-        fl_query_order_by(q_cur, "id", true);
-        fl_query_start_after(q_cur, anchor); // JUMP directly after anchor doc
-        fl_query_limit(q_cur, page_size);
-        char* res_cur = fl_query_execute(db, q_cur);
-        double end_cur = get_time();
-        
-        printf("   [CURSOR] Jumped to %d:    %.4fs\n", target_depth, (end_cur - start_cur));
-        
-        fl_string_free(res_cur);
-        fl_query_free(q_cur);
-        fl_doc_free(anchor);
-    }
-
-    fl_string_free(res_off);
-    fl_query_free(q_off);
-}
-
-void bench_patch_efficiency(FL_Engine* db) {
-    printf(">> firelite_patch_vs_put (50KB document optimization)...\n");
-
-    // 1. Prepare a large 50KB document
-    string big_blob = make_blob(51200);
-    FL_Doc* doc = fl_doc_new();
-    fl_doc_insert_str(doc, "payload", big_blob.c_str());
-    fl_doc_insert_int(doc, "version", 1);
-    fl_engine_insert(db, "patch_test", "doc1", doc);
-
-    // --- TEST A: Full Rewrite (The slow way) ---
-    double start_put = get_time();
-    for(int i=0; i<100; i++) {
-        fl_doc_insert_int(doc, "version", i);
-        fl_engine_insert(db, "patch_test", "doc1", doc);
-    }
-    double end_put = get_time();
-    printf("   [FULL PUT]   100 rewrites of 50KB: %.4fs\n", (end_put - start_put));
-
-    // --- TEST B: In-place Patch (The fast way) ---
-    // We only send the field we want to change
-    FL_Doc* update = fl_doc_new();
-    double start_patch = get_time();
-    for(int i=0; i<100; i++) {
-        fl_doc_insert_int(update, "version", i);
-        fl_engine_patch(db, "patch_test", "doc1", update);
-    }
-    double end_patch = get_time();
-    printf("   [PATCH]      100 updates of 8 bytes: %.4fs\n", (end_patch - start_patch));
-
-    fl_doc_free(doc);
-    fl_doc_free(update);
-}
-
-void bench_logical_logic(FL_Engine* db) {
-    printf(">> firelite_logical_OR_and_IN (Filtering stress)...\n");
-
-    // 1. Test OR: (id == 1) OR (id == 2)
-    FL_Query* q_or = fl_query_new("bench");
-    fl_query_where_eq_int(q_or, "id", 1);
-    fl_query_where_or_int(q_or, "id", 2);
-    
-    char* res_or = fl_query_execute(db, q_or);
-    printf("   OR Result: %s\n", res_or); // Should contain docs 1 and 2
-    fl_string_free(res_or);
-    fl_query_free(q_or);
-
-    // 2. Test IN: id IN [10, 20, 30]
-    FL_Array* arr = fl_array_new();
-    fl_array_append_int(arr, 10);
-    fl_array_append_int(arr, 20);
-    fl_array_append_int(arr, 30);
-
-    FL_Query* q_in = fl_query_new("bench");
-    fl_query_where_in(q_in, "id", arr); // Takes ownership of arr
-    
-    char* res_in = fl_query_execute(db, q_in);
-    printf("   IN Result: %s\n", res_in); // Should contain docs 10, 20, 30
-    fl_string_free(res_in);
-    fl_query_free(q_in);
-}
-
-// --- NEW v0.5 Shard Parallelism Test ---
-void bench_shard_parallel_write(FL_Engine* db, int thread_count) {
-    printf(">> firelite_shard_parallel_write (%d threads, different collections)...\n", thread_count);
-    vector<thread> workers;
-    string collections[] = {"shard_a", "shard_b", "shard_c", "shard_d"};
-    
-    double start = get_time();
-    for (int t = 0; t < thread_count; t++) {
-        workers.push_back(thread([db, t, &collections]() {
-            string my_col = collections[t % 4];
-            for (int i = 0; i < 200; i++) {
-                FL_Doc* d = fl_doc_new();
-                fl_doc_insert_int(d, "val", i);
-                char id[32]; sprintf(id, "t%d_%d", t, i);
-                fl_engine_insert(db, my_col.c_str(), id, d);
-                fl_doc_free(d);
-            }
-        }));
-    }
-    for (auto& w : workers) w.join();
-    double end = get_time();
-    printf("   Result: %.2f total ops/sec across 4 shards\n", (thread_count * 200) / (end - start));
-}
-
-// --- NEW v0.5.1 Audit Viewer ---
-void display_audit_tail(FL_Engine* db) {
-    printf(">> firelite_audit_log_verification (Recent History)...\n");
-    char* log_json = fl_engine_get_audit_log(db);
-    if (log_json) {
-        // We just print the length to show it captured data, or first 100 chars
-        printf("   Capture: %zu bytes of log data.\n", strlen(log_json));
-        if (strlen(log_json) > 100) {
-            string sample(log_json);
-            printf("   Latest Entry: ...%s\n", sample.substr(sample.length() - 80).c_str());
-        }
-        fl_string_free(log_json);
-    }
-}
-
-
-// --- MAIN ---
-
+// ============================================================
+// MAIN
+// ============================================================
 int main(int argc, char* argv[]) {
     int durability = 3, threads = 8;
-    const char* key = "none";
-    string data_raw = "";
+    bool zip = false;
 
     for (int i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--dur=", 6) == 0) durability = atoi(argv[i] + 6);
-        else if (strncmp(argv[i], "--thr=", 6) == 0) threads = atoi(argv[i] + 6);
-        else if (strncmp(argv[i], "--key=", 6) == 0) key = argv[i] + 6;
-        else if (strncmp(argv[i], "--data=", 7) == 0) data_raw = argv[i] + 7;
+        if (strncmp(argv[i], "--dur=", 6) == 0) durability = atoi(argv[i]+6);
+        else if (strncmp(argv[i], "--thr=", 6) == 0) threads = atoi(argv[i]+6);
+        else if (strcmp(argv[i], "--zip=true") == 0) zip = true;
     }
 
-    if (!data_raw.empty()) parse_user_data(data_raw);
+#ifdef _WIN32
+    system("rd /s /q bench_data 2>nul");
+#else
+    system("rm -rf ./bench_data");
+#endif
 
-    printf("--- FireLite C++/FFI Mirror Benchmark ---\n");
-    printf("Durability: %d | Threads: %d | Key: %s\n", durability, threads, key);
-    printf("-----------------------------------------\n");
+    print_config(durability, threads, zip);
 
-    FL_Config* config = fl_config_new();
-    fl_config_set_durability(config, durability);
-    fl_config_set_query_workers(config, (uintptr_t)threads);
-    if (strcmp(key, "none") != 0) fl_config_set_encryption_key(config, key);
+    printf("=== FireLite Benchmark v2 ===\n");
 
-    // Increase memory limits slightly to handle 50KB variant tests comfortably
-    fl_config_set_memory_limits(config, 256 * 1024 * 1024, 64 * 1024);
+    FL_Config* cfg = fl_config_new();
+    fl_config_set_durability(cfg, durability);
+    fl_config_set_query_workers(cfg, threads);
+    if (zip) fl_config_set_compression(cfg, true, 3);
 
-    #ifdef _WIN32
-        system("rd /s /q bench_data 2>nul");
-    #else
-        system("rm -rf ./bench_data");
-    #endif
+    FL_Engine* db = fl_engine_open_with_config("./bench_data", cfg);
 
-    double boot_start = get_time();
-    FL_Engine* db = fl_engine_open_with_config("./bench_data", config);
-    if (!db) return 1;
-    printf("\n>> Engine Open: %.4fs\n\n", (get_time() - boot_start));
+    seed_all(db);
 
-    // Seeding 10k
-    printf("Seeding %d docs...\n\n", SEED_COUNT);
-    FL_Batch* b = fl_batch_new();
-    for (int i = 0; i < SEED_COUNT; i++) {
-        FL_Doc* d = fl_doc_new(); fl_doc_insert_int(d, "id", i);
-        char id[32]; sprintf(id, "%d", i);
-        fl_batch_set(b, "bench", id, d);
-        fl_doc_free(d);
-        if (i % 1000 == 0 && i > 0) {
-            fl_batch_commit(db, b); fl_batch_free(b); b = fl_batch_new();
-        }
-    }
-    fl_batch_commit(db, b); fl_batch_free(b);
+    bench_write(db);
+    bench_compression(db);
+    bench_read(db, threads);
+    bench_query(db);
+    bench_refs(db);
 
-    // Benchmarks
-    bench_write_single(db, 2000);
-    printf("\n");
-    bench_write_batch(db, 20);
-    printf("\n");
+    printf("\n=== ADVANCED FEATURES ===\n");
 
-    bench_variant_single(db);
-    printf("\n");
-    bench_variant_batch(db);
-    
-    printf("\n");
-    bench_read_parallel(db, threads);
-    printf("\n");
-    bench_watch_latency(db);
+    bench_patch_vs_put(db);
+    bench_aggregation(db);
+    bench_tx(db);
+    bench_logic(db);
+    bench_watch(db);
+    bench_index_backfill(db);
 
-    printf("\n--- v0.3 Advanced Features ---\n");
-    // New Phase 2 & 3 Tests
-    bench_pagination(db);
-    printf("\n");
-    bench_complex_docs(db);
-    printf("\n");
-    bench_aggregations(db);
-    printf("\n");
-    bench_reference_resolution(db);
-    printf("\n");
-    bench_transaction_logic(db);
-    
-    printf("\n--- v0.4 New Performance features ---\n");
-    bench_cursor_vs_offset(db);
-    printf("\n");
-    bench_patch_efficiency(db);
-    printf("\n");
-    bench_logical_logic(db);
-    
-    // 1. Shard Parallelism (The new v0.5 feature)
-    printf("\n");
-    bench_shard_parallel_write(db, threads);
-    printf("\n");
-    // 4. Persistence Verification
-    printf("\n>> Manual Index Snapshotting...\n");
-    fl_engine_snapshot_indices(db);
-    
-    printf("\n");
-    display_audit_tail(db);
-    
-    // System Diagnostics
     char* stats = fl_engine_get_stats(db);
-    printf("\n>> Engine Stats: %s\n", stats);
+    printf("\n>> Stats: %s\n", stats);
     fl_string_free(stats);
 
-    // if (durability != 3) {
-    //     printf("\n>> Sleeping 3 second, giving time flushing to work..");
-    //     std::this_thread::sleep_for(3000ms);
-    // }
-
-    printf("\n>> Flushing..");
-    double start_time = get_time();
+    printf("\n>> Shutdown...\n");
+    double t = now_sec();
     fl_engine_free(db);
-    double end_time = get_time();
-    printf("\n>>   Complete -  %.4fs\n", (end_time - start_time));
-    printf("-----------------------------------------\n");
+    printf("   Done in %.3fs\n", now_sec() - t);
+
     return 0;
 }

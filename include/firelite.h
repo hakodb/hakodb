@@ -229,4 +229,6 @@ int32_t fl_query_where_in(FL_Query *query, const char *field, FL_Array *array);
 
 int32_t fl_engine_snapshot_indices(FL_Engine *engine);
 
+void fl_config_set_compression(FL_Config *config, bool enabled, int32_t level);
+
 }  // extern "C"

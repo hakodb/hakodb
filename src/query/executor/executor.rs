@@ -32,60 +32,95 @@ impl ParallelQueryExecutor {
         plan: QueryPlan,
     ) -> Result<Vec<(String, FireLiteDoc)>> {
         let docs = match &plan.scan {
-            ScanType::FullCollection => storage.scan_prefix(&format!("{}:", plan.collection))?,
-            ScanType::CompositeIndex { fields, values } => {
-                if let Some(doc_ids) = indexes.exact_match_doc_ids(&plan.collection, fields, values) {
-                    let mut out = Vec::new();
-                    for doc_id in doc_ids {
-                        let key = format!("{}:{}", plan.collection, doc_id);
-                        if let Some(raw) = storage.get(&key)? {
-                            out.push((key, raw));
-                        }
-                    }
-                    out
-                } else {
-                    storage.scan_prefix(&format!("{}:", plan.collection))?
-                }
-            },
-            ScanType::CursorIndex { start_key } => {
-                let mut out = Vec::new();
-                // We jump to the exact spot in the B-Tree index
-                // This is O(log N) instead of O(N)
-                for idx in indexes.indexes_for_collection(&plan.collection) {
-                    // Find the index that matches this scan
-                    let end_key = { let mut e = start_key.clone(); e.push(0xFF); e };
-                    let doc_ids: Vec<std::sync::Arc<str>> = idx.range_scan(&start_key, &end_key);
+            // ScanType::FullCollection => storage.scan_prefix(&format!("{}:", plan.collection))?,
+            // ScanType::CompositeIndex { fields, values } => {
+            //     if let Some(doc_ids) = indexes.exact_match_doc_ids(&plan.collection, fields, values) {
+            //         let mut out = Vec::new();
+            //         for doc_id in doc_ids {
+            //             let key = format!("{}:{}", plan.collection, doc_id);
+            //             if let Some(raw) = storage.get(&key)? {
+            //                 out.push((key, raw));
+            //             }
+            //         }
+            //         out
+            //     } else {
+            //         storage.scan_prefix(&format!("{}:", plan.collection))?
+            //     }
+            // },
+            // ScanType::CursorIndex { start_key } => {
+            //     let mut out = Vec::new();
+            //     // We jump to the exact spot in the B-Tree index
+            //     // This is O(log N) instead of O(N)
+            //     for idx in indexes.indexes_for_collection(&plan.collection) {
+            //         // Find the index that matches this scan
+            //         let end_key = { let mut e = start_key.clone(); e.push(0xFF); e };
+            //         let doc_ids: Vec<std::sync::Arc<str>> = idx.range_scan(&start_key, &end_key);
                     
-                    for doc_id in doc_ids {
-                        let key = format!("{}:{}", plan.collection, doc_id);
-                        if let Some(raw) = storage.get(&key)? {
-                            out.push((key, raw));
-                        }
-                        // Optimization: If no filters, we can stop once limit is reached
-                        if plan.filters.is_empty() && plan.limit.map_or(false, |l| out.len() >= l) {
-                            break;
-                        }
+            //         for doc_id in doc_ids {
+            //             let key = format!("{}:{}", plan.collection, doc_id);
+            //             if let Some(raw) = storage.get(&key)? {
+            //                 out.push((key, raw));
+            //             }
+            //             // Optimization: If no filters, we can stop once limit is reached
+            //             if plan.filters.is_empty() && plan.limit.map_or(false, |l| out.len() >= l) {
+            //                 break;
+            //             }
+            //         }
+            //         if !out.is_empty() { break; }
+            //     }
+            //     out
+            // },
+            // ScanType::SecondaryIndex { field, value } => {
+            //     let mut out = Vec::new();
+            //     if let Some(sec_map) = indexes.secondary.get(&plan.collection) {
+            //         if let Some(index) = sec_map.get(field) {
+            //             // Secondary indexes return Vec<String> (Doc IDs)
+            //             let doc_ids = index.range_scan(value, value);
+            //             for doc_id in doc_ids {
+            //                 let key = format!("{}:{}", plan.collection, doc_id);
+            //                 if let Some(raw) = storage.get(&key)? {
+            //                     out.push((key, raw));
+            //                 }
+            //             }
+            //         }
+            //     }
+            //     out
+            // },
+            // ScanType::UnionIndex { scans } => {
+            //     let mut unique_keys = hashbrown::HashSet::new();
+                
+            //     // 1. Collect IDs from all index branches
+            //     for scan in scans {
+            //         // Reuse the existing single-scan logic to get keys
+            //         let branch_docs = self.execute_single_scan(storage, indexes, scan, &plan.collection)?;
+            //         for (key, _) in branch_docs {
+            //             unique_keys.insert(key);
+            //         }
+            //     }
+
+            //     // 2. Fetch actual data for unique IDs
+            //     let mut out = Vec::new();
+            //     for key in unique_keys {
+            //         if let Some(raw) = storage.get(&key)? {
+            //             out.push((key, raw));
+            //         }
+            //     }
+            //     out
+            // }
+            ScanType::UnionIndex { scans } => {
+                // v0.6.1 Optimization: Run multiple index scans and merge unique results
+                let mut union_map = HashMap::new();
+                for scan in scans {
+                    let branch_docs = self.execute_single_scan(storage, indexes, scan, &plan.collection)?;
+                    for (key, raw) in branch_docs {
+                        // Using a HashMap to deduplicate documents that match multiple OR branches
+                        union_map.insert(key, raw);
                     }
-                    if !out.is_empty() { break; }
                 }
-                out
-            },
-            ScanType::SecondaryIndex { field, value } => {
-                let mut out = Vec::new();
-                if let Some(sec_map) = indexes.secondary.get(&plan.collection) {
-                    if let Some(index) = sec_map.get(field) {
-                        // Secondary indexes return Vec<String> (Doc IDs)
-                        let doc_ids = index.range_scan(value, value);
-                        for doc_id in doc_ids {
-                            let key = format!("{}:{}", plan.collection, doc_id);
-                            if let Some(raw) = storage.get(&key)? {
-                                out.push((key, raw));
-                            }
-                        }
-                    }
-                }
-                out
+                union_map.into_iter().collect()
             }
+            // Standard paths call the same helper
+            _ => self.execute_single_scan(storage, indexes, &plan.scan, &plan.collection)?,
         };
 
         let tasks = shard_tasks(docs, self.workers, plan.clone());
@@ -189,5 +224,60 @@ impl ParallelQueryExecutor {
             }
         }
         Ok(results)
+    }
+
+    /// Internal Helper: The logic for individual index/collection scans
+    fn execute_single_scan(
+        &self, 
+        storage: &StorageEngine, 
+        indexes: &IndexManager, 
+        scan: &ScanType, 
+        collection: &str
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        match scan {
+            ScanType::FullCollection => storage.scan_prefix(&format!("{}:", collection)),
+            
+            ScanType::SecondaryIndex { field, value } => {
+                let mut out = Vec::new();
+                if let Some(sec_map) = indexes.secondary.get(collection) {
+                    if let Some(index) = sec_map.get(field) {
+                        let doc_ids = index.range_scan(value, value);
+                        for doc_id in doc_ids {
+                            let key = format!("{}:{}", collection, doc_id);
+                            if let Some(raw) = storage.get(&key)? { out.push((key, raw)); }
+                        }
+                    }
+                }
+                Ok(out)
+            }
+
+            ScanType::CompositeIndex { fields, values } => {
+                let mut out = Vec::new();
+                if let Some(doc_ids) = indexes.exact_match_doc_ids(collection, fields, values) {
+                    for doc_id in doc_ids {
+                        let key = format!("{}:{}", collection, doc_id);
+                        if let Some(raw) = storage.get(&key)? { out.push((key, raw)); }
+                    }
+                }
+                Ok(out)
+            }
+
+            ScanType::CursorIndex { start_key } => {
+                let mut out = Vec::new();
+                for idx in indexes.indexes_for_collection(collection) {
+                    let end_key = { let mut e = start_key.clone(); e.push(0xFF); e };
+                    let doc_ids: Vec<std::sync::Arc<str>> = idx.range_scan(&start_key, &end_key);
+                    for doc_id in doc_ids {
+                        let key = format!("{}:{}", collection, doc_id);
+                        if let Some(raw) = storage.get(&key)? { out.push((key, raw)); }
+                    }
+                    if !out.is_empty() { break; }
+                }
+                Ok(out)
+            }
+
+            // UnionIndex is handled by the caller, but match must be exhaustive
+            ScanType::UnionIndex { .. } => Ok(vec![]),
+        }
     }
 }
