@@ -30,6 +30,14 @@ pub enum FireLiteOp {
         collection: String,
         doc_id: String,
     },
+    CreateIndex {
+        collection: String,
+        field: String,
+    },
+    CreateFtsIndex {
+        collection: String,
+        field: String,
+    },
     Query {
         collection: String,
         #[serde(default)]
@@ -40,6 +48,13 @@ pub enum FireLiteOp {
     },
     Batch {
         mutations: Vec<BatchInput>,
+    },
+    Aggregate {
+        collection: String,
+        #[serde(default)]
+        filters: Vec<FilterInput>,
+        kind: AggregateKind,
+        field: Option<String>,
     },
     Subscribe {
         listener_id: String,
@@ -62,6 +77,7 @@ pub enum FireLiteResponse {
     Ok,
     Document { data: Option<serde_json::Value> },
     QueryResult { rows: Vec<serde_json::Value> },
+    AggregateResult { value: f64 },
     SubscriptionAck { listener_id: String },
     Unsubscribed { listener_id: String },
 }
@@ -106,6 +122,18 @@ pub enum FilterOperator {
     Gte,
     Lt,
     Lte,
+    Match,
+    Contains,
+    StartsWith,
+    In,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AggregateKind {
+    Count,
+    Sum,
+    Avg,
 }
 
 #[derive(Clone)]
@@ -278,6 +306,20 @@ pub fn firelite_exec<R: Runtime>(
                 .map_err(|e| e.to_string())?;
             Ok(FireLiteResponse::Ok)
         }
+        FireLiteOp::CreateIndex { collection, field } => {
+            state
+                .db
+                .create_index(&collection, &field)
+                .map_err(|e| e.to_string())?;
+            Ok(FireLiteResponse::Ok)
+        }
+        FireLiteOp::CreateFtsIndex { collection, field } => {
+            state
+                .db
+                .create_fts_index(&collection, &field)
+                .map_err(|e| e.to_string())?;
+            Ok(FireLiteResponse::Ok)
+        }
         FireLiteOp::Query {
             collection,
             filters,
@@ -324,6 +366,55 @@ pub fn firelite_exec<R: Runtime>(
             }
             state.db.write_batch(batch).map_err(|e| e.to_string())?;
             Ok(FireLiteResponse::Ok)
+        }
+        FireLiteOp::Aggregate {
+            collection,
+            filters,
+            kind,
+            field,
+        } => {
+            let mut query = Query::new(&collection);
+            for filter in filters {
+                query = query.where_filter(
+                    &filter.field,
+                    map_operator(&filter.op),
+                    json_filter_value_to_value(&filter.value)?,
+                );
+            }
+
+            use crate::query::query::AggregateOp;
+            query = match &kind {
+                AggregateKind::Count => query.aggregate(AggregateOp::Count),
+                AggregateKind::Sum => {
+                    let f = field
+                        .clone()
+                        .ok_or_else(|| "sum aggregate requires 'field'".to_string())?;
+                    query.aggregate(AggregateOp::Sum(f))
+                }
+                AggregateKind::Avg => {
+                    let f = field
+                        .clone()
+                        .ok_or_else(|| "avg aggregate requires 'field'".to_string())?;
+                    query.aggregate(AggregateOp::Avg(f))
+                }
+            };
+
+            let result = state
+                .db
+                .execute_aggregation(query)
+                .map_err(|e| e.to_string())?;
+            let value = match &kind {
+                AggregateKind::Count => *result.get("count").unwrap_or(&0.0),
+                AggregateKind::Sum => {
+                    let field = field.clone().unwrap_or_default();
+                    *result.get(&format!("sum_{}", field)).unwrap_or(&0.0)
+                }
+                AggregateKind::Avg => {
+                    let field = field.clone().unwrap_or_default();
+                    *result.get(&format!("avg_{}", field)).unwrap_or(&0.0)
+                }
+            };
+            Ok(FireLiteResponse::AggregateResult { value })
         }
         FireLiteOp::Subscribe {
             listener_id,
@@ -401,6 +492,10 @@ fn map_operator(op: &FilterOperator) -> Operator {
         FilterOperator::Gte => Operator::Gte,
         FilterOperator::Lt => Operator::Lt,
         FilterOperator::Lte => Operator::Lte,
+        FilterOperator::Match => Operator::Match,
+        FilterOperator::Contains => Operator::Contains,
+        FilterOperator::StartsWith => Operator::StartsWith,
+        FilterOperator::In => Operator::In,
     }
 }
 
@@ -446,6 +541,19 @@ fn json_value_to_value(v: &serde_json::Value) -> Result<Value, String> {
         serde_json::Value::Object(_) => {
             Err("nested objects are not supported in FireLiteDoc payloads".to_string())
         }
+    }
+}
+
+fn json_filter_value_to_value(v: &serde_json::Value) -> Result<Value, String> {
+    match v {
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(json_filter_value_to_value(item)?);
+            }
+            Ok(Value::Array(out))
+        }
+        _ => json_value_to_value(v),
     }
 }
 
