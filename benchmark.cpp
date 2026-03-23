@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <sstream>
@@ -15,237 +16,224 @@
 #include <vector>
 
 namespace fs = std::filesystem;
+using namespace std;
+
+// ============================================================
+// DATA STRUCTURES
+// ============================================================
+const int TOTAL_DOCS = 10000;
+const int BATCH_SIZE = 100;
 
 struct BenchConfig {
-  std::string db_path = "./bench_data_cli";
-  std::string report_path = "./benchmark_report.md";
-  int total_docs = 20'000;
-  int seed_docs = 1'000;      // written as s_0 ... s_999
-  int batch_size = 200;       // written as b_0 ... b_n
-  int query_limit = 20;
-  int durability_mode = 1;    // 0 Always / 1 Interval / 2 Manual / 3 OnCommit
-  int query_workers = 8;
-  bool compression = true;
-  int compression_level = 3;
-  bool encryption = false;
-  std::string encryption_key = "firelite-bench";
-  bool audit_log = true;
-  std::size_t mmap_size = 256ull * 1024ull * 1024ull;
-  std::size_t max_inline_bytes = 32ull * 1024ull * 1024ull;
-  std::size_t page_size = 4096;
-  std::size_t compaction_threshold = 8ull * 1024ull * 1024ull;
-  std::size_t group_commit_max_ops = 256;
-  bool fts = true;
-  bool simple_index = true;
-  bool compact = true;
-  bool realtime = true;
+    string name;
+    int durability;    // 0:Always, 1:Interval, 2:Manual, 3:OnCommit
+    int threads;
+    bool zip;
+    bool enc;
+    size_t inline_mb;
+    bool fts = true;
+    bool realtime = true;
+    size_t mmap_mb = 128;
+    size_t query_limit = 5;
 };
 
 struct Stats {
-  double avg_ms = 0.0;
-  double p95_ms = 0.0;
-  double p99_ms = 0.0;
-  double tps = 0.0;
+    double p99 = 0;
+    double tps = 0;
 };
 
 struct Report {
-  BenchConfig cfg;
-  Stats single_write;
-  Stats batch_commit;
-  Stats point_read;
-  Stats query_scan;
-  double agg_count_ms = 0.0;
-  double agg_avg_ms = 0.0;
-  double fts_contains_ms = 0.0;
-  double fts_match_ms = 0.0;
-  double fts_gain = 0.0;
-  double offset_ms = 0.0;
-  double cursor_ms = 0.0;
-  double cursor_gain = 0.0;
-  double storage_mb = 0.0;
-  std::string engine_stats_json;
-  std::string audit_json;
-  std::string warnings;
+    BenchConfig cfg;
+    Stats single_write;
+    Stats batch_write;
+    double read_p99 = 0;
+    double storage_mb = 0;
+    double agg_ms = 0;
+    double cursor_gain = 0;
+    double fts_gain = 0;
+    double contains_ms = 0;
+    double match_ms = 0;
+    double offset_ms = 0;
+    double cursor_ms = 0;
+    string warnings;
+    bool success = true;
 };
 
+static mutex cout_mu;
+
+// ============================================================
+// UTILITIES
+// ============================================================
 static double now_ms() {
-  using namespace std::chrono;
-  return duration_cast<duration<double, std::milli>>(steady_clock::now().time_since_epoch()).count();
+    return (double)chrono::duration_cast<chrono::nanoseconds>(
+               chrono::steady_clock::now().time_since_epoch()).count() / 1e6;
 }
 
-static std::string text_for(int id) {
-  static const char* vocab[] = {"alpha", "beta", "gamma", "delta", "echo", "foxtrot", "query", "engine"};
-  std::ostringstream ss;
-  ss << "FireLite doc " << id << " " << vocab[id % 8] << " " << vocab[(id + 3) % 8];
-  return ss.str();
+static string text_for(int id, bool rare = false) {
+    if (rare) return "The rare obsidian butterfly flies at midnight in the FireLite engine.";
+    static const char* words[] = {"alpha", "beta", "gamma", "delta", "echo", "apple", "banana", "cherry"};
+    return "FireLite benchmark doc " + to_string(id) + " " + words[id % 8];
 }
 
-static void append_warning(std::string& w, const std::string& message) {
-  if (!w.empty()) w += "\n";
-  w += "- " + message;
-}
-
-static Stats make_stats(const std::vector<double>& samples, int ops, double elapsed_ms) {
-  Stats s{};
-  if (samples.empty() || elapsed_ms <= 0.0) return s;
-  std::vector<double> v = samples;
-  std::sort(v.begin(), v.end());
-  auto percentile = [&](double q) -> double {
-    std::size_t idx = static_cast<std::size_t>(q * static_cast<double>(v.size() - 1));
-    return v[idx];
-  };
-  s.avg_ms = std::accumulate(v.begin(), v.end(), 0.0) / static_cast<double>(v.size());
-  s.p95_ms = percentile(0.95);
-  s.p99_ms = percentile(0.99);
-  s.tps = static_cast<double>(ops) / (elapsed_ms / 1000.0);
-  return s;
-}
-
-static std::optional<std::string> arg_value(const std::string& arg, const std::string& name) {
-  const std::string prefix = "--" + name + "=";
-  if (arg.rfind(prefix, 0) == 0) return arg.substr(prefix.size());
-  return std::nullopt;
-}
-
-static bool to_bool(const std::string& v) {
-  return v == "1" || v == "true" || v == "yes" || v == "on";
-}
-
-static BenchConfig parse_cli(int argc, char** argv) {
-  BenchConfig cfg{};
-  for (int i = 1; i < argc; i++) {
-    std::string arg = argv[i];
-    if (arg == "--help") {
-      std::cout
-          << "FireLite realtime CLI benchmark\n"
-          << "Options:\n"
-          << "  --total-docs=N --seed-docs=N --batch-size=N --query-limit=N\n"
-          << "  --durability-mode=0|1|2|3 --query-workers=N\n"
-          << "  --compression=true|false --compression-level=N\n"
-          << "  --encryption=true|false --encryption-key=TEXT\n"
-          << "  --audit-log=true|false\n"
-          << "  --mmap-size=N --max-inline-bytes=N --page-size=N\n"
-          << "  --compaction-threshold=N --group-commit-max-ops=N\n"
-          << "  --fts=true|false --simple-index=true|false --compact=true|false\n"
-          << "  --realtime=true|false --db-path=PATH --report-path=PATH\n";
-      std::exit(0);
+static uintmax_t dir_size(const string& path) {
+    uintmax_t total = 0;
+    if (!fs::exists(path)) return 0;
+    for (const auto& entry : fs::recursive_directory_iterator(path)) {
+        if (fs::is_regular_file(entry.path())) total += fs::file_size(entry.path());
     }
-    if (auto v = arg_value(arg, "total-docs")) cfg.total_docs = std::stoi(*v);
-    else if (auto v = arg_value(arg, "seed-docs")) cfg.seed_docs = std::stoi(*v);
-    else if (auto v = arg_value(arg, "batch-size")) cfg.batch_size = std::stoi(*v);
-    else if (auto v = arg_value(arg, "query-limit")) cfg.query_limit = std::stoi(*v);
-    else if (auto v = arg_value(arg, "durability-mode")) cfg.durability_mode = std::stoi(*v);
-    else if (auto v = arg_value(arg, "query-workers")) cfg.query_workers = std::stoi(*v);
-    else if (auto v = arg_value(arg, "compression")) cfg.compression = to_bool(*v);
-    else if (auto v = arg_value(arg, "compression-level")) cfg.compression_level = std::stoi(*v);
-    else if (auto v = arg_value(arg, "encryption")) cfg.encryption = to_bool(*v);
-    else if (auto v = arg_value(arg, "encryption-key")) cfg.encryption_key = *v;
-    else if (auto v = arg_value(arg, "audit-log")) cfg.audit_log = to_bool(*v);
-    else if (auto v = arg_value(arg, "mmap-size")) cfg.mmap_size = static_cast<std::size_t>(std::stoull(*v));
-    else if (auto v = arg_value(arg, "max-inline-bytes")) cfg.max_inline_bytes = static_cast<std::size_t>(std::stoull(*v));
-    else if (auto v = arg_value(arg, "page-size")) cfg.page_size = static_cast<std::size_t>(std::stoull(*v));
-    else if (auto v = arg_value(arg, "compaction-threshold")) cfg.compaction_threshold = static_cast<std::size_t>(std::stoull(*v));
-    else if (auto v = arg_value(arg, "group-commit-max-ops")) cfg.group_commit_max_ops = static_cast<std::size_t>(std::stoull(*v));
-    else if (auto v = arg_value(arg, "fts")) cfg.fts = to_bool(*v);
-    else if (auto v = arg_value(arg, "simple-index")) cfg.simple_index = to_bool(*v);
-    else if (auto v = arg_value(arg, "compact")) cfg.compact = to_bool(*v);
-    else if (auto v = arg_value(arg, "realtime")) cfg.realtime = to_bool(*v);
-    else if (auto v = arg_value(arg, "db-path")) cfg.db_path = *v;
-    else if (auto v = arg_value(arg, "report-path")) cfg.report_path = *v;
-  }
-  if (cfg.seed_docs >= cfg.total_docs) cfg.seed_docs = std::max(1, cfg.total_docs / 10);
-  if (cfg.batch_size <= 0) cfg.batch_size = 100;
-  return cfg;
+    return total;
 }
 
-static std::string consume(char* p) {
-  if (!p) return {};
-  std::string s = p;
-  fl_string_free(p);
-  return s;
+static void add_warning(Report& r, const string& m) {
+    if (!r.warnings.empty()) r.warnings += "\n";
+    r.warnings += "- " + m;
 }
 
-static uintmax_t dir_size(const std::string& path) {
-  uintmax_t total = 0;
-  if (!fs::exists(path)) return total;
-  for (const auto& entry : fs::recursive_directory_iterator(path)) {
-    if (fs::is_regular_file(entry.path())) total += fs::file_size(entry.path());
-  }
-  return total;
+static void stage_log(const BenchConfig& cfg, const string& msg) {
+    if (!cfg.realtime) return;
+    lock_guard<mutex> lk(cout_mu);
+    cout << "   [stage] " << msg << endl;
 }
 
-static void stage(const BenchConfig& cfg, const std::string& msg) {
-  if (cfg.realtime) std::cout << "[stage] " << msg << std::endl;
-}
+// ============================================================
+// CORE BENCHMARK CYCLE
+// ============================================================
+Report run_cycle(BenchConfig cfg) {
+    Report res;
+    res.cfg = cfg;
+    const string path = "./bench_data_" + cfg.name;
+    try { fs::remove_all(path); } catch (...) {}
 
-static Report run_benchmark_cycle(const BenchConfig& cfg) {
-  Report out{};
-  out.cfg = cfg;
+    FL_Config* fcfg = fl_config_new();
+    fl_config_set_durability(fcfg, cfg.durability);
+    fl_config_set_query_workers(fcfg, cfg.threads);
+    fl_config_set_compression(fcfg, cfg.zip, 3);
+    fl_config_set_memory_limits(fcfg, cfg.mmap_mb * 1024 * 1024, cfg.inline_mb * 1024 * 1024);
+    fl_config_set_audit_log(fcfg, true, nullptr);
+    if (cfg.enc) fl_config_set_encryption_key(fcfg, "bench-secret");
 
-  try {
-    fs::remove_all(cfg.db_path);
-  } catch (...) {
-    append_warning(out.warnings, "could not clear old benchmark directory");
-  }
-
-  FL_Config* fcfg = fl_config_new();
-  fl_config_set_durability(fcfg, cfg.durability_mode);
-  fl_config_set_query_workers(fcfg, static_cast<uintptr_t>(cfg.query_workers));
-  fl_config_set_memory_limits(fcfg, static_cast<uintptr_t>(cfg.mmap_size), static_cast<uintptr_t>(cfg.max_inline_bytes));
-  fl_config_set_storage_tuning(
-      fcfg,
-      static_cast<uintptr_t>(cfg.page_size),
-      static_cast<uintptr_t>(cfg.compaction_threshold),
-      static_cast<uintptr_t>(cfg.group_commit_max_ops));
-  fl_config_set_compression(fcfg, cfg.compression, cfg.compression_level);
-  fl_config_set_audit_log(fcfg, cfg.audit_log, nullptr);
-  if (cfg.encryption) fl_config_set_encryption_key(fcfg, cfg.encryption_key.c_str());
-
-  FL_Engine* db = fl_engine_open_with_config(cfg.db_path.c_str(), fcfg);
-  if (!db) {
-    append_warning(out.warnings, std::string("engine_open failed: ") + (fl_last_error() ? fl_last_error() : "unknown"));
-    return out;
-  }
-
-  // 1) seed single writes -> s_*
-  stage(cfg, "single inserts (seed)");
-  std::vector<double> single_samples;
-  single_samples.reserve(cfg.seed_docs);
-  const double sw_start = now_ms();
-  for (int i = 0; i < cfg.seed_docs; i++) {
-    FL_Doc* d = fl_doc_new();
-    const auto text = text_for(i);
-    fl_doc_insert_int(d, "id", i);
-    fl_doc_insert_str(d, "text", text.c_str());
-    const auto id = "s_" + std::to_string(i);
-    const double t0 = now_ms();
-    if (fl_engine_insert(db, "bench", id.c_str(), d) != 0) {
-      append_warning(out.warnings, "seed insert failed for " + id);
+    FL_Engine* db = fl_engine_open_with_config(path.c_str(), fcfg);
+    if (!db) {
+        res.success = false;
+        add_warning(res, string("engine open failed: ") + (fl_last_error() ? fl_last_error() : "unknown"));
+        return res;
     }
-    single_samples.push_back(now_ms() - t0);
-    fl_doc_free(d);
-  }
-  out.single_write = make_stats(single_samples, cfg.seed_docs, now_ms() - sw_start);
-  if (cfg.realtime) std::cout << "  -> single p99: " << out.single_write.p99_ms << " ms\n";
 
-  // 2) batch writes -> b_*
-  stage(cfg, "batch inserts");
-  std::vector<double> batch_samples;
-  const int batch_docs = cfg.total_docs - cfg.seed_docs;
-  int batch_written = 0;
-  const double bw_start = now_ms();
-  while (batch_written < batch_docs) {
-    const int n = std::min(cfg.batch_size, batch_docs - batch_written);
-    FL_Batch* b = fl_batch_new();
-    for (int j = 0; j < n; j++) {
-      const int idx = batch_written + j;
-      FL_Doc* d = fl_doc_new();
-      fl_doc_insert_int(d, "id", cfg.seed_docs + idx);
-      const auto text = text_for(cfg.seed_docs + idx);
-      fl_doc_insert_str(d, "text", text.c_str());
-      const auto id = "b_" + std::to_string(idx);
-      fl_batch_set(b, "bench", id.c_str(), d);
-      fl_doc_free(d);
+    // 1. Single Writes (Latency Aware)
+    stage_log(cfg, "single writes");
+    vector<double> s_samples;
+    const double s_start = now_ms();
+    for (int i = 0; i < 500; i++) {
+        FL_Doc* d = fl_doc_new();
+        fl_doc_insert_int(d, "id", i);
+        fl_doc_insert_str(d, "text", text_for(i).c_str());
+        const double t0 = now_ms();
+        if (fl_engine_insert(db, "bench", ("s_" + to_string(i)).c_str(), d) != 0) {
+            add_warning(res, "single insert failed on s_" + to_string(i));
+        }
+        s_samples.push_back(now_ms() - t0);
+        fl_doc_free(d);
+    }
+    sort(s_samples.begin(), s_samples.end());
+    res.single_write = {
+        s_samples[(size_t)(s_samples.size()*0.99)],
+        500.0 / ((now_ms()-s_start)/1000.0)
+    };
+
+    // 2. Batch Writes (Throughput Aware) => b_500 ... b_9999
+    stage_log(cfg, "batch writes");
+    vector<double> b_samples;
+    const double b_start = now_ms();
+    for (int i = 0; i < 9500; i += BATCH_SIZE) {
+        FL_Batch* b = fl_batch_new();
+        for (int j = 0; j < BATCH_SIZE; j++) {
+            const int id = i + j + 500;
+            FL_Doc* d = fl_doc_new();
+            fl_doc_insert_int(d, "id", id);
+            fl_doc_insert_str(d, "text", text_for(id, id == 5000).c_str()); // unique rare token in b_5000
+            fl_batch_set(b, "bench", ("b_" + to_string(id)).c_str(), d);
+            fl_doc_free(d);
+        }
+        const double t0 = now_ms();
+        if (fl_batch_commit(db, b) != 0) add_warning(res, "batch commit failed near id " + to_string(i + 500));
+        b_samples.push_back(now_ms() - t0);
+        fl_batch_free(b);
+    }
+    sort(b_samples.begin(), b_samples.end());
+    res.batch_write = {
+        b_samples[(size_t)(b_samples.size()*0.99)],
+        9500.0 / ((now_ms()-b_start)/1000.0)
+    };
+
+    // 3. Point Reads
+    stage_log(cfg, "point reads");
+    vector<double> r_samples;
+    for (int i = 0; i < 200; i++) {
+        const double t0 = now_ms();
+        FL_Doc* got = fl_engine_get(db, "bench", "b_5000");
+        r_samples.push_back(now_ms() - t0);
+        if (got) fl_doc_free(got);
+    }
+    sort(r_samples.begin(), r_samples.end());
+    res.read_p99 = r_samples[(size_t)(r_samples.size()*0.99)];
+
+    // 4. Index Gains
+    stage_log(cfg, "index + cursor + fts gains");
+    fl_engine_create_simple_index(db, "bench", "id");
+    if (cfg.fts) fl_engine_create_fts_index(db, "bench", "text");
+    this_thread::sleep_for(chrono::milliseconds(500));
+
+    // Cursor vs Offset with guaranteed anchor
+    FL_Query* q_off = fl_query_new("bench");
+    fl_query_order_by(q_off, "id", true);
+    fl_query_offset(q_off, 4000);
+    fl_query_limit(q_off, cfg.query_limit);
+    const double t_off = now_ms();
+    char* off_json = fl_query_execute(db, q_off);
+    const double d_off = now_ms() - t_off;
+    if (off_json) fl_string_free(off_json);
+
+    FL_Doc* anchor = fl_engine_get(db, "bench", "b_4000");
+    if (anchor) {
+        FL_Query* q_cur = fl_query_new("bench");
+        fl_query_order_by(q_cur, "id", true);
+        fl_query_start_after(q_cur, anchor);
+        fl_query_limit(q_cur, cfg.query_limit);
+        const double t_cur = now_ms();
+        char* cur_json = fl_query_execute(db, q_cur);
+        const double d_cur = now_ms() - t_cur;
+        if (cur_json) fl_string_free(cur_json);
+        res.offset_ms = d_off;
+        res.cursor_ms = d_cur;
+        if (d_cur > 0.0) res.cursor_gain = d_off / d_cur;
+        fl_query_free(q_cur);
+        fl_doc_free(anchor);
+    } else {
+        add_warning(res, "anchor b_4000 not found for cursor benchmark");
+    }
+
+    // FTS Gain using rare keyword "obsidian"
+    if (cfg.fts) {
+        FL_Query* q_lin = fl_query_new("bench");
+        fl_query_where_contains(q_lin, "text", "obsidian");
+        const double t_lin = now_ms();
+        char* lin_json = fl_query_execute(db, q_lin);
+        const double d_lin = now_ms() - t_lin;
+        if (lin_json) fl_string_free(lin_json);
+
+        FL_Query* q_fts = fl_query_new("bench");
+        fl_query_where_match(q_fts, "text", "obsidian");
+        const double t_fts = now_ms();
+        char* fts_json = fl_query_execute(db, q_fts);
+        const double d_fts = now_ms() - t_fts;
+        if (fts_json) fl_string_free(fts_json);
+
+        res.contains_ms = d_lin;
+        res.match_ms = d_fts;
+        if (d_fts > 0.0) res.fts_gain = d_lin / d_fts;
+
+        fl_query_free(q_lin);
+        fl_query_free(q_fts);
     }
     const double t0 = now_ms();
     if (fl_batch_commit(db, b) != 0) append_warning(out.warnings, "batch commit failed");
@@ -270,177 +258,149 @@ static Report run_benchmark_cycle(const BenchConfig& cfg) {
   }
   out.point_read = make_stats(read_samples, read_ops, std::accumulate(read_samples.begin(), read_samples.end(), 0.0));
 
-  // 4) query timings
-  stage(cfg, "ordered scans");
-  std::vector<double> query_samples;
-  for (int i = 0; i < 50; i++) {
-    FL_Query* q = fl_query_new("bench");
-    fl_query_order_by(q, "id", true);
-    fl_query_offset(q, static_cast<uintptr_t>((i * 23) % std::max(1, batch_docs / 4)));
-    fl_query_limit(q, static_cast<uintptr_t>(cfg.query_limit));
-    const double t0 = now_ms();
-    char* rows = fl_query_execute(db, q);
-    query_samples.push_back(now_ms() - t0);
-    if (rows) fl_string_free(rows);
-    fl_query_free(q);
-  }
-  out.query_scan = make_stats(query_samples, static_cast<int>(query_samples.size()), std::accumulate(query_samples.begin(), query_samples.end(), 0.0));
+    // 5. Aggregation
+    stage_log(cfg, "aggregation");
+    FL_Query* aq = fl_query_new("bench");
+    fl_query_aggregate_avg(aq, "id");
+    const double t_agg = now_ms();
+    char* agg_json = fl_query_execute_aggregation(db, aq);
+    res.agg_ms = now_ms() - t_agg;
+    if (agg_json) fl_string_free(agg_json);
 
-  // 5) FTS comparison using rare token
-  if (cfg.fts) {
-    stage(cfg, "fts index + rare-word comparison");
-    fl_engine_create_fts_index(db, "bench", "text");
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // Cleanup
+    fl_engine_compact(db);
+    res.storage_mb = (double)dir_size(path) / (1024.0 * 1024.0);
+    fl_query_free(q_off);
+    fl_query_free(aq);
+    fl_engine_free(db);
+    return res;
+}
 
-    FL_Doc* unique = fl_doc_new();
-    fl_doc_insert_str(unique, "text", "The rare obsidian butterfly flies at midnight");
-    fl_doc_insert_int(unique, "id", cfg.total_docs + 777);
-    fl_engine_insert(db, "bench", "unique_butterfly", unique);
-    fl_doc_free(unique);
-
-    FL_Query* q_lin = fl_query_new("bench");
-    fl_query_where_contains(q_lin, "text", "obsidian");
-    double t1 = now_ms();
-    char* r1 = fl_query_execute(db, q_lin);
-    out.fts_contains_ms = now_ms() - t1;
-    if (r1) fl_string_free(r1);
-    fl_query_free(q_lin);
-
-    FL_Query* q_fts = fl_query_new("bench");
-    fl_query_where_match(q_fts, "text", "obsidian");
-    double t2 = now_ms();
-    char* r2 = fl_query_execute(db, q_fts);
-    out.fts_match_ms = now_ms() - t2;
-    if (r2) fl_string_free(r2);
-    fl_query_free(q_fts);
-
-    if (out.fts_match_ms > 0.0) out.fts_gain = out.fts_contains_ms / out.fts_match_ms;
-  }
-
-  // 6) cursor anchor fix (b_middle)
-  if (cfg.simple_index) {
-    stage(cfg, "simple index + cursor benchmark");
-    fl_engine_create_simple_index(db, "bench", "id");
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-    const int middle_idx = std::max(1, batch_docs / 2);
-    char anchor_id[32];
-    std::snprintf(anchor_id, sizeof(anchor_id), "b_%d", middle_idx);
-    FL_Doc* anchor = fl_engine_get(db, "bench", anchor_id);
-
-    if (anchor) {
-      FL_Query* q_off = fl_query_new("bench");
-      fl_query_order_by(q_off, "id", true);
-      fl_query_offset(q_off, static_cast<uintptr_t>(middle_idx));
-      fl_query_limit(q_off, 10);
-      const double t_off = now_ms();
-      char* off_rows = fl_query_execute(db, q_off);
-      out.offset_ms = now_ms() - t_off;
-      if (off_rows) fl_string_free(off_rows);
-      fl_query_free(q_off);
-
-      FL_Query* q_cur = fl_query_new("bench");
-      fl_query_order_by(q_cur, "id", true);
-      fl_query_start_after(q_cur, anchor);
-      fl_query_limit(q_cur, 10);
-      const double t_cur = now_ms();
-      char* cur_rows = fl_query_execute(db, q_cur);
-      out.cursor_ms = now_ms() - t_cur;
-      if (cur_rows) fl_string_free(cur_rows);
-      fl_query_free(q_cur);
-
-      if (out.cursor_ms > 0.0) out.cursor_gain = out.offset_ms / out.cursor_ms;
-      fl_doc_free(anchor);
-    } else {
-      append_warning(out.warnings, std::string("anchor not found: ") + anchor_id);
+static void write_markdown_report(const vector<Report>& results, const string& out_path) {
+    ofstream out(out_path, ios::trunc);
+    out << "# FireLite Comprehensive CLI Benchmark Report\n\n";
+    out << "## Summary table\n\n";
+    out << "| Profile | S-TPS (p99) | B-TPS (p99) | Read p99 | Size MB | Agg ms | Idx gain | FTS gain |\n";
+    out << "|---|---:|---:|---:|---:|---:|---:|---:|\n";
+    for (const auto& r : results) {
+        if (!r.success) {
+            out << "| " << r.cfg.name << " | failed | failed | failed | - | - | - | - |\n";
+            continue;
+        }
+        out << "| " << r.cfg.name
+            << " | " << fixed << setprecision(0) << r.single_write.tps << " (" << setprecision(2) << r.single_write.p99 << "ms)"
+            << " | " << setprecision(0) << r.batch_write.tps << " (" << setprecision(2) << r.batch_write.p99 << "ms)"
+            << " | " << setprecision(2) << r.read_p99
+            << " | " << setprecision(2) << r.storage_mb
+            << " | " << setprecision(2) << r.agg_ms
+            << " | " << setprecision(2) << r.cursor_gain << "x"
+            << " | " << setprecision(2) << r.fts_gain << "x |\n";
     }
-  }
 
-  // 7) aggregates
-  stage(cfg, "aggregates");
-  {
-    FL_Query* q = fl_query_new("bench");
-    fl_query_aggregate_count(q);
-    const double t0 = now_ms();
-    char* r = fl_query_execute_aggregation(db, q);
-    out.agg_count_ms = now_ms() - t0;
-    if (r) fl_string_free(r);
-    fl_query_free(q);
-  }
-  {
-    FL_Query* q = fl_query_new("bench");
-    fl_query_aggregate_avg(q, "id");
-    const double t0 = now_ms();
-    char* r = fl_query_execute_aggregation(db, q);
-    out.agg_avg_ms = now_ms() - t0;
-    if (r) fl_string_free(r);
-    fl_query_free(q);
-  }
-
-  if (cfg.compact) fl_engine_compact(db);
-  out.engine_stats_json = consume(fl_engine_get_stats(db));
-  out.audit_json = consume(fl_engine_get_audit_log(db));
-  out.storage_mb = static_cast<double>(dir_size(cfg.db_path)) / (1024.0 * 1024.0);
-
-  fl_engine_free(db);
-  return out;
+    out << "\n## Detailed profile diagnostics\n";
+    for (const auto& r : results) {
+        out << "\n### " << r.cfg.name << "\n";
+        out << "- Durability: " << r.cfg.durability << "\n";
+        out << "- Query Workers: " << r.cfg.threads << "\n";
+        out << "- Compression: " << (r.cfg.zip ? "enabled" : "disabled") << "\n";
+        out << "- Encryption: " << (r.cfg.enc ? "enabled" : "disabled") << "\n";
+        out << "- Inline memory: " << r.cfg.inline_mb << "MB\n";
+        out << "- Cursor timing: offset " << r.offset_ms << "ms vs cursor " << r.cursor_ms << "ms\n";
+        out << "- FTS timing: contains " << r.contains_ms << "ms vs match " << r.match_ms << "ms\n";
+        if (!r.warnings.empty()) out << "- Warnings:\n" << r.warnings << "\n";
+    }
 }
 
-static void write_markdown_report(const Report& r) {
-  std::ofstream out(r.cfg.report_path, std::ios::trunc);
-  out << "# FireLite CLI Realtime Benchmark Report\n\n";
-  out << "## Config\n\n";
-  out << "| key | value |\n|---|---|\n";
-  out << "| total_docs | " << r.cfg.total_docs << " |\n";
-  out << "| seed_docs | " << r.cfg.seed_docs << " |\n";
-  out << "| batch_size | " << r.cfg.batch_size << " |\n";
-  out << "| durability_mode | " << r.cfg.durability_mode << " |\n";
-  out << "| query_workers | " << r.cfg.query_workers << " |\n";
-  out << "| compression | " << (r.cfg.compression ? "on" : "off") << " |\n";
-  out << "| encryption | " << (r.cfg.encryption ? "on" : "off") << " |\n";
-  out << "| fts | " << (r.cfg.fts ? "on" : "off") << " |\n";
-  out << "| simple_index | " << (r.cfg.simple_index ? "on" : "off") << " |\n\n";
-
-  out << "## Metrics\n\n";
-  out << "| scenario | avg ms | p95 ms | p99 ms | tps |\n|---|---:|---:|---:|---:|\n";
-  out << std::fixed << std::setprecision(3);
-  out << "| single write | " << r.single_write.avg_ms << " | " << r.single_write.p95_ms << " | " << r.single_write.p99_ms << " | " << r.single_write.tps << " |\n";
-  out << "| batch commit | " << r.batch_commit.avg_ms << " | " << r.batch_commit.p95_ms << " | " << r.batch_commit.p99_ms << " | " << r.batch_commit.tps << " |\n";
-  out << "| point read | " << r.point_read.avg_ms << " | " << r.point_read.p95_ms << " | " << r.point_read.p99_ms << " | " << r.point_read.tps << " |\n";
-  out << "| ordered query | " << r.query_scan.avg_ms << " | " << r.query_scan.p95_ms << " | " << r.query_scan.p99_ms << " | " << r.query_scan.tps << " |\n\n";
-
-  out << "## Feature deltas\n\n";
-  out << "- FTS contains: **" << r.fts_contains_ms << " ms**\n";
-  out << "- FTS match: **" << r.fts_match_ms << " ms**\n";
-  out << "- FTS gain (contains/match): **" << r.fts_gain << "x**\n";
-  out << "- Offset: **" << r.offset_ms << " ms**\n";
-  out << "- Cursor: **" << r.cursor_ms << " ms**\n";
-  out << "- Cursor gain (offset/cursor): **" << r.cursor_gain << "x**\n";
-  out << "- Aggregate count: **" << r.agg_count_ms << " ms**\n";
-  out << "- Aggregate avg: **" << r.agg_avg_ms << " ms**\n";
-  out << "- Storage size: **" << r.storage_mb << " MB**\n\n";
-
-  out << "## Capability assessment\n\n";
-  out << "### Strengths\n\n";
-  out << "- Embedded local-first architecture (no external database service required).\n";
-  out << "- Rich query features: full-text match, cursor pagination, aggregation, projection.\n";
-  out << "- Tunable operational controls via config (durability/compression/encryption/audit).\n\n";
-  out << "### Trade-offs\n\n";
-  out << "- No built-in distributed/multi-region replication plane.\n";
-  out << "- Index planning still matters for high-cardinality query shapes.\n";
-  out << "- Security and compression knobs can increase CPU cost under heavy ingest.\n\n";
-
-  if (!r.warnings.empty()) out << "## Warnings\n\n" << r.warnings << "\n\n";
-  if (!r.engine_stats_json.empty()) out << "## Engine stats\n\n```json\n" << r.engine_stats_json << "\n```\n\n";
-  if (!r.audit_json.empty()) out << "## Audit snapshot\n\n```json\n" << r.audit_json << "\n```\n\n";
-}
-
+// ============================================================
+// MAIN CLI PARSER & REPORTER
+// ============================================================
 int main(int argc, char** argv) {
-  BenchConfig cfg = parse_cli(argc, argv);
-  std::cout << "FireLite realtime CLI benchmark start\n";
-  Report report = run_benchmark_cycle(cfg);
-  write_markdown_report(report);
-  std::cout << "Done. Report written to: " << cfg.report_path << "\n";
-  if (!report.warnings.empty()) std::cout << "Warnings:\n" << report.warnings << "\n";
-  return 0;
+    vector<BenchConfig> suite;
+    string markdown_path = "./benchmark_report.md";
+
+    if (argc > 1) {
+        BenchConfig c = {"Custom", 3, 8, true, false, 0, true, true, 128, 5};
+        for (int i=1; i<argc; i++) {
+            string a = argv[i];
+            if (a.find("--dur=") == 0) c.durability = stoi(a.substr(6));
+            else if (a.find("--thr=") == 0) c.threads = stoi(a.substr(6));
+            else if (a.find("--zip=") == 0) c.zip = (a.substr(6) == "true");
+            else if (a.find("--enc=") == 0) c.enc = (a.substr(6) == "true");
+            else if (a.find("--mem=") == 0) c.inline_mb = stoul(a.substr(6));
+            else if (a.find("--fts=") == 0) c.fts = (a.substr(6) == "true");
+            else if (a.find("--rt=") == 0) c.realtime = (a.substr(5) == "true");
+            else if (a.find("--mmap=") == 0) c.mmap_mb = stoul(a.substr(7));
+            else if (a.find("--qlim=") == 0) c.query_limit = stoul(a.substr(7));
+            else if (a.find("--md=") == 0) markdown_path = a.substr(5);
+            else if (a == "--help") {
+                cout << "Usage examples:\n"
+                     << "  ./firelite_bench\n"
+                     << "  ./firelite_bench --dur=3 --thr=8 --zip=true --enc=false --mem=16 --fts=true --rt=true --md=./out.md\n";
+                return 0;
+            }
+        }
+        suite.push_back(c);
+    } else {
+        suite = {
+            {"Strict_Sync", 0, 4,  false, true,  0,  true, true, 128, 5},  // Always Sync, Encrypted
+            {"Interval",    1, 4,  true,  false, 0,  true, true, 128, 5},  // 10ms Sync, Zstd
+            {"OnCommit",    3, 8,  true,  false, 2,  true, true, 128, 5},  // Sync on Batch, 2MB Inline
+            {"Turbo_RAM",   2, 8,  false, false, 60, true, true, 128, 5},  // Manual, 60MB Inline
+            {"Secure_FTS",  3, 8,  true,  true,  10, true, true, 128, 5},  // All Features On
+            {"Thread_Scale",3, 32, false, false, 2,  true, true, 128, 5}   // 32-Thread Stress
+        };
+    }
+
+    cout << "========================================================================================\n";
+    cout << " FIRE LITE COMPREHENSIVE CLI BENCHMARK (v0.5.6)\n";
+    cout << "========================================================================================\n";
+
+    vector<Report> results;
+    for (auto& cfg : suite) {
+        cout << ">> Process: " << left << setw(13) << cfg.name
+             << " [D:" << cfg.durability << " T:" << setw(2) << cfg.threads
+             << " Z:" << cfg.zip << " E:" << cfg.enc << " M:" << setw(2) << cfg.inline_mb << "MB] ... " << flush;
+
+        Report r = run_cycle(cfg);
+        results.push_back(r);
+        cout << (r.success ? "[SUCCESS]" : "[FAILED]") << endl;
+        this_thread::sleep_for(chrono::milliseconds(250));
+    }
+
+    // --- FINAL CONCLUSION TABLE ---
+    cout << "\n\n" << string(110, '=') << "\n";
+    cout << " FINAL BENCHMARK CONCLUSION (Side-by-Side Comparison)\n";
+    cout << string(110, '-') << "\n";
+    cout << left << setw(14) << "Profile" << " | "
+         << setw(18) << "S-TPS (p99 Lat)" << " | "
+         << setw(18) << "B-TPS (p99 Lat)" << " | "
+         << setw(8) << "Rd-p99" << " | "
+         << setw(8) << "Size" << " | "
+         << setw(6) << "Agg" << " | "
+         << setw(6) << "IdxV" << " | "
+         << "FTSV\n";
+    cout << string(110, '-') << "\n";
+
+    for (const auto& r : results) {
+        if (!r.success) {
+            cout << left << setw(14) << r.cfg.name << " | FAILED\n";
+            continue;
+        }
+        cout << left << setw(14) << r.cfg.name << " | "
+             << fixed << setprecision(0) << setw(5) << r.single_write.tps
+             << " (" << setprecision(2) << setw(6) << r.single_write.p99 << "ms) | "
+             << setprecision(0) << setw(5) << r.batch_write.tps
+             << " (" << setprecision(2) << setw(6) << r.batch_write.p99 << "ms) | "
+             << setprecision(2) << setw(6) << r.read_p99 << "ms | "
+             << setw(6) << r.storage_mb << "MB | "
+             << setw(4) << r.agg_ms << "ms | "
+             << setw(4) << r.cursor_gain << "x | "
+             << r.fts_gain << "x\n";
+    }
+    cout << string(110, '=') << endl;
+
+    write_markdown_report(results, markdown_path);
+    cout << "Detailed markdown report written to: " << markdown_path << endl;
+    return 0;
 }
+
