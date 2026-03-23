@@ -6,7 +6,7 @@ It runs in-process (no external service), stores typed binary documents, and pro
 
 ---
 
-## Current Status (v0.5.3 - High Velocity)
+## Current Status (v0.5.6 - High Velocity)
 
 FireLite has evolved from a foundation stage into a **Production-Candidate** engine. The core architecture now supports physical data sharding and near-instant recovery, capable of **20,000+ TPS** and sub-millisecond query responses on standard hardware.
 
@@ -203,7 +203,7 @@ firelite = { version = "0.1", features = ["tauri-gateway"] }
 
 - Command: `firelite_exec`
 - Internal-tagged operation enum: `FireLiteOp`
-  - `Get`, `Set`, `Delete`, `Query`, `Batch`, `Subscribe`, `Unsubscribe`
+  - `Get`, `Set`, `Delete`, `CreateIndex`, `CreateFtsIndex`, `Query`, `Batch`, `Aggregate`, `Subscribe`, `Unsubscribe`
 - Reactive subscription registry:
   - tracks listener IDs per window
   - re-runs query snapshots on collection change
@@ -211,6 +211,9 @@ firelite = { version = "0.1", features = ["tauri-gateway"] }
 - Lifecycle helpers:
   - unsubscribe command support
   - `cleanup_window_subscriptions(window_label)` for close-event cleanup
+- Query enhancements over gateway:
+  - FTS operators (`match`, `contains`, `startsWith`) and `in`
+  - aggregate routing (`count`, `sum`, `avg`)
 
 ### Frontend SDK usage (Tauri)
 
@@ -418,6 +421,7 @@ API (FireLite + FFI + SDKs)
 ## Bench & CI
 
 - Local benchmark target: `cargo bench --bench engine_bench`
+- C-FFI benchmark harness: `benchmark.cpp` (configurable runtime profiles + markdown report output)
 - CI performance workflow: `.github/workflows/perf.yml`
 
 ---

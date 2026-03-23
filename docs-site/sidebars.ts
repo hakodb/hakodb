@@ -33,7 +33,12 @@ const sidebars: SidebarsConfig = {
     {
       type: 'category',
       label: 'Reference',
-      items: ['reference/rust-api', 'reference/c-ffi-api']
+      items: [
+        'reference/rust-api',
+        'reference/c-ffi-api',
+        'reference/benchmarking',
+        'reference/developer-evaluation'
+      ]
     },
     {
       type: 'category',

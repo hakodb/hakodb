@@ -20,3 +20,9 @@ FireLite is an embedded, in-process document database with:
 FireLite is in an **advanced foundation stage**: core architecture is implemented (storage durability, WAL recovery, compaction, query planner/executor, composite indexes, real-time watch, encryption-at-rest, serializable conflict-aware transactions), with production hardening still in progress.
 
 Use the left nav to jump directly to platform onboarding, API operation recipes, and deep technical internals.
+
+## What is new in this docs pass
+
+- Full Rust and C-FFI API surface references for current `v0.5.6`.
+- Dedicated benchmarking guide tied to `benchmark.cpp` runtime options.
+- Developer evaluation guide (fit, trade-offs, implementation coverage, and adoption checklist).

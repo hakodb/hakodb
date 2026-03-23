@@ -13,7 +13,7 @@ export type FireLitePrimitive =
 
 export type FireLiteRecord = { [key: string]: FireLitePrimitive };
 
-// 2. UPDATED: Full list of v0.7.0 Operators
+// v0.5.6 operators exposed by the Tauri gateway
 export type FilterOperator = 
   | 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' 
   | 'match' | 'contains' | 'startsWith' | 'in';
@@ -31,7 +31,6 @@ type FireLiteOp =
       orderBy?: OrderByInput;
       limit?: number;
       projection?: string[];
-      startAfterId?: string; // NEW: Cursor support for Tauri
     }
   | { op: 'batch'; mutations: BatchInput[] }
   | {
@@ -45,12 +44,13 @@ type FireLiteOp =
       eventName: string;
     }
   | { op: 'unsubscribe'; listenerId: string }
-  | { op: 'aggregate'; collection: string; filters: FilterInput[]; type: 'count' | 'sum' | 'avg'; field?: string };
+  | { op: 'aggregate'; collection: string; filters: FilterInput[]; kind: 'count' | 'sum' | 'avg'; field?: string };
 
 type FireLiteResponse =
   | { ok: null }
   | { document: { data: FireLiteRecord | null } }
   | { queryResult: { rows: FireLiteRecord[] } }
+  | { aggregateResult: { value: number } }
   | { subscriptionAck: { listenerId: string } }
   | { unsubscribed: { listenerId: string } };
 
@@ -143,8 +143,7 @@ export class TauriFireLite {
     filters: FilterInput[],
     orderBy?: OrderByInput,
     limit?: number,
-    projection?: string[],
-    startAfterId?: string
+    projection?: string[]
   ): Promise<FireLiteRecord[]> {
     const normalizedFilters = filters.map((f) => ({
       ...f,
@@ -157,8 +156,7 @@ export class TauriFireLite {
       filters: normalizedFilters,
       orderBy,
       limit,
-      projection,
-      startAfterId
+      projection
     });
 
     if ('queryResult' in res) {
@@ -272,7 +270,6 @@ export class TauriQuery {
   private orderByDef?: OrderByInput;
   private limitDef?: number;
   private projectionDef?: string[];
-  private _startAfterId?: string;
 
   constructor(private readonly collection: string) {}
 
@@ -282,8 +279,8 @@ export class TauriQuery {
   }
 
   startAfter(snapshot: TauriDocumentSnapshot): TauriQuery {
-    this._startAfterId = snapshot.id;
-    return this;
+    void snapshot;
+    throw new Error('startAfter is not supported by the v0.5.6 Tauri gateway');
   }
 
   orderBy(field: string, direction: 'asc' | 'desc' = 'asc'): TauriQuery {
@@ -307,8 +304,7 @@ export class TauriQuery {
         this.filters, 
         this.orderByDef, 
         this.limitDef, 
-        this.projectionDef, 
-        this._startAfterId
+        this.projectionDef
     );
   }
 
@@ -327,18 +323,18 @@ export class TauriQuery {
   }
 
   async count(): Promise<number> {
-    const res = await exec({ op: 'aggregate', collection: this.collection, filters: this.filters, type: 'count' });
-    return (res as any).value || 0;
+    const res = await exec({ op: 'aggregate', collection: this.collection, filters: this.filters, kind: 'count' });
+    return 'aggregateResult' in res ? res.aggregateResult.value : 0;
   }
 
   async sum(field: string): Promise<number> {
-    const res = await exec({ op: 'aggregate', collection: this.collection, filters: this.filters, type: 'sum', field });
-    return (res as any).value || 0;
+    const res = await exec({ op: 'aggregate', collection: this.collection, filters: this.filters, kind: 'sum', field });
+    return 'aggregateResult' in res ? res.aggregateResult.value : 0;
   }
 
   async avg(field: string): Promise<number> {
-    const res = await exec({ op: 'aggregate', collection: this.collection, filters: this.filters, type: 'avg', field });
-    return (res as any).value || 0;
+    const res = await exec({ op: 'aggregate', collection: this.collection, filters: this.filters, kind: 'avg', field });
+    return 'aggregateResult' in res ? res.aggregateResult.value : 0;
   }
 
 }

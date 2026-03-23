@@ -14,8 +14,8 @@ type
   PFL_Query = Pointer;
   PFL_Config = Pointer;
   PFL_Watch = Pointer;
-  PFL_Array = Pointer;       // New v0.5.3
-  PFL_Transaction = Pointer; // New v0.5.3
+  PFL_Array = Pointer;       // Added in v0.5.6
+  PFL_Transaction = Pointer; // Added in v0.5.6
 
   { Callback for real-time snapshots }
   TFL_OnSnapshotCallback = procedure(collection: PChar; path: PChar; kind: cint32; user_data: Pointer); cdecl;

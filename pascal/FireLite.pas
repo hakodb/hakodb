@@ -238,6 +238,62 @@ begin EnsureHandle; fl_array_append_int(FHandle, Value); Result := Self; end;
 function TFLArray.AppendDoc(ADoc: TFLDocument): TFLArray;
 begin EnsureHandle; fl_array_append_doc(FHandle, ADoc.Handle); Result := Self; end;
 
+{ TFLConfig }
+
+constructor TFLConfig.Create;
+begin
+  inherited Create;
+  FHandle := fl_config_new;
+end;
+
+destructor TFLConfig.Destroy;
+begin
+  if FHandle <> nil then fl_config_free(FHandle);
+  inherited;
+end;
+
+function TFLConfig.SetDurability(Mode: TFLDurabilityMode): TFLConfig;
+begin
+  fl_config_set_durability(FHandle, Ord(Mode));
+  Result := Self;
+end;
+
+function TFLConfig.SetEncryptionKey(const Key: string): TFLConfig;
+begin
+  fl_config_set_encryption_key(FHandle, PChar(Key));
+  Result := Self;
+end;
+
+function TFLConfig.SetAuditLog(Enabled: Boolean; const LogPath: string): TFLConfig;
+begin
+  if LogPath = '' then
+    fl_config_set_audit_log(FHandle, Enabled, nil)
+  else
+    fl_config_set_audit_log(FHandle, Enabled, PChar(LogPath));
+  Result := Self;
+end;
+
+function TFLConfig.SetQueryWorkers(Count: NativeUInt): TFLConfig;
+begin
+  fl_config_set_query_workers(FHandle, Count);
+  Result := Self;
+end;
+
+function TFLConfig.SetMemoryLimits(MMapSize, MaxInlinedBytes: NativeUInt): TFLConfig;
+begin
+  fl_config_set_memory_limits(FHandle, MMapSize, MaxInlinedBytes);
+  Result := Self;
+end;
+
+function TFLConfig.SetCompression(Enabled: Boolean; Level: Integer): TFLConfig;
+begin
+  if Enabled then
+    fl_config_set_storage_tuning(FHandle, 4096, 1024, NativeUInt(Level), 256)
+  else
+    fl_config_set_storage_tuning(FHandle, 4096, 1024, 0, 256);
+  Result := Self;
+end;
+
 { TFLDocument }
 
 constructor TFLDocument.Create;
@@ -254,6 +310,18 @@ begin fl_doc_insert_str(FHandle, PChar(Key), PChar(Value)); Result := Self; end;
 
 function TFLDocument.InsertInt(const Key: string; Value: Int64): TFLDocument;
 begin fl_doc_insert_int(FHandle, PChar(Key), Value); Result := Self; end;
+
+function TFLDocument.InsertFloat(const Key: string; Value: Double): TFLDocument;
+begin fl_doc_insert_float(FHandle, PChar(Key), Value); Result := Self; end;
+
+function TFLDocument.InsertBool(const Key: string; Value: Boolean): TFLDocument;
+begin fl_doc_insert_bool(FHandle, PChar(Key), Value); Result := Self; end;
+
+function TFLDocument.InsertNull(const Key: string): TFLDocument;
+begin fl_doc_insert_null(FHandle, PChar(Key)); Result := Self; end;
+
+function TFLDocument.InsertBin(const Key: string; Data: PByte; Len: NativeUInt): TFLDocument;
+begin fl_doc_insert_bin(FHandle, PChar(Key), Data, Len); Result := Self; end;
 
 function TFLDocument.InsertDoc(const Key: string; ADoc: TFLDocument): TFLDocument;
 begin fl_doc_insert_doc(FHandle, PChar(Key), ADoc.Handle); Result := Self; end;

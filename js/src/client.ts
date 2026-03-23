@@ -109,7 +109,7 @@ function parseQueryRows(json: string | null): FireLiteDocData[] {
 }
 
 /**
- * RECURSIVE FIELD INSERTER (v0.7.0)
+ * Recursive field inserter (v0.5.6)
  */
 function insertField(native: NativeBindings, handle: unknown, key: string, value: Primitive): void {
   if (value === SERVER_TIMESTAMP_SENTINEL) {
