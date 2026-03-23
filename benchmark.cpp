@@ -235,6 +235,28 @@ Report run_cycle(BenchConfig cfg) {
         fl_query_free(q_lin);
         fl_query_free(q_fts);
     }
+    const double t0 = now_ms();
+    if (fl_batch_commit(db, b) != 0) append_warning(out.warnings, "batch commit failed");
+    batch_samples.push_back(now_ms() - t0);
+    fl_batch_free(b);
+    batch_written += n;
+  }
+  out.batch_commit = make_stats(batch_samples, batch_docs, now_ms() - bw_start);
+  if (cfg.realtime) std::cout << "  -> batch p99: " << out.batch_commit.p99_ms << " ms\n";
+
+  // 3) read sample
+  stage(cfg, "point reads");
+  std::vector<double> read_samples;
+  const int read_ops = std::min(cfg.total_docs, 500);
+  for (int i = 0; i < read_ops; i++) {
+    const bool seeded = i < cfg.seed_docs;
+    const std::string id = seeded ? ("s_" + std::to_string(i)) : ("b_" + std::to_string(i - cfg.seed_docs));
+    const double t0 = now_ms();
+    FL_Doc* got = fl_engine_get(db, "bench", id.c_str());
+    read_samples.push_back(now_ms() - t0);
+    if (got) fl_doc_free(got);
+  }
+  out.point_read = make_stats(read_samples, read_ops, std::accumulate(read_samples.begin(), read_samples.end(), 0.0));
 
     // 5. Aggregation
     stage_log(cfg, "aggregation");
