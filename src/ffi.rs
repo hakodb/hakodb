@@ -1490,6 +1490,14 @@ pub extern "C" fn fl_engine_get_by_ref(
     })
 }
 
+
+/// Internal helper to extract values from an anchor document based on the query's sort order
+fn get_anchor_values(q: &crate::query::query::Query, doc: &FireLiteDoc) -> Option<Vec<Value>> {
+    let order = q.order_by.as_ref()?;
+    let val = doc.get(&order.field)?;
+    Some(vec![val.clone()])
+}
+
 #[no_mangle]
 pub extern "C" fn fl_query_start_after(
     query: *mut FL_Query,
@@ -1499,8 +1507,6 @@ pub extern "C" fn fl_query_start_after(
     let q = unsafe { &mut *query };
     let doc = unsafe { &*anchor_doc };
     
-    // Logic: Look at what the query is sorting by, 
-    // and extract those values from the anchor document.
     if let Some(order) = &q.query.order_by {
         if let Some(val) = doc.doc.get(&order.field) {
             q.query.start_after = Some(vec![val.clone()]);
@@ -1509,6 +1515,51 @@ pub extern "C" fn fl_query_start_after(
     }
     set_last_error("Anchor document missing sort field");
     -1
+}
+
+#[no_mangle]
+pub extern "C" fn fl_query_start_at(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> i32 {
+    safety_shield!(-1, {
+        let q = unsafe { &mut *query };
+        let doc = unsafe { &*anchor_doc };
+        if let Some(vals) = get_anchor_values(&q.query, &doc.doc) {
+            q.query.start_at = Some(vals);
+            0
+        } else {
+            set_last_error("Anchor document missing sort field");
+            -1
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn fl_query_end_at(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> i32 {
+    safety_shield!(-1, {
+        let q = unsafe { &mut *query };
+        let doc = unsafe { &*anchor_doc };
+        if let Some(vals) = get_anchor_values(&q.query, &doc.doc) {
+            q.query.end_at = Some(vals);
+            0
+        } else {
+            set_last_error("Anchor document missing sort field");
+            -1
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn fl_query_end_before(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> i32 {
+    safety_shield!(-1, {
+        let q = unsafe { &mut *query };
+        let doc = unsafe { &*anchor_doc };
+        if let Some(vals) = get_anchor_values(&q.query, &doc.doc) {
+            q.query.end_before = Some(vals);
+            0
+        } else {
+            set_last_error("Anchor document missing sort field");
+            -1
+        }
+    })
 }
 
 #[no_mangle]

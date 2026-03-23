@@ -164,6 +164,19 @@ impl<'a> BorrowedValue<'a> {
     pub fn to_owned_value(&self) -> Option<Value> {
         decode_value(self.tag, self.data)
     }
+    pub fn as_f64(&self) -> Option<f64> {
+        match self.tag {
+            3 => { // Int
+                let b = self.data.get(..8)?;
+                Some(i64::from_le_bytes(b.try_into().ok()?) as f64)
+            }
+            4 => { // Float
+                let b = self.data.get(..8)?;
+                Some(f64::from_le_bytes(b.try_into().ok()?))
+            }
+            _ => None,
+        }
+    }
 }
 
 pub struct FireLiteDocIter<'a> {

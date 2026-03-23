@@ -99,6 +99,9 @@ export interface NativeBindings {
   // Query extensions
   queryWhereIn(query: Handle, field: string, array: Handle): number;
   queryStartAfter(query: Handle, anchorDoc: Handle): number;
+  queryStartAt(query: Handle, anchorDoc: Handle): number;
+  queryEndAt(query: Handle, anchorDoc: Handle): number;
+  queryEndBefore(query: Handle, anchorDoc: Handle): number;
 
   lastError(): string;
 }
@@ -199,6 +202,9 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     // Query extensions
     fl_query_where_in: { args: [FFIType.ptr, FFIType.cstring, FFIType.ptr], returns: FFIType.i32 },
     fl_query_start_after: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+    fl_query_start_at: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+    fl_query_end_at: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+    fl_query_end_before: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
 
     // ================= ERRORS =================
     fl_last_error: { args: [], returns: FFIType.ptr },
@@ -389,6 +395,9 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     // Query extensions
     fl_query_where_in: lib.func('int fl_query_where_in(FL_Query* query, const char* field, FL_Array* arr)'),
     fl_query_start_after: lib.func('int fl_query_start_after(FL_Query* query, FL_Doc* anchor)'),
+    fl_query_start_at: lib.func('int fl_query_start_at(FL_Query* query, const FL_Doc* anchor)'),
+    fl_query_end_at: lib.func('int fl_query_end_at(FL_Query* query, const FL_Doc* anchor)'),
+    fl_query_end_before: lib.func('int fl_query_end_before(FL_Query* query, const FL_Doc* anchor)'),
 
     fl_last_error: lib.func('const char* fl_last_error()'),
     fl_string_free: lib.func('void fl_string_free(char* value)')

@@ -1,5 +1,5 @@
 use smallvec::SmallVec;
-
+use std::ops::Bound;
 use crate::document::value::Value;
 
 use super::filter::Filter;
@@ -12,10 +12,15 @@ pub enum ScanType {
         fields: Vec<String>,
         values: Vec<Value>,
     },
-    CursorIndex { start_key: SmallVec<[u8; 32]> },
+    // CursorIndex { start_key: SmallVec<[u8; 32]> },
     SecondaryIndex { field: String, value: Vec<u8> },
     UnionIndex { scans: Vec<ScanType> },
     InvertedIndex { field: String, query: String },
+    // UPDATED: CursorIndex now defines a strict range
+    CursorIndex { 
+        start: Bound<SmallVec<[u8; 32]>>, 
+        end: Bound<SmallVec<[u8; 32]>>
+    },
 }
 
 #[derive(Debug, Clone)]

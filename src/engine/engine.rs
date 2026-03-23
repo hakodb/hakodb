@@ -1,6 +1,6 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender, SyncSender};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -18,7 +18,7 @@ use crate::index::storage::index_storage::IndexStorage;
 use crate::query::executor::executor::ParallelQueryExecutor;
 use crate::query::planner::QueryPlanner;
 use crate::query::query::Query;
-use crate::storage::engine::{StorageEngine, StorageMutation};
+use crate::storage::engine::{StorageEngine, StorageMutation, BlobWork};
 
 use crate::util::lock::SafeLock; 
 
@@ -97,9 +97,11 @@ pub struct FireLite {
     doc_versions: RwLock<HashMap<String, u64>>, 
     global_version: AtomicU64,
     security_rules: RwLock<Vec<SecurityRule>>,
-    audit_tx: Sender<AuditEntry>,
     audit_data: Arc<RwLock<Vec<AuditEntry>>>,
+
+    audit_tx: Sender<AuditEntry>,
     index_tx: Sender<IndexOp>,
+    blob_tx: SyncSender<BlobWork>, 
 
     audit_stop: Mutex<Option<Sender<()>>>,
     audit_handle: Mutex<Option<thread::JoinHandle<()>>>,
@@ -112,11 +114,15 @@ impl FireLite {
     pub fn open(path: impl AsRef<Path>, config: FireLiteConfig) -> Result<Self> {
         let root_path = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&root_path)?;
-        
+
         // 1. Initialize Global Shared State & Channels (ONCE)
         let indexes = Arc::new(RwLock::new(IndexManager::default()));
+        
         let (index_tx, index_rx) = channel::<IndexOp>();
         let (audit_tx, audit_rx) = channel::<AuditEntry>();
+        let (blob_tx, blob_rx) = std::sync::mpsc::sync_channel::<BlobWork>(5000);
+        // let (blob_tx, blob_rx) = std::sync::mpsc::sync_channel::<BlobWork>(1000);
+
         let audit_data = Arc::new(RwLock::new(Vec::new()));
         let (audit_stop_tx, audit_stop_rx) = channel::<()>(); 
 
@@ -210,7 +216,7 @@ impl FireLite {
 
         // 5. Assemble the Engine Instance
         let db = Self {
-            root_path,
+            root_path: root_path.clone(),
             config: config.clone(),
             shards: Arc::new(RwLock::new(HashMap::new())),
             index_storage,
@@ -222,13 +228,73 @@ impl FireLite {
             global_version: AtomicU64::new(1),
             security_rules: RwLock::new(Vec::new()),
             audit_tx,
+            index_tx,
+            blob_tx: blob_tx.clone(),
             audit_data,
             audit_stop: Mutex::new(Some(audit_stop_tx)), // <--- INITIALIZE
             audit_handle: Mutex::new(Some(audit_handle_inner)), // <--- INITIALIZE
-            index_tx,
             maintenance_stop: Mutex::new(None),
             maintenance_handle: Mutex::new(None),
         };
+
+        // B. Blob Worker (The Janitor)
+        let shards_ptr = Arc::clone(&db.shards);
+        let root_path_clone = root_path.clone();
+        let encryption_key = config.encryption_key.clone();
+        
+ 
+        let blob_rx = Arc::new(Mutex::new(blob_rx));
+
+        // SPAWN MULTIPLE BLOB WORKERS (e.g., 4 workers)
+        for _ in 0..4 {
+            let rx = Arc::clone(&blob_rx);
+            let shards_ptr = Arc::clone(&shards_ptr);
+            let root_path_clone = root_path_clone.clone();
+            let enc_key = encryption_key.clone();
+
+            thread::spawn(move || {
+                let enc_ctx = enc_key.map(|k| crate::storage::crypto::EncryptionContext::from_secret(&k));
+                let mut file_handles: HashMap<String, std::fs::File> = HashMap::new();
+
+                loop {
+                    // 1. Get work (Locking the receiver is very fast)
+                    let work = {
+                        let lock = rx.lock().unwrap();
+                        match lock.recv() {
+                            Ok(w) => w,
+                            Err(_) => break,
+                        }
+                    };
+
+                    let BlobWork::Put { collection, key, data } = work;
+
+                    // 2. Open shard-specific blob file
+                    let file = file_handles.entry(collection.clone()).or_insert_with(|| {
+                        let p = root_path_clone.join(&collection).join("blobs.dat");
+                        std::fs::OpenOptions::new().create(true).read(true).append(true).open(p).expect("IO Fail")
+                    });
+
+                    // 3. Encrypt (Parallel across the 4 workers)
+                    let payload = if let Some(ref enc) = enc_ctx {
+                        enc.encrypt(&data).unwrap_or_else(|_| data.to_vec())
+                    } else { data.to_vec() };
+
+                    // 4. Write to Disk (Thread-safe positional append)
+                    use std::io::{Write, Seek, SeekFrom};
+                    let offset = file.seek(SeekFrom::End(0)).unwrap();
+                    let len = payload.len() as u32;
+                    file.write_all(&payload).unwrap();
+
+                    // 5. Atomic Pointer Swap
+                    let shards = shards_ptr.read().unwrap();
+                    if let Some(shard_lock) = shards.get(&collection) {
+                        if let Ok(mut shard) = shard_lock.write() {
+                            shard.index.insert(key, crate::storage::engine::Pointer::Blob { offset, len });
+                        }
+                    }
+                }
+            });
+        }
 
         // 6. Recovery & Sync
         db.recover_existing_shards()?;
@@ -271,7 +337,11 @@ impl FireLite {
             let entry = entry?;
             if entry.path().is_dir() {
                 let col = entry.file_name().to_string_lossy().to_string();
-                shards.insert(col, Arc::new(RwLock::new(StorageEngine::open(entry.path(), &self.config)?)));
+                let mut storage = StorageEngine::open(entry.path(), &self.config)?;
+
+                storage.blob_tx = Some(self.blob_tx.clone());
+
+                shards.insert(col, Arc::new(RwLock::new(storage)));
             }
         }
         Ok(())
@@ -298,9 +368,14 @@ impl FireLite {
     fn get_shard(&self, collection: &str) -> Arc<RwLock<StorageEngine>> {
         if let Some(s) = self.shards.read().unwrap().get(collection) { return Arc::clone(s); }
         let mut shards = self.shards.write().unwrap();
+        
         shards.entry(collection.to_string()).or_insert_with(|| {
             let path = self.root_path.join(collection);
-            Arc::new(RwLock::new(StorageEngine::open(path, &self.config).expect("Shard fail")))
+            let mut storage = StorageEngine::open(path, &self.config).expect("Shard fail");
+            
+            storage.blob_tx = Some(self.blob_tx.clone());
+
+            Arc::new(RwLock::new(storage))
         }).clone()
     }
 
@@ -385,14 +460,23 @@ impl FireLite {
         let mut sorted_shards: Vec<_> = shard_groups.keys().cloned().collect();
         sorted_shards.sort(); // Always lock in alphabetical order
 
+
+        let mut all_blob_work = Vec::new();
+
         // 3. EXECUTION: Write to each shard folder
         for col_name in sorted_shards {
             if let Some(ops) = shard_groups.get(&col_name) {
                 let shard = self.get_shard(&col_name);
                 // Lock ONLY this shard. Thread B can simultaneously lock a different shard!
                 let mut storage = shard.write().unwrap();
-                storage.apply_batch(ops)?; 
+                // storage.apply_batch(ops)?;
+                let pending_blobs = storage.apply_batch(ops)?; 
+                all_blob_work.extend(pending_blobs); 
             }
+        }
+
+        for work in all_blob_work {
+            let _ = self.blob_tx.send(work);
         }
 
         // 2. METADATA & ASYNC TASKS
@@ -408,6 +492,7 @@ impl FireLite {
         for (col, event) in change_events {
             self.notify_watchers(&col, event);
         }
+
         Ok(())
     }
 
@@ -422,10 +507,7 @@ impl FireLite {
         }
         
         let shard = self.get_shard(collection);
-        // SAFE LOCKING: Replace shard.read().unwrap()
         let storage = shard.safe_read()?; 
-        // let key = doc_key(collection, doc_id);
-        // let res = shard.read().unwrap().get(&key)?.and_then(|b| FireLiteDoc::decode(&b));
         let res = storage.get(&doc_key(collection, doc_id))?.and_then(|b| FireLiteDoc::decode(&b));
         
         // AUDIT SUCCESS
@@ -447,11 +529,13 @@ impl FireLite {
             self.record_audit(AuditEntry { op: AccessOp::Query, collection: query.collection.clone(), doc_id: None, ok: false });
             return Err(FireLiteError::Corrupt("Denied".into())); 
         }
-        let shard = self.get_shard(&query.collection);
-        let storage = shard.read().unwrap();
+
+        let shard_arc = self.get_shard(&query.collection);
+        // let storage = shard_arc.read().unwrap();
 
         let indexes = self.indexes.read().unwrap();
-        let rows = storage.count_prefix(&format!("{}:", query.collection));
+        // let rows = storage.count_prefix(&format!("{}:", query.collection));
+        let rows = shard_arc.read().unwrap().count_prefix(&format!("{}:", query.collection));
         
         // UPDATED: Pass self.config.query_workers
         let plan = QueryPlanner::plan(
@@ -461,7 +545,8 @@ impl FireLite {
             self.config.query_workers
         );
         
-        let res = self.executor.execute(&storage, &indexes, plan);
+        // let res = self.executor.execute(&storage, &indexes, plan);
+        let res = self.executor.execute(shard_arc, &indexes, plan);
         
         // AUDIT RESULT
         self.record_audit(AuditEntry { op: AccessOp::Query, collection: query.collection.clone(), doc_id: None, ok: res.is_ok() });
@@ -480,15 +565,21 @@ impl FireLite {
         q.projection = fields.to_vec();
 
         // 3. Acquire Locks
-        let shard = self.get_shard(&q.collection);
-        let storage = shard.read().unwrap();
-        let indexes = self.indexes.read().unwrap();
+        let shard_arc = self.get_shard(&q.collection);
         
         // 4. Plan & Execute
-        let rows = storage.count_prefix(&format!("{}:", q.collection));
+
+        let indexes = self.indexes.read().unwrap();
+        
+        let rows = {
+            let storage = shard_arc.read().unwrap();
+            storage.count_prefix(&format!("{}:", q.collection))
+        };
+
         let plan = QueryPlanner::plan(&q, &indexes, rows, self.config.query_workers);
         
-        let res = self.executor.execute_projected(&storage, &indexes, plan);
+        // let res = self.executor.execute_projected(&storage, &indexes, plan);
+        let res = self.executor.execute_projected(shard_arc, &indexes, plan);
         
         // 5. Audit & Return
         self.record_audit(AuditEntry { 
@@ -590,15 +681,14 @@ impl FireLite {
             return Err(FireLiteError::Corrupt("Denied".into()));
         }
 
-        let shard = self.get_shard(&query.collection);
-        let storage = shard.read().unwrap();
+        let shard_arc = self.get_shard(&query.collection);
         let indexes = self.indexes.read().unwrap();
-        let rows = storage.count_prefix(&format!("{}:", query.collection));
+        let rows = shard_arc.read().unwrap().count_prefix(&format!("{}:", query.collection));
         
         // FIX: Add self.config.query_workers as the 4th argument
         let plan = QueryPlanner::plan(&query, &indexes, rows, self.config.query_workers);
         
-        let res = self.executor.execute_aggregation(&storage, &indexes, plan, &query.aggregations);
+        let res = self.executor.execute_aggregation(shard_arc, &indexes, plan, &query.aggregations);
         
         self.record_audit(AuditEntry { op: AccessOp::Query, collection: query.collection.clone(), doc_id: None, ok: res.is_ok() });
         res
@@ -723,14 +813,6 @@ impl FireLite {
         Ok(())
     }
 
-    /// Explicitly trigger a snapshot (called by Maintenance Thread or FFI)
-    pub fn save_index_snapshots(&self) -> Result<()> {
-        let persist = self.index_storage.lock().unwrap();
-        // Snapshot the primary composite index (ID 1)
-        persist.snapshot(1).map_err(|e| FireLiteError::Io(e))?;
-        Ok(())
-    }
-
     pub fn create_fts_index(&self, collection: &str, field: &str) -> Result<()> {
         // 1. Register
         self.indexes.write().unwrap().create_fts_index(collection, field);
@@ -756,6 +838,16 @@ impl FireLite {
         }
         Ok(())
     }
+
+    /// Explicitly trigger a snapshot (called by Maintenance Thread or FFI)
+    pub fn save_index_snapshots(&self) -> Result<()> {
+        let persist = self.index_storage.lock().unwrap();
+        // Snapshot the primary composite index (ID 1)
+        persist.snapshot(1).map_err(|e| FireLiteError::Io(e))?;
+        Ok(())
+    }
+
+    
 }
 
 

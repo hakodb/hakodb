@@ -1,10 +1,11 @@
-// use std::collections::HashMap;
 use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
+use std::fs::File;
 
 use crate::config::{FireLiteConfig, DurabilityMode};
 use crate::error::{FireLiteError, Result};
-use std::sync::{Arc, Mutex}; // <--- ADD THIS
+use std::sync::{Arc, Mutex}; 
+use std::sync::mpsc::SyncSender;
 use crate::memory::page_cache::PageCache; 
 
 use super::compaction::compact_segment;
@@ -12,7 +13,7 @@ use super::crypto::EncryptionContext;
 use super::segment::Segment;
 use super::wal::{Wal, WalOp};
 
-#[derive(Debug, Clone)] // Remove Copy, as Inlined contains a Vec
+#[derive(Debug, Clone)] 
 pub enum Pointer {
     Segment {
         segment_id: u64,
@@ -20,12 +21,25 @@ pub enum Pointer {
         len: u32,
     },
     Inlined(Vec<u8>),
+    Blob {
+        offset: u64,
+        len: u32,
+    },
+    BlobPending(Arc<Vec<u8>>),
 }
 
 #[derive(Debug, Clone)]
 pub enum StorageMutation {
     Put { key: String, value: Vec<u8> },
     Delete { key: String },
+}
+
+pub enum BlobWork {
+    Put {
+        collection: String,
+        key: String,
+        data: Arc<Vec<u8>>,
+    },
 }
 
 struct SegmentMeta {
@@ -40,32 +54,33 @@ pub struct StorageEngine {
     active_segment_id: u64,
     next_segment_id: u64,
     wal: Wal,
-    index: HashMap<String, Pointer>,
     next_tx_id: u64,
     compaction_threshold_bytes: usize,
-    encryption: Option<EncryptionContext>,
+    pub(crate) encryption: Option<EncryptionContext>,
     inlined_bytes: usize,
     max_inlined_bytes: usize,
     use_compression: bool, 
-    // collection_counts: HashMap<String, usize>, 
     pub(crate) collection_counts: HashMap<String, usize>,
     pub cache: Arc<Mutex<PageCache>>,
     pub mmap_size: usize, 
+    pub index: HashMap<String, Pointer>,
+    pub(crate) blob_file: Option<File>,
+    pub(crate) blob_tx: Option<SyncSender<BlobWork>>,
 }
 
 impl StorageEngine {
-    // src/storage/engine.rs
-
     pub fn open(base_dir: impl AsRef<Path>, cfg: &FireLiteConfig) -> Result<Self> {
-        std::fs::create_dir_all(base_dir.as_ref())?;
+        let base_path = base_dir.as_ref().to_path_buf(); 
+        std::fs::create_dir_all(&base_path)?;
+        // std::fs::create_dir_all(base_dir.as_ref())?;
 
         let encryption = cfg
             .encryption_key
             .as_ref()
             .map(|secret| EncryptionContext::from_secret(secret));
 
-        // 1. Initialize the Shared Decompression Cache FIRST
-        let cache = Arc::new(Mutex::new(PageCache::new(cfg.page_cache_capacity)));
+        let cache_limit_bytes = cfg.page_cache_capacity * cfg.page_size;
+        let cache = Arc::new(Mutex::new(PageCache::new(cache_limit_bytes)));
 
         let wal = Wal::open(
             base_dir.as_ref().join("wal.log"),
@@ -78,13 +93,15 @@ impl StorageEngine {
         let mut max_id = 0;
         let mut active_segment_id = 0;
 
-        // 2. Load existing segments using the cache and mmap_size
+        let blob_file = std::fs::OpenOptions::new()
+            .create(true).read(true).append(true)
+            .open(base_path.join("blobs.dat"))?;
+
         for entry in std::fs::read_dir(base_dir.as_ref())? {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if let Some((level, id)) = parse_segment_name(&name) {
-                // UPDATED: Now passes id, cache, and mmap_size
                 let segment = Segment::open(
                     entry.path(), 
                     id, 
@@ -99,10 +116,8 @@ impl StorageEngine {
             }
         }
 
-        // 3. Handle fresh install (empty directory)
         if segments.is_empty() {
             let path = segment_path(base_dir.as_ref(), 0, 0);
-            // UPDATED: Now passes id (0), cache, and mmap_size
             let segment = Segment::open(
                 path, 
                 0, 
@@ -116,9 +131,8 @@ impl StorageEngine {
             active_segment_id = 0;
         }
 
-        // 4. Initialize the Engine
         let mut engine = Self {
-            base_dir: base_dir.as_ref().to_path_buf(),
+            base_dir: base_path,
             segments,
             active_segment_id,
             next_segment_id: max_id + 1,
@@ -131,8 +145,10 @@ impl StorageEngine {
             inlined_bytes: 0, 
             max_inlined_bytes: cfg.max_inlined_memory_bytes,
             collection_counts: HashMap::new(),
-            cache, // Pass the initialized Arc
+            cache, 
             mmap_size: cfg.mmap_size,
+            blob_file: Some(blob_file),
+            blob_tx: None,
         };
 
         engine.recover()?;
@@ -158,6 +174,9 @@ impl StorageEngine {
                 WalOp::PutInlined { key, value } => {
                     let pointer = Pointer::Inlined(value);
                     self.update_index_entry(key, Some(pointer));
+                }
+                WalOp::PutBlob { key, offset, len } => {
+                    self.update_index_entry(key, Some(Pointer::Blob { offset, len }));
                 }
             }
         }
@@ -267,9 +286,9 @@ impl StorageEngine {
         Ok(cols)
     }
 
-    pub fn apply_batch(&mut self, mutations: &[StorageMutation]) -> Result<()> {
+    pub fn apply_batch(&mut self, mutations: &[StorageMutation]) -> Result<Vec<BlobWork>> {
         if mutations.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let tx_id = self.next_tx_id;
@@ -287,6 +306,8 @@ impl StorageEngine {
         let mut puts_to_segment = Vec::new();
         let mut segment_mutation_indices = Vec::new();
 
+        let mut blob_work_todo = Vec::new();
+
         // --- STEP 1: Decide Strategy (Inline or Segment) ---
         for (i, mutation) in mutations.iter().enumerate() {
             match mutation {
@@ -298,6 +319,19 @@ impl StorageEngine {
                             value: value.clone(),
                         });
                         index_updates.push((key.clone(), Some(Pointer::Inlined(value.clone()))));
+                    } else if value.len() > 32768 {
+                        // Path 2: Large (v0.8.0 Async Side-load)
+                        let arc_data = Arc::new(value.clone());
+                        
+                        // Mark in index as Pending (UI gets RAM speed)
+                        index_updates.push((key.clone(), Some(Pointer::BlobPending(arc_data.clone()))));
+
+                        // Hand off to the background thread
+                        blob_work_todo.push(BlobWork::Put {
+                            collection: self.base_dir.file_name().unwrap().to_str().unwrap().to_string(),
+                            key: key.clone(),
+                            data: arc_data,
+                        });
                     } else {
                         // Strategy: Segment (Collect for bulk write later)
                         puts_to_segment.push(value.as_slice());
@@ -355,7 +389,8 @@ impl StorageEngine {
             self.update_index_entry(key, pointer);
         }
 
-        Ok(())
+        // RETURN the work
+        Ok(blob_work_todo)
     }
 
     pub fn flush_all(&mut self) -> Result<()> {
@@ -447,7 +482,6 @@ impl StorageEngine {
 
         // 3. Perform merge with Compression support
         let target_path = segment_path(&self.base_dir, target_level, target_id);
-        // let mut target = Segment::open(target_path, self.encryption.clone())?;
         // FIX: Add missing 3 arguments
         let mut target = Segment::open(
             target_path, 
@@ -503,20 +537,67 @@ impl StorageEngine {
                         value: value.clone(),
                     });
                 }
+                // v0.8.0 Recovery variants
+                Pointer::Blob { offset, len } => {
+                    ops.push(WalOp::PutBlob { key: key.clone(), offset: *offset, len: *len });
+                }
+                Pointer::BlobPending(data) => {
+                    // If we crash while pending, treat it as inlined in WAL for safety
+                    ops.push(WalOp::PutInlined { key: key.clone(), value: (**data).clone() });
+                }
             }
         }
         self.wal.append_batch(&ops)?;
         Ok(())
     }
 
-    fn read_pointer(&self, pointer: &Pointer) -> Result<Option<Vec<u8>>> {
+
+    pub(crate) fn read_pointer_internal(&self, pointer: &Pointer, use_cache: bool) -> Result<Option<Vec<u8>>> {
         match pointer {
+            Pointer::BlobPending(data) => Ok(Some((**data).clone())),
             Pointer::Inlined(data) => Ok(Some(data.clone())),
+            Pointer::Blob { offset, len } => {
+                let mut buf = vec![0u8; *len as usize];
+                let file = self.blob_file.as_ref().ok_or_else(|| FireLiteError::StorageError("Blob file missing".into()))?;
+                
+                #[cfg(windows)] {
+                    use std::os::windows::fs::FileExt;
+                    file.seek_read(&mut buf, *offset)?;
+                }
+                #[cfg(unix)] {
+                    use std::os::unix::fs::FileExt;
+                    file.read_at(&mut buf, *offset)?;
+                }
+
+                if let Some(enc) = &self.encryption {
+                    Ok(Some(enc.decrypt(&buf)?))
+                } else {
+                    Ok(Some(buf))
+                }
+            },
             Pointer::Segment { segment_id, offset, len } => {
+                // Corrected hashmap access for u64 keys
                 let Some(meta) = self.segments.get(segment_id) else { return Ok(None); };
-                Ok(Some(meta.segment.read_at(*offset, *len)?))
+                Ok(Some(meta.segment.read_at(*offset, *len, use_cache)?))
             }
         }
+    }
+
+
+    // UPDATED: Use the internal helper to avoid E0004
+    pub fn read_pointer(&self, pointer: &Pointer) -> Result<Option<Vec<u8>>> {
+        self.read_pointer_internal(pointer, true)
+    }
+
+    // UPDATED: Use the internal helper to avoid E0004
+    pub fn read_pointer_uncached(&self, pointer: &Pointer) -> Result<Option<Vec<u8>>> {
+        self.read_pointer_internal(pointer, false)
+    }
+
+    // UPDATED: Use the internal helper to avoid E0004
+    pub fn read_pointer_uncached_by_key(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let Some(pointer) = self.index.get(key) else { return Ok(None); }; 
+        self.read_pointer_internal(pointer, false)
     }
 
     pub fn flush_wal(&mut self) -> Result<()> {
@@ -529,20 +610,59 @@ impl StorageEngine {
             value: value.to_vec(),
         };
 
-        self.apply_batch(&[mutation])
+        // self.apply_batch(&[mutation])
+        let work = self.apply_batch(&[mutation])?;
+
+        // 2. Since this is a synchronous put, we send the work here
+        for w in work {
+            if let Some(tx) = &self.blob_tx {
+                let _ = tx.send(w);
+            }
+        }
+
+        Ok(())
     }
 
+    // pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+    //     let Some(pointer) = self.index.get(key).cloned() else { return Ok(None); };
+    //     match pointer {
+    //         Pointer::Inlined(data) => Ok(Some(data.clone())),
+    //         Pointer::Segment { segment_id, offset, len } => {
+    //             let Some(meta) = self.segments.get(&segment_id) else { return Ok(None); };
+    //             Ok(Some(meta.segment.read_at(offset, len, true)?))
+    //         }
+    //     }
+    // }
     pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let Some(pointer) = self.index.get(key).cloned() else {
-            return Ok(None);
+        // 1. Look up the pointer in the index
+        let Some(pointer) = self.index.get(key) else { 
+            return Ok(None); 
         };
-        self.read_pointer(&pointer)
+        
+        // 2. Use the centralized internal reader which handles 
+        // Inlined, BlobPending, Blob, and Segment exhaustive matching.
+        self.read_pointer_internal(pointer, true)
     }
 
     pub fn delete(&mut self, key: &str) -> Result<()> {
-        self.apply_batch(&[StorageMutation::Delete {
+        // self.apply_batch(&[StorageMutation::Delete {
+        //     key: key.to_string(),
+        // }])
+        let mutation = StorageMutation::Delete {
             key: key.to_string(),
-        }])
+        };
+
+        // 1. Capture the work
+        let work = self.apply_batch(&[mutation])?;
+
+        // 2. Send to background worker
+        for w in work {
+            if let Some(tx) = &self.blob_tx {
+                let _ = tx.send(w);
+            }
+        }
+
+        Ok(())
     }
 
     pub fn count_prefix(&self, prefix: &str) -> usize {
@@ -679,6 +799,34 @@ impl StorageEngine {
                 let dest = destination_path.as_ref().join(file_name);
                 std::fs::copy(entry.path(), dest)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Returns only the keys matching a prefix. 
+    /// Extremely memory efficient because it doesn't touch the disk/mmap bodies.
+    pub fn scan_prefix_keys(&self, prefix: &str) -> Vec<String> {
+        self.index.keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect()
+    }
+
+    pub fn scan_chunks<F>(&self, prefix: &str, chunk_size: usize, mut f: F) -> Result<()> 
+    where F: FnMut(Vec<(String, Vec<u8>)>) -> Result<()> 
+    {
+        let keys = self.scan_prefix_keys(prefix);
+
+        for chunk_keys in keys.chunks(chunk_size) {
+            let mut chunk_data = Vec::with_capacity(chunk_keys.len());
+            for key in chunk_keys {
+                if let Some(ptr) = self.index.get(key) {
+                    if let Some(val) = self.read_pointer(ptr)? {
+                        chunk_data.push((key.clone(), val));
+                    }
+                }
+            }
+            f(chunk_data)?;
         }
         Ok(())
     }

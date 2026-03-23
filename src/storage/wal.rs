@@ -29,6 +29,11 @@ pub enum WalOp {
         key: String,
         value: Vec<u8>,
     },
+    PutBlob {
+        key: String,
+        offset: u64,
+        len: u32,
+    },
 }
 
 pub struct Wal {
@@ -53,14 +58,8 @@ impl Wal {
         .create(true)
         .read(true)
         .write(true)
-        // .append(true)
         .open(path)?;
    
-        // Print encryption info safely
-        // match &encryption {
-        //     Some(_) => println!("Encryption is enabled for WAL"),
-        //     None => println!("Encryption is disabled for WAL"),
-        // }
         file.seek(SeekFrom::End(0))?;
 
         Ok(Self {
@@ -76,33 +75,6 @@ impl Wal {
     }
 
     pub fn append(&mut self, op: &WalOp) -> Result<()> {
-
-        // let start = self.write_buffer.len();
-
-        // // reserve header space (len + crc)
-        // self.write_buffer.extend_from_slice(&[0u8; 8]);
-
-        // // encode payload directly
-        // let mut temp_payload = Vec::new();
-        // encode_into(&mut self.write_buffer, op);
-
-        // let payload = &self.write_buffer[start + 8..];
-
-        // let crc = crc32fast::hash(payload);
-        // let len = payload.len() as u32;
-
-        // // fill header
-        // self.write_buffer[start..start + 4]
-        //     .copy_from_slice(&len.to_le_bytes());
-
-        // self.write_buffer[start + 4..start + 8]
-        //     .copy_from_slice(&crc.to_le_bytes());
-
-        // self.pending_ops_since_sync += 1;
-
-        // let is_commit = matches!(op, WalOp::CommitTx { .. });
-
-        // self.maybe_sync(is_commit)
 
         let start = self.write_buffer.len();
 
@@ -296,7 +268,7 @@ fn filter_committed_ops(raw_ops: Vec<WalOp>) -> Vec<WalOp> {
                 current_tx = None;
                 tx_ops.clear();
             }
-            WalOp::Put { .. } | WalOp::Delete { .. } | WalOp::PutInlined { .. } => {
+            WalOp::Put { .. } | WalOp::Delete { .. } | WalOp::PutInlined { .. } | WalOp::PutBlob { .. }  => {
                 if current_tx.is_some() {
                     tx_ops.push(op);
                 } else {
@@ -350,6 +322,14 @@ fn encode_into(buf: &mut Vec<u8>, op: &WalOp) {
             buf.extend_from_slice(key.as_bytes());
             buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
             buf.extend_from_slice(value);
+        }
+
+        WalOp::PutBlob { key, offset, len } => {
+            buf.push(5);
+            buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(&offset.to_le_bytes());
+            buf.extend_from_slice(&len.to_le_bytes());
         }
     }
 }
@@ -430,6 +410,16 @@ fn decode(payload: &[u8]) -> Result<WalOp> {
             pos += 4;
             let value = payload[pos..pos+val_len].to_vec();
             Ok(WalOp::PutInlined { key, value })
+        }
+        5 => { // FIX: Error E0004
+            let key_len = u16::from_le_bytes(payload[pos..pos+2].try_into().unwrap()) as usize;
+            pos += 2;
+            let key = String::from_utf8(payload[pos..pos+key_len].to_vec()).map_err(|_| FireLiteError::Corrupt("bad key".into()))?;
+            pos += key_len;
+            let offset = u64::from_le_bytes(payload[pos..pos+8].try_into().unwrap());
+            pos += 8;
+            let len = u32::from_le_bytes(payload[pos..pos+4].try_into().unwrap());
+            Ok(WalOp::PutBlob { key, offset, len })
         }
         _ => Err(FireLiteError::Corrupt("unknown wal op".into())),
     }

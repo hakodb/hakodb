@@ -13,7 +13,11 @@ pub struct Query {
     pub offset: Option<usize>,
     pub projection: Vec<String>,
     pub aggregations: Vec<AggregateOp>, // Added this field
-    pub start_after: Option<Vec<Value>>, 
+
+    pub start_at: Option<Vec<Value>>,
+    pub start_after: Option<Vec<Value>>,
+    pub end_at: Option<Vec<Value>>,
+    pub end_before: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,7 +38,11 @@ impl Query {
             offset: None, 
             projection: Vec::new(),
             aggregations: Vec::new(), // Initialize
+            
+            start_at: None,
             start_after: None,
+            end_at: None,
+            end_before: None,
         }
     }
 

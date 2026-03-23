@@ -24,34 +24,47 @@ pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)
     let mut out = Vec::new();
     let projection = &task.plan.projection;
 
-    for (id, bytes) in task.docs {
-        let Some(view) = FireLiteDocView::new(&bytes) else { continue; };
-
-        // FIX: Removed super::super::worker:: because the function is in this file
-        if matches_filters_view(&bytes, &task.plan) {
-            
-            let mut fields = Vec::with_capacity(projection.len());
-            
-            if projection.is_empty() {
-                if let Some(doc) = crate::document::firelite_doc::FireLiteDoc::decode(&bytes) {
-                    fields = doc.fields;
-                }
-            } else {
-                for field_name in projection {
-                    if let Some(borrowed) = view.get_field_value(field_name) {
-                        if let Some(val) = borrowed.to_owned_value() {
-                            fields.push((field_name.clone(), val));
-                        }
+    for (id, mut bytes) in task.docs {
+        if bytes.is_empty() {
+            if let Some(storage_lock) = &task.storage {
+                if let Ok(storage) = storage_lock.read() {
+                    if let Ok(Some(data)) = storage.get(&id) {
+                        bytes = data;
                     }
                 }
             }
-            out.push((id, fields));
+        }
+        if bytes.is_empty() { continue; }
+
+        // let Some(view) = FireLiteDocView::new(&bytes) else { continue; };
+
+        // FIX: Removed super::super::worker:: because the function is in this file
+        if let Some(view) = FireLiteDocView::new(&bytes) {
+            if matches_filters_view(&bytes, &task.plan) {
+                
+                let mut fields = Vec::with_capacity(projection.len());
+                
+                if projection.is_empty() {
+                    if let Some(doc) = crate::document::firelite_doc::FireLiteDoc::decode(&bytes) {
+                        fields = doc.fields;
+                    }
+                } else {
+                    for field_name in projection {
+                        if let Some(borrowed) = view.get_field_value(field_name) {
+                            if let Some(val) = borrowed.to_owned_value() {
+                                fields.push((field_name.clone(), val));
+                            }
+                        }
+                    }
+                }
+                out.push((id, fields));
+            }
         }
     }
     out
 }
 
-fn matches_filters_view(bytes: &[u8], plan: &crate::query::plan::QueryPlan) -> bool {
+pub(crate) fn matches_filters_view(bytes: &[u8], plan: &crate::query::plan::QueryPlan) -> bool {
     let Some(view) = FireLiteDocView::new(bytes) else { return false; };
 
     // 1. Check main AND filters (The Base Group)

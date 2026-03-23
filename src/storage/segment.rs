@@ -100,47 +100,41 @@ impl Segment {
         Ok(())
     }
 
-    pub fn read_at(&self, offset: u64, stored_len: u32) -> Result<Vec<u8>> {
+    pub fn read_at(&self, offset: u64, stored_len: u32, use_cache: bool) -> Result<Vec<u8>> {
         let cache_key = BlockKey { segment_id: self.segment_id, offset };
 
-        // 1. HIT: Check Processed Cache (Plaintext, Decompressed)
-        {
+        // 1. Check cache only if requested
+        if use_cache {
             let mut cache = self.cache.lock().unwrap();
             if let Some(data) = cache.get(&cache_key) {
                 return Ok((*data).clone());
             }
         }
 
-        // 2. MISS: Read from Mmap (Zero syscalls)
+        // 2. Physical Read (Mmap or File)
         let is_compressed = (stored_len >> 31) == 1;
         let actual_payload_len = (stored_len & 0x7FFFFFFF) as usize;
-        let total_len = 4 + actual_payload_len;
-        
-        let buffer = if offset + total_len as u64 <= self.store.size as u64 {
-            // Use Mmap for data that existed when segment was opened
-            self.store.read_slice(offset as usize, total_len)
+        let total_to_read = 4 + actual_payload_len;
+
+        let buffer = if offset + total_to_read as u64 <= self.store.size as u64 {
+            self.store.read_slice(offset as usize, total_to_read)
         } else {
-            // Fallback to standard File I/O for data appended during this session
-            let mut buf = vec![0u8; total_len];
+            let mut buf = vec![0u8; total_to_read];
             let f = self.file.as_ref().ok_or_else(|| FireLiteError::StorageError("File closed".into()))?;
             #[cfg(windows)] f.seek_read(&mut buf, offset)?;
             #[cfg(unix)] f.read_at(&mut buf, offset)?;
             buf
         };
+
         let mut out = buffer[4..].to_vec();
-
-        // 3. Process (Decrypt -> Decompress)
-        if let Some(enc) = &self.encryption {
-            out = enc.decrypt(&out)?;
-        }
-
+        if let Some(enc) = &self.encryption { out = enc.decrypt(&out)?; }
         if is_compressed {
             out = zstd::decode_all(&out[..])
                 .map_err(|e| FireLiteError::StorageError(format!("Zstd fail: {}", e)))?;
         }
 
-        // 4. CACHE result for the next access
-        {
+        // 3. Only populate cache if this isn't a one-time analytical scan
+        if use_cache {
             let mut cache = self.cache.lock().unwrap();
             cache.put(cache_key, out.clone());
         }

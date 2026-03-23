@@ -364,6 +364,27 @@ export class Query {
     return this;
   }
 
+  startAt(snapshot: DocumentSnapshot): Query {
+    if (snapshot._nativeHandle) {
+      this.client.nativeBindings().queryStartAt(this._queryHandle, snapshot._nativeHandle);
+    }
+    return this;
+  }
+
+  endAt(snapshot: DocumentSnapshot): Query {
+    if (snapshot._nativeHandle) {
+      this.client.nativeBindings().queryEndAt(this._queryHandle, snapshot._nativeHandle);
+    }
+    return this;
+  }
+
+  endBefore(snapshot: DocumentSnapshot): Query {
+    if (snapshot._nativeHandle) {
+      this.client.nativeBindings().queryEndBefore(this._queryHandle, snapshot._nativeHandle);
+    }
+    return this;
+  }
+
   orderBy(field: string, direction: 'asc' | 'desc' = 'asc'): Query {
     this.order = { field, ascending: direction === 'asc' };
     return this;
