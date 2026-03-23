@@ -1,8 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-
-use crc32fast::Hasher;
+use std::time::{Duration, Instant};
 
 use crate::config::DurabilityMode;
 use crate::error::{FireLiteError, Result};
@@ -26,6 +25,10 @@ pub enum WalOp {
     CommitTx {
         tx_id: u64,
     },
+    PutInlined {
+        key: String,
+        value: Vec<u8>,
+    },
 }
 
 pub struct Wal {
@@ -34,6 +37,9 @@ pub struct Wal {
     group_commit_max_ops: usize,
     pending_ops_since_sync: usize,
     encryption: Option<EncryptionContext>,
+    write_buffer: Vec<u8>,
+    last_sync: Instant,
+    group_commit_interval: Duration,
 }
 
 impl Wal {
@@ -43,81 +49,197 @@ impl Wal {
         group_commit_max_ops: usize,
         encryption: Option<EncryptionContext>,
     ) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(path)?;
+        let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        // .append(true)
+        .open(path)?;
+   
+        // Print encryption info safely
+        // match &encryption {
+        //     Some(_) => println!("Encryption is enabled for WAL"),
+        //     None => println!("Encryption is disabled for WAL"),
+        // }
+        file.seek(SeekFrom::End(0))?;
+
         Ok(Self {
             file,
             mode,
             group_commit_max_ops: group_commit_max_ops.max(1),
             pending_ops_since_sync: 0,
             encryption,
+            write_buffer: Vec::with_capacity(1024 * 1024), // 1MB WAL buffer
+            last_sync: Instant::now(),
+            group_commit_interval: Duration::from_millis(2),
         })
     }
 
     pub fn append(&mut self, op: &WalOp) -> Result<()> {
-        self.append_batch(std::slice::from_ref(op))
+
+        // let start = self.write_buffer.len();
+
+        // // reserve header space (len + crc)
+        // self.write_buffer.extend_from_slice(&[0u8; 8]);
+
+        // // encode payload directly
+        // let mut temp_payload = Vec::new();
+        // encode_into(&mut self.write_buffer, op);
+
+        // let payload = &self.write_buffer[start + 8..];
+
+        // let crc = crc32fast::hash(payload);
+        // let len = payload.len() as u32;
+
+        // // fill header
+        // self.write_buffer[start..start + 4]
+        //     .copy_from_slice(&len.to_le_bytes());
+
+        // self.write_buffer[start + 4..start + 8]
+        //     .copy_from_slice(&crc.to_le_bytes());
+
+        // self.pending_ops_since_sync += 1;
+
+        // let is_commit = matches!(op, WalOp::CommitTx { .. });
+
+        // self.maybe_sync(is_commit)
+
+        let start = self.write_buffer.len();
+
+        // 1. Reserve header space
+        self.write_buffer.extend_from_slice(&[0u8; 8]);
+
+        // 2. Encode to a temporary buffer first so we can encrypt the whole thing
+        let mut temp_payload = Vec::new();
+        encode_into(&mut temp_payload, op);
+
+        // 3. ENCRYPTION FIX: Encrypt the payload if a key is set
+        let final_payload = if let Some(enc) = &self.encryption {
+            enc.encrypt(&temp_payload)?
+        } else {
+            temp_payload
+        };
+
+        // 4. Calculate CRC and Length based on the (possibly encrypted) payload
+        let crc = crc32fast::hash(&final_payload);
+        let len = final_payload.len() as u32;
+
+        // 5. Fill header and append payload
+        self.write_buffer[start..start + 4].copy_from_slice(&len.to_le_bytes());
+        self.write_buffer[start + 4..start + 8].copy_from_slice(&crc.to_le_bytes());
+        self.write_buffer.extend_from_slice(&final_payload);
+
+        self.pending_ops_since_sync += 1;
+        let is_commit = matches!(op, WalOp::CommitTx { .. });
+        self.maybe_sync(is_commit)
     }
 
     pub fn append_batch(&mut self, ops: &[WalOp]) -> Result<()> {
+        // We must update append_batch to use the same logic
         for op in ops {
-            let mut payload = encode(op);
-            if let Some(enc) = &self.encryption {
-                payload = enc.encrypt(&payload)?;
-            }
-            let mut hasher = Hasher::new();
-            hasher.update(&payload);
-            let crc = hasher.finalize();
-            self.file.write_all(&(payload.len() as u32).to_le_bytes())?;
-            self.file.write_all(&crc.to_le_bytes())?;
-            self.file.write_all(&payload)?;
+            let start = self.write_buffer.len();
+            self.write_buffer.extend_from_slice(&[0u8; 8]);
+
+            let mut temp_payload = Vec::new();
+            encode_into(&mut temp_payload, op);
+
+            let final_payload = if let Some(enc) = &self.encryption {
+                enc.encrypt(&temp_payload)?
+            } else {
+                temp_payload
+            };
+
+            let crc = crc32fast::hash(&final_payload);
+            let len = final_payload.len() as u32;
+
+            self.write_buffer[start..start + 4].copy_from_slice(&len.to_le_bytes());
+            self.write_buffer[start + 4..start + 8].copy_from_slice(&crc.to_le_bytes());
+            self.write_buffer.extend_from_slice(&final_payload);
+            
             self.pending_ops_since_sync += 1;
         }
-        self.maybe_sync(true)
+
+        let has_commit = ops.iter().any(|op| matches!(op, WalOp::CommitTx { .. }));
+        self.maybe_sync(has_commit)
     }
 
     pub fn flush(&mut self) -> Result<()> {
+        // Write buffered WAL records first
+        if !self.write_buffer.is_empty() {
+            self.file.write_all(&self.write_buffer)?;
+            self.write_buffer.clear();
+        }
+        
+        // 1. Push data from BufWriter to the Operating System
+        self.file.flush()?; 
+
+        // 2. Push data from Operating System to physical Disk
         self.file.sync_data()?;
         self.pending_ops_since_sync = 0;
         Ok(())
     }
 
-    fn maybe_sync(&mut self, is_batch_boundary: bool) -> Result<()> {
-        match self.mode {
-            DurabilityMode::Always => self.flush(),
+    fn maybe_sync(&mut self, is_commit: bool) -> Result<()> {
+        let now = Instant::now();
+
+        let should_flush = match self.mode {
+
+            DurabilityMode::Always => true,
+
+            DurabilityMode::OnCommit => is_commit, 
+
             DurabilityMode::Interval => {
-                if self.pending_ops_since_sync >= self.group_commit_max_ops || is_batch_boundary {
-                    self.flush()
-                } else {
-                    Ok(())
-                }
+
+                is_commit &&
+                (
+                    self.pending_ops_since_sync >= self.group_commit_max_ops
+                    || now.duration_since(self.last_sync) >= self.group_commit_interval
+                )
+
             }
-            DurabilityMode::Manual => Ok(()),
+
+            DurabilityMode::Manual => false,
+        };
+
+        if !should_flush {
+            return Ok(());
         }
+
+        if !self.write_buffer.is_empty() {
+            self.file.write_all(&self.write_buffer)?;
+            self.write_buffer.clear();
+        }
+
+        self.file.sync_data()?;
+
+        self.pending_ops_since_sync = 0;
+        self.last_sync = now;
+
+        Ok(())
     }
 
     pub fn replay(&mut self) -> Result<Vec<WalOp>> {
         self.file.seek(SeekFrom::Start(0))?;
         let mut raw_ops = Vec::new();
         loop {
+
             let mut len_buf = [0u8; 4];
             match self.file.read_exact(&mut len_buf) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e.into()),
             }
+
             let len = u32::from_le_bytes(len_buf) as usize;
+
             let mut crc_buf = [0u8; 4];
             self.file.read_exact(&mut crc_buf)?;
             let expected = u32::from_le_bytes(crc_buf);
+
             let mut payload = vec![0; len];
             self.file.read_exact(&mut payload)?;
 
-            let mut hasher = Hasher::new();
-            hasher.update(&payload);
-            if hasher.finalize() != expected {
+            if crc32fast::hash(&payload) != expected {
                 return Err(FireLiteError::Corrupt("wal checksum mismatch".into()));
             }
 
@@ -137,6 +259,22 @@ impl Wal {
         self.file.seek(SeekFrom::Start(0))?;
         self.pending_ops_since_sync = 0;
         Ok(())
+    }
+
+    pub fn durability_mode(&self) -> DurabilityMode {
+        self.mode
+    }
+
+    pub fn set_durability_mode(&mut self, mode: DurabilityMode) {
+        self.mode = mode;
+    }
+    
+}
+
+impl Drop for Wal {
+    fn drop(&mut self) {
+        // Final attempt to save data when the database handle is closed
+        let _ = self.flush();
     }
 }
 
@@ -158,7 +296,7 @@ fn filter_committed_ops(raw_ops: Vec<WalOp>) -> Vec<WalOp> {
                 current_tx = None;
                 tx_ops.clear();
             }
-            WalOp::Put { .. } | WalOp::Delete { .. } => {
+            WalOp::Put { .. } | WalOp::Delete { .. } | WalOp::PutInlined { .. } => {
                 if current_tx.is_some() {
                     tx_ops.push(op);
                 } else {
@@ -171,37 +309,49 @@ fn filter_committed_ops(raw_ops: Vec<WalOp>) -> Vec<WalOp> {
     output
 }
 
-fn encode(op: &WalOp) -> Vec<u8> {
-    let mut out = Vec::new();
+fn encode_into(buf: &mut Vec<u8>, op: &WalOp) {
     match op {
         WalOp::BeginTx { tx_id } => {
-            out.push(0);
-            out.extend(tx_id.to_le_bytes());
+            buf.push(0);
+            buf.extend_from_slice(&tx_id.to_le_bytes());
         }
+
         WalOp::Put {
             key,
             segment_id,
             segment_offset,
             len,
         } => {
-            out.push(1);
-            out.extend((key.len() as u16).to_le_bytes());
-            out.extend(key.as_bytes());
-            out.extend(segment_id.to_le_bytes());
-            out.extend(segment_offset.to_le_bytes());
-            out.extend(len.to_le_bytes());
+            buf.push(1);
+
+            buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
+
+            buf.extend_from_slice(&segment_id.to_le_bytes());
+            buf.extend_from_slice(&segment_offset.to_le_bytes());
+            buf.extend_from_slice(&len.to_le_bytes());
         }
+
         WalOp::Delete { key } => {
-            out.push(2);
-            out.extend((key.len() as u16).to_le_bytes());
-            out.extend(key.as_bytes());
+            buf.push(2);
+
+            buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
         }
+
         WalOp::CommitTx { tx_id } => {
-            out.push(3);
-            out.extend(tx_id.to_le_bytes());
+            buf.push(3);
+            buf.extend_from_slice(&tx_id.to_le_bytes());
+        }
+
+        WalOp::PutInlined { key, value } => {
+            buf.push(4); // New Tag
+            buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            buf.extend_from_slice(value);
         }
     }
-    out
 }
 
 fn decode(payload: &[u8]) -> Result<WalOp> {
@@ -270,6 +420,16 @@ fn decode(payload: &[u8]) -> Result<WalOp> {
                     .map_err(|_| FireLiteError::Corrupt("bad commit tx id".into()))?,
             );
             Ok(WalOp::CommitTx { tx_id })
+        }
+        4 => { // NEW
+            let key_len = u16::from_le_bytes(payload[pos..pos+2].try_into().unwrap()) as usize;
+            pos += 2;
+            let key = String::from_utf8(payload[pos..pos+key_len].to_vec()).map_err(|_| FireLiteError::Corrupt("bad key".into()))?;
+            pos += key_len;
+            let val_len = u32::from_le_bytes(payload[pos..pos+4].try_into().unwrap()) as usize;
+            pos += 4;
+            let value = payload[pos..pos+val_len].to_vec();
+            Ok(WalOp::PutInlined { key, value })
         }
         _ => Err(FireLiteError::Corrupt("unknown wal op".into())),
     }

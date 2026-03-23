@@ -1,17 +1,17 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::error::{FireLiteError, Result};
-
+use crate::error::{Result, FireLiteError};
+use crate::memory::page_cache::{BlockKey, PageCache};
 use super::allocator::Allocator;
 use super::mmap_store::MmapStore;
-use super::page::{Page, DEFAULT_PAGE_SIZE};
-use super::page_cache::PageCache;
+use super::page::DEFAULT_PAGE_SIZE;
+// use super::page_cache::PageCache;
 
 pub struct MemoryEngine {
     page_size: usize,
-    store: Arc<MmapStore>,
-    allocator: Allocator,
+    store: Arc<super::mmap_store::MmapStore>,
+    allocator: super::allocator::Allocator,
     cache: Mutex<PageCache>,
 }
 
@@ -38,15 +38,21 @@ impl MemoryEngine {
         self.store.read_slice(offset, len)
     }
 
-    pub fn load_page(&self, page_id: u64) -> Page {
+    pub fn load_page(&self, page_id: u64) -> Vec<u8> {
         let mut cache = self.cache.lock().expect("cache lock poisoned");
-        if let Some(page) = cache.get(page_id) {
-            return page;
+        // Using segment_id 0 to represent the MemoryEngine's linear address space
+        let key = BlockKey { 
+            segment_id: 0, 
+            offset: page_id * self.page_size as u64 
+        };
+
+        if let Some(data) = cache.get(&key) {
+            return (*data).clone();
         }
+
         let offset = page_id as usize * self.page_size;
         let data = self.store.read_slice(offset, self.page_size);
-        let page = Page { id: page_id, data };
-        cache.put(page.clone());
-        page
+        cache.put(key, data.clone());
+        data
     }
 }

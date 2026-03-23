@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::document::firelite_doc::FireLiteDoc;
 use crate::document::value::Value;
@@ -59,6 +60,18 @@ impl CompositeIndexManager {
         }
     }
 
+    pub fn index_batch<'a, I>(&mut self, collection: &str, docs: I)
+    where
+        I: IntoIterator<Item = (&'a str, &'a FireLiteDoc)> + Clone,
+    {
+        let ids = self.by_collection.get(collection).cloned().unwrap_or_default();
+        for id in ids {
+            if let Some(index) = self.by_id.get_mut(&id) {
+                index.index_batch(docs.clone());
+            }
+        }
+    }
+
     pub fn remove_document(&mut self, collection: &str, doc_id: &str, doc: &FireLiteDoc) {
         let ids = self
             .by_collection
@@ -72,12 +85,25 @@ impl CompositeIndexManager {
         }
     }
 
+    pub fn remove_batch<'a, I>(&mut self, collection: &str, docs: I)
+    where
+        I: IntoIterator<Item = (&'a str, &'a FireLiteDoc)> + Clone,
+    {
+        let ids = self.by_collection.get(collection).cloned().unwrap_or_default();
+        for id in ids {
+            if let Some(index) = self.by_id.get_mut(&id) {
+                index.remove_batch(docs.clone());
+            }
+        }
+    }
+
     pub fn exact_match_doc_ids(
         &self,
         collection: &str,
         fields: &[String],
         values: &[Value],
-    ) -> Option<Vec<String>> {
+    // ) -> Option<Vec<String>> {
+    ) -> Option<Vec<Arc<str>>> {
         for idx in self.indexes_for_collection(collection) {
             let idx_fields: Vec<&str> = idx
                 .definition

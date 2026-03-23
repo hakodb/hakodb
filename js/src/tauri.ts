@@ -1,15 +1,29 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
-export type FireLitePrimitive = string | number | boolean | null | Uint8Array;
-export type FireLiteRecord = Record<string, FireLitePrimitive>;
+// 1. UPDATED: Recursive Types to match client.ts
+export type FireLitePrimitive = 
+  | string 
+  | number 
+  | boolean 
+  | null 
+  | Uint8Array 
+  | FireLiteRecord 
+  | FireLitePrimitive[];
 
-export type FilterOperator = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte';
+export type FireLiteRecord = { [key: string]: FireLitePrimitive };
+
+// 2. UPDATED: Full list of v0.7.0 Operators
+export type FilterOperator = 
+  | 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' 
+  | 'match' | 'contains' | 'startsWith' | 'in';
 
 type FireLiteOp =
   | { op: 'get'; collection: string; docId: string }
   | { op: 'set'; collection: string; docId: string; data: FireLiteRecord }
   | { op: 'delete'; collection: string; docId: string }
+  | { op: 'createIndex'; collection: string; field: string }      // NEW
+  | { op: 'createFtsIndex'; collection: string; field: string }   // NEW
   | {
       op: 'query';
       collection: string;
@@ -17,6 +31,7 @@ type FireLiteOp =
       orderBy?: OrderByInput;
       limit?: number;
       projection?: string[];
+      startAfterId?: string; // NEW: Cursor support for Tauri
     }
   | { op: 'batch'; mutations: BatchInput[] }
   | {
@@ -29,7 +44,8 @@ type FireLiteOp =
       projection?: string[];
       eventName: string;
     }
-  | { op: 'unsubscribe'; listenerId: string };
+  | { op: 'unsubscribe'; listenerId: string }
+  | { op: 'aggregate'; collection: string; filters: FilterInput[]; type: 'count' | 'sum' | 'avg'; field?: string };
 
 type FireLiteResponse =
   | { ok: null }
@@ -41,7 +57,7 @@ type FireLiteResponse =
 interface FilterInput {
   field: string;
   op: FilterOperator;
-  value: FireLitePrimitive;
+  value: any;
 }
 
 interface OrderByInput {
@@ -67,12 +83,21 @@ function nextListenerId(): string {
   return `fl_listener_${Date.now()}_${listenerCounter}`;
 }
 
-function normalizeRecord(data: FireLiteRecord): Record<string, FireLitePrimitive | number[]> {
-  const normalized: Record<string, FireLitePrimitive | number[]> = {};
-  for (const [k, v] of Object.entries(data)) {
-    normalized[k] = v instanceof Uint8Array ? Array.from(v) : v;
+/**
+ * RECURSIVE NORMALIZATION: 
+ * Converts Uint8Array to number[] so it can cross the Tauri JSON bridge
+ */
+function normalizeValue(v: FireLitePrimitive): any {
+  if (v instanceof Uint8Array) return Array.from(v);
+  if (Array.isArray(v)) return v.map(normalizeValue);
+  if (typeof v === 'object' && v !== null) {
+    const normalized: any = {};
+    for (const [key, val] of Object.entries(v)) {
+      normalized[key] = normalizeValue(val);
+    }
+    return normalized;
   }
-  return normalized;
+  return v;
 }
 
 async function exec(op: FireLiteOp): Promise<FireLiteResponse> {
@@ -89,7 +114,7 @@ export class TauriFireLite {
   }
 
   async set(collection: string, docId: string, data: FireLiteRecord): Promise<void> {
-    await exec({ op: 'set', collection, docId, data: normalizeRecord(data) as FireLiteRecord });
+    await exec({ op: 'set', collection, docId, data: normalizeValue(data) });
   }
 
   async get(collection: string, docId: string): Promise<TauriDocumentSnapshot> {
@@ -104,16 +129,26 @@ export class TauriFireLite {
     await exec({ op: 'delete', collection, docId });
   }
 
+  // INDEX MANAGEMENT
+  async createIndex(collection: string, field: string): Promise<void> {
+    await exec({ op: 'createIndex', collection, field });
+  }
+
+  async createFtsIndex(collection: string, field: string): Promise<void> {
+    await exec({ op: 'createFtsIndex', collection, field });
+  }
+
   async query(
     collection: string,
     filters: FilterInput[],
     orderBy?: OrderByInput,
     limit?: number,
-    projection?: string[]
+    projection?: string[],
+    startAfterId?: string
   ): Promise<FireLiteRecord[]> {
     const normalizedFilters = filters.map((f) => ({
       ...f,
-      value: f.value instanceof Uint8Array ? Array.from(f.value) : f.value
+      value: normalizeValue(f.value)
     }));
 
     const res = await exec({
@@ -122,7 +157,8 @@ export class TauriFireLite {
       filters: normalizedFilters,
       orderBy,
       limit,
-      projection
+      projection,
+      startAfterId
     });
 
     if ('queryResult' in res) {
@@ -153,7 +189,7 @@ export class TauriFireLite {
       op: 'subscribe',
       listenerId,
       collection: params.collection,
-      filters: params.filters,
+      filters: params.filters.map(f => ({ ...f, value: normalizeValue(f.value) })),
       orderBy: params.orderBy,
       limit: params.limit,
       projection: params.projection,
@@ -174,7 +210,7 @@ export class TauriCollectionReference {
     return new TauriDocumentReference(this._collection, id);
   }
 
-  where(field: string, op: FilterOperator, value: FireLitePrimitive): TauriQuery {
+  where(field: string, op: FilterOperator, value: any): TauriQuery {
     return new TauriQuery(this._collection).where(field, op, value);
   }
 
@@ -190,8 +226,16 @@ export class TauriCollectionReference {
     return new TauriQuery(this._collection).select(...fields);
   }
 
+  async createIndex(field: string): Promise<void> {
+    await new TauriFireLite().createIndex(this._collection, field);
+  }
+
+  async createFtsIndex(field: string): Promise<void> {
+    await new TauriFireLite().createFtsIndex(this._collection, field);
+  }
+
   async get(): Promise<FireLiteRecord[]> {
-    return new TauriFireLite().query(this._collection, []);
+    return new TauriQuery(this._collection).get();
   }
 }
 
@@ -228,11 +272,17 @@ export class TauriQuery {
   private orderByDef?: OrderByInput;
   private limitDef?: number;
   private projectionDef?: string[];
+  private _startAfterId?: string;
 
   constructor(private readonly collection: string) {}
 
-  where(field: string, op: FilterOperator, value: FireLitePrimitive): TauriQuery {
+  where(field: string, op: FilterOperator, value: any): TauriQuery {
     this.filters.push({ field, op, value });
+    return this;
+  }
+
+  startAfter(snapshot: TauriDocumentSnapshot): TauriQuery {
+    this._startAfterId = snapshot.id;
     return this;
   }
 
@@ -252,7 +302,14 @@ export class TauriQuery {
   }
 
   async get(): Promise<FireLiteRecord[]> {
-    return new TauriFireLite().query(this.collection, this.filters, this.orderByDef, this.limitDef, this.projectionDef);
+    return new TauriFireLite().query(
+        this.collection, 
+        this.filters, 
+        this.orderByDef, 
+        this.limitDef, 
+        this.projectionDef, 
+        this._startAfterId
+    );
   }
 
   async onSnapshot(callback: (rows: FireLiteRecord[]) => void): Promise<() => Promise<void>> {
@@ -268,6 +325,22 @@ export class TauriQuery {
       callback
     );
   }
+
+  async count(): Promise<number> {
+    const res = await exec({ op: 'aggregate', collection: this.collection, filters: this.filters, type: 'count' });
+    return (res as any).value || 0;
+  }
+
+  async sum(field: string): Promise<number> {
+    const res = await exec({ op: 'aggregate', collection: this.collection, filters: this.filters, type: 'sum', field });
+    return (res as any).value || 0;
+  }
+
+  async avg(field: string): Promise<number> {
+    const res = await exec({ op: 'aggregate', collection: this.collection, filters: this.filters, type: 'avg', field });
+    return (res as any).value || 0;
+  }
+
 }
 
 export class TauriWriteBatch {
@@ -278,7 +351,7 @@ export class TauriWriteBatch {
       mutation: 'set',
       collection: docRef._collection,
       docId: docRef._docId,
-      data: normalizeRecord(data) as FireLiteRecord
+      data: normalizeValue(data)
     });
     return this;
   }

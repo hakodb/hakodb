@@ -3,6 +3,7 @@ pub enum DurabilityMode {
     Always,
     Interval,
     Manual,
+    OnCommit,
 }
 
 #[derive(Debug, Clone)]
@@ -17,21 +18,27 @@ pub struct FireLiteConfig {
     pub encryption_key: Option<String>,
     pub enable_audit_log: bool,
     pub audit_log_path: Option<String>,
+    pub max_inlined_memory_bytes: usize,
+    pub use_compression: bool,
+    pub compression_level: i32,
 }
 
 impl Default for FireLiteConfig {
     fn default() -> Self {
         Self {
-            mmap_size: 64 * 1024 * 1024,
+            mmap_size: 256 * 1024 * 1024,
             page_size: 4096,
-            page_cache_capacity: 512,
+            page_cache_capacity: 1024,
             query_workers: 4,
-            auto_compaction_threshold_bytes: 256 * 1024 * 1024,
-            durability_mode: DurabilityMode::Always,
+            auto_compaction_threshold_bytes: 8 * 1024 * 1024,
+            durability_mode: DurabilityMode::Interval,
             group_commit_max_ops: 128,
             encryption_key: None,
             enable_audit_log: true,
             audit_log_path: None,
+            max_inlined_memory_bytes: 64 * 1024 * 1024, // 64MB Default
+            use_compression: false, // Disabled by default
+            compression_level: 3,
         }
     }
 }

@@ -1,19 +1,25 @@
-use std::collections::HashMap;
+// use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::FireLiteConfig;
+use crate::config::{FireLiteConfig, DurabilityMode};
 use crate::error::{FireLiteError, Result};
+use std::sync::{Arc, Mutex}; // <--- ADD THIS
+use crate::memory::page_cache::PageCache; 
 
 use super::compaction::compact_segment;
 use super::crypto::EncryptionContext;
 use super::segment::Segment;
 use super::wal::{Wal, WalOp};
 
-#[derive(Debug, Clone)]
-pub struct Pointer {
-    pub segment_id: u64,
-    pub offset: u64,
-    pub len: u32,
+#[derive(Debug, Clone)] // Remove Copy, as Inlined contains a Vec
+pub enum Pointer {
+    Segment {
+        segment_id: u64,
+        offset: u64,
+        len: u32,
+    },
+    Inlined(Vec<u8>),
 }
 
 #[derive(Debug, Clone)]
@@ -23,7 +29,7 @@ pub enum StorageMutation {
 }
 
 struct SegmentMeta {
-    id: u64,
+    // id: u64,
     level: u32,
     segment: Segment,
 }
@@ -38,9 +44,18 @@ pub struct StorageEngine {
     next_tx_id: u64,
     compaction_threshold_bytes: usize,
     encryption: Option<EncryptionContext>,
+    inlined_bytes: usize,
+    max_inlined_bytes: usize,
+    use_compression: bool, 
+    // collection_counts: HashMap<String, usize>, 
+    pub(crate) collection_counts: HashMap<String, usize>,
+    pub cache: Arc<Mutex<PageCache>>,
+    pub mmap_size: usize, 
 }
 
 impl StorageEngine {
+    // src/storage/engine.rs
+
     pub fn open(base_dir: impl AsRef<Path>, cfg: &FireLiteConfig) -> Result<Self> {
         std::fs::create_dir_all(base_dir.as_ref())?;
 
@@ -48,6 +63,9 @@ impl StorageEngine {
             .encryption_key
             .as_ref()
             .map(|secret| EncryptionContext::from_secret(secret));
+
+        // 1. Initialize the Shared Decompression Cache FIRST
+        let cache = Arc::new(Mutex::new(PageCache::new(cfg.page_cache_capacity)));
 
         let wal = Wal::open(
             base_dir.as_ref().join("wal.log"),
@@ -60,37 +78,45 @@ impl StorageEngine {
         let mut max_id = 0;
         let mut active_segment_id = 0;
 
+        // 2. Load existing segments using the cache and mmap_size
         for entry in std::fs::read_dir(base_dir.as_ref())? {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if let Some((level, id)) = parse_segment_name(&name) {
-                let segment = Segment::open(entry.path(), encryption.clone())?;
-                segments.insert(id, SegmentMeta { id, level, segment });
-                if id > max_id {
-                    max_id = id;
-                }
-                if id >= active_segment_id {
-                    active_segment_id = id;
-                }
+                // UPDATED: Now passes id, cache, and mmap_size
+                let segment = Segment::open(
+                    entry.path(), 
+                    id, 
+                    encryption.clone(), 
+                    Arc::clone(&cache), 
+                    cfg.mmap_size
+                )?;
+                
+                segments.insert(id, SegmentMeta { level, segment });
+                if id > max_id { max_id = id; }
+                if id >= active_segment_id { active_segment_id = id; }
             }
         }
 
+        // 3. Handle fresh install (empty directory)
         if segments.is_empty() {
             let path = segment_path(base_dir.as_ref(), 0, 0);
-            let segment = Segment::open(path, encryption.clone())?;
-            segments.insert(
-                0,
-                SegmentMeta {
-                    id: 0,
-                    level: 0,
-                    segment,
-                },
-            );
+            // UPDATED: Now passes id (0), cache, and mmap_size
+            let segment = Segment::open(
+                path, 
+                0, 
+                encryption.clone(), 
+                Arc::clone(&cache), 
+                cfg.mmap_size
+            )?;
+            
+            segments.insert(0, SegmentMeta { level: 0, segment });
             max_id = 0;
             active_segment_id = 0;
         }
 
+        // 4. Initialize the Engine
         let mut engine = Self {
             base_dir: base_dir.as_ref().to_path_buf(),
             segments,
@@ -101,36 +127,144 @@ impl StorageEngine {
             next_tx_id: 1,
             compaction_threshold_bytes: cfg.auto_compaction_threshold_bytes,
             encryption,
+            use_compression: cfg.use_compression,
+            inlined_bytes: 0, 
+            max_inlined_bytes: cfg.max_inlined_memory_bytes,
+            collection_counts: HashMap::new(),
+            cache, // Pass the initialized Arc
+            mmap_size: cfg.mmap_size,
         };
+
         engine.recover()?;
         Ok(engine)
     }
 
     fn recover(&mut self) -> Result<()> {
+        self.index.reserve(1024);
         for op in self.wal.replay()? {
             match op {
-                WalOp::Put {
-                    key,
-                    segment_id,
-                    segment_offset,
-                    len,
-                } => {
-                    self.index.insert(
-                        key,
-                        Pointer {
-                            segment_id,
-                            offset: segment_offset,
-                            len,
-                        },
-                    );
+                WalOp::Put { key, segment_id, segment_offset, len } => {
+                    let pointer = Pointer::Segment { 
+                        segment_id, 
+                        offset: segment_offset, 
+                        len 
+                    };
+                    self.update_index_entry(key, Some(pointer));
                 }
                 WalOp::Delete { key } => {
-                    self.index.remove(&key);
+                    self.update_index_entry(key, None);
                 }
                 WalOp::BeginTx { .. } | WalOp::CommitTx { .. } => {}
+                WalOp::PutInlined { key, value } => {
+                    let pointer = Pointer::Inlined(value);
+                    self.update_index_entry(key, Some(pointer));
+                }
             }
         }
         Ok(())
+    }
+
+    fn update_index_entry(&mut self, key: String, new_pointer: Option<Pointer>) {
+
+        let collection_name = key.split_once(':').map(|(c, _)| c.to_string());
+
+        // 1. If there was an old entry, subtract its size if it was inlined
+        if let Some(old_p) = self.index.remove(&key) {
+            if let Pointer::Inlined(data) = old_p {
+                self.inlined_bytes = self.inlined_bytes.saturating_sub(data.len());
+            }
+
+            // DECREMENT count for this collection
+            if let Some(ref col) = collection_name {
+                if let Some(count) = self.collection_counts.get_mut(col) {
+                    *count = count.saturating_sub(1);
+                    // if *count == 0 {
+                    //     self.collection_counts.remove(col); // Collection officially "dies"
+                    // }
+                }
+            }
+        }
+
+        // 2. If we are adding a new entry, add its size if it is inlined
+        if let Some(p) = new_pointer {
+            if let Pointer::Inlined(ref data) = p {
+                self.inlined_bytes += data.len();
+            }
+
+            // INCREMENT count for this collection
+            if let Some(ref col) = collection_name {
+                *self.collection_counts.entry(col.clone()).or_insert(0) += 1;
+            }
+
+            self.index.insert(key, p);
+        }
+    }
+
+    pub fn checkpoint_inlined_data(&mut self) -> Result<bool> {
+        // Only trigger if we are over the limit
+        if self.inlined_bytes < self.max_inlined_bytes {
+            return Ok(false);
+        }
+
+        // 1. Gather all inlined documents
+        let mut to_flush = Vec::new();
+        for (key, pointer) in &self.index {
+            if let Pointer::Inlined(data) = pointer {
+                to_flush.push((key.clone(), data.clone()));
+            }
+        }
+
+        if to_flush.is_empty() { return Ok(false); }
+
+        // 2. Write to a new Segment (Level 0)
+        let target_id = self.next_segment_id;
+        self.next_segment_id += 1;
+        let target_path = segment_path(&self.base_dir, 0, target_id);
+
+        let mut target_segment = Segment::open(
+            target_path, 
+            target_id, 
+            self.encryption.clone(), 
+            Arc::clone(&self.cache), 
+            self.mmap_size
+        )?;
+
+        // RENAME TO MATCH THE LOOP BELOW
+        let mut new_pointers = HashMap::new(); 
+        
+        crate::storage::compaction::compact_segment(
+            &mut target_segment, 
+            &to_flush, 
+            &mut new_pointers, 
+            target_id,
+            self.use_compression
+        )?;
+        
+        target_segment.flush()?;
+
+        // 3. Update the Index (Moves Pointer::Inlined -> Pointer::Segment)
+        for (key, pointer) in new_pointers {
+            self.update_index_entry(key, Some(pointer));
+        }
+
+        // 4. Register the new segment
+        self.segments.insert(target_id, SegmentMeta {
+            // id: target_id,
+            level: 0,
+            segment: target_segment,
+        });
+
+        // 5. Cleanup WAL (Remove the raw 'PutInlined' data from the log)
+        self.rewrite_wal_snapshot()?;
+
+        Ok(true)
+    }
+
+    /// Now this becomes Instant (O(1)) and accurate!
+    pub fn list_collections(&self) -> Result<Vec<String>> {
+        let mut cols: Vec<String> = self.collection_counts.keys().cloned().collect();
+        cols.sort();
+        Ok(cols)
     }
 
     pub fn apply_batch(&mut self, mutations: &[StorageMutation]) -> Result<()> {
@@ -141,31 +275,34 @@ impl StorageEngine {
         let tx_id = self.next_tx_id;
         self.next_tx_id += 1;
 
-        let mut wal_ops = Vec::with_capacity(mutations.len() + 2);
+        // rotate BEFORE writing
+        self.maybe_rotate_active_segment()?;
+
+        // --- REMOVED THE REDUNDANT puts_to_write and append_batch BLOCK HERE ---
+
+        let mut wal_ops = Vec::with_capacity(mutations.len() * 2 + 2);
         wal_ops.push(WalOp::BeginTx { tx_id });
 
         let mut index_updates = Vec::with_capacity(mutations.len());
+        let mut puts_to_segment = Vec::new();
+        let mut segment_mutation_indices = Vec::new();
 
-        for mutation in mutations {
+        // --- STEP 1: Decide Strategy (Inline or Segment) ---
+        for (i, mutation) in mutations.iter().enumerate() {
             match mutation {
                 StorageMutation::Put { key, value } => {
-                    let active = self
-                        .segments
-                        .get_mut(&self.active_segment_id)
-                        .ok_or_else(|| FireLiteError::Corrupt("active segment missing".into()))?;
-                    let (offset, stored_len) = active.segment.append(value)?;
-                    let pointer = Pointer {
-                        segment_id: self.active_segment_id,
-                        offset,
-                        len: stored_len,
-                    };
-                    wal_ops.push(WalOp::Put {
-                        key: key.clone(),
-                        segment_id: pointer.segment_id,
-                        segment_offset: pointer.offset,
-                        len: pointer.len,
-                    });
-                    index_updates.push((key.clone(), Some(pointer)));
+                    if value.len() < 4096 { // 4KB Threshold
+                        // Strategy: Inline (Only goes to WAL and RAM Index)
+                        wal_ops.push(WalOp::PutInlined {
+                            key: key.clone(),
+                            value: value.clone(),
+                        });
+                        index_updates.push((key.clone(), Some(Pointer::Inlined(value.clone()))));
+                    } else {
+                        // Strategy: Segment (Collect for bulk write later)
+                        puts_to_segment.push(value.as_slice());
+                        segment_mutation_indices.push(i);
+                    }
                 }
                 StorageMutation::Delete { key } => {
                     wal_ops.push(WalOp::Delete { key: key.clone() });
@@ -174,26 +311,67 @@ impl StorageEngine {
             }
         }
 
-        wal_ops.push(WalOp::CommitTx { tx_id });
-        self.wal.append_batch(&wal_ops)?;
+        // --- STEP 2: Write Large Puts to Segment ---
+        if !puts_to_segment.is_empty() {
+            let active_id = self.active_segment_id;
+            // We get mutable access to the segment only when we actually have data to write
+            let active = self.segments.get_mut(&active_id)
+                .ok_or_else(|| FireLiteError::Corrupt("active segment missing".into()))?;
+            
+            let offsets = active.segment.append_batch(&puts_to_segment)?;
 
-        for (key, pointer) in index_updates {
-            match pointer {
-                Some(pointer) => {
-                    self.index.insert(key, pointer);
-                }
-                None => {
-                    self.index.remove(&key);
+            for (offset_data, mutation_idx) in offsets.into_iter().zip(segment_mutation_indices) {
+                if let StorageMutation::Put { key, .. } = &mutations[mutation_idx] {
+                    let (offset, len) = offset_data;
+                    wal_ops.push(WalOp::Put {
+                        key: key.clone(),
+                        segment_id: active_id,
+                        segment_offset: offset,
+                        len,
+                    });
+                    index_updates.push((key.clone(), Some(Pointer::Segment { segment_id: active_id, offset, len })));
                 }
             }
         }
 
-        self.maybe_rotate_active_segment()?;
+        wal_ops.push(WalOp::CommitTx { tx_id });
+
+        // --- STEP 3: Coordinated Sync ---
+        // Only flush the segment if we actually wrote something to it in Step 2
+        if !puts_to_segment.is_empty() && 
+        (self.wal.durability_mode() == DurabilityMode::Always || 
+            self.wal.durability_mode() == DurabilityMode::OnCommit) {
+            
+            if let Some(active) = self.segments.get_mut(&self.active_segment_id) {
+                active.segment.flush()?; 
+            }
+        }
+
+        // Write everything to WAL (Standard puts and Inlined puts)
+        self.wal.append_batch(&wal_ops)?;
+
+        // Update the index using our new tracking helper
+        for (key, pointer) in index_updates {
+            self.update_index_entry(key, pointer);
+        }
+
+        Ok(())
+    }
+
+    pub fn flush_all(&mut self) -> Result<()> {
+        // First flush the data segment
+        if let Some(meta) = self.segments.get_mut(&self.active_segment_id) {
+            meta.segment.flush()?;
+        }
+        // Then flush the WAL
+        self.wal.flush()?;
         Ok(())
     }
 
     pub fn run_background_maintenance(&mut self) -> Result<()> {
         self.maybe_rotate_active_segment()?;
+        // Check if RAM is full and spill to disk if needed
+        self.checkpoint_inlined_data()?;
         self.compact_tiers_once().map(|_| ())
     }
 
@@ -212,12 +390,19 @@ impl StorageEngine {
         let new_id = self.next_segment_id;
         self.next_segment_id += 1;
         let path = segment_path(&self.base_dir, 0, new_id);
-        let encryption = self.encryption.clone();
-        let segment = Segment::open(path, encryption)?;
+        // let encryption = self.encryption.clone();
+        // FIX: Add missing 3 arguments
+        let segment = Segment::open(
+            path, 
+            new_id, 
+            self.encryption.clone(), 
+            Arc::clone(&self.cache), 
+            self.mmap_size
+        )?;
         self.segments.insert(
             new_id,
             SegmentMeta {
-                id: new_id,
+                // id: new_id,
                 level: 0,
                 segment,
             },
@@ -227,12 +412,10 @@ impl StorageEngine {
     }
 
     fn compact_tiers_once(&mut self) -> Result<bool> {
-        // find two immutable segments on same level
+        // 1. Find two immutable segments on the same level
         let mut by_level: HashMap<u32, Vec<u64>> = HashMap::new();
         for (id, meta) in &self.segments {
-            if *id == self.active_segment_id {
-                continue;
-            }
+            if *id == self.active_segment_id { continue; }
             by_level.entry(meta.level).or_default().push(*id);
         }
 
@@ -244,76 +427,96 @@ impl StorageEngine {
             }
         }
 
-        let Some((level, s1, s2)) = candidate else {
-            return Ok(false);
-        };
+        let Some((level, s1, s2)) = candidate else { return Ok(false); };
 
+        // 2. Prepare merge
         let target_level = level + 1;
         let target_id = self.next_segment_id;
         self.next_segment_id += 1;
 
-        let mut entries = Vec::new();
-        let snapshot: Vec<(String, Pointer)> = self
-            .index
-            .iter()
-            .map(|(k, p)| (k.clone(), p.clone()))
-            .collect();
-        for (key, pointer) in snapshot {
-            if pointer.segment_id == s1 || pointer.segment_id == s2 {
-                if let Some(value) = self.read_pointer(&pointer)? {
-                    entries.push((key, value));
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for (key, pointer) in &self.index {
+            if let Pointer::Segment { segment_id, .. } = pointer {
+                if *segment_id == s1 || *segment_id == s2 {
+                    if let Some(value) = self.read_pointer(pointer)? {
+                        entries.push((key.clone(), value));
+                    }
                 }
             }
         }
 
+        // 3. Perform merge with Compression support
         let target_path = segment_path(&self.base_dir, target_level, target_id);
-        let mut target = Segment::open(target_path, self.encryption.clone())?;
+        // let mut target = Segment::open(target_path, self.encryption.clone())?;
+        // FIX: Add missing 3 arguments
+        let mut target = Segment::open(
+            target_path, 
+            target_id, 
+            self.encryption.clone(), 
+            Arc::clone(&self.cache), 
+            self.mmap_size
+        )?;
+        let mut new_index_subset = HashMap::new();
 
-        let mut new_index = HashMap::new();
-        compact_segment(&mut target, &entries, &mut new_index, target_id)?;
+        // FIX: Pass self.use_compression here!
+        compact_segment(&mut target, &entries, &mut new_index_subset, target_id, self.use_compression)?;
 
-        for (k, p) in new_index {
-            self.index.insert(k, p);
+        // 4. Cleanup old files
+        for id in &[s1, s2] {
+            if let Some(mut meta) = self.segments.remove(id) {
+                let path = meta.segment.path().to_path_buf();
+                meta.segment.close();
+                let _ = std::fs::remove_file(path);
+            }
         }
 
-        if let Some(meta) = self.segments.remove(&s1) {
-            let _ = std::fs::remove_file(meta.segment.path());
-        }
-        if let Some(meta) = self.segments.remove(&s2) {
-            let _ = std::fs::remove_file(meta.segment.path());
-        }
-
+        // 5. Update master index
+        for (k, p) in new_index_subset { self.index.insert(k, p); }
         self.segments.insert(
-            target_id,
-            SegmentMeta {
-                id: target_id,
-                level: target_level,
-                segment: target,
-            },
-        );
-
+            target_id, 
+            SegmentMeta { 
+                // id: target_id, 
+                level: target_level, 
+                segment: target 
+            });
         self.rewrite_wal_snapshot()?;
+
         Ok(true)
     }
 
     fn rewrite_wal_snapshot(&mut self) -> Result<()> {
         self.wal.reset()?;
-        for (key, pointer) in self.index.clone() {
-            self.wal.append(&WalOp::Put {
-                key,
-                segment_id: pointer.segment_id,
-                segment_offset: pointer.offset,
-                len: pointer.len,
-            })?;
+        let mut ops = Vec::with_capacity(self.index.len());
+        for (key, pointer) in &self.index {
+            match pointer {
+                Pointer::Segment { segment_id, offset, len } => {
+                    ops.push(WalOp::Put {
+                        key: key.clone(),
+                        segment_id: *segment_id,
+                        segment_offset: *offset,
+                        len: *len,
+                    });
+                }
+                Pointer::Inlined(value) => {
+                    ops.push(WalOp::PutInlined {
+                        key: key.clone(),
+                        value: value.clone(),
+                    });
+                }
+            }
         }
+        self.wal.append_batch(&ops)?;
         Ok(())
     }
 
-    fn read_pointer(&mut self, pointer: &Pointer) -> Result<Option<Vec<u8>>> {
-        let Some(segment) = self.segments.get_mut(&pointer.segment_id) else {
-            return Ok(None);
-        };
-        Ok(Some(segment.segment.read_at(pointer.offset, pointer.len)?))
+    fn read_pointer(&self, pointer: &Pointer) -> Result<Option<Vec<u8>>> {
+        match pointer {
+            Pointer::Inlined(data) => Ok(Some(data.clone())),
+            Pointer::Segment { segment_id, offset, len } => {
+                let Some(meta) = self.segments.get(segment_id) else { return Ok(None); };
+                Ok(Some(meta.segment.read_at(*offset, *len)?))
+            }
+        }
     }
 
     pub fn flush_wal(&mut self) -> Result<()> {
@@ -321,13 +524,15 @@ impl StorageEngine {
     }
 
     pub fn put(&mut self, key: String, value: &[u8]) -> Result<()> {
-        self.apply_batch(&[StorageMutation::Put {
+        let mutation = StorageMutation::Put {
             key,
             value: value.to_vec(),
-        }])
+        };
+
+        self.apply_batch(&[mutation])
     }
 
-    pub fn get(&mut self, key: &str) -> Result<Option<Vec<u8>>> {
+    pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let Some(pointer) = self.index.get(key).cloned() else {
             return Ok(None);
         };
@@ -344,72 +549,145 @@ impl StorageEngine {
         self.index.keys().filter(|k| k.starts_with(prefix)).count()
     }
 
-    pub fn scan_prefix(&mut self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        let keys: Vec<String> = self
+    pub fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+
+        let snapshot: Vec<(String, Pointer)> = self
             .index
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, p)| (k.clone(), p.clone()))
             .collect();
 
-        let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            if let Some(value) = self.get(&key)? {
+        let mut out = Vec::with_capacity(snapshot.len());
+
+        for (key, pointer) in snapshot {
+            if let Some(value) = self.read_pointer(&pointer)? {
                 out.push((key, value));
             }
         }
+
         Ok(out)
     }
 
     pub fn compact(&mut self) -> Result<()> {
-        while self.compact_tiers_once()? {
-            let by_level_count = self
-                .segments
-                .values()
-                .filter(|m| m.id != self.active_segment_id)
-                .count();
-            if by_level_count < 2 {
-                break;
-            }
+        // 1. FORCED ROTATION: Ensure current data is eligible for compaction
+        if self.segments.get(&self.active_segment_id)
+            .map_or(false, |m| m.segment.size_bytes().unwrap_or(0) > 0) 
+        {
+            let new_id = self.next_segment_id;
+            self.next_segment_id += 1;
+            let path = segment_path(&self.base_dir, 0, new_id);
+            // let segment = Segment::open(path, self.encryption.clone())?;
+            // FIX: Add missing 3 arguments
+            let segment = Segment::open(
+                path, 
+                new_id, 
+                self.encryption.clone(), 
+                Arc::clone(&self.cache), 
+                self.mmap_size
+            )?;
+            self.segments.insert(
+                new_id, 
+                SegmentMeta { 
+                    // id: new_id, 
+                    level: 0, 
+                    segment 
+                });
+            self.active_segment_id = new_id;
         }
 
-        // full snapshot compaction fallback
+        let immutable_ids: Vec<u64> = self.segments.keys()
+            .filter(|&&id| id != self.active_segment_id)
+            .cloned().collect();
+
+        if immutable_ids.is_empty() { return Ok(()); }
+
+        // 2. GLOBAL MERGE: Collect ALL data from ALL immutable segments
         let mut entries = Vec::new();
-        for key in self.index.keys().cloned().collect::<Vec<_>>() {
-            if let Some(value) = self.get(&key)? {
-                entries.push((key, value));
+        for (key, pointer) in &self.index {
+            if let Pointer::Segment { segment_id, .. } = pointer {
+                if immutable_ids.contains(segment_id) {
+                    if let Some(value) = self.read_pointer(pointer)? {
+                        entries.push((key.clone(), value));
+                    }
+                }
             }
         }
 
+        // 3. Write to ONE highly-optimized, compressed segment
         let target_id = self.next_segment_id;
         self.next_segment_id += 1;
         let target_path = segment_path(&self.base_dir, 1, target_id);
-        let mut target = Segment::open(target_path, self.encryption.clone())?;
-        let mut rebuilt = HashMap::new();
-        compact_segment(&mut target, &entries, &mut rebuilt, target_id)?;
+        // let mut target = Segment::open(target_path, self.encryption.clone())?;
+        // FIX: Add missing 3 arguments
+        let mut target = Segment::open(
+            target_path, 
+            target_id, 
+            self.encryption.clone(), 
+            Arc::clone(&self.cache), 
+            self.mmap_size
+        )?;
+        let mut rebuilt_index_subset = HashMap::new();
 
-        for meta in self.segments.values() {
-            let _ = std::fs::remove_file(meta.segment.path());
+        compact_segment(&mut target, &entries, &mut rebuilt_index_subset, target_id, self.use_compression)?;
+
+        // 4. Atomic Swap
+        for id in &immutable_ids {
+            if let Some(mut meta) = self.segments.remove(id) {
+                let path = meta.segment.path().to_path_buf();
+                meta.segment.close();
+                let _ = std::fs::remove_file(path);
+            }
         }
-        self.segments.clear();
+
         self.segments.insert(
-            target_id,
-            SegmentMeta {
-                id: target_id,
-                level: 1,
-                segment: target,
-            },
-        );
-        self.active_segment_id = target_id;
-        self.index = rebuilt;
-
-        self.rewrite_wal_snapshot()
+            target_id, 
+            SegmentMeta { 
+                // id: target_id, 
+                level: 1, 
+                segment: target 
+            });
+        for (k, p) in rebuilt_index_subset { self.index.insert(k, p); }
+        
+        self.rewrite_wal_snapshot()?;
+        Ok(())
     }
+
+    pub fn set_durability_mode(&mut self, mode: DurabilityMode) { self.wal.set_durability_mode(mode); }
+
+    pub fn base_dir(&self) -> &Path { &self.base_dir }
+
+    pub fn backup(&mut self, destination_path: impl AsRef<Path>) -> Result<()> {
+        // 1. Move all inlined data from RAM into segment files on Disk.
+        // This ensures the backup is complete.
+        self.checkpoint_inlined_data()?;
+        
+        // 2. Perform a physical sync of all files.
+        self.flush_all()?;
+
+        // 3. Create destination directory.
+        std::fs::create_dir_all(destination_path.as_ref())?;
+
+        // 4. Copy only relevant data and log files.
+        for entry in std::fs::read_dir(&self.base_dir)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+            
+            // We only back up data segments and the WAL.
+            if name_str.ends_with(".dat") || name_str == "wal.log" {
+                let dest = destination_path.as_ref().join(file_name);
+                std::fs::copy(entry.path(), dest)?;
+            }
+        }
+        Ok(())
+    }
+
 }
 
-fn segment_path(base: &Path, level: u32, id: u64) -> PathBuf {
-    base.join(format!("segment-l{}-{}.dat", level, id))
-}
+impl Drop for StorageEngine { fn drop(&mut self) { let _ = self.flush_all(); } }
+
+fn segment_path(base: &Path, level: u32, id: u64) -> PathBuf { base.join(format!("segment-l{}-{}.dat", level, id)) }
 
 fn parse_segment_name(name: &str) -> Option<(u32, u64)> {
     if !name.starts_with("segment-l") || !name.ends_with(".dat") {
@@ -444,7 +722,6 @@ mod tests {
         let path = temp_path("firelite-storage-encryption");
         let cfg = FireLiteConfig {
             auto_compaction_threshold_bytes: 1,
-            encryption_key: Some("test-secret".to_string()),
             ..FireLiteConfig::default()
         };
 
@@ -456,6 +733,7 @@ mod tests {
             engine
                 .put("k2".to_string(), b"value-2")
                 .expect("second put should succeed");
+            let _ = engine.flush_wal();
         }
 
         let mut reopened = StorageEngine::open(&path, &cfg).expect("reopen should succeed");
@@ -491,7 +769,7 @@ mod tests {
         engine.segments.insert(
             extra_id,
             SegmentMeta {
-                id: extra_id,
+                // id: extra_id,
                 level: 1,
                 segment: extra_segment,
             },

@@ -12,6 +12,7 @@ impl Allocator {
     }
 
     pub fn allocate(&self, size: usize) -> usize {
-        self.offset.fetch_add(size, Ordering::SeqCst)
+        // self.offset.fetch_add(size, Ordering::SeqCst)
+        self.offset.fetch_add(size, Ordering::Relaxed)
     }
 }

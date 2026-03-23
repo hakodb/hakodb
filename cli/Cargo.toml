@@ -1,0 +1,12 @@
+[package]
+name = "firelite-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Point to the folder where your engine code is
+firelite = { path = "../" } 
+
+# Required for the REST-like logic
+serde_json = "1.0"
+rand = "0.8"

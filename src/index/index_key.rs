@@ -26,5 +26,20 @@ pub fn encode_scalar(value: &Value) -> Vec<u8> {
             out.extend(v);
             out
         }
+        Value::Timestamp(v) => {
+            let mut out = vec![6];
+            out.extend(v.to_be_bytes());
+            out
+        }
+        Value::ServerTimestamp => vec![0], // Fallback to Null
+        Value::Map(_) => vec![8],
+        Value::Array(_) => vec![9],
+        Value::Reference { collection, doc_id } => {
+            let mut b = vec![10]; // Tag 10
+            b.extend_from_slice(collection.as_bytes());
+            b.push(b':');
+            b.extend_from_slice(doc_id.as_bytes());
+            b
+        },
     }
 }

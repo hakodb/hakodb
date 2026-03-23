@@ -1,3 +1,5 @@
+use smallvec::SmallVec;
+
 use crate::document::value::Value;
 
 use super::filter::Filter;
@@ -10,6 +12,10 @@ pub enum ScanType {
         fields: Vec<String>,
         values: Vec<Value>,
     },
+    CursorIndex { start_key: SmallVec<[u8; 32]> },
+    SecondaryIndex { field: String, value: Vec<u8> },
+    UnionIndex { scans: Vec<ScanType> },
+    InvertedIndex { field: String, query: String },
 }
 
 #[derive(Debug, Clone)]
@@ -17,6 +23,9 @@ pub struct QueryPlan {
     pub collection: String,
     pub scan: ScanType,
     pub filters: Vec<Filter>,
+    pub or_groups: Vec<Vec<crate::query::filter::Filter>>, // <--- ADD THIS
     pub order_by: Option<OrderBy>,
     pub limit: Option<usize>,
+    pub offset: Option<usize>, 
+    pub projection: Vec<String>,
 }
