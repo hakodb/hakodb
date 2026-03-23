@@ -1,12 +1,22 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
-use super::page::Page;
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct BlockKey {
+    pub segment_id: u64,
+    pub offset: u64,
+}
+
+#[derive(Debug)] // <--- ADD THIS
+pub struct ProcessedBlock {
+    pub data: Arc<Vec<u8>>,
+}
 
 #[derive(Debug)]
 pub struct PageCache {
     capacity: usize,
-    order: VecDeque<u64>,
-    pages: HashMap<u64, Page>,
+    order: VecDeque<BlockKey>,
+    blocks: HashMap<BlockKey, ProcessedBlock>,
 }
 
 impl PageCache {
@@ -14,29 +24,28 @@ impl PageCache {
         Self {
             capacity,
             order: VecDeque::new(),
-            pages: HashMap::new(),
+            blocks: HashMap::new(),
         }
     }
 
-    pub fn get(&mut self, id: u64) -> Option<Page> {
-        if let Some(pos) = self.order.iter().position(|v| *v == id) {
-            self.order.remove(pos);
-            self.order.push_back(id);
+    pub fn get(&mut self, key: &BlockKey) -> Option<Arc<Vec<u8>>> {
+        if self.blocks.contains_key(key) {
+            if let Some(pos) = self.order.iter().position(|k| k == key) {
+                let k = self.order.remove(pos).unwrap();
+                self.order.push_back(k);
+            }
+            return Some(Arc::clone(&self.blocks.get(key).unwrap().data));
         }
-        self.pages.get(&id).cloned()
+        None
     }
 
-    pub fn put(&mut self, page: Page) {
-        if self.pages.contains_key(&page.id) {
-            self.order.retain(|id| *id != page.id);
-        }
-        self.order.push_back(page.id);
-        self.pages.insert(page.id, page);
-
-        if self.pages.len() > self.capacity {
+    pub fn put(&mut self, key: BlockKey, data: Vec<u8>) {
+        if self.blocks.len() >= self.capacity {
             if let Some(victim) = self.order.pop_front() {
-                self.pages.remove(&victim);
+                self.blocks.remove(&victim);
             }
         }
+        self.order.push_back(key.clone());
+        self.blocks.insert(key, ProcessedBlock { data: Arc::new(data) });
     }
 }

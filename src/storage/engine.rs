@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{FireLiteConfig, DurabilityMode};
 use crate::error::{FireLiteError, Result};
+use std::sync::{Arc, Mutex}; // <--- ADD THIS
+use crate::memory::page_cache::PageCache; 
 
 use super::compaction::compact_segment;
 use super::crypto::EncryptionContext;
@@ -47,9 +49,13 @@ pub struct StorageEngine {
     use_compression: bool, 
     // collection_counts: HashMap<String, usize>, 
     pub(crate) collection_counts: HashMap<String, usize>,
+    pub cache: Arc<Mutex<PageCache>>,
+    pub mmap_size: usize, 
 }
 
 impl StorageEngine {
+    // src/storage/engine.rs
+
     pub fn open(base_dir: impl AsRef<Path>, cfg: &FireLiteConfig) -> Result<Self> {
         std::fs::create_dir_all(base_dir.as_ref())?;
 
@@ -57,6 +63,9 @@ impl StorageEngine {
             .encryption_key
             .as_ref()
             .map(|secret| EncryptionContext::from_secret(secret));
+
+        // 1. Initialize the Shared Decompression Cache FIRST
+        let cache = Arc::new(Mutex::new(PageCache::new(cfg.page_cache_capacity)));
 
         let wal = Wal::open(
             base_dir.as_ref().join("wal.log"),
@@ -69,42 +78,45 @@ impl StorageEngine {
         let mut max_id = 0;
         let mut active_segment_id = 0;
 
+        // 2. Load existing segments using the cache and mmap_size
         for entry in std::fs::read_dir(base_dir.as_ref())? {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if let Some((level, id)) = parse_segment_name(&name) {
-                let segment = Segment::open(entry.path(), encryption.clone())?;
-                segments.insert(
-                    id, SegmentMeta { 
-                        // id, 
-                        level, 
-                        segment 
-                    });
-                if id > max_id {
-                    max_id = id;
-                }
-                if id >= active_segment_id {
-                    active_segment_id = id;
-                }
+                // UPDATED: Now passes id, cache, and mmap_size
+                let segment = Segment::open(
+                    entry.path(), 
+                    id, 
+                    encryption.clone(), 
+                    Arc::clone(&cache), 
+                    cfg.mmap_size
+                )?;
+                
+                segments.insert(id, SegmentMeta { level, segment });
+                if id > max_id { max_id = id; }
+                if id >= active_segment_id { active_segment_id = id; }
             }
         }
 
+        // 3. Handle fresh install (empty directory)
         if segments.is_empty() {
             let path = segment_path(base_dir.as_ref(), 0, 0);
-            let segment = Segment::open(path, encryption.clone())?;
-            segments.insert(
-                0,
-                SegmentMeta {
-                    // id: 0,
-                    level: 0,
-                    segment,
-                },
-            );
+            // UPDATED: Now passes id (0), cache, and mmap_size
+            let segment = Segment::open(
+                path, 
+                0, 
+                encryption.clone(), 
+                Arc::clone(&cache), 
+                cfg.mmap_size
+            )?;
+            
+            segments.insert(0, SegmentMeta { level: 0, segment });
             max_id = 0;
             active_segment_id = 0;
         }
 
+        // 4. Initialize the Engine
         let mut engine = Self {
             base_dir: base_dir.as_ref().to_path_buf(),
             segments,
@@ -116,11 +128,13 @@ impl StorageEngine {
             compaction_threshold_bytes: cfg.auto_compaction_threshold_bytes,
             encryption,
             use_compression: cfg.use_compression,
-            // ADD THESE TWO LINES:
             inlined_bytes: 0, 
             max_inlined_bytes: cfg.max_inlined_memory_bytes,
             collection_counts: HashMap::new(),
+            cache, // Pass the initialized Arc
+            mmap_size: cfg.mmap_size,
         };
+
         engine.recover()?;
         Ok(engine)
     }
@@ -164,9 +178,9 @@ impl StorageEngine {
             if let Some(ref col) = collection_name {
                 if let Some(count) = self.collection_counts.get_mut(col) {
                     *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        self.collection_counts.remove(col); // Collection officially "dies"
-                    }
+                    // if *count == 0 {
+                    //     self.collection_counts.remove(col); // Collection officially "dies"
+                    // }
                 }
             }
         }
@@ -206,10 +220,19 @@ impl StorageEngine {
         let target_id = self.next_segment_id;
         self.next_segment_id += 1;
         let target_path = segment_path(&self.base_dir, 0, target_id);
-        let mut target_segment = Segment::open(target_path, self.encryption.clone())?;
 
-        let mut new_pointers = HashMap::new();
-        compact_segment(
+        let mut target_segment = Segment::open(
+            target_path, 
+            target_id, 
+            self.encryption.clone(), 
+            Arc::clone(&self.cache), 
+            self.mmap_size
+        )?;
+
+        // RENAME TO MATCH THE LOOP BELOW
+        let mut new_pointers = HashMap::new(); 
+        
+        crate::storage::compaction::compact_segment(
             &mut target_segment, 
             &to_flush, 
             &mut new_pointers, 
@@ -367,8 +390,15 @@ impl StorageEngine {
         let new_id = self.next_segment_id;
         self.next_segment_id += 1;
         let path = segment_path(&self.base_dir, 0, new_id);
-        let encryption = self.encryption.clone();
-        let segment = Segment::open(path, encryption)?;
+        // let encryption = self.encryption.clone();
+        // FIX: Add missing 3 arguments
+        let segment = Segment::open(
+            path, 
+            new_id, 
+            self.encryption.clone(), 
+            Arc::clone(&self.cache), 
+            self.mmap_size
+        )?;
         self.segments.insert(
             new_id,
             SegmentMeta {
@@ -417,7 +447,15 @@ impl StorageEngine {
 
         // 3. Perform merge with Compression support
         let target_path = segment_path(&self.base_dir, target_level, target_id);
-        let mut target = Segment::open(target_path, self.encryption.clone())?;
+        // let mut target = Segment::open(target_path, self.encryption.clone())?;
+        // FIX: Add missing 3 arguments
+        let mut target = Segment::open(
+            target_path, 
+            target_id, 
+            self.encryption.clone(), 
+            Arc::clone(&self.cache), 
+            self.mmap_size
+        )?;
         let mut new_index_subset = HashMap::new();
 
         // FIX: Pass self.use_compression here!
@@ -539,7 +577,15 @@ impl StorageEngine {
             let new_id = self.next_segment_id;
             self.next_segment_id += 1;
             let path = segment_path(&self.base_dir, 0, new_id);
-            let segment = Segment::open(path, self.encryption.clone())?;
+            // let segment = Segment::open(path, self.encryption.clone())?;
+            // FIX: Add missing 3 arguments
+            let segment = Segment::open(
+                path, 
+                new_id, 
+                self.encryption.clone(), 
+                Arc::clone(&self.cache), 
+                self.mmap_size
+            )?;
             self.segments.insert(
                 new_id, 
                 SegmentMeta { 
@@ -572,7 +618,15 @@ impl StorageEngine {
         let target_id = self.next_segment_id;
         self.next_segment_id += 1;
         let target_path = segment_path(&self.base_dir, 1, target_id);
-        let mut target = Segment::open(target_path, self.encryption.clone())?;
+        // let mut target = Segment::open(target_path, self.encryption.clone())?;
+        // FIX: Add missing 3 arguments
+        let mut target = Segment::open(
+            target_path, 
+            target_id, 
+            self.encryption.clone(), 
+            Arc::clone(&self.cache), 
+            self.mmap_size
+        )?;
         let mut rebuilt_index_subset = HashMap::new();
 
         compact_segment(&mut target, &entries, &mut rebuilt_index_subset, target_id, self.use_compression)?;

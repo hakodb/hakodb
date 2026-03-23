@@ -7,7 +7,6 @@ const VERSION: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FireLiteDoc {
-    // pub fields: BTreeMap<String, Value>,
     pub fields: Vec<(String, Value)>,
 }
 
@@ -144,6 +143,15 @@ impl<'a> FireLiteDocView<'a> {
             pos: self.pos,
             remaining: self.fields,
         }
+    }
+
+    pub fn get_field_value(&self, target_key: &str) -> Option<BorrowedValue<'a>> {
+        for (key, val) in self.iter() {
+            if key == target_key {
+                return Some(val);
+            }
+        }
+        None
     }
 }
 

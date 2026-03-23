@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use hashbrown::HashMap; 
 
 use crate::config::FireLiteConfig;
-use crate::document::firelite_doc::{FireLiteDoc, FireLiteDocView};
+use crate::document::firelite_doc::FireLiteDoc;
 use crate::document::value::Value; 
 use crate::error::{FireLiteError, Result};
 use crate::index::composite::definition::{CompositeIndexDefinition, SortDirection};
@@ -19,6 +19,8 @@ use crate::query::executor::executor::ParallelQueryExecutor;
 use crate::query::planner::QueryPlanner;
 use crate::query::query::Query;
 use crate::storage::engine::{StorageEngine, StorageMutation};
+
+use crate::util::lock::SafeLock; 
 
 // --- Data Types ---
 
@@ -137,8 +139,15 @@ impl FireLite {
             while let Ok(op) = index_rx.recv() {
                 match op {
                     IndexOp::Update { collection, puts, deletes } => {
-                        let mut mgr = idx_clone.write().unwrap();
-                        let mut persist = storage_persist.lock().unwrap();
+
+                        let mut mgr = match idx_clone.write() {
+                            Ok(guard) => guard,
+                            Err(_) => break, 
+                        };
+                        let mut persist = match storage_persist.lock() {
+                            Ok(guard) => guard,
+                            Err(_) => break,
+                        };
 
                         for (id, doc) in puts {
                             mgr.index_document(&collection, &id, &doc);
@@ -413,11 +422,19 @@ impl FireLite {
         }
         
         let shard = self.get_shard(collection);
-        let key = doc_key(collection, doc_id);
-        let res = shard.read().unwrap().get(&key)?.and_then(|b| FireLiteDoc::decode(&b));
+        // SAFE LOCKING: Replace shard.read().unwrap()
+        let storage = shard.safe_read()?; 
+        // let key = doc_key(collection, doc_id);
+        // let res = shard.read().unwrap().get(&key)?.and_then(|b| FireLiteDoc::decode(&b));
+        let res = storage.get(&doc_key(collection, doc_id))?.and_then(|b| FireLiteDoc::decode(&b));
         
         // AUDIT SUCCESS
-        self.record_audit(AuditEntry { op: AccessOp::Get, collection: collection.into(), doc_id: Some(doc_id.into()), ok: true });
+        self.record_audit(AuditEntry { 
+            op: AccessOp::Get, 
+            collection: collection.into(), 
+            doc_id: Some(doc_id.into()), 
+            ok: true 
+        });
         Ok(res)
     }
 
@@ -430,12 +447,19 @@ impl FireLite {
             self.record_audit(AuditEntry { op: AccessOp::Query, collection: query.collection.clone(), doc_id: None, ok: false });
             return Err(FireLiteError::Corrupt("Denied".into())); 
         }
-        
         let shard = self.get_shard(&query.collection);
         let storage = shard.read().unwrap();
+
         let indexes = self.indexes.read().unwrap();
         let rows = storage.count_prefix(&format!("{}:", query.collection));
-        let plan = QueryPlanner::plan(&query, &indexes, rows);
+        
+        // UPDATED: Pass self.config.query_workers
+        let plan = QueryPlanner::plan(
+            &query, 
+            &indexes, 
+            rows, 
+            self.config.query_workers
+        );
         
         let res = self.executor.execute(&storage, &indexes, plan);
         
@@ -445,26 +469,36 @@ impl FireLite {
     }
 
     pub fn query_projected_zero_copy(&self, query: Query, fields: &[String]) -> Result<Vec<(String, Vec<(String, Value)>)>> {
-        let shard = self.get_shard(&query.collection);
+        // 1. Security Check
+        if !self.allowed(&query.collection, AccessOp::Query) {
+            self.record_audit(AuditEntry { op: AccessOp::Query, collection: query.collection.clone(), doc_id: None, ok: false });
+            return Err(FireLiteError::Corrupt("Denied".into()));
+        }
+        
+        // 2. Prepare Query with Projection
+        let mut q = query;
+        q.projection = fields.to_vec();
+
+        // 3. Acquire Locks
+        let shard = self.get_shard(&q.collection);
         let storage = shard.read().unwrap();
-        let docs = storage.scan_prefix(&format!("{}:", query.collection))?;
-        let mut out = Vec::new();
-        for (id, raw) in docs {
-            if matches_filters_borrowed(&raw, &query.filters) {
-                let projected = project_fields_borrowed(&raw, fields);
-                let order_val = query.order_by.as_ref().and_then(|o| extract_field_value_borrowed(&raw, &o.field));
-                out.push((id, projected, order_val));
-            }
-        }
-        if let Some(order) = &query.order_by {
-            // Add this type hint to the closure parameter
-            out.sort_by(|(_, _, av): &(String, Vec<(String, Value)>, Option<Value>), (_, _, bv)| {
-                av.cmp(&bv)
-            });
-            if !order.ascending { out.reverse(); }
-        }
-        if let Some(limit) = query.limit { out.truncate(limit); }
-        Ok(out.into_iter().map(|(id, proj, _)| (id, proj)).collect())
+        let indexes = self.indexes.read().unwrap();
+        
+        // 4. Plan & Execute
+        let rows = storage.count_prefix(&format!("{}:", q.collection));
+        let plan = QueryPlanner::plan(&q, &indexes, rows, self.config.query_workers);
+        
+        let res = self.executor.execute_projected(&storage, &indexes, plan);
+        
+        // 5. Audit & Return
+        self.record_audit(AuditEntry { 
+            op: AccessOp::Query, 
+            collection: q.collection.clone(), 
+            doc_id: None, 
+            ok: res.is_ok() 
+        });
+        
+        res
     }
 
     pub fn patch(&self, col: &str, id: &str, updates: Vec<(String, Value)>) -> Result<()> {
@@ -560,7 +594,9 @@ impl FireLite {
         let storage = shard.read().unwrap();
         let indexes = self.indexes.read().unwrap();
         let rows = storage.count_prefix(&format!("{}:", query.collection));
-        let plan = QueryPlanner::plan(&query, &indexes, rows);
+        
+        // FIX: Add self.config.query_workers as the 4th argument
+        let plan = QueryPlanner::plan(&query, &indexes, rows, self.config.query_workers);
         
         let res = self.executor.execute_aggregation(&storage, &indexes, plan, &query.aggregations);
         
@@ -694,6 +730,32 @@ impl FireLite {
         persist.snapshot(1).map_err(|e| FireLiteError::Io(e))?;
         Ok(())
     }
+
+    pub fn create_fts_index(&self, collection: &str, field: &str) -> Result<()> {
+        // 1. Register
+        self.indexes.write().unwrap().create_fts_index(collection, field);
+
+        // 2. Backfill from disk
+        let shard = self.get_shard(collection);
+        let storage = shard.read().unwrap();
+        let entries = storage.scan_prefix(&format!("{}:", collection))?;
+
+        let mut mgr = self.indexes.write().unwrap();
+        if let Some(fields) = mgr.fts.get_mut(collection) {
+            if let Some(index) = fields.get_mut(field) {
+                for (full_key, bytes) in entries {
+                    if let Some(doc) = FireLiteDoc::decode(&bytes) {
+                        if let Some(Value::String(text)) = doc.get(field) {
+                            if let Some((_, doc_id)) = full_key.split_once(':') {
+                                index.insert(text, doc_id.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 
@@ -737,32 +799,32 @@ impl Drop for FireLite {
 fn doc_key(collection: &str, doc_id: &str) -> String { format!("{}:{}", collection, doc_id) }
 fn subcollection_prefix(collection: &str, doc_id: &str, subcollection: &str) -> String { format!("{}:{}/{}", collection, doc_id, subcollection) }
 
-fn extract_field_value_borrowed(raw: &[u8], field: &str) -> Option<Value> {
-    let view = FireLiteDocView::new(raw)?;
-    for (k, v) in view.iter() { if k == field { return v.to_owned_value(); } }
-    None
-}
+// fn extract_field_value_borrowed(raw: &[u8], field: &str) -> Option<Value> {
+//     let view = FireLiteDocView::new(raw)?;
+//     for (k, v) in view.iter() { if k == field { return v.to_owned_value(); } }
+//     None
+// }
 
-fn matches_filters_borrowed(raw: &[u8], filters: &[crate::query::filter::Filter]) -> bool {
-    if filters.is_empty() { return true; }
-    let Some(view) = crate::document::firelite_doc::FireLiteDocView::new(raw) else { return false; };
-    filters.iter().all(|f| {
-        let mut matched = None;
-        for (k, v) in view.iter() { if k == f.field { matched = v.to_owned_value(); break; } }
-        matched.as_ref().map(|v| crate::query::filter::compare_values(v, &f.op, &f.value)).unwrap_or(false)
-    })
-}
+// fn matches_filters_borrowed(raw: &[u8], filters: &[crate::query::filter::Filter]) -> bool {
+//     if filters.is_empty() { return true; }
+//     let Some(view) = crate::document::firelite_doc::FireLiteDocView::new(raw) else { return false; };
+//     filters.iter().all(|f| {
+//         let mut matched = None;
+//         for (k, v) in view.iter() { if k == f.field { matched = v.to_owned_value(); break; } }
+//         matched.as_ref().map(|v| crate::query::filter::compare_values(v, &f.op, &f.value)).unwrap_or(false)
+//     })
+// }
 
-fn project_fields_borrowed(raw: &[u8], fields: &[String]) -> Vec<(String, Value)> {
-    let mut out = Vec::new();
-    let Some(view) = crate::document::firelite_doc::FireLiteDocView::new(raw) else { return out; };
-    for (k, v) in view.iter() {
-        if fields.is_empty() || fields.iter().any(|f| f == k) {
-            if let Some(value) = v.to_owned_value() { out.push((k.to_string(), value)); }
-        }
-    }
-    out
-}
+// fn project_fields_borrowed(raw: &[u8], fields: &[String]) -> Vec<(String, Value)> {
+//     let mut out = Vec::new();
+//     let Some(view) = crate::document::firelite_doc::FireLiteDocView::new(raw) else { return out; };
+//     for (k, v) in view.iter() {
+//         if fields.is_empty() || fields.iter().any(|f| f == k) {
+//             if let Some(value) = v.to_owned_value() { out.push((k.to_string(), value)); }
+//         }
+//     }
+//     out
+// }
 
 
 

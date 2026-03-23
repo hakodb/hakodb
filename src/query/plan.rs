@@ -15,6 +15,7 @@ pub enum ScanType {
     CursorIndex { start_key: SmallVec<[u8; 32]> },
     SecondaryIndex { field: String, value: Vec<u8> },
     UnionIndex { scans: Vec<ScanType> },
+    InvertedIndex { field: String, query: String },
 }
 
 #[derive(Debug, Clone)]

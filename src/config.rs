@@ -26,12 +26,12 @@ pub struct FireLiteConfig {
 impl Default for FireLiteConfig {
     fn default() -> Self {
         Self {
-            mmap_size: 64 * 1024 * 1024,
+            mmap_size: 256 * 1024 * 1024,
             page_size: 4096,
-            page_cache_capacity: 512,
+            page_cache_capacity: 1024,
             query_workers: 4,
-            auto_compaction_threshold_bytes: 256 * 1024 * 1024,
-            durability_mode: DurabilityMode::Always,
+            auto_compaction_threshold_bytes: 8 * 1024 * 1024,
+            durability_mode: DurabilityMode::Interval,
             group_commit_max_ops: 128,
             encryption_key: None,
             enable_audit_log: true,

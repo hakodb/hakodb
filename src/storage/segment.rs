@@ -1,7 +1,10 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
+use crate::memory::mmap_store::MmapStore;
+use crate::memory::page_cache::{BlockKey, PageCache};
 use crate::error::{FireLiteError, Result};
 use super::crypto::EncryptionContext;
 
@@ -11,21 +14,40 @@ use std::os::unix::fs::FileExt;
 use std::os::windows::fs::FileExt;
 
 pub struct Segment {
+    pub store: Arc<MmapStore>, 
+    pub segment_id: u64,
+    pub cache: Arc<Mutex<PageCache>>, 
+
     file: Option<File>,
     path: PathBuf,
-    pub(crate) encryption: Option<EncryptionContext>, // Made pub(crate) for compaction access
+    pub(crate) encryption: Option<EncryptionContext>,
     write_buffer: Vec<u8>,
 }
 
 impl Segment {
-    pub fn open(path: impl AsRef<Path>, encryption: Option<EncryptionContext>) -> Result<Self> {
+    pub fn open(
+        path: impl AsRef<Path>, 
+        segment_id: u64,
+        encryption: Option<EncryptionContext>,
+        cache: Arc<Mutex<PageCache>>,
+        mmap_size: usize,
+    ) -> Result<Self> {
         let path_buf = path.as_ref().to_path_buf();
+        
+        // 1. Open File handle for WRITES (Durability)
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .open(&path_buf)?;
+
+        // 2. Open MmapStore for READS (Performance)
+        let store = Arc::new(MmapStore::open(&path_buf, mmap_size)?);
+
         Ok(Self {
+            store,
+            segment_id,
+            cache,
             file: Some(file),
             path: path_buf,
             encryption,
@@ -33,7 +55,6 @@ impl Segment {
         })
     }
 
-    /// Primary append used by standard writes (Uncompressed path)
     pub fn append(&mut self, value: &[u8]) -> Result<(u64, u32)> {
         let mut results = self.append_batch(&[value])?;
         Ok(results.pop().unwrap())
@@ -56,7 +77,6 @@ impl Segment {
             } else {
                 value.to_vec()
             };
-            // Standard append: bit 31 is 0 (uncompressed)
             self.write_buffer.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             self.write_buffer.extend_from_slice(&payload);
             results.push((current_offset, payload.len() as u32));
@@ -67,14 +87,11 @@ impl Segment {
         Ok(results)
     }
 
-    /// Internal helper used by Compaction to write data with specific bit-flags
     pub(crate) fn append_raw_with_len(&mut self, payload: &[u8], stored_len: u32) -> Result<u64> {
         let afile = self.file.as_mut().unwrap();
         let offset = afile.seek(SeekFrom::End(0))?;
-        
         afile.write_all(&stored_len.to_le_bytes())?;
         afile.write_all(payload)?;
-        
         Ok(offset)
     }
 
@@ -84,33 +101,48 @@ impl Segment {
     }
 
     pub fn read_at(&self, offset: u64, stored_len: u32) -> Result<Vec<u8>> {
-        let f = self.file.as_ref().unwrap();
-        
-        // 1. Extract the compression bit (bit 31) and the actual data length
+        let cache_key = BlockKey { segment_id: self.segment_id, offset };
+
+        // 1. HIT: Check Processed Cache (Plaintext, Decompressed)
+        {
+            let mut cache = self.cache.lock().unwrap();
+            if let Some(data) = cache.get(&cache_key) {
+                return Ok((*data).clone());
+            }
+        }
+
+        // 2. MISS: Read from Mmap (Zero syscalls)
         let is_compressed = (stored_len >> 31) == 1;
-        let actual_payload_len = stored_len & 0x7FFFFFFF;
-
-        let total_to_read = 4 + actual_payload_len as usize;
-        let mut buffer = vec![0u8; total_to_read];
-
-        // 2. Atomic Positional Read
-        #[cfg(windows)]
-        f.seek_read(&mut buffer, offset)?;
-        #[cfg(unix)]
-        f.read_at(&mut buffer, offset)?;
-
-        // Byte 4 onwards is the payload (encrypted and/or compressed)
+        let actual_payload_len = (stored_len & 0x7FFFFFFF) as usize;
+        let total_len = 4 + actual_payload_len;
+        
+        let buffer = if offset + total_len as u64 <= self.store.size as u64 {
+            // Use Mmap for data that existed when segment was opened
+            self.store.read_slice(offset as usize, total_len)
+        } else {
+            // Fallback to standard File I/O for data appended during this session
+            let mut buf = vec![0u8; total_len];
+            let f = self.file.as_ref().ok_or_else(|| FireLiteError::StorageError("File closed".into()))?;
+            #[cfg(windows)] f.seek_read(&mut buf, offset)?;
+            #[cfg(unix)] f.read_at(&mut buf, offset)?;
+            buf
+        };
         let mut out = buffer[4..].to_vec();
 
-        // 3. Decrypt first (standard security: Encrypt-then-Compress is avoided)
+        // 3. Process (Decrypt -> Decompress)
         if let Some(enc) = &self.encryption {
             out = enc.decrypt(&out)?;
         }
 
-        // 4. Decompress if the flag was set
         if is_compressed {
             out = zstd::decode_all(&out[..])
-                .map_err(|e| FireLiteError::StorageError(format!("Decompression failed: {}", e)))?;
+                .map_err(|e| FireLiteError::StorageError(format!("Zstd fail: {}", e)))?;
+        }
+
+        // 4. CACHE result for the next access
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.put(cache_key, out.clone());
         }
 
         Ok(out)

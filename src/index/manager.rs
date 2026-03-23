@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use super::composite::definition::CompositeIndexDefinition;
 use super::composite::manager::CompositeIndexManager;
+use super::inverted_index::InvertedIndex;
 use crate::index::composite::composite_index::CompositeIndex;
 use crate::index::secondary_index::SecondaryIndex;
 
@@ -12,9 +13,15 @@ use crate::index::secondary_index::SecondaryIndex;
 pub struct IndexManager {
     pub composite: CompositeIndexManager,
     pub secondary: HashMap<String, HashMap<String, SecondaryIndex>>,
+    pub fts: HashMap<String, HashMap<String, InvertedIndex>>, 
 }
 
 impl IndexManager {
+    pub fn create_fts_index(&mut self, collection: &str, field: &str) {
+        self.fts.entry(collection.to_string())
+            .or_default()
+            .insert(field.to_string(), InvertedIndex::default());
+    }
 
     pub fn indexes_for_collection(&self, collection: &str) -> impl Iterator<Item = &CompositeIndex> {
         self.composite.indexes_for_collection(collection)
@@ -49,6 +56,14 @@ impl IndexManager {
 
     pub fn index_document(&mut self, collection: &str, doc_id: &str, doc: &FireLiteDoc) {
         self.composite.index_document(collection, doc_id, doc);
+        // Update FTS Indexes
+        if let Some(fields) = self.fts.get_mut(collection) {
+            for (field_name, index) in fields.iter_mut() {
+                if let Some(Value::String(text)) = doc.get(field_name) {
+                    index.insert(text, doc_id.to_string());
+                }
+            }
+        }
     }
 
     pub fn index_batch<'a, I>(&mut self, collection: &str, docs: I)

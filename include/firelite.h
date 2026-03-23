@@ -179,6 +179,8 @@ uint32_t fl_engine_create_index(FL_Engine *engine, const char *collection, const
 /// Simplified indexer: Create an index for a single field.
 int32_t fl_engine_create_simple_index(FL_Engine *engine, const char *collection, const char *field);
 
+int32_t fl_engine_create_fts_index(FL_Engine *engine, const char *collection, const char *field);
+
 FL_Transaction *fl_transaction_begin(FL_Engine *engine);
 
 FL_Doc *fl_transaction_get(FL_Engine *engine,

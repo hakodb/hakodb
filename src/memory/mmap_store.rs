@@ -5,38 +5,61 @@ use memmap2::{MmapMut, MmapOptions};
 use crate::error::Result;
 
 pub struct MmapStore {
-    mmap: RwLock<MmapMut>,
+    mmap: Option<RwLock<MmapMut>>,
     pub size: usize,
 }
 
 impl MmapStore {
-    pub fn open<P: AsRef<Path>>(path: P, size: usize) -> Result<Self> {
+    pub fn open<P: AsRef<Path>>(path: P, _size: usize) -> Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .open(path)?;
-        file.set_len(size as u64)?;
-        let mmap = unsafe { MmapOptions::new().len(size).map_mut(&file)? };
+
+        let metadata = file.metadata()?;
+        let len = metadata.len() as usize;
+
+        if len == 0 {
+            return Ok(Self {
+                mmap: None,
+                size: 0,
+            });
+        }
+
+        let mmap = unsafe { MmapOptions::new().len(len).map_mut(&file)? };
+        
         Ok(Self {
-            mmap: RwLock::new(mmap),
-            size,
+            mmap: Some(RwLock::new(mmap)),
+            size: len,
         })
     }
 
     pub fn read_slice(&self, offset: usize, len: usize) -> Vec<u8> {
-        let mmap = self.mmap.read().expect("mmap read lock poisoned");
+        let Some(ref mmap_lock) = self.mmap else { return vec![0; len]; };
+        let mmap = mmap_lock.read().expect("mmap lock poisoned");
+        
+        // Bounds check to prevent crashing on growing files
+        if offset + len > mmap.len() {
+            return vec![0; len];
+        }
         mmap[offset..offset + len].to_vec()
     }
 
     pub fn write_slice(&self, offset: usize, data: &[u8]) {
-        let mut mmap = self.mmap.write().expect("mmap write lock poisoned");
-        mmap[offset..offset + data.len()].copy_from_slice(data);
+        if let Some(ref mmap_lock) = self.mmap {
+            let mut mmap = mmap_lock.write().expect("mmap write lock poisoned");
+            if offset + data.len() <= mmap.len() {
+                mmap[offset..offset + data.len()].copy_from_slice(data);
+            }
+        }
     }
 
     pub fn flush(&self) -> Result<()> {
-        let mmap = self.mmap.read().expect("mmap read lock poisoned");
-        mmap.flush()?;
+        if let Some(ref mmap_lock) = self.mmap {
+            let mmap = mmap_lock.read().expect("mmap read lock poisoned");
+            mmap.flush()?;
+        }
         Ok(())
     }
 }

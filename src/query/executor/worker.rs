@@ -1,6 +1,7 @@
 use crate::document::firelite_doc::{FireLiteDoc, FireLiteDocView};
 
 use super::super::filter::{compare_values, Filter};
+use crate::document::value::Value;
 use super::task::QueryTask;
 
 pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
@@ -8,13 +9,43 @@ pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
     let projection = &task.plan.projection; 
     for (id, bytes) in task.docs {
         if matches_filters_view(&bytes, &task.plan) {
-            // if let Some(doc) = FireLiteDoc::decode(&bytes) {
-            //     out.push((id, doc));
-            // }
+
             // OPTIMIZATION: Use decode_projected instead of decode
             if let Some(doc) = FireLiteDoc::decode_projected(&bytes, projection) {
                 out.push((id, doc));
             }
+        }
+    }
+    out
+}
+
+/// Optimized projected worker: Extracts only requested fields without full doc decoding.
+pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)> {
+    let mut out = Vec::new();
+    let projection = &task.plan.projection;
+
+    for (id, bytes) in task.docs {
+        let Some(view) = FireLiteDocView::new(&bytes) else { continue; };
+
+        // FIX: Removed super::super::worker:: because the function is in this file
+        if matches_filters_view(&bytes, &task.plan) {
+            
+            let mut fields = Vec::with_capacity(projection.len());
+            
+            if projection.is_empty() {
+                if let Some(doc) = crate::document::firelite_doc::FireLiteDoc::decode(&bytes) {
+                    fields = doc.fields;
+                }
+            } else {
+                for field_name in projection {
+                    if let Some(borrowed) = view.get_field_value(field_name) {
+                        if let Some(val) = borrowed.to_owned_value() {
+                            fields.push((field_name.clone(), val));
+                        }
+                    }
+                }
+            }
+            out.push((id, fields));
         }
     }
     out

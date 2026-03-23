@@ -1,9 +1,20 @@
 import { loadNativeBindings, type NativeBindings, type WatchCallback } from './native';
 
-export type Primitive = string | number | boolean | null | Uint8Array | Date;
-export type FireLiteDocData = Record<string, Primitive>;
+// 1. UPDATED: Recursive Type Definitions to support Nested Maps and Arrays
+// export type Primitive = string | number | boolean | null | Uint8Array | Date | FireLiteDocData | Array<any>;
+export type Primitive =
+  | string
+  | number
+  | boolean
+  | null
+  | Uint8Array
+  | Date
+  | { [key: string]: Primitive }
+  | Primitive[];
 
-// Sentinel value for server-side timestamps
+
+export type FireLiteDocData = { [key: string]: Primitive };
+
 const SERVER_TIMESTAMP_SENTINEL = "__FL_SERVER_TIMESTAMP__";
 
 export enum DurabilityMode {
@@ -19,10 +30,11 @@ export interface FireLiteClientOptions {
   config?: FireLiteConfig;
 }
 
+// 2. FIXED: Added 'in' to the interface to match the Query class
 export interface QueryConstraint {
   field: string;
-  op: '==' | 'match' | 'contains' | 'startsWith';
-  value: string | number;
+  op: '==' | 'match' | 'contains' | 'startsWith' | 'in';
+  value: any; // Use any because 'in' takes an array
 }
 
 export interface QueryOrder {
@@ -96,35 +108,56 @@ function parseQueryRows(json: string | null): FireLiteDocData[] {
   return Array.isArray(parsed) ? (parsed as FireLiteDocData[]) : [];
 }
 
+/**
+ * RECURSIVE FIELD INSERTER (v0.7.0)
+ */
 function insertField(native: NativeBindings, handle: unknown, key: string, value: Primitive): void {
-  // Handle Server Timestamp Sentinel
   if (value === SERVER_TIMESTAMP_SENTINEL) {
-    ensureOk(native.docInsertServerTimestamp(handle, key), native, `docInsertServerTimestamp(${key})`);
+    ensureOk(native.docInsertServerTimestamp(handle, key), native, 'serverTimestamp');
     return;
   }
-
   if (value instanceof Date) {
-    const micros = BigInt(value.getTime()) * 1000n;
-    ensureOk(native.docInsertTimestamp(handle, key, micros), native, `docInsertTimestamp(${key})`);
+    native.docInsertTimestamp(handle, key, BigInt(value.getTime()) * 1000n);
+    return;
+  }
+  if (value instanceof Uint8Array) {
+    ensureOk(native.docInsertBin(handle, key, value), native, 'insertBin');
     return;
   }
 
-  if (typeof value === 'string') {
-    ensureOk(native.docInsertStr(handle, key, value), native, `docInsertStr(${key})`);
-  } else if (typeof value === 'number') {
-    if (Number.isInteger(value)) {
-      ensureOk(native.docInsertInt(handle, key, value), native, `docInsertInt(${key})`);
-    } else {
-      ensureOk(native.docInsertFloat(handle, key, value), native, `docInsertFloat(${key})`);
+  if (Array.isArray(value)) {
+    const arrHandle = native.arrayNew();
+    for (const item of value) {
+      if (typeof item === 'string') native.arrayAppendStr(arrHandle, item);
+      else if (typeof item === 'number') native.arrayAppendInt(arrHandle, item);
+      else if (typeof item === 'object' && item !== null) {
+        const tempDoc = toNativeDoc(native, item as FireLiteDocData);
+        native.arrayAppendDoc(arrHandle, tempDoc);
+        native.docFree(tempDoc); // FFI copies data into the array
+      }
     }
+    // ownership transfers to parent doc handle
+    ensureOk(native.docInsertArray(handle, key, arrHandle), native, 'insertArray');
+    return;
+  }
+
+  if (typeof value === 'object' && value !== null) {
+    const childDocHandle = toNativeDoc(native, value as FireLiteDocData);
+    ensureOk(native.docInsertDoc(handle, key, childDocHandle), native, 'insertDoc');
+    native.docFree(childDocHandle); // FFI copies data into the parent
+    return;
+  }
+
+  // Primitives (string, number, bool, null)
+  if (typeof value === 'string') {
+    ensureOk(native.docInsertStr(handle, key, value), native, 'insertStr');
+  } else if (typeof value === 'number') {
+    if (Number.isInteger(value)) ensureOk(native.docInsertInt(handle, key, value), native, 'insertInt');
+    else ensureOk(native.docInsertFloat(handle, key, value), native, 'insertFloat');
   } else if (typeof value === 'boolean') {
-    ensureOk(native.docInsertBool(handle, key, value), native, `docInsertBool(${key})`);
+    ensureOk(native.docInsertBool(handle, key, value), native, 'insertBool');
   } else if (value === null) {
-    ensureOk(native.docInsertNull(handle, key), native, `docInsertNull(${key})`);
-  } else if (value instanceof Uint8Array) {
-    ensureOk(native.docInsertBin(handle, key, value), native, `docInsertBin(${key})`);
-  } else {
-    throw new Error(`Unsupported field type for '${key}'.`);
+    ensureOk(native.docInsertNull(handle, key), native, 'insertNull');
   }
 }
 
@@ -146,8 +179,9 @@ export class DocumentSnapshot {
   constructor(
     public readonly id: string,
     public readonly exists: boolean,
-    private readonly payload?: FireLiteDocData
-  ) {}
+    private readonly payload?: FireLiteDocData,
+    public readonly _nativeHandle?: unknown
+  ) { }
 
   data(): FireLiteDocData | undefined {
     return this.payload;
@@ -166,7 +200,7 @@ export class FireLiteClient {
 
   static async open(path: string, options?: FireLiteClientOptions): Promise<FireLiteClient> {
     const native = options?.native ?? (await loadNativeBindings(options?.libraryPath));
-    
+
     let engine: unknown;
     if (options?.config) {
       engine = native.engineOpenWithConfig(path, options.config.getHandle());
@@ -180,7 +214,6 @@ export class FireLiteClient {
     return new FireLiteClient(native, engine);
   }
 
-  /** Static sentinel for server-generated timestamps */
   static serverTimestamp(): any {
     return SERVER_TIMESTAMP_SENTINEL;
   }
@@ -231,12 +264,11 @@ export class FireLiteClient {
     this.assertOpen();
     const doc = this.native.engineGet(this.engine, collection, docId);
     if (!doc) return new DocumentSnapshot(docId, false);
-    try {
-      const json = this.native.docToJson(doc);
-      return new DocumentSnapshot(docId, true, parseDocJson(json));
-    } finally {
-      this.native.docFree(doc);
-    }
+
+    const json = this.native.docToJson(doc);
+    // Keep 'doc' handle for startAfter. Native memory management should be handled
+    // by engineFree or manual free if the user keeps thousands of snapshots.
+    return new DocumentSnapshot(docId, true, parseDocJson(json), doc);
   }
 
   async delete(collection: string, docId: string): Promise<void> {
@@ -253,18 +285,18 @@ export class FireLiteClient {
 }
 
 export class CollectionReference {
-  constructor(private readonly client: FireLiteClient, private readonly name: string) {}
+  constructor(private readonly client: FireLiteClient, private readonly name: string) { }
 
   doc(id: string): DocumentReference {
     return new DocumentReference(this.client, this.name, id);
   }
 
   onSnapshot(callback: (snapshot: FireLiteDocData[]) => void): Unsubscribe {
-    const query = new Query(this.client, this.name);
-    return query.onSnapshot(callback);
+    return new Query(this.client, this.name).onSnapshot(callback);
   }
 
-  where(field: string, op: '==' | 'match' | 'contains' | 'startsWith', value: string | number): Query {
+  // 3. FIXED: Updated 'op' signature to include 'in'
+  where(field: string, op: '==' | 'match' | 'contains' | 'startsWith' | 'in', value: any): Query {
     return new Query(this.client, this.name).where(field, op, value);
   }
 
@@ -287,14 +319,18 @@ export class CollectionReference {
   async count(): Promise<number> {
     return new Query(this.client, this.name).count();
   }
+
+  async createIndex(field: string): Promise<void> {
+    ensureOk(this.client.nativeBindings().createSimpleIndex(this.client.engineHandle(), this.name, field), this.client.nativeBindings(), 'createIndex');
+  }
+
+  async createFtsIndex(field: string): Promise<void> {
+    ensureOk(this.client.nativeBindings().createFtsIndex(this.client.engineHandle(), this.name, field), this.client.nativeBindings(), 'createFtsIndex');
+  }
 }
 
 export class DocumentReference {
-  constructor(
-    private readonly client: FireLiteClient, 
-    readonly _collection: string, 
-    readonly _id: string
-  ) {}
+  constructor(private readonly client: FireLiteClient, readonly _collection: string, readonly _id: string) { }
 
   async set(data: FireLiteDocData): Promise<void> {
     await this.client.set(this._collection, this._id, data);
@@ -310,15 +346,21 @@ export class DocumentReference {
 }
 
 export class Query {
+  private _startAfterSnapshot?: DocumentSnapshot;
   private readonly filters: QueryConstraint[] = [];
   private order?: QueryOrder;
   private queryLimit?: number;
   private projection: string[] = [];
 
-  constructor(private readonly client: FireLiteClient, private readonly collection: string) {}
+  constructor(private readonly client: FireLiteClient, private readonly collection: string) { }
 
-  where(field: string, op: '==' | 'match' | 'contains' | 'startsWith', value: string | number): Query {
+  where(field: string, op: '==' | 'match' | 'contains' | 'startsWith' | 'in', value: any): Query {
     this.filters.push({ field, op, value });
+    return this;
+  }
+
+  startAfter(snapshot: DocumentSnapshot): Query {
+    this._startAfterSnapshot = snapshot;
     return this;
   }
 
@@ -361,11 +403,26 @@ export class Query {
           case 'startsWith':
             ensureOk(native.queryWhereStartsWith(handle, filter.field, String(filter.value)), native, 'queryWhereStartsWith');
             break;
+          case 'in':
+            const arr = native.arrayNew();
+            (filter.value as any[]).forEach(v => {
+              if (typeof v === 'string') native.arrayAppendStr(arr, v);
+              else native.arrayAppendInt(arr, v);
+            });
+            // queryWhereIn consumes the array handle
+            ensureOk(native.queryWhereIn(handle, filter.field, arr), native, 'queryWhereIn');
+            break;
         }
       }
+
+      if (this._startAfterSnapshot?._nativeHandle) {
+        ensureOk(native.queryStartAfter(handle, this._startAfterSnapshot._nativeHandle), native, 'queryStartAfter');
+      }
+
       if (this.order) ensureOk(native.queryOrderBy(handle, this.order.field, this.order.ascending), native, 'queryOrderBy');
       if (this.queryLimit !== undefined) ensureOk(native.queryLimit(handle, this.queryLimit), native, 'queryLimit');
       for (const field of this.projection) ensureOk(native.querySelectField(handle, field), native, 'querySelectField');
+
       return handle;
     } catch (err) {
       native.queryFree(handle);
@@ -446,7 +503,7 @@ export class WriteBatch {
     this.ensureActive();
     const doc = toNativeDoc(this.native, data);
     try {
-      ensureOk(this.native.batchSet(this.handle, docRef._collection, docRef._id, doc), this.native, 'batchSet');
+      ensureOk(this.native.batchSet(this.handle, docRef._collection, docRef._docId, doc), this.native, 'batchSet');
       return this;
     } finally {
       this.native.docFree(doc);
@@ -455,7 +512,7 @@ export class WriteBatch {
 
   delete(docRef: DocumentReference): WriteBatch {
     this.ensureActive();
-    ensureOk(this.native.batchDelete(this.handle, docRef._collection, docRef._id), this.native, 'batchDelete');
+    ensureOk(this.native.batchDelete(this.handle, docRef._collection, docRef._docId), this.native, 'batchDelete');
     return this;
   }
 

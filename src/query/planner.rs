@@ -8,63 +8,65 @@ use super::query::Query;
 pub struct QueryPlanner;
 
 impl QueryPlanner {
-    pub fn plan(query: &Query, indexes: &IndexManager, collection_rows: usize) -> QueryPlan {
-        // 1. Try to build a Union Scan for OR / IN logic (v0.6.1 Optimization)
-        if !query.or_groups.is_empty() || query.filters.iter().any(|f| matches!(f.op, Operator::In)) {
-            // Call as associated function using Self::
-            if let Some(union_scan) = Self::try_plan_union(query, indexes) {
-                return QueryPlan {
-                    collection: query.collection.clone(),
-                    scan: union_scan,
-                    filters: query.filters.clone(),
-                    or_groups: query.or_groups.clone(),
-                    order_by: query.order_by.clone(),
-                    limit: query.limit,
-                    offset: query.offset,
-                    projection: query.projection.clone(),
-                };
+    pub fn plan(
+        query: &Query, 
+        indexes: &IndexManager, 
+        collection_rows: usize,
+        worker_count: usize // NEW: Consider hardware resources
+    ) -> QueryPlan {
+        for filter in &query.filters {
+            if matches!(filter.op, Operator::Match) {
+                if let Value::String(q_text) = &filter.value {
+                    if indexes.fts.get(&query.collection).map_or(false, |m| m.contains_key(&filter.field)) {
+                        return Self::make_plan(query, ScanType::InvertedIndex { 
+                            field: filter.field.clone(), 
+                            query: q_text.clone() 
+                        });
+                    }
+                }
             }
         }
+        // --- INTELLIGENCE: Cost-Based Heuristic ---
+        // A parallel full scan is extremely fast if we have many workers and few rows.
+        // We calculate if the "work per thread" is low enough to ignore the index.
 
-        // 2. If we have an OrderBy and a Cursor, try to jump!
+        let work_per_thread = collection_rows / worker_count.max(1);
+        
+        // If work per thread is low (e.g., < 1000 docs), 
+        // a parallel full scan is usually faster than index traversal overhead.
+        // let use_index_heuristic = work_per_thread > 800 || collection_rows > 5000;
+        let use_index_heuristic = work_per_thread > 1000 && collection_rows > 15000;
+
+        // 1. Force Index for Cursor/Pagination (Algorithmically necessary)
         if let (Some(order), Some(cursor)) = (&query.order_by, &query.start_after) {
             for idx in indexes.indexes_for_collection(&query.collection) {
                 if idx.definition.fields[0].field == order.field {
                     let start_key = build_cursor_range(&idx.definition, cursor, true);
-                    return QueryPlan {
-                        collection: query.collection.clone(),
-                        scan: ScanType::CursorIndex { start_key },
-                        filters: query.filters.clone(),
-                        or_groups: query.or_groups.clone(),
-                        order_by: query.order_by.clone(),
-                        limit: query.limit,
-                        offset: query.offset, // Carry over requested offset
-                        projection: query.projection.clone(),
-                    };
+                    return Self::make_plan(query, ScanType::CursorIndex { start_key });
                 }
             }
         }
 
-        // 3. Check Secondary Indexes
-        for filter in &query.filters {
-            if matches!(filter.op, Operator::Eq) {
-                if indexes.secondary.get(&query.collection)
-                    .map_or(false, |m| m.contains_key(&filter.field)) 
-                {
-                    let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
-                    return QueryPlan {
-                        collection: query.collection.clone(),
-                        scan: ScanType::SecondaryIndex { 
+        // 2. Try Union/OR/IN Logic
+        if !query.or_groups.is_empty() || query.filters.iter().any(|f| matches!(f.op, Operator::In)) {
+            if let Some(union_scan) = Self::try_plan_union(query, indexes) {
+                return Self::make_plan(query, union_scan);
+            }
+        }
+
+        // 3. Conditional Secondary Index (Only if collection is large enough)
+        if use_index_heuristic {
+            for filter in &query.filters {
+                if matches!(filter.op, Operator::Eq) {
+                    if indexes.secondary.get(&query.collection)
+                        .map_or(false, |m| m.contains_key(&filter.field)) 
+                    {
+                        let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
+                        return Self::make_plan(query, ScanType::SecondaryIndex { 
                             field: filter.field.clone(), 
                             value: val_bytes 
-                        },
-                        filters: query.filters.clone(),
-                        or_groups: query.or_groups.clone(),
-                        order_by: query.order_by.clone(),
-                        limit: query.limit,
-                        offset: query.offset,
-                        projection: query.projection.clone(),
-                    };
+                        });
+                    }
                 }
             }
         }
@@ -75,16 +77,10 @@ impl QueryPlanner {
             matches!(f.op, Operator::Eq | Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte)
         });
 
-        let scan = if is_index_compatible {
+        let scan = if is_index_compatible && use_index_heuristic {
             let values: Vec<_> = query.filters.iter().map(|f| f.value.clone()).collect();
-            let candidates = indexes.exact_match_doc_ids(&query.collection, &fields, &values);
-
-            if let Some(ids) = candidates {
-                 if !ids.is_empty() && ids.len() <= collection_rows.max(1) {
-                    ScanType::CompositeIndex { fields, values }
-                 } else {
-                    ScanType::FullCollection
-                 }
+            if indexes.has_index(&query.collection, &fields) {
+                ScanType::CompositeIndex { fields, values }
             } else {
                 ScanType::FullCollection
             }
@@ -92,6 +88,11 @@ impl QueryPlanner {
             ScanType::FullCollection
         };
 
+        Self::make_plan(query, scan)
+    }
+    
+    // Helper to reduce boilerplate
+    fn make_plan(query: &Query, scan: ScanType) -> QueryPlan {
         QueryPlan {
             collection: query.collection.clone(),
             scan,
@@ -99,11 +100,11 @@ impl QueryPlanner {
             or_groups: query.or_groups.clone(),
             order_by: query.order_by.clone(),
             limit: query.limit,
-            offset: query.offset,  
-            projection: query.projection.clone()
+            offset: query.offset,
+            projection: query.projection.clone(),
         }
     }
-    
+
     // Changed from &self to associated function
     fn try_plan_union(query: &Query, indexes: &IndexManager) -> Option<ScanType> {
         let mut scans = Vec::new();

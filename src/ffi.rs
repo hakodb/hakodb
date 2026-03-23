@@ -1166,6 +1166,24 @@ pub extern "C" fn fl_array_append_int(array: *mut FL_Array, value: i64) -> i32 {
     0
 }
 
+#[no_mangle]
+pub extern "C" fn fl_array_append_doc(array: *mut FL_Array, doc: *const FL_Doc) -> i32 {
+    safety_shield!(-1, {
+        if array.is_null() || doc.is_null() {
+            return set_last_error("null array or doc handle");
+        }
+        
+        let array_ptr = unsafe { &mut *array };
+        let doc_ptr = unsafe { &*doc };
+        
+        // Convert the document's fields into a Value::Map and push to the array
+        array_ptr.items.push(Value::Map(doc_ptr.doc.fields.clone()));
+        
+        clear_last_error();
+        0
+    })
+}
+
 // --- DOCUMENT NESTING METHODS ---
 
 /// Takes the contents of 'child' and inserts it as a Map into 'parent'
@@ -1265,6 +1283,23 @@ pub extern "C" fn fl_engine_create_simple_index(
     let fld = match cstr_to_string(field) { Ok(v) => v, Err(_e) => return -1 };
 
     match engine.db.create_index(&col, &fld) {
+        Ok(_) => 0,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_engine_create_fts_index(
+    engine: *mut FL_Engine,
+    collection: *const c_char,
+    field: *const c_char,
+) -> i32 {
+    if engine.is_null() { return -1; }
+    let engine = unsafe { &*engine };
+    let col = match cstr_to_string(collection) { Ok(v) => v, Err(_) => return -1 };
+    let fld = match cstr_to_string(field) { Ok(v) => v, Err(_) => return -1 };
+
+    match engine.db.create_fts_index(&col, &fld) {
         Ok(_) => 0,
         Err(_) => -1,
     }

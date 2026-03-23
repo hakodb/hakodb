@@ -81,6 +81,25 @@ export interface NativeBindings {
 
   engineListCollections(engine: Handle): string | null;
 
+  // v0.5.6
+  createFtsIndex(engine: Handle, collection: string, field: string): number;
+  createSimpleIndex(engine: Handle, collection: string, field: string): number;
+  
+  // Array API
+  arrayNew(): Handle;
+  arrayFree(array: Handle): void;
+  arrayAppendStr(array: Handle, value: string): number;
+  arrayAppendInt(array: Handle, value: number | bigint): number;
+  arrayAppendDoc(array: Handle, doc: Handle): number;
+
+  // Nested structures
+  docInsertDoc(parent: Handle, key: string, child: Handle): number;
+  docInsertArray(parent: Handle, key: string, array: Handle): number;
+  
+  // Query extensions
+  queryWhereIn(query: Handle, field: string, array: Handle): number;
+  queryStartAfter(query: Handle, anchorDoc: Handle): number;
+
   lastError(): string;
 }
 
@@ -161,8 +180,30 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
 
     fl_engine_list_collections: { args: [FFIType.ptr], returns: FFIType.ptr },
 
+    // v0.5.6
+    // Indexing
+    fl_engine_create_fts_index: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
+    fl_engine_create_simple_index: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
+
+    // Array API
+    fl_array_new: { args: [], returns: FFIType.ptr },
+    fl_array_free: { args: [FFIType.ptr], returns: FFIType.void },
+    fl_array_append_str: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.i32 },
+    fl_array_append_int: { args: [FFIType.ptr, FFIType.i64], returns: FFIType.i32 },
+    fl_array_append_doc: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+
+    // Nested structures
+    fl_doc_insert_doc: { args: [FFIType.ptr, FFIType.cstring, FFIType.ptr], returns: FFIType.i32 },
+    fl_doc_insert_array: { args: [FFIType.ptr, FFIType.cstring, FFIType.ptr], returns: FFIType.i32 },
+
+    // Query extensions
+    fl_query_where_in: { args: [FFIType.ptr, FFIType.cstring, FFIType.ptr], returns: FFIType.i32 },
+    fl_query_start_after: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+
+    // ================= ERRORS =================
     fl_last_error: { args: [], returns: FFIType.ptr },
     fl_string_free: { args: [FFIType.ptr], returns: FFIType.void }
+
   }).symbols;
 
   const toC = (s: string | null) => s ? Buffer.from(s + '\0') : null;
@@ -234,6 +275,27 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     queryAggregateSum: (q, f) => symbols.fl_query_aggregate_sum(q, toC(f)),
     queryAggregateAvg: (q, f) => symbols.fl_query_aggregate_avg(q, toC(f)),
     queryExecuteAggregation: (e, q) => ptrToStringAndFree(symbols.fl_query_execute_aggregation(e, q)),
+
+    // ================= v0.5.6 =================
+
+    // Indexing
+    createFtsIndex: (engine, collection, field) => symbols.fl_engine_create_fts_index(engine, toC(collection), toC(field)),
+    createSimpleIndex: (engine, collection, field) => symbols.fl_engine_create_simple_index(engine, toC(collection), toC(field)),
+
+    // Array API
+    arrayNew: () => symbols.fl_array_new(),
+    arrayFree: (arr) => symbols.fl_array_free(arr),
+    arrayAppendStr: (arr, value) => symbols.fl_array_append_str(arr, toC(value)),
+    arrayAppendInt: (arr, value) => symbols.fl_array_append_int(arr, BigInt(value)),
+    arrayAppendDoc: (arr, doc) => symbols.fl_array_append_doc(arr, doc),
+
+    // Nested
+    docInsertDoc: (parent, key, child) => symbols.fl_doc_insert_doc(parent, toC(key), child),
+    docInsertArray: (parent, key, arr) => symbols.fl_doc_insert_array(parent, toC(key), arr),
+
+    // Query extensions
+    queryWhereIn: (query, field, arr) => symbols.fl_query_where_in(query, toC(field), arr),
+    queryStartAfter: (query, anchorDoc) => symbols.fl_query_start_after(query, anchorDoc),
 
     lastError: () => {
       const ptr = symbols.fl_last_error();
@@ -308,6 +370,26 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
 
     fl_engine_list_collections: lib.func('char* fl_engine_list_collections(FL_Engine* engine)'),
 
+    // v0.5.6
+    // Indexing
+    fl_engine_create_fts_index: lib.func('int fl_engine_create_fts_index(FL_Engine* engine, const char* collection, const char* field)'),
+    fl_engine_create_simple_index: lib.func('int fl_engine_create_simple_index(FL_Engine* engine, const char* collection, const char* field)'),
+
+    // Array API
+    fl_array_new: lib.func('FL_Array* fl_array_new()'),
+    fl_array_free: lib.func('void fl_array_free(FL_Array* arr)'),
+    fl_array_append_str: lib.func('int fl_array_append_str(FL_Array* arr, const char* value)'),
+    fl_array_append_int: lib.func('int fl_array_append_int(FL_Array* arr, int64_t value)'),
+    fl_array_append_doc: lib.func('int fl_array_append_doc(FL_Array* arr, const FL_Doc* doc)'),
+
+    // Nested
+    fl_doc_insert_doc: lib.func('int fl_doc_insert_doc(FL_Doc* parent, const char* key, FL_Doc* child)'),
+    fl_doc_insert_array: lib.func('int fl_doc_insert_array(FL_Doc* parent, const char* key, FL_Array* arr)'),
+
+    // Query extensions
+    fl_query_where_in: lib.func('int fl_query_where_in(FL_Query* query, const char* field, FL_Array* arr)'),
+    fl_query_start_after: lib.func('int fl_query_start_after(FL_Query* query, FL_Doc* anchor)'),
+
     fl_last_error: lib.func('const char* fl_last_error()'),
     fl_string_free: lib.func('void fl_string_free(char* value)')
   };
@@ -379,11 +461,44 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     queryAggregateAvg: (q, f) => fn.fl_query_aggregate_avg(q, f),
     queryExecuteAggregation: (e, q) => ptrToStringAndFree(fn.fl_query_execute_aggregation(e, q)),
 
+    // ================= v0.5.6 =================
+
+    // Indexing
+    createFtsIndex: (engine, collection, field) => fn.fl_engine_create_fts_index(engine, collection, field),
+    createSimpleIndex: (engine, collection, field) => fn.fl_engine_create_simple_index(engine, collection, field),
+
+    // Array API
+    arrayNew: () => fn.fl_array_new(),
+    arrayFree: (arr) => fn.fl_array_free(arr),
+    arrayAppendStr: (arr, value) => fn.fl_array_append_str(arr, value),
+    arrayAppendInt: (arr, value) => fn.fl_array_append_int(arr, value),
+    arrayAppendDoc: (arr, doc) => fn.fl_array_append_doc(arr, doc),
+
+    // Nested
+    docInsertDoc: (parent, key, child) => fn.fl_doc_insert_doc(parent, key, child),
+    docInsertArray: (parent, key, arr) => fn.fl_doc_insert_array(parent, key, arr),
+
+    // Query extensions
+    queryWhereIn: (query, field, arr) => fn.fl_query_where_in(query, field, arr),
+    queryStartAfter: (query, anchorDoc) => fn.fl_query_start_after(query, anchorDoc),
+
     lastError: () => (fn.fl_last_error() as string) || 'unknown ffi error'
   };
 }
 
 export async function loadNativeBindings(explicitPath?: string): Promise<NativeBindings> {
   const libPath = resolveLibraryPath(explicitPath);
-  return isBunRuntime() ? createBunBindings(libPath) : createNodeBindings(libPath);
+  // return isBunRuntime() ? createBunBindings(libPath) : createNodeBindings(libPath);
+
+  // 1. Check for Bun
+  if (typeof (globalThis as any).Bun !== 'undefined') {
+    return createBunBindings(libPath);
+  }
+
+  // 2. Check for Node.js (via process)
+  if (typeof process !== 'undefined' && process.versions && process.versions.node) {
+    return createNodeBindings(libPath);
+  }
+
+  throw new Error("FireLite Native Bindings are only supported in Node.js or Bun environments. For browsers, use the Tauri Gateway.");
 }
