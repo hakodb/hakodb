@@ -26,3 +26,11 @@ begin
   end;
 end;
 ```
+
+## v0.5.6 highlights (Pascal)
+
+- Advanced config builder (`TFLConfig`) for durability, audit log, encryption, worker, and memory tuning.
+- Query FTS methods: `Match`, `Contains`, `StartsWith`.
+- Query pagination/filter extensions: `WhereIn`, `StartAfter`, `Offset`.
+- Aggregates from query builder: `Count`, `Sum`, `Avg`.
+- Index helpers on collections: `CreateIndex` and `CreateFTSIndex`.

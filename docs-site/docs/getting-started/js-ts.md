@@ -27,3 +27,11 @@ if (snap.exists) {
 
 await db.close();
 ```
+
+## v0.5.6 highlights (JS/TS)
+
+- Full-text operators in fluent queries: `match`, `contains`, `startsWith`.
+- `in` query support for membership filters.
+- Projection pushdown via `.select(...)` to avoid full document inflation.
+- Aggregates on queries: `count()`, `sum(field)`, `avg(field)`.
+- Manual index creation hooks: `createIndex(field)` and `createFtsIndex(field)`.

@@ -9,8 +9,11 @@ title: Tauri Unified Dispatcher (`firelite_exec`)
 - `get { collection, docId }`
 - `set { collection, docId, data }`
 - `delete { collection, docId }`
+- `createIndex { collection, field }`
+- `createFtsIndex { collection, field }`
 - `query { collection, filters, orderBy?, limit?, projection? }`
 - `batch { mutations }`
+- `aggregate { collection, filters, kind: count|sum|avg, field? }`
 - `subscribe { listenerId, collection, filters, orderBy?, limit?, projection?, eventName? }`
 - `unsubscribe { listenerId }`
 
