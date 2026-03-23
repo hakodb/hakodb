@@ -161,6 +161,8 @@ int32_t fl_array_append_str(FL_Array *array, const char *value);
 
 int32_t fl_array_append_int(FL_Array *array, int64_t value);
 
+int32_t fl_array_append_doc(FL_Array *array, const FL_Doc *doc);
+
 /// Takes the contents of 'child' and inserts it as a Map into 'parent'
 int32_t fl_doc_insert_doc(FL_Doc *parent, const char *key, const FL_Doc *child);
 
