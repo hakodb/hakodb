@@ -7,4 +7,5 @@ pub struct QueryTask {
     pub docs: Vec<(String, Vec<u8>)>,
     pub plan: QueryPlan,
     pub storage: Option<Arc<RwLock<StorageEngine>>>,
+    pub catalog: Arc<crate::util::catalog::Catalog>,
 }

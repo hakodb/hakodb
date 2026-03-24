@@ -104,13 +104,15 @@ Report run_benchmark(BenchConfig cfg) {
     try { fs::remove_all(path); } catch (...) {}
 
     stage("Engine Open");
+    double t_start = now_ms();
     FL_Engine* db = fl_engine_open_with_config(path.c_str(), create_config_ptr(cfg));
     if (!db) { res.success = false; return res; }
-    cout << "OK";
+    // cout << "OK";
+    cout << now_ms() - t_start;
 
     // 1. WRITE TEST (Single vs Batch)
     stage("Single Write Latency");
-    double t_start = now_ms();
+    t_start = now_ms();
     for (int i = 0; i < 100; i++) {
         FL_Doc* d = fl_doc_new();
         fl_doc_insert_int(d, "id", i);
@@ -119,7 +121,8 @@ Report run_benchmark(BenchConfig cfg) {
         fl_doc_free(d);
     }
     res.single_tps = 100.0 / ((now_ms() - t_start) / 1000.0);
-    cout << "OK";
+    // cout << "OK";
+    cout << res.single_tps;
 
     stage("Batch Write Throughput");
     t_start = now_ms();
@@ -138,7 +141,8 @@ Report run_benchmark(BenchConfig cfg) {
         fl_batch_free(b);
     }
     res.batch_tps = (double)b_total / ((now_ms() - t_start) / 1000.0);
-    cout << "OK";
+    // cout << "OK";
+    cout << res.batch_tps;
 
     // 2. READ TEST (Single vs Parallel)
     stage("Point Read (Sequential)");
@@ -148,7 +152,8 @@ Report run_benchmark(BenchConfig cfg) {
         if (d) fl_doc_free(d);
     }
     res.s_read_ms = (now_ms() - t_start) / 200.0;
-    cout << "OK";
+    // cout << "OK";
+    cout << res.s_read_ms;
 
     stage("Point Read (Parallel)");
     t_start = now_ms();
@@ -164,7 +169,8 @@ Report run_benchmark(BenchConfig cfg) {
     }
     for(auto& t : pool) t.join();
     res.p_read_ms = (now_ms() - t_start) / (cfg.threads * 50.0);
-    cout << "OK";
+    // cout << "OK";
+    cout << res.p_read_ms;
 
     // 3. BULK UPDATE & SERIALIZABLE TX
     stage("Bulk Update (Patch)");
@@ -176,7 +182,8 @@ Report run_benchmark(BenchConfig cfg) {
     }
     res.bulk_upd_ms = now_ms() - t_start;
     fl_doc_free(upd);
-    cout << "OK";
+    // cout << "OK";
+    cout << res.bulk_upd_ms;
 
     stage("Serializable Transactions");
     t_start = now_ms();
@@ -191,7 +198,8 @@ Report run_benchmark(BenchConfig cfg) {
         } else { fl_transaction_free(tx); }
     }
     res.tx_ms = now_ms() - t_start;
-    cout << "OK";
+    // cout << "OK";
+    cout << res.tx_ms;
 
     // 4. RANGE QUERY (Offset vs Cursor)
     stage("Range Query (Off vs Cur)");
@@ -200,7 +208,7 @@ Report run_benchmark(BenchConfig cfg) {
     // this_thread::sleep_for(chrono::milliseconds(500));
     int backfill_wait = cfg.large_docs ? 2000 : 500; 
     this_thread::sleep_for(chrono::milliseconds(backfill_wait));
-    cout << "OK";
+    // cout << "OK";
     
     int mid = b_total / 2;
     FL_Query* q_off = fl_query_new("bench");
@@ -215,34 +223,41 @@ Report run_benchmark(BenchConfig cfg) {
     fl_query_end_before(q_cur, end_doc);
     t_start = now_ms(); fl_string_free(fl_query_execute(db, q_cur)); res.cursor_ms = now_ms() - t_start;
     res.cursor_gain = res.offset_ms / (res.cursor_ms > 0 ? res.cursor_ms : 0.1);
-    cout << "OK";
+    // cout << "OK";
+    cout << res.cursor_gain;
 
     // 5. AGGREGATION
     stage("Aggregation (Parallel Sum)");
     FL_Query* aq = fl_query_new("bench");
     fl_query_aggregate_sum(aq, "id");
-    t_start = now_ms(); fl_string_free(fl_query_execute_aggregation(db, aq)); res.agg_ms = now_ms() - t_start;
-    cout << "OK";
+    t_start = now_ms(); 
+    fl_string_free(fl_query_execute_aggregation(db, aq)); 
+    res.agg_ms = now_ms() - t_start;
+    // cout << "OK";
+    cout << res.agg_ms;
 
     // 6. BULK DELETE
     stage("Bulk Delete");
     t_start = now_ms();
     for(int i=0; i<100; i++) fl_engine_delete(db, "bench", (string("b_") + to_string(i+500)).c_str());
     res.bulk_del_ms = now_ms() - t_start;
-    cout << "OK";
+    // cout << "OK";
+    cout << res.bulk_del_ms;
 
     // 7. SHUTDOWN & STARTUP
     stage("Shutdown (Flush)");
     t_start = now_ms();
     fl_engine_free(db);
     res.shutdown_ms = now_ms() - t_start;
-    cout << "OK";
+    // cout << "OK";
+    cout << res.shutdown_ms;
 
     stage("Startup (Index Rebuild)");
     t_start = now_ms();
     FL_Engine* db2 = fl_engine_open_with_config(path.c_str(), create_config_ptr(cfg));
     res.startup_ms = now_ms() - t_start;
-    cout << "OK";
+    // cout << "OK";
+    cout << res.startup_ms;
     
     res.storage_mb = (double)get_dir_size(path) / (1024.0 * 1024.0);
     
@@ -291,7 +306,7 @@ int main(int argc, char** argv) {
     cout << string(140, '-') << "\n";
     cout << left << setw(14) << "Profile" << " | "
          << setw(13) << "S/B TPS" << " | "
-         << setw(12) << "Read(S/P)" << " | "
+         << setw(15) << "Read(S/P)" << " | "
          << setw(13) << "Off/Cur ms" << " | "
          << setw(9) << "Agg(ms)" << " | "
          << setw(8) << "Tx(ms)" << " | "
@@ -303,14 +318,14 @@ int main(int argc, char** argv) {
     for (const auto& r : results) {
         stringstream ss_tps, ss_read, ss_query, ss_maint, ss_bulk;
         ss_tps << (int)r.single_tps << "/" << (int)r.batch_tps;
-        ss_read << fixed << setprecision(2) << r.s_read_ms << "/" << r.p_read_ms;
+        ss_read << fixed << setprecision(4) << r.s_read_ms << "/" << r.p_read_ms;
         ss_query << fixed << setprecision(1) << r.offset_ms << "/" << r.cursor_ms;
         ss_bulk << (int)r.bulk_upd_ms << "/" << (int)r.bulk_del_ms;
         ss_maint << (int)r.startup_ms << "/" << (int)r.shutdown_ms;
 
         cout << left << setw(14) << r.cfg.name << " | "
              << left << setw(13) << ss_tps.str() << " | "
-             << left << setw(12) << ss_read.str() << " | "
+             << left << setw(15) << ss_read.str() << " | "
              << left << setw(13) << ss_query.str() << " | "
              << fixed << setprecision(0) << setw(9) << r.agg_ms << " | "
              << setw(8) << r.tx_ms << " | "

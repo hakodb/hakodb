@@ -5,6 +5,8 @@ use crate::document::value::Value;
 const MAGIC: u8 = 0xF1;
 const VERSION: u8 = 1;
 
+const TAG_POOLED_KEY: u8 = 128; 
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FireLiteDoc {
     pub fields: Vec<(String, Value)>,
@@ -51,11 +53,41 @@ impl FireLiteDoc {
         out
     }
 
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let view = FireLiteDocView::new(bytes)?;
+    pub fn decode(bytes: &[u8], catalog: Option<&crate::util::catalog::Catalog>) -> Option<Self> {
+        // Check MAGIC and VERSION via view, but we'll parse raw for the ID resolution
+        let _view = FireLiteDocView::new(bytes)?; 
         let mut doc = FireLiteDoc::default();
-        for (k, v) in view.iter() {
-            doc.insert(k.to_string(), v.to_owned_value()?);
+        
+        let mut pos = 4; // Skip MAGIC + VERSION + COUNT
+        let fields_count = u16::from_le_bytes(bytes[2..4].try_into().ok()?);
+
+        for _ in 0..fields_count {
+            let tag_or_len = *bytes.get(pos)?;
+            pos += 1;
+
+            let key: String = if tag_or_len == TAG_POOLED_KEY {
+                let id = u16::from_le_bytes(bytes.get(pos..pos+2)?.try_into().ok()?);
+                pos += 2;
+                if let Some(cat) = catalog {
+                    cat.resolve_key(id).unwrap_or_else(|| format!("$id:{}", id))
+                } else {
+                    format!("$id:{}", id)
+                }
+            } else {
+                let len = tag_or_len as usize;
+                let s = std::str::from_utf8(bytes.get(pos..pos+len)?).ok()?.to_string();
+                pos += len;
+                s
+            };
+
+            let tag = *bytes.get(pos)?;
+            pos += 1;
+            let v_len = u32::from_le_bytes(bytes.get(pos..pos+4)?.try_into().ok()?) as usize;
+            pos += 4;
+            let val_data = bytes.get(pos..pos+v_len)?;
+            pos += v_len;
+
+            doc.insert(key, decode_value(tag, val_data)?);
         }
         Some(doc)
     }
@@ -79,6 +111,24 @@ impl FireLiteDoc {
         }
         Some(doc)
     }
+
+    pub fn encode_compact(&self, catalog: &crate::util::catalog::Catalog) -> Vec<u8> {
+        let mut out = vec![MAGIC, VERSION];
+        out.extend((self.fields.len() as u16).to_le_bytes());
+        
+        for (k, v) in &self.fields {
+            // Write the key ID instead of the string
+            out.push(TAG_POOLED_KEY);
+            out.extend(catalog.get_key_id(k).to_le_bytes());
+
+            let (tag, bytes) = encode_value(v);
+            out.push(tag);
+            out.extend((bytes.len() as u32).to_le_bytes());
+            out.extend(bytes);
+        }
+        out
+    }
+
 
     pub fn apply_patch_binary(old_bytes: &[u8], updates: &[(String, Value)]) -> Option<Vec<u8>> {
         let view = FireLiteDocView::new(old_bytes)?;
@@ -192,16 +242,36 @@ impl<'a> Iterator for FireLiteDocIter<'a> {
         if self.remaining == 0 {
             return None;
         }
-        let key_len = *self.bytes.get(self.pos)? as usize;
-        self.pos += 1;
-        let key = std::str::from_utf8(self.bytes.get(self.pos..self.pos + key_len)?).ok()?;
-        self.pos += key_len;
 
+        let tag_or_len = *self.bytes.get(self.pos)?;
+        self.pos += 1;
+
+        // FIXED: Only parse the key once. Corrected variable shadowing.
+        let key: &'a str = if tag_or_len == TAG_POOLED_KEY {
+            // It's a pooled key (2-byte ID)
+            let _id_bytes = self.bytes.get(self.pos..self.pos+2)?;
+            self.pos += 2;
+            // We return a placeholder. The 'decode' method handles full resolution.
+            "$id$" 
+        } else {
+            // It's a standard literal string key
+            let key_len = tag_or_len as usize;
+            let s = std::str::from_utf8(self.bytes.get(self.pos..self.pos + key_len)?).ok()?;
+            self.pos += key_len;
+            s
+        };
+
+        // Parse the value Tag
         let tag = *self.bytes.get(self.pos)?;
         self.pos += 1;
-        let len =
-            u32::from_le_bytes(self.bytes.get(self.pos..self.pos + 4)?.try_into().ok()?) as usize;
+
+        // Parse the value Length (u32)
+        let len = u32::from_le_bytes(
+            self.bytes.get(self.pos..self.pos + 4)?.try_into().ok()?
+        ) as usize;
         self.pos += 4;
+
+        // Slice the value Data
         let data = self.bytes.get(self.pos..self.pos + len)?;
         self.pos += len;
 

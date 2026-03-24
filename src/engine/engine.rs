@@ -108,6 +108,7 @@ pub struct FireLite {
     
     maintenance_stop: Mutex<Option<Sender<()>>>,
     maintenance_handle: Mutex<Option<thread::JoinHandle<()>>>,
+    pub(crate) catalog: Arc<crate::util::catalog::Catalog>,
 }
 
 impl FireLite {
@@ -115,6 +116,7 @@ impl FireLite {
         let root_path = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&root_path)?;
 
+        let catalog = Arc::new(crate::util::catalog::Catalog::load(&root_path));
         // 1. Initialize Global Shared State & Channels (ONCE)
         let indexes = Arc::new(RwLock::new(IndexManager::default()));
         
@@ -222,7 +224,7 @@ impl FireLite {
             shards: Arc::new(RwLock::new(HashMap::new())),
             index_storage,
             indexes,
-            executor: ParallelQueryExecutor::new(config.query_workers),
+            executor: ParallelQueryExecutor::new(config.query_workers, Arc::clone(&catalog)),
             tx_lock: Mutex::new(()),
             listeners: Mutex::new(HashMap::new()),
             doc_versions: RwLock::new(HashMap::new()),
@@ -236,67 +238,9 @@ impl FireLite {
             audit_handle: Mutex::new(Some(audit_handle_inner)), // <--- INITIALIZE
             maintenance_stop: Mutex::new(None),
             maintenance_handle: Mutex::new(None),
+            catalog
         };
 
-        // B. Blob Worker (The Janitor)
-        // let shards_ptr = Arc::clone(&db.shards);
-        // let root_path_clone = root_path.clone();
-        // let root_path_worker = root_path.clone();
-        // let encryption_key = config.encryption_key.clone();
-        
- 
-        // let blob_rx = Arc::new(Mutex::new(blob_rx));
-
-        // SPAWN MULTIPLE BLOB WORKERS (e.g., 4 workers)
-        // for _ in 0..4 {
-        //     let rx = Arc::clone(&blob_rx);
-        //     let shards_ptr = Arc::clone(&shards_ptr);
-        //     let root_path_clone = root_path_clone.clone();
-        //     let enc_key = encryption_key.clone();
-
-        //     thread::spawn(move || {
-        //         let enc_ctx = enc_key.map(|k| crate::storage::crypto::EncryptionContext::from_secret(&k));
-        //         let mut file_handles: HashMap<String, std::fs::File> = HashMap::new();
-
-        //         loop {
-        //             // 1. Get work (Locking the receiver is very fast)
-        //             let work = {
-        //                 let lock = rx.lock().unwrap();
-        //                 match lock.recv() {
-        //                     Ok(w) => w,
-        //                     Err(_) => break,
-        //                 }
-        //             };
-
-        //             let BlobWork::Put { collection, key, data } = work;
-
-        //             // 2. Open shard-specific blob file
-        //             let file = file_handles.entry(collection.clone()).or_insert_with(|| {
-        //                 let p = root_path_clone.join(&collection).join("blobs.dat");
-        //                 std::fs::OpenOptions::new().create(true).read(true).append(true).open(p).expect("IO Fail")
-        //             });
-
-        //             // 3. Encrypt (Parallel across the 4 workers)
-        //             let payload = if let Some(ref enc) = enc_ctx {
-        //                 enc.encrypt(&data).unwrap_or_else(|_| data.to_vec())
-        //             } else { data.to_vec() };
-
-        //             // 4. Write to Disk (Thread-safe positional append)
-        //             use std::io::{Write, Seek, SeekFrom};
-        //             let offset = file.seek(SeekFrom::End(0)).unwrap();
-        //             let len = payload.len() as u32;
-        //             file.write_all(&payload).unwrap();
-
-        //             // 5. Atomic Pointer Swap
-        //             let shards = shards_ptr.read().unwrap();
-        //             if let Some(shard_lock) = shards.get(&collection) {
-        //                 if let Ok(mut shard) = shard_lock.write() {
-        //                     shard.index.insert(key, crate::storage::engine::Pointer::Blob { offset, len });
-        //                 }
-        //             }
-        //         }
-        //     });
-        // }
         let shards_ptr = Arc::clone(&db.shards);
         let encryption_key = config.encryption_key.clone();
         
@@ -389,18 +333,34 @@ impl FireLite {
         Ok(db)
     }
 
+    // fn recover_existing_shards(&self) -> Result<()> {
+    //     let mut shards = self.shards.write().unwrap();
+    //     if !self.root_path.exists() { return Ok(()); }
+    //     for entry in std::fs::read_dir(&self.root_path)? {
+    //         let entry = entry?;
+    //         if entry.path().is_dir() {
+    //             let col = entry.file_name().to_string_lossy().to_string();
+    //             let mut storage = StorageEngine::open(entry.path(), &self.config)?;
+
+    //             storage.blob_tx = Some(self.blob_tx.clone());
+
+    //             shards.insert(col, Arc::new(RwLock::new(storage)));
+    //         }
+    //     }
+    //     Ok(())
+    // }
     fn recover_existing_shards(&self) -> Result<()> {
         let mut shards = self.shards.write().unwrap();
-        if !self.root_path.exists() { return Ok(()); }
-        for entry in std::fs::read_dir(&self.root_path)? {
-            let entry = entry?;
-            if entry.path().is_dir() {
-                let col = entry.file_name().to_string_lossy().to_string();
-                let mut storage = StorageEngine::open(entry.path(), &self.config)?;
-
+        let collections = self.catalog.get_all_collections();
+        
+        for col_name in collections {
+            let folder_name = self.catalog.get_folder_name(&col_name);
+            let path = self.root_path.join(folder_name);
+            
+            if path.exists() {
+                let mut storage = StorageEngine::open(path, &self.config)?;
                 storage.blob_tx = Some(self.blob_tx.clone());
-
-                shards.insert(col, Arc::new(RwLock::new(storage)));
+                shards.insert(col_name, Arc::new(RwLock::new(storage)));
             }
         }
         Ok(())
@@ -414,7 +374,7 @@ impl FireLite {
             let storage = shard.read().unwrap();
             for (key, bytes) in storage.scan_prefix("")? {
                 if let Some((_, doc_id)) = key.split_once(':') {
-                    if let Some(doc) = FireLiteDoc::decode(&bytes) {
+                    if let Some(doc) = FireLiteDoc::decode(&bytes, Some(&self.catalog)) {
                         indexes.index_document(col, doc_id, &doc);
                         versions.insert(key, self.global_version.fetch_add(1, Ordering::SeqCst));
                     }
@@ -424,16 +384,30 @@ impl FireLite {
         Ok(())
     }
 
+    // fn get_shard(&self, collection: &str) -> Arc<RwLock<StorageEngine>> {
+    //     if let Some(s) = self.shards.read().unwrap().get(collection) { return Arc::clone(s); }
+    //     let mut shards = self.shards.write().unwrap();
+        
+    //     shards.entry(collection.to_string()).or_insert_with(|| {
+    //         let path = self.root_path.join(collection);
+    //         let mut storage = StorageEngine::open(path, &self.config).expect("Shard fail");
+            
+    //         storage.blob_tx = Some(self.blob_tx.clone());
+
+    //         Arc::new(RwLock::new(storage))
+    //     }).clone()
+    // }
     fn get_shard(&self, collection: &str) -> Arc<RwLock<StorageEngine>> {
         if let Some(s) = self.shards.read().unwrap().get(collection) { return Arc::clone(s); }
-        let mut shards = self.shards.write().unwrap();
         
+        let mut shards = self.shards.write().unwrap();
         shards.entry(collection.to_string()).or_insert_with(|| {
-            let path = self.root_path.join(collection);
-            let mut storage = StorageEngine::open(path, &self.config).expect("Shard fail");
+            // MAPPING: "users" -> "c1"
+            let folder_name = self.catalog.get_folder_name(collection);
+            let path = self.root_path.join(folder_name);
             
+            let mut storage = StorageEngine::open(path, &self.config).expect("Shard fail");
             storage.blob_tx = Some(self.blob_tx.clone());
-
             Arc::new(RwLock::new(storage))
         }).clone()
     }
@@ -493,9 +467,13 @@ impl FireLite {
                         if matches!(v, Value::ServerTimestamp) { *v = Value::Timestamp(now); } 
                     }
                     let key = doc_key(collection, doc_id);
+
+                    let compact_bytes = doc.encode_compact(&self.catalog);
+
                     shard_groups.entry(collection.clone()).or_default().push(StorageMutation::Put {
                         key: key.clone(),
-                        value: doc.encode(),
+                        // value: doc.encode(),
+                        value: compact_bytes,
                     });
                     index_puts.entry(collection.clone()).or_default().push((doc_id.clone(), doc.clone()));
                     change_events.push((collection.clone(), ChangeEvent { path: key, kind: ChangeKind::Put }));
@@ -505,7 +483,7 @@ impl FireLite {
                     let shard = self.get_shard(collection);
                     // Scope the read lock so it drops immediately
                     if let Some(bytes) = shard.read().unwrap().get(&key)? {
-                        if let Some(old_doc) = FireLiteDoc::decode(&bytes) {
+                        if let Some(old_doc) = FireLiteDoc::decode(&bytes, Some(&self.catalog)) {
                             index_dels.entry(collection.clone()).or_default().push((doc_id.clone(), old_doc));
                         }
                     }
@@ -567,7 +545,7 @@ impl FireLite {
         
         let shard = self.get_shard(collection);
         let storage = shard.safe_read()?; 
-        let res = storage.get(&doc_key(collection, doc_id))?.and_then(|b| FireLiteDoc::decode(&b));
+        let res = storage.get(&doc_key(collection, doc_id))?.and_then(|b| FireLiteDoc::decode(&b, Some(&self.catalog)));
         
         // AUDIT SUCCESS
         self.record_audit(AuditEntry { 
@@ -799,7 +777,7 @@ impl FireLite {
                     // Shard has new data: scan and update index
                     for (key, bytes) in storage.scan_prefix("")? {
                         if let Some((_, doc_id)) = key.split_once(':') {
-                            if let Some(doc) = FireLiteDoc::decode(&bytes) {
+                            if let Some(doc) = FireLiteDoc::decode(&bytes, Some(&self.catalog)) {
                                 mgr.composite.index_document(col_name, doc_id, &doc);
                             }
                         }
@@ -830,6 +808,7 @@ impl FireLite {
         let idx_mgr = Arc::clone(&self.indexes);
         let f_name = field.to_string();
         let col_name = collection.to_string();
+        let catalog_clone = Arc::clone(&self.catalog); 
 
         thread::spawn(move || {
             // Step A: Lock, take a snapshot of the pointers, then release IMMEDIATELY
@@ -858,7 +837,7 @@ impl FireLite {
                 if let Some(sec_map) = mgr.secondary.get_mut(&col_name) {
                     if let Some(index) = sec_map.get_mut(&f_name) {
                         for (full_key, bytes) in resolved_docs {
-                            if let Some(doc) = FireLiteDoc::decode(&bytes) {
+                            if let Some(doc) = FireLiteDoc::decode(&bytes, Some(&catalog_clone)) {
                                 if let Some(val) = doc.get(&f_name) {
                                     let idx_key = crate::index::index_key::encode_scalar(val);
                                     if let Some((_, doc_id)) = full_key.split_once(':') {
@@ -885,6 +864,7 @@ impl FireLite {
         let idx_mgr = Arc::clone(&self.indexes);
         let f_name = field.to_string();
         let col_name = collection.to_string();
+        let catalog_clone = Arc::clone(&self.catalog); 
 
         thread::spawn(move || {
             // Step A: Lock, take a snapshot of the pointers, then release IMMEDIATELY
@@ -913,7 +893,7 @@ impl FireLite {
                 if let Some(sec_map) = mgr.secondary.get_mut(&col_name) {
                     if let Some(index) = sec_map.get_mut(&f_name) {
                         for (full_key, bytes) in resolved_docs {
-                            if let Some(doc) = FireLiteDoc::decode(&bytes) {
+                            if let Some(doc) = FireLiteDoc::decode(&bytes, Some(&catalog_clone)) {
                                 if let Some(val) = doc.get(&f_name) {
                                     let idx_key = crate::index::index_key::encode_scalar(val);
                                     if let Some((_, doc_id)) = full_key.split_once(':') {
@@ -975,6 +955,9 @@ impl Drop for FireLite {
         // 4. Join the controller threads (Now near-instant because they woke up in step 1)
         if let Some(h) = self.maintenance_handle.lock().unwrap().take() { let _ = h.join(); }
         if let Some(h) = self.audit_handle.lock().unwrap().take() { let _ = h.join(); }
+        
+        // catalog save
+        self.catalog.save();
     }
 }
 

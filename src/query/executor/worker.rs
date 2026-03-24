@@ -43,7 +43,7 @@ pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)
                 let mut fields = Vec::with_capacity(projection.len());
                 
                 if projection.is_empty() {
-                    if let Some(doc) = crate::document::firelite_doc::FireLiteDoc::decode(&bytes) {
+                    if let Some(doc) = crate::document::firelite_doc::FireLiteDoc::decode(&bytes, Some(&task.catalog)) {
                         fields = doc.fields;
                     }
                 } else {

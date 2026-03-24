@@ -17,12 +17,14 @@ use super::scheduler::shard_tasks;
 
 pub struct ParallelQueryExecutor {
     workers: usize,
+    catalog: Arc<crate::util::catalog::Catalog>,
 }
 
 impl ParallelQueryExecutor {
-    pub fn new(workers: usize) -> Self {
+    pub fn new(workers: usize, catalog: Arc<crate::util::catalog::Catalog>) -> Self {
         Self {
             workers: workers.max(1),
+            catalog
         }
     }
 
@@ -51,7 +53,7 @@ impl ParallelQueryExecutor {
             }
         };
 
-        let tasks = shard_tasks(docs, self.workers, plan.clone(), Some(storage_arc.clone()));
+        let tasks = shard_tasks(docs, self.workers, plan.clone(), Some(storage_arc.clone()), self.catalog.clone());
         let mut handles = Vec::new();
         for task in tasks {
             handles.push(thread::spawn(move || run_task(task)));
@@ -98,7 +100,7 @@ impl ParallelQueryExecutor {
             self.execute_single_scan(&storage, indexes, &plan.scan, &plan.collection, plan.limit)?
         };
 
-        let tasks = shard_tasks(docs, self.workers, plan.clone(), Some(storage_arc.clone()));
+        let tasks = shard_tasks(docs, self.workers, plan.clone(), Some(storage_arc.clone()), self.catalog.clone());
         let (tx, rx) = std::sync::mpsc::channel();
 
         for task in tasks {
@@ -183,7 +185,7 @@ impl ParallelQueryExecutor {
             self.execute_single_scan(&storage, indexes, &plan.scan, &plan.collection, plan.limit)?
         };
         
-        let tasks = shard_tasks(docs, self.workers, plan.clone(), Some(storage_arc.clone()));
+        let tasks = shard_tasks(docs, self.workers, plan.clone(), Some(storage_arc.clone()), self.catalog.clone());
         let mut handles = Vec::new();
         for task in tasks {
             handles.push(thread::spawn(move || run_task_projected(task)));
