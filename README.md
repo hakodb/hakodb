@@ -6,11 +6,11 @@ It runs in-process (no external service), stores typed binary documents, and pro
 
 ---
 
-## Current Status (v0.5.6 - High Velocity)
+## Current Status (v0.5.9 - High Velocity)
 
 FireLite has evolved from a foundation stage into a **Production-Candidate** engine. The core architecture now supports physical data sharding and near-instant recovery, capable of **20,000+ TPS** and sub-millisecond query responses on standard hardware.
 
-### 🚀 New in v0.5.6 ("Extreme" Update)
+### 🚀 New in v0.5.9
 
 - **Zero-Copy Projection Pipeline**
   - Queries no longer "inflate" full document objects. 
@@ -175,7 +175,7 @@ await db.close();
 ### API coverage in JS SDK
 
 - CRUD: `set/get/delete`
-- Fluent query: `where(==)`, `orderBy`, `limit`, `get`
+- Fluent query: `where`, `orderBy`, `limit`, `offset`, cursor helpers (`startAt/startAfter/endAt/endBefore`)
 - Atomic batch: `set/delete/commit`
 - Value mapping to FFI builder:
   - `string` -> `fl_doc_insert_str`
@@ -196,7 +196,7 @@ FireLite now includes an optional Tauri bridge that routes all operations throug
 ### Enable feature
 
 ```toml
-firelite = { version = "0.1", features = ["tauri-gateway"] }
+firelite = { version = "0.5.9", features = ["tauri-gateway"] }
 ```
 
 ### Rust bridge surface
@@ -212,7 +212,8 @@ firelite = { version = "0.1", features = ["tauri-gateway"] }
   - unsubscribe command support
   - `cleanup_window_subscriptions(window_label)` for close-event cleanup
 - Query enhancements over gateway:
-  - FTS operators (`match`, `contains`, `startsWith`) and `in`
+  - FTS + advanced operators (`match`, `contains`, `startsWith`, `in`, `notIn`, `arrayContains`, `arrayContainsAny`)
+  - offset support for paginated query windows
   - aggregate routing (`count`, `sum`, `avg`)
 
 ### Frontend SDK usage (Tauri)
@@ -251,6 +252,7 @@ A production-focused Pascal wrapper is available under `pascal/`:
   - object-oriented API: `TFireLite`, `TFLCollection`, `TFLDocument`, `TFLQuery`, `TFLBatch`, `TFLTransaction`
   - fluent Firestore-like flow (`Collection(...).Doc(...).Set/Get/Delete`, query chaining)
   - projection pushdown (`Select([...])`) wired to `fl_query_select_field`
+  - advanced filters (`WhereNotIn`, `ArrayContains`, `ArrayContainsAny`) mapped to FFI
   - callback-based `OnSnapshot` via a polling thread and optional `TThread.Queue` UI dispatch.
 
 ### Minimal Pascal usage
