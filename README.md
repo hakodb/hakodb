@@ -6,11 +6,11 @@ It runs in-process (no external service), stores typed binary documents, and pro
 
 ---
 
-## Current Status (v0.5.9 - High Velocity)
+## Current Status (v0.5.10 - High Velocity)
 
 FireLite has evolved from a foundation stage into a **Production-Candidate** engine. The core architecture now supports physical data sharding and near-instant recovery, capable of **20,000+ TPS** and sub-millisecond query responses on standard hardware.
 
-### 🚀 New in v0.5.9
+### 🚀 New in v0.5.10
 
 - **Zero-Copy Projection Pipeline**
   - Queries no longer "inflate" full document objects. 
@@ -76,6 +76,11 @@ FireLite has evolved from a foundation stage into a **Production-Candidate** eng
   - opaque handle types (`FL_Engine`, `FL_Doc`, `FL_Batch`, `FL_Query`)
   - C ABI document builder, CRUD, query, and atomic batch commit functions
   - thread-local `fl_last_error` and explicit free APIs
+
+- Go Gateway SDK (`go/`)
+  - Full C-FFI coverage exposed via typed Go wrappers (`Engine`, `Doc`, `Query`, `Batch`, `Transaction`, `Watch`).
+  - Firestore-style API (`Client`, `Collection`, `Doc`, `Query`, `WriteBatch`, transaction callback).
+  - Native watch callback bridge (`fl_engine_watch`) via cgo.
 - JavaScript/TypeScript SDK (`js/`)
   - Node.js + Bun dynamic loading
   - Firestore-like API: `db.collection().doc().set()/get()/delete()`
@@ -196,7 +201,7 @@ FireLite now includes an optional Tauri bridge that routes all operations throug
 ### Enable feature
 
 ```toml
-firelite = { version = "0.5.9", features = ["tauri-gateway"] }
+firelite = { version = "0.5.10", features = ["tauri-gateway"] }
 ```
 
 ### Rust bridge surface

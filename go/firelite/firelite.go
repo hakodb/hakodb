@@ -1,0 +1,1007 @@
+package firelite
+
+/*
+#cgo CXXFLAGS: -std=c++17
+#cgo LDFLAGS: -L../../target/debug -lfirelite
+#include <stdlib.h>
+#include <stdint.h>
+#include "firelite_c.h"
+
+extern void firelite_watch_bridge(char* collection, char* path, int32_t kind, void* user_data);
+static inline void firelite_watch_bridge_const(const char* collection, const char* path, int32_t kind, void* user_data) {
+	firelite_watch_bridge((char*)collection, (char*)path, kind, user_data);
+}
+static inline FL_Watch* firelite_watch_bridge_register(FL_Engine* engine, const char* collection, void* user_data) {
+	return fl_engine_watch(engine, collection, firelite_watch_bridge_const, user_data);
+}
+*/
+import "C"
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"runtime/cgo"
+	"unsafe"
+)
+
+type (
+	Engine      struct{ ptr *C.FL_Engine }
+	Config      struct{ ptr *C.FL_Config }
+	Doc         struct{ ptr *C.FL_Doc }
+	Array       struct{ ptr *C.FL_Array }
+	Query       struct{ ptr *C.FL_Query }
+	Batch       struct{ ptr *C.FL_Batch }
+	Transaction struct{ ptr *C.FL_Transaction }
+	Watch       struct {
+		ptr    *C.FL_Watch
+		handle cgo.Handle
+	}
+)
+
+type DurabilityMode int32
+
+const (
+	DurabilityAlways   DurabilityMode = 0
+	DurabilityInterval DurabilityMode = 1
+	DurabilityManual   DurabilityMode = 2
+	DurabilityOnCommit DurabilityMode = 3
+)
+
+type SnapshotKind int32
+
+const (
+	SnapshotInsert SnapshotKind = 1
+	SnapshotDelete SnapshotKind = 2
+)
+
+type Reference struct {
+	Collection string
+	DocID      string
+}
+
+type ServerTimestamp struct{}
+
+type TimestampMicros int64
+
+type SnapshotCallback func(collection, path string, kind SnapshotKind)
+
+func lastError() string {
+	err := C.fl_last_error()
+	if err == nil {
+		return "unknown ffi error"
+	}
+	return C.GoString(err)
+}
+
+func checkStatus(op string, status C.int32_t) error {
+	if status == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s failed: %s", op, lastError())
+}
+
+func cString(v string) (*C.char, func()) {
+	cv := C.CString(v)
+	return cv, func() { C.free(unsafe.Pointer(cv)) }
+}
+
+func Open(path string) (*Engine, error) {
+	cp, free := cString(path)
+	defer free()
+	ptr := C.fl_engine_open(cp)
+	if ptr == nil {
+		return nil, fmt.Errorf("fl_engine_open failed: %s", lastError())
+	}
+	return &Engine{ptr: ptr}, nil
+}
+
+func OpenWithConfig(path string, cfg *Config) (*Engine, error) {
+	if cfg == nil || cfg.ptr == nil {
+		return nil, errors.New("config is nil")
+	}
+	cp, free := cString(path)
+	defer free()
+	ptr := C.fl_engine_open_with_config(cp, cfg.ptr)
+	cfg.ptr = nil
+	if ptr == nil {
+		return nil, fmt.Errorf("fl_engine_open_with_config failed: %s", lastError())
+	}
+	return &Engine{ptr: ptr}, nil
+}
+
+func (e *Engine) Close() {
+	if e != nil && e.ptr != nil {
+		C.fl_engine_free(e.ptr)
+		e.ptr = nil
+	}
+}
+
+func NewConfig() *Config { return &Config{ptr: C.fl_config_new()} }
+func (c *Config) Free() {
+	if c != nil && c.ptr != nil {
+		C.fl_config_free(c.ptr)
+		c.ptr = nil
+	}
+}
+
+func (c *Config) SetDurability(mode DurabilityMode) {
+	C.fl_config_set_durability(c.ptr, C.int32_t(mode))
+}
+func (c *Config) SetQueryWorkers(count uintptr) {
+	C.fl_config_set_query_workers(c.ptr, C.uintptr_t(count))
+}
+func (c *Config) SetCompression(enabled bool, level int32) {
+	C.fl_config_set_compression(c.ptr, C.bool(enabled), C.int32_t(level))
+}
+
+func (c *Config) SetEncryptionKey(key string) {
+	ck, free := cString(key)
+	defer free()
+	C.fl_config_set_encryption_key(c.ptr, ck)
+}
+
+func (c *Config) SetAuditLog(enabled bool, path string) {
+	cp, free := cString(path)
+	defer free()
+	C.fl_config_set_audit_log(c.ptr, C.bool(enabled), cp)
+}
+
+func (c *Config) SetMemoryLimits(mmapSize, maxInlined uintptr) {
+	C.fl_config_set_memory_limits(c.ptr, C.uintptr_t(mmapSize), C.uintptr_t(maxInlined))
+}
+
+func (c *Config) SetStorageTuning(pageSize, compactionThreshold, groupCommitMaxOps uintptr) {
+	C.fl_config_set_storage_tuning(c.ptr, C.uintptr_t(pageSize), C.uintptr_t(compactionThreshold), C.uintptr_t(groupCommitMaxOps))
+}
+
+func NewDoc() *Doc { return &Doc{ptr: C.fl_doc_new()} }
+func (d *Doc) Free() {
+	if d != nil && d.ptr != nil {
+		C.fl_doc_free(d.ptr)
+		d.ptr = nil
+	}
+}
+
+func (d *Doc) ToJSON() (string, error) {
+	ptr := C.fl_doc_to_json(d.ptr)
+	if ptr == nil {
+		return "", fmt.Errorf("fl_doc_to_json failed: %s", lastError())
+	}
+	defer C.fl_string_free(ptr)
+	return C.GoString(ptr), nil
+}
+
+func (d *Doc) InsertString(key, value string) error {
+	ck, fk := cString(key)
+	cv, fv := cString(value)
+	defer fk()
+	defer fv()
+	return checkStatus("fl_doc_insert_str", C.fl_doc_insert_str(d.ptr, ck, cv))
+}
+func (d *Doc) InsertInt(key string, value int64) error {
+	ck, fk := cString(key)
+	defer fk()
+	return checkStatus("fl_doc_insert_int", C.fl_doc_insert_int(d.ptr, ck, C.int64_t(value)))
+}
+func (d *Doc) InsertFloat(key string, value float64) error {
+	ck, fk := cString(key)
+	defer fk()
+	return checkStatus("fl_doc_insert_float", C.fl_doc_insert_float(d.ptr, ck, C.double(value)))
+}
+func (d *Doc) InsertBool(key string, value bool) error {
+	ck, fk := cString(key)
+	defer fk()
+	return checkStatus("fl_doc_insert_bool", C.fl_doc_insert_bool(d.ptr, ck, C.bool(value)))
+}
+func (d *Doc) InsertNull(key string) error {
+	ck, fk := cString(key)
+	defer fk()
+	return checkStatus("fl_doc_insert_null", C.fl_doc_insert_null(d.ptr, ck))
+}
+func (d *Doc) InsertTimestamp(key string, micros int64) error {
+	ck, fk := cString(key)
+	defer fk()
+	return checkStatus("fl_doc_insert_timestamp", C.fl_doc_insert_timestamp(d.ptr, ck, C.int64_t(micros)))
+}
+func (d *Doc) InsertServerTimestamp(key string) error {
+	ck, fk := cString(key)
+	defer fk()
+	return checkStatus("fl_doc_insert_server_timestamp", C.fl_doc_insert_server_timestamp(d.ptr, ck))
+}
+func (d *Doc) InsertBinary(key string, data []byte) error {
+	ck, fk := cString(key)
+	defer fk()
+	if len(data) == 0 {
+		return checkStatus("fl_doc_insert_bin", C.fl_doc_insert_bin(d.ptr, ck, nil, 0))
+	}
+	return checkStatus("fl_doc_insert_bin", C.fl_doc_insert_bin(d.ptr, ck, (*C.uint8_t)(unsafe.Pointer(&data[0])), C.uintptr_t(len(data))))
+}
+func (d *Doc) InsertDoc(key string, child *Doc) error {
+	ck, fk := cString(key)
+	defer fk()
+	if child == nil || child.ptr == nil {
+		return errors.New("child doc is nil")
+	}
+	return checkStatus("fl_doc_insert_doc", C.fl_doc_insert_doc(d.ptr, ck, child.ptr))
+}
+func (d *Doc) InsertArray(key string, arr *Array) error {
+	ck, fk := cString(key)
+	defer fk()
+	if arr == nil || arr.ptr == nil {
+		return errors.New("array is nil")
+	}
+	ptr := arr.ptr
+	arr.ptr = nil
+	return checkStatus("fl_doc_insert_array", C.fl_doc_insert_array(d.ptr, ck, ptr))
+}
+func (d *Doc) InsertReference(key, targetCollection, targetID string) error {
+	ck, fk := cString(key)
+	cc, fc := cString(targetCollection)
+	ci, fi := cString(targetID)
+	defer fk()
+	defer fc()
+	defer fi()
+	return checkStatus("fl_doc_insert_reference", C.fl_doc_insert_reference(d.ptr, ck, cc, ci))
+}
+
+func NewArray() *Array { return &Array{ptr: C.fl_array_new()} }
+func (a *Array) Free() {
+	if a != nil && a.ptr != nil {
+		C.fl_array_free(a.ptr)
+		a.ptr = nil
+	}
+}
+func (a *Array) AppendString(v string) error {
+	cv, free := cString(v)
+	defer free()
+	return checkStatus("fl_array_append_str", C.fl_array_append_str(a.ptr, cv))
+}
+func (a *Array) AppendInt(v int64) error {
+	return checkStatus("fl_array_append_int", C.fl_array_append_int(a.ptr, C.int64_t(v)))
+}
+func (a *Array) AppendDoc(d *Doc) error {
+	if d == nil || d.ptr == nil {
+		return errors.New("doc is nil")
+	}
+	return checkStatus("fl_array_append_doc", C.fl_array_append_doc(a.ptr, d.ptr))
+}
+
+func (e *Engine) Set(collection, docID string, doc *Doc) error {
+	cc, fc := cString(collection)
+	ci, fi := cString(docID)
+	defer fc()
+	defer fi()
+	return checkStatus("fl_engine_insert", C.fl_engine_insert(e.ptr, cc, ci, doc.ptr))
+}
+
+func (e *Engine) GetDoc(collection, docID string) (*Doc, error) {
+	cc, fc := cString(collection)
+	ci, fi := cString(docID)
+	defer fc()
+	defer fi()
+	ptr := C.fl_engine_get(e.ptr, cc, ci)
+	if ptr == nil {
+		return nil, nil
+	}
+	return &Doc{ptr: ptr}, nil
+}
+
+func (e *Engine) Delete(collection, docID string) error {
+	cc, fc := cString(collection)
+	ci, fi := cString(docID)
+	defer fc()
+	defer fi()
+	return checkStatus("fl_engine_delete", C.fl_engine_delete(e.ptr, cc, ci))
+}
+
+func (e *Engine) Patch(collection, docID string, updates *Doc) error {
+	cc, fc := cString(collection)
+	ci, fi := cString(docID)
+	defer fc()
+	defer fi()
+	return checkStatus("fl_engine_patch", C.fl_engine_patch(e.ptr, cc, ci, updates.ptr))
+}
+
+func (e *Engine) GetByReference(doc *Doc, fieldKey string) (*Doc, error) {
+	ck, fk := cString(fieldKey)
+	defer fk()
+	ptr := C.fl_engine_get_by_ref(e.ptr, doc.ptr, ck)
+	if ptr == nil {
+		return nil, nil
+	}
+	return &Doc{ptr: ptr}, nil
+}
+
+func (e *Engine) Backup(path string) error {
+	cp, free := cString(path)
+	defer free()
+	return checkStatus("fl_engine_backup", C.fl_engine_backup(e.ptr, cp))
+}
+func (e *Engine) Compact() error { return checkStatus("fl_engine_compact", C.fl_engine_compact(e.ptr)) }
+
+func (e *Engine) ListCollections() ([]string, error) {
+	s, err := ownedCStringJSON(func() *C.char { return C.fl_engine_list_collections(e.ptr) })
+	if err != nil {
+		return nil, err
+	}
+	var cols []string
+	if err := json.Unmarshal([]byte(s), &cols); err != nil {
+		return nil, err
+	}
+	return cols, nil
+}
+func (e *Engine) StatsJSON() (string, error) {
+	return ownedCStringJSON(func() *C.char { return C.fl_engine_get_stats(e.ptr) })
+}
+func (e *Engine) AuditLogJSON() (string, error) {
+	return ownedCStringJSON(func() *C.char { return C.fl_engine_get_audit_log(e.ptr) })
+}
+
+func (e *Engine) InsertSubDoc(col, id, subCol, subID string, doc *Doc) error {
+	cc, fc := cString(col)
+	ci, fi := cString(id)
+	cs, fs := cString(subCol)
+	csi, fsi := cString(subID)
+	defer fc()
+	defer fi()
+	defer fs()
+	defer fsi()
+	return checkStatus("fl_engine_insert_subdoc", C.fl_engine_insert_subdoc(e.ptr, cc, ci, cs, csi, doc.ptr))
+}
+
+func (e *Engine) CreateIndex(collection string, fieldsJSON string) (uint32, error) {
+	cc, fc := cString(collection)
+	cj, fj := cString(fieldsJSON)
+	defer fc()
+	defer fj()
+	v := C.fl_engine_create_index(e.ptr, cc, cj)
+	if v == 0 {
+		return 0, fmt.Errorf("fl_engine_create_index failed: %s", lastError())
+	}
+	return uint32(v), nil
+}
+func (e *Engine) CreateSimpleIndex(collection, field string) error {
+	cc, fc := cString(collection)
+	cf, ff := cString(field)
+	defer fc()
+	defer ff()
+	return checkStatus("fl_engine_create_simple_index", C.fl_engine_create_simple_index(e.ptr, cc, cf))
+}
+func (e *Engine) CreateFTSIndex(collection, field string) error {
+	cc, fc := cString(collection)
+	cf, ff := cString(field)
+	defer fc()
+	defer ff()
+	return checkStatus("fl_engine_create_fts_index", C.fl_engine_create_fts_index(e.ptr, cc, cf))
+}
+func (e *Engine) SnapshotIndices() error {
+	return checkStatus("fl_engine_snapshot_indices", C.fl_engine_snapshot_indices(e.ptr))
+}
+
+func NewBatch() *Batch { return &Batch{ptr: C.fl_batch_new()} }
+func (b *Batch) Free() {
+	if b != nil && b.ptr != nil {
+		C.fl_batch_free(b.ptr)
+		b.ptr = nil
+	}
+}
+func (b *Batch) Set(collection, docID string, doc *Doc) error {
+	cc, fc := cString(collection)
+	ci, fi := cString(docID)
+	defer fc()
+	defer fi()
+	return checkStatus("fl_batch_set", C.fl_batch_set(b.ptr, cc, ci, doc.ptr))
+}
+func (b *Batch) Delete(collection, docID string) error {
+	cc, fc := cString(collection)
+	ci, fi := cString(docID)
+	defer fc()
+	defer fi()
+	return checkStatus("fl_batch_delete", C.fl_batch_delete(b.ptr, cc, ci))
+}
+func (e *Engine) CommitBatch(batch *Batch) error {
+	return checkStatus("fl_batch_commit", C.fl_batch_commit(e.ptr, batch.ptr))
+}
+
+func (e *Engine) BeginTransaction() (*Transaction, error) {
+	ptr := C.fl_transaction_begin(e.ptr)
+	if ptr == nil {
+		return nil, fmt.Errorf("fl_transaction_begin failed: %s", lastError())
+	}
+	return &Transaction{ptr: ptr}, nil
+}
+func (t *Transaction) Free() {
+	if t != nil && t.ptr != nil {
+		C.fl_transaction_free(t.ptr)
+		t.ptr = nil
+	}
+}
+func (e *Engine) TxGet(t *Transaction, collection, docID string) (*Doc, error) {
+	cc, fc := cString(collection)
+	ci, fi := cString(docID)
+	defer fc()
+	defer fi()
+	ptr := C.fl_transaction_get(e.ptr, t.ptr, cc, ci)
+	if ptr == nil {
+		return nil, nil
+	}
+	return &Doc{ptr: ptr}, nil
+}
+func (t *Transaction) Set(collection, docID string, doc *Doc) error {
+	cc, fc := cString(collection)
+	ci, fi := cString(docID)
+	defer fc()
+	defer fi()
+	return checkStatus("fl_transaction_set", C.fl_transaction_set(t.ptr, cc, ci, doc.ptr))
+}
+func (e *Engine) CommitTransaction(t *Transaction) error {
+	return checkStatus("fl_transaction_commit", C.fl_transaction_commit(e.ptr, t.ptr))
+}
+
+func NewQuery(collection string) *Query {
+	cc, free := cString(collection)
+	defer free()
+	return &Query{ptr: C.fl_query_new(cc)}
+}
+func (q *Query) Free() {
+	if q != nil && q.ptr != nil {
+		C.fl_query_free(q.ptr)
+		q.ptr = nil
+	}
+}
+func (q *Query) WhereEqString(field, value string) error {
+	cf, ff := cString(field)
+	cv, fv := cString(value)
+	defer ff()
+	defer fv()
+	return checkStatus("fl_query_where_eq_str", C.fl_query_where_eq_str(q.ptr, cf, cv))
+}
+func (q *Query) WhereEqInt(field string, value int64) error {
+	cf, ff := cString(field)
+	defer ff()
+	return checkStatus("fl_query_where_eq_int", C.fl_query_where_eq_int(q.ptr, cf, C.int64_t(value)))
+}
+func (q *Query) WhereOrString(field, value string) error {
+	cf, ff := cString(field)
+	cv, fv := cString(value)
+	defer ff()
+	defer fv()
+	return checkStatus("fl_query_where_or_str", C.fl_query_where_or_str(q.ptr, cf, cv))
+}
+func (q *Query) WhereOrInt(field string, value int64) error {
+	cf, ff := cString(field)
+	defer ff()
+	return checkStatus("fl_query_where_or_int", C.fl_query_where_or_int(q.ptr, cf, C.int64_t(value)))
+}
+func (q *Query) WhereIn(field string, arr *Array) error {
+	cf, ff := cString(field)
+	defer ff()
+	ptr := arr.ptr
+	arr.ptr = nil
+	return checkStatus("fl_query_where_in", C.fl_query_where_in(q.ptr, cf, ptr))
+}
+func (q *Query) WhereNotIn(field string, arr *Array) error {
+	cf, ff := cString(field)
+	defer ff()
+	ptr := arr.ptr
+	arr.ptr = nil
+	return checkStatus("fl_query_where_not_in", C.fl_query_where_not_in(q.ptr, cf, ptr))
+}
+func (q *Query) WhereArrayContainsAny(field string, arr *Array) error {
+	cf, ff := cString(field)
+	defer ff()
+	ptr := arr.ptr
+	arr.ptr = nil
+	return checkStatus("fl_query_where_array_contains_any", C.fl_query_where_array_contains_any(q.ptr, cf, ptr))
+}
+func (q *Query) WhereArrayContains(field, value string) error {
+	cf, ff := cString(field)
+	cv, fv := cString(value)
+	defer ff()
+	defer fv()
+	return checkStatus("fl_query_where_array_contains", C.fl_query_where_array_contains(q.ptr, cf, cv))
+}
+func (q *Query) WhereMatch(field, value string) error {
+	cf, ff := cString(field)
+	cv, fv := cString(value)
+	defer ff()
+	defer fv()
+	return checkStatus("fl_query_where_match", C.fl_query_where_match(q.ptr, cf, cv))
+}
+func (q *Query) WhereContains(field, value string) error {
+	cf, ff := cString(field)
+	cv, fv := cString(value)
+	defer ff()
+	defer fv()
+	return checkStatus("fl_query_where_contains", C.fl_query_where_contains(q.ptr, cf, cv))
+}
+func (q *Query) WhereStartsWith(field, value string) error {
+	cf, ff := cString(field)
+	cv, fv := cString(value)
+	defer ff()
+	defer fv()
+	return checkStatus("fl_query_where_starts_with", C.fl_query_where_starts_with(q.ptr, cf, cv))
+}
+func (q *Query) OrderBy(field string, ascending bool) error {
+	cf, ff := cString(field)
+	defer ff()
+	return checkStatus("fl_query_order_by", C.fl_query_order_by(q.ptr, cf, C.bool(ascending)))
+}
+func (q *Query) Limit(v uintptr) error {
+	return checkStatus("fl_query_limit", C.fl_query_limit(q.ptr, C.uintptr_t(v)))
+}
+func (q *Query) Offset(v uintptr) error {
+	return checkStatus("fl_query_offset", C.fl_query_offset(q.ptr, C.uintptr_t(v)))
+}
+func (q *Query) SelectField(field string) error {
+	cf, ff := cString(field)
+	defer ff()
+	return checkStatus("fl_query_select_field", C.fl_query_select_field(q.ptr, cf))
+}
+func (q *Query) StartAfter(anchor *Doc) error {
+	return checkStatus("fl_query_start_after", C.fl_query_start_after(q.ptr, anchor.ptr))
+}
+func (q *Query) StartAt(anchor *Doc) error {
+	return checkStatus("fl_query_start_at", C.fl_query_start_at(q.ptr, anchor.ptr))
+}
+func (q *Query) EndAt(anchor *Doc) error {
+	return checkStatus("fl_query_end_at", C.fl_query_end_at(q.ptr, anchor.ptr))
+}
+func (q *Query) EndBefore(anchor *Doc) error {
+	return checkStatus("fl_query_end_before", C.fl_query_end_before(q.ptr, anchor.ptr))
+}
+func (q *Query) AggregateCount() error {
+	return checkStatus("fl_query_aggregate_count", C.fl_query_aggregate_count(q.ptr))
+}
+func (q *Query) AggregateSum(field string) error {
+	cf, ff := cString(field)
+	defer ff()
+	return checkStatus("fl_query_aggregate_sum", C.fl_query_aggregate_sum(q.ptr, cf))
+}
+func (q *Query) AggregateAvg(field string) error {
+	cf, ff := cString(field)
+	defer ff()
+	return checkStatus("fl_query_aggregate_avg", C.fl_query_aggregate_avg(q.ptr, cf))
+}
+func (e *Engine) ExecuteQuery(q *Query) (string, error) {
+	return ownedCStringJSON(func() *C.char { return C.fl_query_execute(e.ptr, q.ptr) })
+}
+func (e *Engine) ExecuteAggregation(q *Query) (string, error) {
+	return ownedCStringJSON(func() *C.char { return C.fl_query_execute_aggregation(e.ptr, q.ptr) })
+}
+
+func ownedCStringJSON(fn func() *C.char) (string, error) {
+	ptr := fn()
+	if ptr == nil {
+		return "", errors.New(lastError())
+	}
+	defer C.fl_string_free(ptr)
+	return C.GoString(ptr), nil
+}
+
+//export firelite_watch_bridge
+func firelite_watch_bridge(collection *C.char, path *C.char, kind C.int32_t, userData unsafe.Pointer) {
+	h := cgo.Handle(userData)
+	cb, ok := h.Value().(SnapshotCallback)
+	if !ok {
+		return
+	}
+	cb(C.GoString(collection), C.GoString(path), SnapshotKind(kind))
+}
+
+func (e *Engine) Watch(collection string, callback SnapshotCallback) (*Watch, error) {
+	cc, free := cString(collection)
+	defer free()
+	h := cgo.NewHandle(callback)
+	ptr := C.firelite_watch_bridge_register(e.ptr, cc, unsafe.Pointer(h))
+	if ptr == nil {
+		h.Delete()
+		return nil, fmt.Errorf("fl_engine_watch failed: %s", lastError())
+	}
+	return &Watch{ptr: ptr, handle: h}, nil
+}
+
+func (w *Watch) Close() {
+	if w == nil {
+		return
+	}
+	if w.ptr != nil {
+		C.fl_watch_free(w.ptr)
+		w.ptr = nil
+	}
+	if w.handle != 0 {
+		w.handle.Delete()
+		w.handle = 0
+	}
+}
+
+// Firestore-style high-level facade
+
+type Client struct{ engine *Engine }
+
+func OpenClient(path string) (*Client, error) {
+	e, err := Open(path)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{engine: e}, nil
+}
+
+func (c *Client) Close()                                { c.engine.Close() }
+func (c *Client) Collection(name string) *CollectionRef { return &CollectionRef{client: c, name: name} }
+func (c *Client) Batch() *WriteBatch                    { return &WriteBatch{client: c, batch: NewBatch()} }
+
+func (c *Client) RunTransaction(fn func(tx *Tx) error) error {
+	txHandle, err := c.engine.BeginTransaction()
+	if err != nil {
+		return err
+	}
+	defer txHandle.Free()
+	tx := &Tx{engine: c.engine, tx: txHandle}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return c.engine.CommitTransaction(txHandle)
+}
+
+type CollectionRef struct {
+	client *Client
+	name   string
+}
+
+type DocumentRef struct {
+	client     *Client
+	collection string
+	id         string
+}
+
+type DocumentSnapshot struct {
+	Exists bool
+	Data   map[string]any
+}
+
+func (c *CollectionRef) Doc(id string) *DocumentRef {
+	return &DocumentRef{client: c.client, collection: c.name, id: id}
+}
+
+func (d *DocumentRef) Set(data map[string]any) error {
+	doc, err := mapToDoc(data)
+	if err != nil {
+		return err
+	}
+	defer doc.Free()
+	return d.client.engine.Set(d.collection, d.id, doc)
+}
+
+func (d *DocumentRef) Update(data map[string]any) error {
+	updates, err := mapToDoc(data)
+	if err != nil {
+		return err
+	}
+	defer updates.Free()
+	return d.client.engine.Patch(d.collection, d.id, updates)
+}
+
+func (d *DocumentRef) Delete() error { return d.client.engine.Delete(d.collection, d.id) }
+
+func (d *DocumentRef) Get() (*DocumentSnapshot, error) {
+	doc, err := d.client.engine.GetDoc(d.collection, d.id)
+	if err != nil {
+		return nil, err
+	}
+	if doc == nil {
+		return &DocumentSnapshot{Exists: false}, nil
+	}
+	defer doc.Free()
+	jsonText, err := doc.ToJSON()
+	if err != nil {
+		return nil, err
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(jsonText), &payload); err != nil {
+		return nil, err
+	}
+	return &DocumentSnapshot{Exists: true, Data: payload}, nil
+}
+
+func (c *CollectionRef) Where(field, op string, value any) *QueryRef {
+	q := &QueryRef{client: c.client, collection: c.name}
+	_ = q.Where(field, op, value)
+	return q
+}
+
+func (c *CollectionRef) OrderBy(field string, ascending bool) *QueryRef {
+	q := &QueryRef{client: c.client, collection: c.name}
+	_ = q.OrderBy(field, ascending)
+	return q
+}
+
+func (c *CollectionRef) Get() ([]map[string]any, error) {
+	return (&QueryRef{client: c.client, collection: c.name}).Get()
+}
+
+type QueryRef struct {
+	client     *Client
+	collection string
+	ops        []func(*Query) error
+}
+
+func (q *QueryRef) Where(field, op string, value any) *QueryRef {
+	q.ops = append(q.ops, func(raw *Query) error {
+		switch op {
+		case "==":
+			switch v := value.(type) {
+			case string:
+				return raw.WhereEqString(field, v)
+			case int:
+				return raw.WhereEqInt(field, int64(v))
+			case int64:
+				return raw.WhereEqInt(field, v)
+			default:
+				return fmt.Errorf("unsupported == type %T", value)
+			}
+		case "in", "not-in", "array-contains-any":
+			arr, err := anyToArray(value)
+			if err != nil {
+				return err
+			}
+			switch op {
+			case "in":
+				return raw.WhereIn(field, arr)
+			case "not-in":
+				return raw.WhereNotIn(field, arr)
+			default:
+				return raw.WhereArrayContainsAny(field, arr)
+			}
+		case "array-contains":
+			return raw.WhereArrayContains(field, fmt.Sprint(value))
+		case "match":
+			return raw.WhereMatch(field, fmt.Sprint(value))
+		case "contains":
+			return raw.WhereContains(field, fmt.Sprint(value))
+		case "startsWith":
+			return raw.WhereStartsWith(field, fmt.Sprint(value))
+		default:
+			return fmt.Errorf("unsupported operator %q", op)
+		}
+	})
+	return q
+}
+
+func (q *QueryRef) OrderBy(field string, ascending bool) *QueryRef {
+	q.ops = append(q.ops, func(raw *Query) error { return raw.OrderBy(field, ascending) })
+	return q
+}
+func (q *QueryRef) Limit(v int) *QueryRef {
+	q.ops = append(q.ops, func(raw *Query) error { return raw.Limit(uintptr(v)) })
+	return q
+}
+func (q *QueryRef) Offset(v int) *QueryRef {
+	q.ops = append(q.ops, func(raw *Query) error { return raw.Offset(uintptr(v)) })
+	return q
+}
+func (q *QueryRef) Select(fields ...string) *QueryRef {
+	q.ops = append(q.ops, func(raw *Query) error {
+		for _, f := range fields {
+			if err := raw.SelectField(f); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return q
+}
+
+func (q *QueryRef) Get() ([]map[string]any, error) {
+	raw := NewQuery(q.collection)
+	defer raw.Free()
+	for _, op := range q.ops {
+		if err := op(raw); err != nil {
+			return nil, err
+		}
+	}
+	jsonText, err := q.client.engine.ExecuteQuery(raw)
+	if err != nil {
+		return nil, err
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(jsonText), &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+type WriteBatch struct {
+	client *Client
+	batch  *Batch
+}
+
+func (b *WriteBatch) Set(docRef *DocumentRef, data map[string]any) *WriteBatch {
+	doc, err := mapToDoc(data)
+	if err != nil {
+		panic(err)
+	}
+	defer doc.Free()
+	if err := b.batch.Set(docRef.collection, docRef.id, doc); err != nil {
+		panic(err)
+	}
+	return b
+}
+
+func (b *WriteBatch) Delete(docRef *DocumentRef) *WriteBatch {
+	if err := b.batch.Delete(docRef.collection, docRef.id); err != nil {
+		panic(err)
+	}
+	return b
+}
+
+func (b *WriteBatch) Commit() error {
+	defer b.batch.Free()
+	return b.client.engine.CommitBatch(b.batch)
+}
+
+type Tx struct {
+	engine *Engine
+	tx     *Transaction
+}
+
+func (t *Tx) Get(docRef *DocumentRef) (*DocumentSnapshot, error) {
+	doc, err := t.engine.TxGet(t.tx, docRef.collection, docRef.id)
+	if err != nil {
+		return nil, err
+	}
+	if doc == nil {
+		return &DocumentSnapshot{Exists: false}, nil
+	}
+	defer doc.Free()
+	js, err := doc.ToJSON()
+	if err != nil {
+		return nil, err
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(js), &payload); err != nil {
+		return nil, err
+	}
+	return &DocumentSnapshot{Exists: true, Data: payload}, nil
+}
+
+func (t *Tx) Set(docRef *DocumentRef, data map[string]any) error {
+	doc, err := mapToDoc(data)
+	if err != nil {
+		return err
+	}
+	defer doc.Free()
+	return t.tx.Set(docRef.collection, docRef.id, doc)
+}
+
+func mapToDoc(data map[string]any) (*Doc, error) {
+	doc := NewDoc()
+	for k, v := range data {
+		if err := insertAny(doc, k, v); err != nil {
+			doc.Free()
+			return nil, err
+		}
+	}
+	return doc, nil
+}
+
+func anyToArray(value any) (*Array, error) {
+	arr := NewArray()
+	vals, ok := value.([]any)
+	if !ok {
+		switch v := value.(type) {
+		case []string:
+			for _, s := range v {
+				if err := arr.AppendString(s); err != nil {
+					return nil, err
+				}
+			}
+			return arr, nil
+		case []int:
+			for _, i := range v {
+				if err := arr.AppendInt(int64(i)); err != nil {
+					return nil, err
+				}
+			}
+			return arr, nil
+		case []int64:
+			for _, i := range v {
+				if err := arr.AppendInt(i); err != nil {
+					return nil, err
+				}
+			}
+			return arr, nil
+		default:
+			return nil, fmt.Errorf("expected array value, got %T", value)
+		}
+	}
+	for _, item := range vals {
+		switch v := item.(type) {
+		case string:
+			if err := arr.AppendString(v); err != nil {
+				return nil, err
+			}
+		case int:
+			if err := arr.AppendInt(int64(v)); err != nil {
+				return nil, err
+			}
+		case int64:
+			if err := arr.AppendInt(v); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, fmt.Errorf("unsupported array value %T", v)
+		}
+	}
+	return arr, nil
+}
+
+func insertAny(doc *Doc, key string, value any) error {
+	switch v := value.(type) {
+	case nil:
+		return doc.InsertNull(key)
+	case string:
+		return doc.InsertString(key, v)
+	case bool:
+		return doc.InsertBool(key, v)
+	case int:
+		return doc.InsertInt(key, int64(v))
+	case int32:
+		return doc.InsertInt(key, int64(v))
+	case int64:
+		return doc.InsertInt(key, v)
+	case float32:
+		return doc.InsertFloat(key, float64(v))
+	case float64:
+		return doc.InsertFloat(key, v)
+	case []byte:
+		return doc.InsertBinary(key, v)
+	case map[string]any:
+		child, err := mapToDoc(v)
+		if err != nil {
+			return err
+		}
+		defer child.Free()
+		return doc.InsertDoc(key, child)
+	case []any:
+		arr := NewArray()
+		defer arr.Free()
+		for _, item := range v {
+			switch t := item.(type) {
+			case string:
+				if err := arr.AppendString(t); err != nil {
+					return err
+				}
+			case int:
+				if err := arr.AppendInt(int64(t)); err != nil {
+					return err
+				}
+			case int64:
+				if err := arr.AppendInt(t); err != nil {
+					return err
+				}
+			case map[string]any:
+				d, err := mapToDoc(t)
+				if err != nil {
+					return err
+				}
+				defer d.Free()
+				if err := arr.AppendDoc(d); err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("unsupported array item %T", t)
+			}
+		}
+		return doc.InsertArray(key, arr)
+	case TimestampMicros:
+		return doc.InsertTimestamp(key, int64(v))
+	case ServerTimestamp:
+		return doc.InsertServerTimestamp(key)
+	case Reference:
+		return doc.InsertReference(key, v.Collection, v.DocID)
+	default:
+		return fmt.Errorf("unsupported value for key %q: %T", key, v)
+	}
+}
