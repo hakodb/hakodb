@@ -14,8 +14,8 @@ type
   PFL_Query = Pointer;
   PFL_Config = Pointer;
   PFL_Watch = Pointer;
-  PFL_Array = Pointer;       // Added in v0.5.6
-  PFL_Transaction = Pointer; // Added in v0.5.6
+  PFL_Array = Pointer;       // Added in v0.5.9
+  PFL_Transaction = Pointer; // Added in v0.5.9
 
   { Callback for real-time snapshots }
   TFL_OnSnapshotCallback = procedure(collection: PChar; path: PChar; kind: cint32; user_data: Pointer); cdecl;
@@ -108,6 +108,9 @@ function fl_query_where_eq_int(query: PFL_Query; field: PChar; value: cint64): c
 function fl_query_where_or_str(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_where_or_int(query: PFL_Query; field: PChar; value: cint64): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_where_in(query: PFL_Query; field: PChar; arr: PFL_Array): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_where_not_in(query: PFL_Query; field: PChar; arr: PFL_Array): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_where_array_contains_any(query: PFL_Query; field: PChar; arr: PFL_Array): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_where_array_contains(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_order_by(query: PFL_Query; field: PChar; ascending: cbool): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_limit(query: PFL_Query; limit: SizeUInt): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_offset(query: PFL_Query; offset: SizeUInt): cint32; cdecl; external FIRELITE_LIB;

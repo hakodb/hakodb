@@ -33,7 +33,7 @@ export interface FireLiteClientOptions {
 // 2. FIXED: Added 'in' to the interface to match the Query class
 export interface QueryConstraint {
   field: string;
-  op: '==' | 'match' | 'contains' | 'startsWith' | 'in';
+  op: '==' | 'match' | 'contains' | 'startsWith' | 'in' | 'not-in' | 'array-contains' | 'array-contains-any';
   value: any; // Use any because 'in' takes an array
 }
 
@@ -109,7 +109,7 @@ function parseQueryRows(json: string | null): FireLiteDocData[] {
 }
 
 /**
- * Recursive field inserter (v0.5.6)
+ * Recursive field inserter (v0.5.9)
  */
 function insertField(native: NativeBindings, handle: unknown, key: string, value: Primitive): void {
   if (value === SERVER_TIMESTAMP_SENTINEL) {
@@ -296,7 +296,7 @@ export class CollectionReference {
   }
 
   // 3. FIXED: Updated 'op' signature to include 'in'
-  where(field: string, op: '==' | 'match' | 'contains' | 'startsWith' | 'in', value: any): Query {
+  where(field: string, op: '==' | 'match' | 'contains' | 'startsWith' | 'in' | 'not-in' | 'array-contains' | 'array-contains-any', value: any): Query {
     return new Query(this.client, this.name).where(field, op, value);
   }
 
@@ -347,14 +347,18 @@ export class DocumentReference {
 
 export class Query {
   private _startAfterSnapshot?: DocumentSnapshot;
+  private _startAtSnapshot?: DocumentSnapshot;
+  private _endAtSnapshot?: DocumentSnapshot;
+  private _endBeforeSnapshot?: DocumentSnapshot;
   private readonly filters: QueryConstraint[] = [];
   private order?: QueryOrder;
   private queryLimit?: number;
+  private queryOffset?: number;
   private projection: string[] = [];
 
   constructor(private readonly client: FireLiteClient, private readonly collection: string) { }
 
-  where(field: string, op: '==' | 'match' | 'contains' | 'startsWith' | 'in', value: any): Query {
+  where(field: string, op: '==' | 'match' | 'contains' | 'startsWith' | 'in' | 'not-in' | 'array-contains' | 'array-contains-any', value: any): Query {
     this.filters.push({ field, op, value });
     return this;
   }
@@ -365,23 +369,17 @@ export class Query {
   }
 
   startAt(snapshot: DocumentSnapshot): Query {
-    if (snapshot._nativeHandle) {
-      this.client.nativeBindings().queryStartAt(this._queryHandle, snapshot._nativeHandle);
-    }
+    this._startAtSnapshot = snapshot;
     return this;
   }
 
   endAt(snapshot: DocumentSnapshot): Query {
-    if (snapshot._nativeHandle) {
-      this.client.nativeBindings().queryEndAt(this._queryHandle, snapshot._nativeHandle);
-    }
+    this._endAtSnapshot = snapshot;
     return this;
   }
 
   endBefore(snapshot: DocumentSnapshot): Query {
-    if (snapshot._nativeHandle) {
-      this.client.nativeBindings().queryEndBefore(this._queryHandle, snapshot._nativeHandle);
-    }
+    this._endBeforeSnapshot = snapshot;
     return this;
   }
 
@@ -392,6 +390,11 @@ export class Query {
 
   limit(max: number): Query {
     this.queryLimit = max;
+    return this;
+  }
+
+  offset(skip: number): Query {
+    this.queryOffset = skip;
     return this;
   }
 
@@ -425,23 +428,40 @@ export class Query {
             ensureOk(native.queryWhereStartsWith(handle, filter.field, String(filter.value)), native, 'queryWhereStartsWith');
             break;
           case 'in':
+          case 'not-in':
+          case 'array-contains-any':
             const arr = native.arrayNew();
             (filter.value as any[]).forEach(v => {
               if (typeof v === 'string') native.arrayAppendStr(arr, v);
               else native.arrayAppendInt(arr, v);
             });
-            // queryWhereIn consumes the array handle
-            ensureOk(native.queryWhereIn(handle, filter.field, arr), native, 'queryWhereIn');
+            if (filter.op === 'in') ensureOk(native.queryWhereIn(handle, filter.field, arr), native, 'queryWhereIn');
+            else if (filter.op === 'not-in') ensureOk(native.queryWhereNotIn(handle, filter.field, arr), native, 'queryWhereNotIn');
+            else ensureOk(native.queryWhereArrayContainsAny(handle, filter.field, arr), native, 'queryWhereArrayContainsAny');
+            break;
+          case 'array-contains':
+            if (typeof filter.value === 'string') ensureOk(native.queryWhereArrayContainsStr(handle, filter.field, filter.value), native, 'queryWhereArrayContainsStr');
+            else ensureOk(native.queryWhereArrayContainsInt(handle, filter.field, filter.value), native, 'queryWhereArrayContainsInt');
             break;
         }
       }
 
+      if (this._startAtSnapshot?._nativeHandle) {
+        ensureOk(native.queryStartAt(handle, this._startAtSnapshot._nativeHandle), native, 'queryStartAt');
+      }
       if (this._startAfterSnapshot?._nativeHandle) {
         ensureOk(native.queryStartAfter(handle, this._startAfterSnapshot._nativeHandle), native, 'queryStartAfter');
+      }
+      if (this._endAtSnapshot?._nativeHandle) {
+        ensureOk(native.queryEndAt(handle, this._endAtSnapshot._nativeHandle), native, 'queryEndAt');
+      }
+      if (this._endBeforeSnapshot?._nativeHandle) {
+        ensureOk(native.queryEndBefore(handle, this._endBeforeSnapshot._nativeHandle), native, 'queryEndBefore');
       }
 
       if (this.order) ensureOk(native.queryOrderBy(handle, this.order.field, this.order.ascending), native, 'queryOrderBy');
       if (this.queryLimit !== undefined) ensureOk(native.queryLimit(handle, this.queryLimit), native, 'queryLimit');
+      if (this.queryOffset !== undefined) ensureOk(native.queryOffset(handle, this.queryOffset), native, 'queryOffset');
       for (const field of this.projection) ensureOk(native.querySelectField(handle, field), native, 'querySelectField');
 
       return handle;
@@ -524,7 +544,7 @@ export class WriteBatch {
     this.ensureActive();
     const doc = toNativeDoc(this.native, data);
     try {
-      ensureOk(this.native.batchSet(this.handle, docRef._collection, docRef._docId, doc), this.native, 'batchSet');
+      ensureOk(this.native.batchSet(this.handle, docRef._collection, docRef._id, doc), this.native, 'batchSet');
       return this;
     } finally {
       this.native.docFree(doc);
@@ -533,7 +553,7 @@ export class WriteBatch {
 
   delete(docRef: DocumentReference): WriteBatch {
     this.ensureActive();
-    ensureOk(this.native.batchDelete(this.handle, docRef._collection, docRef._docId), this.native, 'batchDelete');
+    ensureOk(this.native.batchDelete(this.handle, docRef._collection, docRef._id), this.native, 'batchDelete');
     return this;
   }
 

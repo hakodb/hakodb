@@ -120,6 +120,8 @@ type
     FWhereStr: array of record Field, Value, Op: string; end;
     FWhereInt: array of record Field: string; Value: Int64; end;
     FWhereIn: array of record Field: string; Data: TJSONArray; end;
+    FWhereNotIn: array of record Field: string; Data: TJSONArray; end;
+    FWhereArrayContainsAny: array of record Field: string; Data: TJSONArray; end;
     FOrderByField: string;
     FOrderByAsc: Boolean;
     FLimit, FOffset: NativeUInt;
@@ -136,6 +138,9 @@ type
     function WhereEqStr(const Field, Value: string): TFLQuery;
     function WhereEqInt(const Field: string; Value: Int64): TFLQuery;
     function WhereIn(const Field: string; const Values: array of const): TFLQuery;
+    function WhereNotIn(const Field: string; const Values: array of const): TFLQuery;
+    function ArrayContains(const Field, Value: string): TFLQuery;
+    function ArrayContainsAny(const Field: string; const Values: array of const): TFLQuery;
     function Match(const Field, Value: string): TFLQuery;
     function Contains(const Field, Value: string): TFLQuery;
     function StartsWith(const Field, Value: string): TFLQuery;
@@ -424,6 +429,8 @@ destructor TFLQuery.Destroy;
 var I: Integer; begin
   FSelectFields.Free;
   for I := Low(FWhereIn) to High(FWhereIn) do FWhereIn[I].Data.Free;
+  for I := Low(FWhereNotIn) to High(FWhereNotIn) do FWhereNotIn[I].Data.Free;
+  for I := Low(FWhereArrayContainsAny) to High(FWhereArrayContainsAny) do FWhereArrayContainsAny[I].Data.Free;
   inherited;
 end;
 
@@ -452,6 +459,44 @@ begin
       vtInteger: FWhereIn[L].Data.Add(Values[I].VInteger);
       vtInt64: FWhereIn[L].Data.Add(Values[I].VInt64^);
       vtAnsiString: FWhereIn[L].Data.Add(string(Values[I].VAnsiString));
+    end;
+  end;
+  Result := Self;
+end;
+
+function TFLQuery.WhereNotIn(const Field: string; const Values: array of const): TFLQuery;
+var L, I: Integer;
+begin
+  L := Length(FWhereNotIn); SetLength(FWhereNotIn, L + 1);
+  FWhereNotIn[L].Field := Field; FWhereNotIn[L].Data := TJSONArray.Create;
+  for I := Low(Values) to High(Values) do begin
+    case Values[I].VType of
+      vtInteger: FWhereNotIn[L].Data.Add(Values[I].VInteger);
+      vtInt64: FWhereNotIn[L].Data.Add(Values[I].VInt64^);
+      vtAnsiString: FWhereNotIn[L].Data.Add(string(Values[I].VAnsiString));
+    end;
+  end;
+  Result := Self;
+end;
+
+function TFLQuery.ArrayContains(const Field, Value: string): TFLQuery;
+var L: Integer;
+begin
+  L := Length(FWhereStr); SetLength(FWhereStr, L + 1);
+  FWhereStr[L].Field := Field; FWhereStr[L].Value := Value; FWhereStr[L].Op := 'array_contains';
+  Result := Self;
+end;
+
+function TFLQuery.ArrayContainsAny(const Field: string; const Values: array of const): TFLQuery;
+var L, I: Integer;
+begin
+  L := Length(FWhereArrayContainsAny); SetLength(FWhereArrayContainsAny, L + 1);
+  FWhereArrayContainsAny[L].Field := Field; FWhereArrayContainsAny[L].Data := TJSONArray.Create;
+  for I := Low(Values) to High(Values) do begin
+    case Values[I].VType of
+      vtInteger: FWhereArrayContainsAny[L].Data.Add(Values[I].VInteger);
+      vtInt64: FWhereArrayContainsAny[L].Data.Add(Values[I].VInt64^);
+      vtAnsiString: FWhereArrayContainsAny[L].Data.Add(string(Values[I].VAnsiString));
     end;
   end;
   Result := Self;
@@ -502,6 +547,7 @@ begin
       if FWhereStr[I].Op = 'match' then fl_query_where_match(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value))
       else if FWhereStr[I].Op = 'contains' then fl_query_where_contains(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value))
       else if FWhereStr[I].Op = 'starts_with' then fl_query_where_starts_with(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value))
+      else if FWhereStr[I].Op = 'array_contains' then fl_query_where_array_contains(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value))
       else fl_query_where_eq_str(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value));
     end;
     for I := Low(FWhereInt) to High(FWhereInt) do fl_query_where_eq_int(Result, PChar(FWhereInt[I].Field), FWhereInt[I].Value);
@@ -511,6 +557,20 @@ begin
         if FWhereIn[I].Data.Items[J].JSONType = jtNumber then fl_array_append_int(TmpArr, FWhereIn[I].Data.Items[J].AsInt64)
         else fl_array_append_str(TmpArr, PChar(FWhereIn[I].Data.Items[J].AsString));
       fl_query_where_in(Result, PChar(FWhereIn[I].Field), TmpArr);
+    end;
+    for I := Low(FWhereNotIn) to High(FWhereNotIn) do begin
+      TmpArr := fl_array_new;
+      for J := 0 to FWhereNotIn[I].Data.Count-1 do
+        if FWhereNotIn[I].Data.Items[J].JSONType = jtNumber then fl_array_append_int(TmpArr, FWhereNotIn[I].Data.Items[J].AsInt64)
+        else fl_array_append_str(TmpArr, PChar(FWhereNotIn[I].Data.Items[J].AsString));
+      fl_query_where_not_in(Result, PChar(FWhereNotIn[I].Field), TmpArr);
+    end;
+    for I := Low(FWhereArrayContainsAny) to High(FWhereArrayContainsAny) do begin
+      TmpArr := fl_array_new;
+      for J := 0 to FWhereArrayContainsAny[I].Data.Count-1 do
+        if FWhereArrayContainsAny[I].Data.Items[J].JSONType = jtNumber then fl_array_append_int(TmpArr, FWhereArrayContainsAny[I].Data.Items[J].AsInt64)
+        else fl_array_append_str(TmpArr, PChar(FWhereArrayContainsAny[I].Data.Items[J].AsString));
+      fl_query_where_array_contains_any(Result, PChar(FWhereArrayContainsAny[I].Field), TmpArr);
     end;
     
     if FStartAt <> nil then fl_query_start_at(Result, FStartAt);
