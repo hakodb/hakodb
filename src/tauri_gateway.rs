@@ -44,6 +44,7 @@ pub enum FireLiteOp {
         filters: Vec<FilterInput>,
         order_by: Option<OrderByInput>,
         limit: Option<usize>,
+        offset: Option<usize>,
         projection: Option<Vec<String>>,
     },
     Batch {
@@ -63,6 +64,7 @@ pub enum FireLiteOp {
         filters: Vec<FilterInput>,
         order_by: Option<OrderByInput>,
         limit: Option<usize>,
+        offset: Option<usize>,
         projection: Option<Vec<String>>,
         event_name: Option<String>,
     },
@@ -126,6 +128,9 @@ pub enum FilterOperator {
     Contains,
     StartsWith,
     In,
+    NotIn,
+    ArrayContains,
+    ArrayContainsAny,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +197,7 @@ impl FireLiteGateway {
         filters: Vec<FilterInput>,
         order_by: Option<OrderByInput>,
         limit: Option<usize>,
+        offset: Option<usize>,
         projection: Option<Vec<String>>,
         event_name: String,
     ) -> Result<(), String> {
@@ -202,6 +208,7 @@ impl FireLiteGateway {
             filters,
             order_by,
             limit,
+            offset,
             projection,
         };
 
@@ -262,6 +269,7 @@ struct QueryInput {
     filters: Vec<FilterInput>,
     order_by: Option<OrderByInput>,
     limit: Option<usize>,
+    offset: Option<usize>,
     projection: Option<Vec<String>>,
 }
 
@@ -325,6 +333,7 @@ pub fn firelite_exec<R: Runtime>(
             filters,
             order_by,
             limit,
+            offset,
             projection,
         } => {
             let rows = execute_query_input(
@@ -334,6 +343,7 @@ pub fn firelite_exec<R: Runtime>(
                     filters,
                     order_by,
                     limit,
+                    offset,
                     projection,
                 },
             )?;
@@ -422,6 +432,7 @@ pub fn firelite_exec<R: Runtime>(
             filters,
             order_by,
             limit,
+            offset,
             projection,
             event_name,
         } => {
@@ -432,6 +443,7 @@ pub fn firelite_exec<R: Runtime>(
                 filters,
                 order_by,
                 limit,
+                offset,
                 projection,
                 event_name.unwrap_or_else(|| "firelite://snapshot".to_string()),
             )?;
@@ -465,6 +477,9 @@ fn execute_query_input(
     if let Some(limit) = input.limit {
         query = query.limit(limit);
     }
+    if let Some(offset) = input.offset {
+        query = query.offset(offset);
+    }
 
     if let Some(projection) = &input.projection {
         if !projection.is_empty() {
@@ -496,6 +511,9 @@ fn map_operator(op: &FilterOperator) -> Operator {
         FilterOperator::Contains => Operator::Contains,
         FilterOperator::StartsWith => Operator::StartsWith,
         FilterOperator::In => Operator::In,
+        FilterOperator::NotIn => Operator::NotIn,
+        FilterOperator::ArrayContains => Operator::ArrayContains,
+        FilterOperator::ArrayContainsAny => Operator::ArrayContainsAny,
     }
 }
 
@@ -525,22 +543,16 @@ fn json_value_to_value(v: &serde_json::Value) -> Result<Value, String> {
             }
         }
         serde_json::Value::String(s) => Ok(Value::String(s.clone())),
-        serde_json::Value::Array(arr) => {
-            let mut bytes = Vec::with_capacity(arr.len());
-            for item in arr {
-                let n = item
-                    .as_u64()
-                    .ok_or_else(|| "only byte arrays are supported as JSON arrays".to_string())?;
-                if n > u8::MAX as u64 {
-                    return Err("byte array value out of range".to_string());
-                }
-                bytes.push(n as u8);
-            }
-            Ok(Value::Binary(bytes))
-        }
-        serde_json::Value::Object(_) => {
-            Err("nested objects are not supported in FireLiteDoc payloads".to_string())
-        }
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .map(json_value_to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        serde_json::Value::Object(obj) => obj
+            .iter()
+            .map(|(k, v)| Ok((k.clone(), json_value_to_value(v)?)))
+            .collect::<Result<Vec<_>, String>>()
+            .map(Value::Map),
     }
 }
 
@@ -587,6 +599,23 @@ fn value_to_json(v: &Value) -> Result<serde_json::Value, String> {
                 .iter()
                 .map(|b| serde_json::Value::Number((*b as u64).into()))
                 .collect(),
+        )),
+        Value::Reference { collection, doc_id } => {
+            let mut map = serde_json::Map::new();
+            map.insert("__ref__".to_string(), serde_json::Value::String(format!("{collection}/{doc_id}")));
+            Ok(serde_json::Value::Object(map))
+        }
+        Value::Timestamp(micros) => Ok(serde_json::Value::Number((*micros).into())),
+        Value::ServerTimestamp => Ok(serde_json::Value::Null),
+        Value::Map(fields) => {
+            let mut map = serde_json::Map::new();
+            for (k, v) in fields {
+                map.insert(k.clone(), value_to_json(v)?);
+            }
+            Ok(serde_json::Value::Object(map))
+        }
+        Value::Array(values) => Ok(serde_json::Value::Array(
+            values.iter().map(value_to_json).collect::<Result<Vec<_>, _>>()?,
         )),
     }
 }

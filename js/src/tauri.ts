@@ -13,10 +13,10 @@ export type FireLitePrimitive =
 
 export type FireLiteRecord = { [key: string]: FireLitePrimitive };
 
-// v0.5.6 operators exposed by the Tauri gateway
+// v0.5.9 operators exposed by the Tauri gateway
 export type FilterOperator = 
   | 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' 
-  | 'match' | 'contains' | 'startsWith' | 'in';
+  | 'match' | 'contains' | 'startsWith' | 'in' | 'notIn' | 'arrayContains' | 'arrayContainsAny';
 
 type FireLiteOp =
   | { op: 'get'; collection: string; docId: string }
@@ -30,6 +30,7 @@ type FireLiteOp =
       filters: FilterInput[];
       orderBy?: OrderByInput;
       limit?: number;
+      offset?: number;
       projection?: string[];
     }
   | { op: 'batch'; mutations: BatchInput[] }
@@ -40,6 +41,7 @@ type FireLiteOp =
       filters: FilterInput[];
       orderBy?: OrderByInput;
       limit?: number;
+      offset?: number;
       projection?: string[];
       eventName: string;
     }
@@ -143,6 +145,7 @@ export class TauriFireLite {
     filters: FilterInput[],
     orderBy?: OrderByInput,
     limit?: number,
+    offset?: number,
     projection?: string[]
   ): Promise<FireLiteRecord[]> {
     const normalizedFilters = filters.map((f) => ({
@@ -156,6 +159,7 @@ export class TauriFireLite {
       filters: normalizedFilters,
       orderBy,
       limit,
+      offset,
       projection
     });
 
@@ -171,6 +175,7 @@ export class TauriFireLite {
       filters: FilterInput[];
       orderBy?: OrderByInput;
       limit?: number;
+      offset?: number;
       projection?: string[];
       eventName: string;
     },
@@ -190,6 +195,7 @@ export class TauriFireLite {
       filters: params.filters.map(f => ({ ...f, value: normalizeValue(f.value) })),
       orderBy: params.orderBy,
       limit: params.limit,
+      offset: params.offset,
       projection: params.projection,
       eventName: params.eventName
     });
@@ -269,6 +275,7 @@ export class TauriQuery {
   private readonly filters: FilterInput[] = [];
   private orderByDef?: OrderByInput;
   private limitDef?: number;
+  private offsetDef?: number;
   private projectionDef?: string[];
 
   constructor(private readonly collection: string) {}
@@ -280,7 +287,7 @@ export class TauriQuery {
 
   startAfter(snapshot: TauriDocumentSnapshot): TauriQuery {
     void snapshot;
-    throw new Error('startAfter is not supported by the v0.5.6 Tauri gateway');
+    throw new Error('startAfter is not currently supported by the JSON-based Tauri gateway transport');
   }
 
   orderBy(field: string, direction: 'asc' | 'desc' = 'asc'): TauriQuery {
@@ -290,6 +297,11 @@ export class TauriQuery {
 
   limit(limit: number): TauriQuery {
     this.limitDef = limit;
+    return this;
+  }
+
+  offset(offset: number): TauriQuery {
+    this.offsetDef = offset;
     return this;
   }
 
@@ -304,6 +316,7 @@ export class TauriQuery {
         this.filters, 
         this.orderByDef, 
         this.limitDef, 
+        this.offsetDef,
         this.projectionDef
     );
   }
@@ -315,6 +328,7 @@ export class TauriQuery {
         filters: this.filters,
         orderBy: this.orderByDef,
         limit: this.limitDef,
+        offset: this.offsetDef,
         projection: this.projectionDef,
         eventName: 'firelite://snapshot'
       },
