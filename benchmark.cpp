@@ -288,7 +288,7 @@ int main(int argc, char** argv) {
     };
 
     cout << "==========================================================================================\n";
-    cout << " FIRE LITE ARCHITECTURAL DEEP-DIVE (v0.8.0) | Total Docs: " << g_docs << "\n";
+    cout << " FIRE LITE ARCHITECTURAL DEEP-DIVE (v0.5.10) | Total Docs: " << g_docs << "\n";
     cout << "==========================================================================================\n";
 
     vector<Report> results;
