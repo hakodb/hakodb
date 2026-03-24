@@ -36,8 +36,6 @@ pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)
         }
         if bytes.is_empty() { continue; }
 
-        // let Some(view) = FireLiteDocView::new(&bytes) else { continue; };
-
         // FIX: Removed super::super::worker:: because the function is in this file
         if let Some(view) = FireLiteDocView::new(&bytes) {
             if matches_filters_view(&bytes, &task.plan) {

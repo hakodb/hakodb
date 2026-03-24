@@ -831,6 +831,12 @@ impl StorageEngine {
         Ok(())
     }
 
+    pub fn get_physical_index_snapshot(&self) -> Vec<(String, Pointer)> {
+        self.index.iter()
+            .map(|(k, p)| (k.clone(), p.clone()))
+            .collect()
+    }
+
 }
 
 impl Drop for StorageEngine { fn drop(&mut self) { let _ = self.flush_all(); } }

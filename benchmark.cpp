@@ -196,7 +196,11 @@ Report run_benchmark(BenchConfig cfg) {
     // 4. RANGE QUERY (Offset vs Cursor)
     stage("Range Query (Off vs Cur)");
     fl_engine_create_simple_index(db, "bench", "id");
-    this_thread::sleep_for(chrono::milliseconds(500));
+
+    // this_thread::sleep_for(chrono::milliseconds(500));
+    int backfill_wait = cfg.large_docs ? 2000 : 500; 
+    this_thread::sleep_for(chrono::milliseconds(backfill_wait));
+    cout << "OK";
     
     int mid = b_total / 2;
     FL_Query* q_off = fl_query_new("bench");

@@ -126,6 +126,7 @@ type
     FHasLimit, FHasOffset: Boolean;
     FStartAfter: PFL_Doc;
     FSelectFields: TStringList;
+    FStartAt, FStartAfter, FEndAt, FEndBefore: PFL_Doc;
 
     function BuildNativeQuery: PFL_Query;
   public
@@ -142,8 +143,12 @@ type
     function OrderBy(const Field: string; Ascending: Boolean = True): TFLQuery;
     function Limit(ACount: NativeUInt): TFLQuery;
     function Offset(ACount: NativeUInt): TFLQuery;
-    function StartAfter(ASnapshot: TFLDocument): TFLQuery;
     function [Select](const Fields: array of string): TFLQuery;
+
+    function StartAt(ASnapshot: TFLDocument): TFLQuery;
+    function StartAfter(ASnapshot: TFLDocument): TFLQuery;
+    function EndAt(ASnapshot: TFLDocument): TFLQuery;
+    function EndBefore(ASnapshot: TFLDocument): TFLQuery;
 
     function Count: Int64;
     function Sum(const Field: string): Double;
@@ -461,8 +466,29 @@ begin FLimit := ACount; FHasLimit := True; Result := Self; end;
 function TFLQuery.Offset(ACount: NativeUInt): TFLQuery;
 begin FOffset := ACount; FHasOffset := True; Result := Self; end;
 
+function TFLQuery.StartAt(ASnapshot: TFLDocument): TFLQuery;
+begin
+  if ASnapshot <> nil then FStartAt := ASnapshot.Handle;
+  Result := Self;
+end;
+
 function TFLQuery.StartAfter(ASnapshot: TFLDocument): TFLQuery;
-begin FStartAfter := ASnapshot.Handle; Result := Self; end;
+begin
+  if ASnapshot <> nil then FStartAfter := ASnapshot.Handle;
+  Result := Self;
+end;
+
+function TFLQuery.EndAt(ASnapshot: TFLDocument): TFLQuery;
+begin
+  if ASnapshot <> nil then FEndAt := ASnapshot.Handle;
+  Result := Self;
+end;
+
+function TFLQuery.EndBefore(ASnapshot: TFLDocument): TFLQuery;
+begin
+  if ASnapshot <> nil then FEndBefore := ASnapshot.Handle;
+  Result := Self;
+end;
 
 function TFLQuery.Select(const Fields: array of string): TFLQuery;
 var I: Integer; begin FSelectFields.Clear; for I := Low(Fields) to High(Fields) do FSelectFields.Add(Fields[I]); Result := Self; end;
@@ -486,7 +512,12 @@ begin
         else fl_array_append_str(TmpArr, PChar(FWhereIn[I].Data.Items[J].AsString));
       fl_query_where_in(Result, PChar(FWhereIn[I].Field), TmpArr);
     end;
+    
+    if FStartAt <> nil then fl_query_start_at(Result, FStartAt);
     if FStartAfter <> nil then fl_query_start_after(Result, FStartAfter);
+    if FEndAt <> nil then fl_query_end_at(Result, FEndAt);
+    if FEndBefore <> nil then fl_query_end_before(Result, FEndBefore);
+
     if FOrderByField <> '' then fl_query_order_by(Result, PChar(FOrderByField), FOrderByAsc);
     if FHasLimit then fl_query_limit(Result, FLimit);
     if FHasOffset then fl_query_offset(Result, FOffset);

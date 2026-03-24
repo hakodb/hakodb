@@ -115,6 +115,12 @@ int32_t fl_query_where_eq_str(FL_Query *query, const char *field, const char *va
 
 int32_t fl_query_where_eq_int(FL_Query *query, const char *field, int64_t value);
 
+int32_t fl_query_where_array_contains(FL_Query *query, const char *field, const char *value);
+
+int32_t fl_query_where_array_contains_any(FL_Query *query, const char *field, FL_Array *array);
+
+int32_t fl_query_where_not_in(FL_Query *query, const char *field, FL_Array *array);
+
 int32_t fl_query_order_by(FL_Query *query, const char *field, bool ascending);
 
 int32_t fl_query_limit(FL_Query *query, uintptr_t limit);

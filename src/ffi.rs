@@ -809,6 +809,43 @@ pub extern "C" fn fl_query_where_eq_int(
 }
 
 #[no_mangle]
+pub extern "C" fn fl_query_where_array_contains(query: *mut FL_Query, field: *const c_char, value: *const c_char) -> i32 {
+    let f = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    let v = match cstr_to_string(value) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    let q = unsafe { &mut *query };
+    q.query = q.query.clone().where_filter(&f, Operator::ArrayContains, Value::String(v));
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn fl_query_where_array_contains_any(query: *mut FL_Query, field: *const c_char, array: *mut FL_Array) -> i32 {
+    if query.is_null() || array.is_null() { return -1; }
+    let q = unsafe { &mut *query };
+    let f = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    let array_inner = unsafe { Box::from_raw(array) };
+    q.query.filters.push(crate::query::filter::Filter {
+        field: f,
+        op: Operator::ArrayContainsAny,
+        value: Value::Array(array_inner.items),
+    });
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn fl_query_where_not_in(query: *mut FL_Query, field: *const c_char, array: *mut FL_Array) -> i32 {
+    if query.is_null() || array.is_null() { return -1; }
+    let q = unsafe { &mut *query };
+    let f = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e) };
+    let array_inner = unsafe { Box::from_raw(array) };
+    q.query.filters.push(crate::query::filter::Filter {
+        field: f,
+        op: Operator::NotIn,
+        value: Value::Array(array_inner.items),
+    });
+    0
+}
+
+#[no_mangle]
 pub extern "C" fn fl_query_order_by(
     query: *mut FL_Query,
     field: *const c_char,

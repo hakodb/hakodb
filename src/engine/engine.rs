@@ -123,6 +123,7 @@ impl FireLite {
         let (blob_tx, blob_rx) = std::sync::mpsc::sync_channel::<BlobWork>(5000);
         // let (blob_tx, blob_rx) = std::sync::mpsc::sync_channel::<BlobWork>(1000);
 
+        let shared_blob_rx = Arc::new(Mutex::new(blob_rx));
         let audit_data = Arc::new(RwLock::new(Vec::new()));
         let (audit_stop_tx, audit_stop_rx) = channel::<()>(); 
 
@@ -238,58 +239,116 @@ impl FireLite {
         };
 
         // B. Blob Worker (The Janitor)
-        let shards_ptr = Arc::clone(&db.shards);
-        let root_path_clone = root_path.clone();
-        let encryption_key = config.encryption_key.clone();
+        // let shards_ptr = Arc::clone(&db.shards);
+        // let root_path_clone = root_path.clone();
+        // let root_path_worker = root_path.clone();
+        // let encryption_key = config.encryption_key.clone();
         
  
-        let blob_rx = Arc::new(Mutex::new(blob_rx));
+        // let blob_rx = Arc::new(Mutex::new(blob_rx));
 
         // SPAWN MULTIPLE BLOB WORKERS (e.g., 4 workers)
+        // for _ in 0..4 {
+        //     let rx = Arc::clone(&blob_rx);
+        //     let shards_ptr = Arc::clone(&shards_ptr);
+        //     let root_path_clone = root_path_clone.clone();
+        //     let enc_key = encryption_key.clone();
+
+        //     thread::spawn(move || {
+        //         let enc_ctx = enc_key.map(|k| crate::storage::crypto::EncryptionContext::from_secret(&k));
+        //         let mut file_handles: HashMap<String, std::fs::File> = HashMap::new();
+
+        //         loop {
+        //             // 1. Get work (Locking the receiver is very fast)
+        //             let work = {
+        //                 let lock = rx.lock().unwrap();
+        //                 match lock.recv() {
+        //                     Ok(w) => w,
+        //                     Err(_) => break,
+        //                 }
+        //             };
+
+        //             let BlobWork::Put { collection, key, data } = work;
+
+        //             // 2. Open shard-specific blob file
+        //             let file = file_handles.entry(collection.clone()).or_insert_with(|| {
+        //                 let p = root_path_clone.join(&collection).join("blobs.dat");
+        //                 std::fs::OpenOptions::new().create(true).read(true).append(true).open(p).expect("IO Fail")
+        //             });
+
+        //             // 3. Encrypt (Parallel across the 4 workers)
+        //             let payload = if let Some(ref enc) = enc_ctx {
+        //                 enc.encrypt(&data).unwrap_or_else(|_| data.to_vec())
+        //             } else { data.to_vec() };
+
+        //             // 4. Write to Disk (Thread-safe positional append)
+        //             use std::io::{Write, Seek, SeekFrom};
+        //             let offset = file.seek(SeekFrom::End(0)).unwrap();
+        //             let len = payload.len() as u32;
+        //             file.write_all(&payload).unwrap();
+
+        //             // 5. Atomic Pointer Swap
+        //             let shards = shards_ptr.read().unwrap();
+        //             if let Some(shard_lock) = shards.get(&collection) {
+        //                 if let Ok(mut shard) = shard_lock.write() {
+        //                     shard.index.insert(key, crate::storage::engine::Pointer::Blob { offset, len });
+        //                 }
+        //             }
+        //         }
+        //     });
+        // }
+        let shards_ptr = Arc::clone(&db.shards);
+        let encryption_key = config.encryption_key.clone();
+        
         for _ in 0..4 {
-            let rx = Arc::clone(&blob_rx);
-            let shards_ptr = Arc::clone(&shards_ptr);
-            let root_path_clone = root_path_clone.clone();
+            let rx = Arc::clone(&shared_blob_rx);
+            let s_ptr = Arc::clone(&shards_ptr);
             let enc_key = encryption_key.clone();
 
             thread::spawn(move || {
                 let enc_ctx = enc_key.map(|k| crate::storage::crypto::EncryptionContext::from_secret(&k));
-                let mut file_handles: HashMap<String, std::fs::File> = HashMap::new();
-
+                
                 loop {
-                    // 1. Get work (Locking the receiver is very fast)
+                    // 1. Get work from the bounded channel
                     let work = {
-                        let lock = rx.lock().unwrap();
+                        let lock = match rx.lock() {
+                            Ok(guard) => guard,
+                            Err(_) => break, // Mutex poisoned
+                        };
                         match lock.recv() {
                             Ok(w) => w,
-                            Err(_) => break,
+                            Err(_) => break, // Channel closed
                         }
-                    };
+                    }; 
 
-                    let BlobWork::Put { collection, key, data } = work;
+                    let crate::storage::engine::BlobWork::Put { collection, key, data } = work;
 
-                    // 2. Open shard-specific blob file
-                    let file = file_handles.entry(collection.clone()).or_insert_with(|| {
-                        let p = root_path_clone.join(&collection).join("blobs.dat");
-                        std::fs::OpenOptions::new().create(true).read(true).append(true).open(p).expect("IO Fail")
-                    });
-
-                    // 3. Encrypt (Parallel across the 4 workers)
+                    // 2. Encrypt (CPU heavy - NO LOCKS HELD)
+                    // This allows 4 CPU cores to encrypt 4 different blobs simultaneously
                     let payload = if let Some(ref enc) = enc_ctx {
                         enc.encrypt(&data).unwrap_or_else(|_| data.to_vec())
-                    } else { data.to_vec() };
+                    } else { 
+                        data.to_vec() 
+                    };
 
-                    // 4. Write to Disk (Thread-safe positional append)
-                    use std::io::{Write, Seek, SeekFrom};
-                    let offset = file.seek(SeekFrom::End(0)).unwrap();
-                    let len = payload.len() as u32;
-                    file.write_all(&payload).unwrap();
-
-                    // 5. Atomic Pointer Swap
-                    let shards = shards_ptr.read().unwrap();
+                    // 3. Thread-Safe Write
+                    let shards = s_ptr.read().unwrap();
                     if let Some(shard_lock) = shards.get(&collection) {
+                        // Acquire write lock ONLY to perform the physical IO and Index swap
                         if let Ok(mut shard) = shard_lock.write() {
-                            shard.index.insert(key, crate::storage::engine::Pointer::Blob { offset, len });
+                            if let Some(file) = shard.blob_file.as_mut() {
+                                use std::io::{Write, Seek, SeekFrom};
+                                
+                                // Atomic Seek + Write
+                                let offset = file.seek(SeekFrom::End(0)).unwrap();
+                                let len = payload.len() as u32;
+                                file.write_all(&payload).unwrap();
+
+                                // 4. SWAP POINTER: pending -> persisted
+                                // The memory for 'data' (Arc) is freed as soon as this insertion
+                                // overwrites the BlobPending(Arc) variant.
+                                shard.index.insert(key, crate::storage::engine::Pointer::Blob { offset, len });
+                            }
                         }
                     }
                 }
@@ -767,36 +826,41 @@ impl FireLite {
         }
 
         // 3. Spawn background thread for backfilling
-        let shard = self.get_shard(collection);
+        let shard_arc = self.get_shard(collection);
         let idx_mgr = Arc::clone(&self.indexes);
+        let f_name = field.to_string();
         let col_name = collection.to_string();
-        let field_name = field.to_string();
 
         thread::spawn(move || {
-            // A. Scan the shard (Read lock is held only during the scan)
-            let entries = {
-                if let Ok(storage) = shard.read() {
-                    storage.scan_prefix("").unwrap_or_default()
-                } else {
-                    return; 
-                }
+            // Step A: Lock, take a snapshot of the pointers, then release IMMEDIATELY
+            let pointers = {
+                let storage = shard_arc.read().unwrap();
+                storage.get_physical_index_snapshot()
             };
 
-            if entries.is_empty() { return; }
+            // Step B: Process documents in chunks
+            for chunk in pointers.chunks(100) {
+                let mut resolved_docs = Vec::new();
 
-            // B. Process in chunks to keep the system responsive
-            for chunk in entries.chunks(500) {
-                // Acquire write lock only for the duration of this chunk
+                // Briefly lock to read bytes, then release
+                {
+                    let storage = shard_arc.read().unwrap();
+                    for (key, ptr) in chunk {
+                        // Use the internal reader (uncached for indexing)
+                        if let Ok(Some(bytes)) = storage.read_pointer_internal(ptr, false) {
+                            resolved_docs.push((key.clone(), bytes));
+                        }
+                    }
+                } // Lock released here!
+
+                // Step C: Slow CPU work (Decoding/Indexing) happens while Shard is UNLOCKED
                 let mut mgr = idx_mgr.write().unwrap();
-                
                 if let Some(sec_map) = mgr.secondary.get_mut(&col_name) {
-                    if let Some(index) = sec_map.get_mut(&field_name) {
-                        for (full_key, bytes) in chunk {
-                            if let Some(doc) = FireLiteDoc::decode(bytes) {
-                                if let Some(val) = doc.get(&field_name) {
+                    if let Some(index) = sec_map.get_mut(&f_name) {
+                        for (full_key, bytes) in resolved_docs {
+                            if let Some(doc) = FireLiteDoc::decode(&bytes) {
+                                if let Some(val) = doc.get(&f_name) {
                                     let idx_key = crate::index::index_key::encode_scalar(val);
-                                    
-                                    // Map "col:id" -> "id"
                                     if let Some((_, doc_id)) = full_key.split_once(':') {
                                         index.insert(idx_key, doc_id.to_string());
                                     }
@@ -805,8 +869,7 @@ impl FireLite {
                         }
                     }
                 }
-                // Lock 'mgr' is automatically dropped here when the scope ends,
-                // allowing query threads to "sneak in" between chunks.
+                // Blob workers can now acquire the Write Lock here because we are between chunks
             }
         });
 
@@ -817,25 +880,54 @@ impl FireLite {
         // 1. Register
         self.indexes.write().unwrap().create_fts_index(collection, field);
 
-        // 2. Backfill from disk
-        let shard = self.get_shard(collection);
-        let storage = shard.read().unwrap();
-        let entries = storage.scan_prefix(&format!("{}:", collection))?;
+        // 3. Spawn background thread for backfilling
+        let shard_arc = self.get_shard(collection);
+        let idx_mgr = Arc::clone(&self.indexes);
+        let f_name = field.to_string();
+        let col_name = collection.to_string();
 
-        let mut mgr = self.indexes.write().unwrap();
-        if let Some(fields) = mgr.fts.get_mut(collection) {
-            if let Some(index) = fields.get_mut(field) {
-                for (full_key, bytes) in entries {
-                    if let Some(doc) = FireLiteDoc::decode(&bytes) {
-                        if let Some(Value::String(text)) = doc.get(field) {
-                            if let Some((_, doc_id)) = full_key.split_once(':') {
-                                index.insert(text, doc_id.to_string());
+        thread::spawn(move || {
+            // Step A: Lock, take a snapshot of the pointers, then release IMMEDIATELY
+            let pointers = {
+                let storage = shard_arc.read().unwrap();
+                storage.get_physical_index_snapshot()
+            };
+
+            // Step B: Process documents in chunks
+            for chunk in pointers.chunks(100) {
+                let mut resolved_docs = Vec::new();
+
+                // Briefly lock to read bytes, then release
+                {
+                    let storage = shard_arc.read().unwrap();
+                    for (key, ptr) in chunk {
+                        // Use the internal reader (uncached for indexing)
+                        if let Ok(Some(bytes)) = storage.read_pointer_internal(ptr, false) {
+                            resolved_docs.push((key.clone(), bytes));
+                        }
+                    }
+                } // Lock released here!
+
+                // Step C: Slow CPU work (Decoding/Indexing) happens while Shard is UNLOCKED
+                let mut mgr = idx_mgr.write().unwrap();
+                if let Some(sec_map) = mgr.secondary.get_mut(&col_name) {
+                    if let Some(index) = sec_map.get_mut(&f_name) {
+                        for (full_key, bytes) in resolved_docs {
+                            if let Some(doc) = FireLiteDoc::decode(&bytes) {
+                                if let Some(val) = doc.get(&f_name) {
+                                    let idx_key = crate::index::index_key::encode_scalar(val);
+                                    if let Some((_, doc_id)) = full_key.split_once(':') {
+                                        index.insert(idx_key, doc_id.to_string());
+                                    }
+                                }
                             }
                         }
                     }
                 }
+                // Blob workers can now acquire the Write Lock here because we are between chunks
             }
-        }
+        });
+
         Ok(())
     }
 

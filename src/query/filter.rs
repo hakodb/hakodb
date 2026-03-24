@@ -14,6 +14,9 @@ pub enum Operator {
     Contains,   // Substring matching
     StartsWith, // Prefix matching
     In,
+    ArrayContains,
+    ArrayContainsAny,
+    NotIn,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -38,12 +41,22 @@ pub struct Filter {
 pub fn compare_values(a: &Value, op: &Operator, b: &Value) -> bool {
     // Handle the 'In' operator first because it breaks the standard (a, b) pairing logic
     // (a is the field value, b is the array of allowed values)
-    if matches!(op, Operator::In) {
-        return if let Value::Array(allowed_values) = b {
-            allowed_values.contains(a)
-        } else {
-            false
-        };
+    match op {
+        Operator::In => {
+            return if let Value::Array(allowed) = b { allowed.contains(a) } else { false };
+        }
+        Operator::NotIn => {
+            return if let Value::Array(allowed) = b { !allowed.contains(a) } else { true };
+        }
+        Operator::ArrayContains => {
+            return if let Value::Array(items) = a { items.contains(b) } else { false };
+        }
+        Operator::ArrayContainsAny => {
+            return if let (Value::Array(items), Value::Array(query_items)) = (a, b) {
+                query_items.iter().any(|qi| items.contains(qi))
+            } else { false };
+        }
+        _ => {} // Fall through to standard comparisons
     }
     match (a, b) {
         // String-specific logic for FTS and standard comparisons
@@ -103,6 +116,12 @@ fn eval_ordering(ord: Ordering, op: &Operator) -> bool {
         Operator::Lt => ord == Ordering::Less,
         Operator::Lte => ord == Ordering::Less || ord == Ordering::Equal,
         // String-only operators return false if used on non-string types
-        Operator::Match | Operator::Contains | Operator::StartsWith | Operator::In => false,
+        Operator::Match | 
+        Operator::Contains | 
+        Operator::StartsWith | 
+        Operator::In |        
+        Operator::NotIn | 
+        Operator::ArrayContains | 
+        Operator::ArrayContainsAny => false,
     }
 }

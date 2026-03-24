@@ -108,7 +108,6 @@ function fl_query_where_eq_int(query: PFL_Query; field: PChar; value: cint64): c
 function fl_query_where_or_str(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_where_or_int(query: PFL_Query; field: PChar; value: cint64): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_where_in(query: PFL_Query; field: PChar; arr: PFL_Array): cint32; cdecl; external FIRELITE_LIB;
-function fl_query_start_after(query: PFL_Query; anchor: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_order_by(query: PFL_Query; field: PChar; ascending: cbool): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_limit(query: PFL_Query; limit: SizeUInt): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_offset(query: PFL_Query; offset: SizeUInt): cint32; cdecl; external FIRELITE_LIB;
@@ -117,6 +116,10 @@ function fl_query_execute(engine: PFL_Engine; query: PFL_Query): PChar; cdecl; e
 function fl_query_where_match(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_where_contains(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_where_starts_with(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_start_at(query: PFL_Query; anchor: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_start_after(query: PFL_Query; anchor: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_end_at(query: PFL_Query; anchor: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_end_before(query: PFL_Query; anchor: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;
 
 { Aggregates }
 function fl_query_aggregate_count(query: PFL_Query): cint32; cdecl; external FIRELITE_LIB;
