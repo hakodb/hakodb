@@ -116,7 +116,11 @@ impl FireLite {
         let root_path = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&root_path)?;
 
+        // ccatalog
         let catalog = Arc::new(crate::util::catalog::Catalog::load(&root_path));
+        let catalog_for_thread = Arc::clone(&catalog);
+        let config_clone = config.clone();
+
         // 1. Initialize Global Shared State & Channels (ONCE)
         let indexes = Arc::new(RwLock::new(IndexManager::default()));
         
@@ -300,7 +304,31 @@ impl FireLite {
         }
 
         // 6. Recovery & Sync
-        db.recover_existing_shards()?;
+        // db.recover_existing_shards()?;
+        // 2. Spawn Background Recovery Worker
+        let db_weak_shards = Arc::clone(&db.shards);
+        let blob_tx_clone = db.blob_tx.clone();
+
+        thread::spawn(move || {
+            // A. Scan disk and update Catalog memory
+            let discovered = catalog_for_thread.recover_from_disk();
+
+            // B. Open StorageEngines for found collections
+            for (col_name, _id) in discovered {
+                let path = catalog_for_thread.get_collection_path(&col_name);
+                
+                if let Ok(mut storage) = StorageEngine::open(path, &config_clone) {
+                    storage.blob_tx = Some(blob_tx_clone.clone());
+                    
+                    let mut shards = db_weak_shards.write().unwrap();
+                    shards.insert(col_name, Arc::new(RwLock::new(storage)));
+                }
+            }
+            
+            // C. Final Catalog Save (to persist recovered mappings)
+            catalog_for_thread.save();
+        });
+
         db.sync_indexes_with_persistence()?; 
 
         let (stop_tx, stop_rx) = channel::<()>();
@@ -335,36 +363,20 @@ impl FireLite {
 
     // fn recover_existing_shards(&self) -> Result<()> {
     //     let mut shards = self.shards.write().unwrap();
-    //     if !self.root_path.exists() { return Ok(()); }
-    //     for entry in std::fs::read_dir(&self.root_path)? {
-    //         let entry = entry?;
-    //         if entry.path().is_dir() {
-    //             let col = entry.file_name().to_string_lossy().to_string();
-    //             let mut storage = StorageEngine::open(entry.path(), &self.config)?;
-
+    //     let collections = self.catalog.get_all_collections();
+        
+    //     for col_name in collections {
+    //         let folder_name = self.catalog.get_folder_name(&col_name);
+    //         let path = self.root_path.join(folder_name);
+            
+    //         if path.exists() {
+    //             let mut storage = StorageEngine::open(path, &self.config)?;
     //             storage.blob_tx = Some(self.blob_tx.clone());
-
-    //             shards.insert(col, Arc::new(RwLock::new(storage)));
+    //             shards.insert(col_name, Arc::new(RwLock::new(storage)));
     //         }
     //     }
     //     Ok(())
     // }
-    fn recover_existing_shards(&self) -> Result<()> {
-        let mut shards = self.shards.write().unwrap();
-        let collections = self.catalog.get_all_collections();
-        
-        for col_name in collections {
-            let folder_name = self.catalog.get_folder_name(&col_name);
-            let path = self.root_path.join(folder_name);
-            
-            if path.exists() {
-                let mut storage = StorageEngine::open(path, &self.config)?;
-                storage.blob_tx = Some(self.blob_tx.clone());
-                shards.insert(col_name, Arc::new(RwLock::new(storage)));
-            }
-        }
-        Ok(())
-    }
 
     fn rebuild_indexes_from_shards(&self) -> Result<()> {
         let shards = self.shards.read().unwrap();
@@ -384,25 +396,11 @@ impl FireLite {
         Ok(())
     }
 
-    // fn get_shard(&self, collection: &str) -> Arc<RwLock<StorageEngine>> {
-    //     if let Some(s) = self.shards.read().unwrap().get(collection) { return Arc::clone(s); }
-    //     let mut shards = self.shards.write().unwrap();
-        
-    //     shards.entry(collection.to_string()).or_insert_with(|| {
-    //         let path = self.root_path.join(collection);
-    //         let mut storage = StorageEngine::open(path, &self.config).expect("Shard fail");
-            
-    //         storage.blob_tx = Some(self.blob_tx.clone());
-
-    //         Arc::new(RwLock::new(storage))
-    //     }).clone()
-    // }
     fn get_shard(&self, collection: &str) -> Arc<RwLock<StorageEngine>> {
         if let Some(s) = self.shards.read().unwrap().get(collection) { return Arc::clone(s); }
         
         let mut shards = self.shards.write().unwrap();
         shards.entry(collection.to_string()).or_insert_with(|| {
-            // MAPPING: "users" -> "c1"
             let folder_name = self.catalog.get_folder_name(collection);
             let path = self.root_path.join(folder_name);
             
@@ -702,11 +700,20 @@ impl FireLite {
     }
     pub fn compact(&self) -> Result<()> { for s in self.shards.read().unwrap().values() { s.write().unwrap().compact()?; } Ok(()) }
     pub fn flush(&self) -> Result<()> { for s in self.shards.read().unwrap().values() { s.write().unwrap().flush_all()?; } Ok(()) }
+    
+    // pub fn list_collections(&self) -> Result<Vec<String>> {
+    //     let mut cols = Vec::new();
+    //     if self.root_path.exists() { for e in std::fs::read_dir(&self.root_path)? { let e = e?; if e.path().is_dir() { cols.push(e.file_name().to_string_lossy().into()); } } }
+    //     cols.sort(); Ok(cols)
+    // }
+
     pub fn list_collections(&self) -> Result<Vec<String>> {
-        let mut cols = Vec::new();
-        if self.root_path.exists() { for e in std::fs::read_dir(&self.root_path)? { let e = e?; if e.path().is_dir() { cols.push(e.file_name().to_string_lossy().into()); } } }
-        cols.sort(); Ok(cols)
+        // Rely on the Catalog's verified list
+        let mut cols = self.catalog.get_all_collections();
+        cols.sort();
+        Ok(cols)
     }
+    
     pub fn get_by_reference(&self, reference: &Value) -> Result<Option<FireLiteDoc>> {
         match reference { Value::Reference { collection, doc_id } => self.get(collection, doc_id), _ => Err(FireLiteError::Corrupt("Not ref".into())) }
     }
@@ -965,33 +972,5 @@ impl Drop for FireLite {
 
 fn doc_key(collection: &str, doc_id: &str) -> String { format!("{}:{}", collection, doc_id) }
 fn subcollection_prefix(collection: &str, doc_id: &str, subcollection: &str) -> String { format!("{}:{}/{}", collection, doc_id, subcollection) }
-
-// fn extract_field_value_borrowed(raw: &[u8], field: &str) -> Option<Value> {
-//     let view = FireLiteDocView::new(raw)?;
-//     for (k, v) in view.iter() { if k == field { return v.to_owned_value(); } }
-//     None
-// }
-
-// fn matches_filters_borrowed(raw: &[u8], filters: &[crate::query::filter::Filter]) -> bool {
-//     if filters.is_empty() { return true; }
-//     let Some(view) = crate::document::firelite_doc::FireLiteDocView::new(raw) else { return false; };
-//     filters.iter().all(|f| {
-//         let mut matched = None;
-//         for (k, v) in view.iter() { if k == f.field { matched = v.to_owned_value(); break; } }
-//         matched.as_ref().map(|v| crate::query::filter::compare_values(v, &f.op, &f.value)).unwrap_or(false)
-//     })
-// }
-
-// fn project_fields_borrowed(raw: &[u8], fields: &[String]) -> Vec<(String, Value)> {
-//     let mut out = Vec::new();
-//     let Some(view) = crate::document::firelite_doc::FireLiteDocView::new(raw) else { return out; };
-//     for (k, v) in view.iter() {
-//         if fields.is_empty() || fields.iter().any(|f| f == k) {
-//             if let Some(value) = v.to_owned_value() { out.push((k.to_string(), value)); }
-//         }
-//     }
-//     out
-// }
-
 
 
