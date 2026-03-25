@@ -77,6 +77,11 @@ enum Commands {
     },
     /// Watch changes in a collection
     Watch { collection: String },
+    /// Seed a collection with random-ish complex JSON docs (max: 500)
+    Seed {
+        collection: String,
+        docsize: usize,
+    },
     /// Index operations
     Index {
         #[command(subcommand)]
@@ -146,6 +151,10 @@ fn main() -> Result<()> {
             filters,
         } => run_aggregate(&db, &collection, kind, field.as_deref(), &filters)?,
         Commands::Watch { collection } => watch_collection(&db, &collection)?,
+        Commands::Seed {
+            collection,
+            docsize,
+        } => seed_collection(&db, &collection, docsize)?,
         Commands::Index { command } => match command {
             IndexCommands::Create { collection, field } => {
                 db.create_index(&collection, &field)?;
@@ -360,6 +369,80 @@ fn watch_collection(db: &FireLite, collection: &str) -> Result<()> {
     Ok(())
 }
 
+fn seed_collection(db: &FireLite, collection: &str, docsize: usize) -> Result<()> {
+    if docsize == 0 {
+        bail!("docsize must be > 0");
+    }
+    if docsize > 500 {
+        bail!("docsize max is 500");
+    }
+
+    for i in 0..docsize {
+        let mut doc = FireLiteDoc::default();
+        let id = format!("{}", 19800000 + i as i64);
+        let valid = i % 2 == 0;
+        let status = if i % 3 == 0 { "active" } else { "idle" };
+        let score = ((i * 37) % 1000) as i64;
+
+        doc.insert(
+            "data".to_string(),
+            Value::String(if valid { "valid" } else { "invalid" }.to_string()),
+        );
+        doc.insert("status".to_string(), Value::String(status.to_string()));
+        doc.insert("score".to_string(), Value::Int(score));
+        doc.insert(
+            "description".to_string(),
+            Value::String(format!(
+                "seeded firelite document {} with {} state and score {}",
+                i, status, score
+            )),
+        );
+        doc.insert(
+            "tags".to_string(),
+            Value::Array(vec![
+                Value::String(format!("group_{}", i % 10)),
+                Value::String(if valid { "valid" } else { "invalid" }.to_string()),
+                Value::String(status.to_string()),
+            ]),
+        );
+        doc.insert(
+            "profile".to_string(),
+            Value::Map(vec![
+                ("level".into(), Value::Int((i % 7) as i64)),
+                (
+                    "country".into(),
+                    Value::String(if i % 2 == 0 { "US" } else { "CA" }.to_string()),
+                ),
+                ("flags".into(), Value::Array(vec![Value::Bool(valid), Value::Bool(i % 5 == 0)])),
+            ]),
+        );
+
+        db.put(collection, &id, &doc)?;
+    }
+
+    // Example indexes for all 3 index modes
+    db.create_index(collection, "data")?;
+    db.create_fts_index(collection, "description")?;
+    let _ = db.create_composite_index(
+        collection,
+        vec![
+            ("data".to_string(), SortDirection::Asc),
+            ("score".to_string(), SortDirection::Desc),
+        ],
+    );
+
+    println!("OK: seeded {docsize} docs into '{collection}'");
+    println!("OK: created sample indexes:");
+    println!("  - simple/secondary: {collection}.data");
+    println!("  - fts: {collection}.description");
+    println!("  - composite: (data asc, score desc)");
+    println!("Try:");
+    println!("  firelite-cli --db <db> query {collection} --where data:eq:valid");
+    println!("  firelite-cli --db <db> query {collection} --where description:match:seeded");
+    println!("  firelite-cli --db <db> query {collection} --where data:eq:valid --order score:desc --limit 5");
+    Ok(())
+}
+
 fn run_rest(
     db: &FireLite,
     method: &str,
@@ -405,9 +488,12 @@ fn parse_filter(input: &str) -> Result<ParsedFilter> {
     if parts.len() != 3 {
         bail!("invalid filter '{input}', expected field:op:value");
     }
-    let field = parts[0].to_string();
+    let field = strip_wrapping_quotes(parts[0]).trim().to_string();
+    if field.is_empty() {
+        bail!("filter field cannot be empty");
+    }
     let op = parse_operator(parts[1])?;
-    let value = parse_literal(parts[2])?;
+    let value = parse_literal(strip_wrapping_quotes(parts[2]).trim())?;
     Ok(ParsedFilter { field, op, value })
 }
 
@@ -468,6 +554,19 @@ fn parse_literal(input: &str) -> Result<Value> {
         return json_to_fire(json);
     }
     Ok(Value::String(input.to_string()))
+}
+
+fn strip_wrapping_quotes(input: &str) -> &str {
+    let trimmed = input.trim();
+    if trimmed.len() >= 2 {
+        let b = trimmed.as_bytes();
+        let first = b[0];
+        let last = b[trimmed.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &trimmed[1..trimmed.len() - 1];
+        }
+    }
+    trimmed
 }
 
 fn json_to_fire(v: JsonValue) -> Result<Value> {
