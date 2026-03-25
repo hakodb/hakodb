@@ -51,9 +51,15 @@ enum Commands {
         /// Repeated filter: field:op:value (e.g. age:gte:21, tags:in:[\"a\",\"b\"])
         #[arg(long = "where")]
         filters: Vec<String>,
+        /// Repeated AND filter alias: field:op:value
+        #[arg(long = "and")]
+        and_filters: Vec<String>,
         /// Repeated OR filter: field:op:value
         #[arg(long = "or")]
         or_filters: Vec<String>,
+        /// Full-text search shortcut: field:text (equivalent to field:match:text)
+        #[arg(long)]
+        fts: Option<String>,
         /// order format: field[:asc|desc]
         #[arg(long)]
         order: Option<String>,
@@ -61,6 +67,18 @@ enum Commands {
         limit: Option<usize>,
         #[arg(long)]
         offset: Option<usize>,
+        /// Cursor start_at values (comma-separated literals)
+        #[arg(long)]
+        start_at: Option<String>,
+        /// Cursor start_after values (comma-separated literals)
+        #[arg(long)]
+        start_after: Option<String>,
+        /// Cursor end_at values (comma-separated literals)
+        #[arg(long)]
+        end_at: Option<String>,
+        /// Cursor end_before values (comma-separated literals)
+        #[arg(long)]
+        end_before: Option<String>,
         /// comma separated projection fields
         #[arg(long)]
         select: Option<String>,
@@ -86,6 +104,12 @@ enum Commands {
     Index {
         #[command(subcommand)]
         command: IndexCommands,
+    },
+    /// Serializable transaction helper (single-doc set)
+    TxSet {
+        path: String,
+        #[arg(long)]
+        data: String,
     },
     /// Print internal stats
     Stats,
@@ -138,12 +162,33 @@ fn main() -> Result<()> {
         Commands::Query {
             collection,
             filters,
+            and_filters,
             or_filters,
+            fts,
             order,
             limit,
             offset,
+            start_at,
+            start_after,
+            end_at,
+            end_before,
             select,
-        } => run_query(&db, &collection, &filters, &or_filters, order.as_deref(), limit, offset, select.as_deref())?,
+        } => run_query(
+            &db,
+            &collection,
+            &filters,
+            &and_filters,
+            &or_filters,
+            fts.as_deref(),
+            order.as_deref(),
+            limit,
+            offset,
+            start_at.as_deref(),
+            start_after.as_deref(),
+            end_at.as_deref(),
+            end_before.as_deref(),
+            select.as_deref(),
+        )?,
         Commands::Aggregate {
             collection,
             kind,
@@ -174,6 +219,7 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&out)?);
             }
         },
+        Commands::TxSet { path, data } => run_tx_set(&db, &path, &data)?,
         Commands::Stats => println!("{}", serde_json::to_string_pretty(&db.get_stats())?),
         Commands::Compact => {
             db.compact()?;
@@ -253,6 +299,26 @@ fn delete_doc(db: &FireLite, path: &str) -> Result<()> {
     Ok(())
 }
 
+fn run_tx_set(db: &FireLite, path: &str, data: &str) -> Result<()> {
+    let (collection, doc_id) = split_doc_path(path)?;
+    let payload: JsonValue = serde_json::from_str(data).context("data must be valid JSON")?;
+    let obj = payload
+        .as_object()
+        .ok_or_else(|| anyhow!("data must be a JSON object"))?;
+
+    let mut doc = FireLiteDoc::default();
+    for (k, v) in obj {
+        doc.insert(k.clone(), json_to_fire(v.clone())?);
+    }
+
+    let mut tx = db.begin_serializable_transaction();
+    tx.get(db, collection, doc_id)?;
+    tx.put(collection, doc_id, doc);
+    tx.commit(db)?;
+    println!("OK: transaction committed for {collection}/{doc_id}");
+    Ok(())
+}
+
 fn parse_composite_fields(input: &str) -> Result<Vec<(String, SortDirection)>> {
     let mut out = Vec::new();
     for raw in input.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -282,10 +348,16 @@ fn run_query(
     db: &FireLite,
     collection: &str,
     filters: &[String],
+    and_filters: &[String],
     or_filters: &[String],
+    fts: Option<&str>,
     order: Option<&str>,
     limit: Option<usize>,
     offset: Option<usize>,
+    start_at: Option<&str>,
+    start_after: Option<&str>,
+    end_at: Option<&str>,
+    end_before: Option<&str>,
     select: Option<&str>,
 ) -> Result<()> {
     let mut q = Query::new(collection);
@@ -294,9 +366,17 @@ fn run_query(
         let parsed = parse_filter(f)?;
         q = q.where_filter(&parsed.field, parsed.op, parsed.value);
     }
+    for f in and_filters {
+        let parsed = parse_filter(f)?;
+        q = q.where_filter(&parsed.field, parsed.op, parsed.value);
+    }
     for f in or_filters {
         let parsed = parse_filter(f)?;
         q = q.or_where(&parsed.field, parsed.op, parsed.value);
+    }
+    if let Some(fts) = fts {
+        let (field, text) = parse_fts(fts)?;
+        q = q.where_filter(field, Operator::Match, Value::String(text.to_string()));
     }
 
     if let Some(order) = order {
@@ -308,6 +388,18 @@ fn run_query(
     }
     if let Some(offset) = offset {
         q = q.offset(offset);
+    }
+    if let Some(v) = start_at {
+        q.start_at = Some(parse_cursor_values(v)?);
+    }
+    if let Some(v) = start_after {
+        q.start_after = Some(parse_cursor_values(v)?);
+    }
+    if let Some(v) = end_at {
+        q.end_at = Some(parse_cursor_values(v)?);
+    }
+    if let Some(v) = end_before {
+        q.end_before = Some(parse_cursor_values(v)?);
     }
 
     if let Some(select) = select {
@@ -455,7 +547,10 @@ fn run_rest(
             let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
             match parts.len() {
                 0 => list_collections(db),
-                1 => run_query(db, parts[0], filters, &[], None, None, None, None),
+                1 => run_query(
+                    db, parts[0], filters, &[], &[], None, None, None, None, None, None, None,
+                    None, None,
+                ),
                 2 => get_doc(db, path),
                 _ => bail!("unsupported path depth for GET"),
             }
@@ -528,6 +623,27 @@ fn parse_operator(input: &str) -> Result<Operator> {
         "arraycontainsany" | "array_contains_any" => Ok(Operator::ArrayContainsAny),
         other => bail!("unsupported operator: {other}"),
     }
+}
+
+fn parse_fts(input: &str) -> Result<(&str, &str)> {
+    let mut parts = input.splitn(2, ':');
+    let field = parts.next().unwrap_or_default().trim();
+    let text = parts.next().unwrap_or_default().trim();
+    if field.is_empty() || text.is_empty() {
+        bail!("invalid --fts format, expected field:text");
+    }
+    Ok((field, strip_wrapping_quotes(text)))
+}
+
+fn parse_cursor_values(input: &str) -> Result<Vec<Value>> {
+    let mut out = Vec::new();
+    for token in input.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+        out.push(parse_literal(strip_wrapping_quotes(token))?);
+    }
+    if out.is_empty() {
+        bail!("cursor values cannot be empty");
+    }
+    Ok(out)
 }
 
 fn parse_literal(input: &str) -> Result<Value> {

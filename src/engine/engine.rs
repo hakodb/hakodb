@@ -91,7 +91,21 @@ pub struct CompositeIndexInfo {
 pub struct IndexList {
     pub simple: HashMap<String, Vec<String>>,
     pub secondary: HashMap<String, Vec<String>>,
+    pub fts: HashMap<String, Vec<String>>,
     pub composite: Vec<CompositeIndexInfo>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct PersistedIndexState {
+    secondary: HashMap<String, Vec<String>>,
+    fts: HashMap<String, Vec<String>>,
+    composite: Vec<PersistedCompositeIndex>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedCompositeIndex {
+    collection: String,
+    fields: Vec<(String, String)>,
 }
 
 pub struct Transaction {
@@ -568,6 +582,8 @@ impl FireLite {
 
         *db.maintenance_stop.lock().unwrap() = Some(stop_tx);
         *db.maintenance_handle.lock().unwrap() = Some(handle);
+
+        let _ = db.restore_index_defs();
 
         Ok(db)
     }
@@ -1175,6 +1191,103 @@ impl FireLite {
         let _ = self.audit_tx.send(entry);
     }
 
+    fn index_defs_path(&self) -> PathBuf {
+        self.root_path.join("_indices").join("definitions.json")
+    }
+
+    fn persist_index_defs(&self) -> Result<()> {
+        let mgr = self.indexes.read().unwrap();
+        let mut secondary: HashMap<String, Vec<String>> = HashMap::new();
+        let mut fts: HashMap<String, Vec<String>> = HashMap::new();
+        let mut composite: Vec<PersistedCompositeIndex> = Vec::new();
+
+        for (col, fields) in &mgr.secondary {
+            let mut list: Vec<String> = fields.keys().cloned().collect();
+            list.sort();
+            secondary.insert(col.clone(), list);
+        }
+        for (col, fields) in &mgr.fts {
+            let mut list: Vec<String> = fields.keys().cloned().collect();
+            list.sort();
+            fts.insert(col.clone(), list);
+        }
+        for col in self.catalog.get_all_collections() {
+            for idx in mgr.indexes_for_collection(&col) {
+                composite.push(PersistedCompositeIndex {
+                    collection: idx.definition.collection.clone(),
+                    fields: idx
+                        .definition
+                        .fields
+                        .iter()
+                        .map(|f| {
+                            (
+                                f.field.clone(),
+                                match f.direction {
+                                    SortDirection::Asc => "asc".to_string(),
+                                    SortDirection::Desc => "desc".to_string(),
+                                },
+                            )
+                        })
+                        .collect(),
+                });
+            }
+        }
+
+        let state = PersistedIndexState {
+            secondary,
+            fts,
+            composite,
+        };
+
+        let path = self.index_defs_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_vec_pretty(&state)
+            .map_err(|e| FireLiteError::Corrupt(format!("index defs serialize failed: {e}")))?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    fn restore_index_defs(&self) -> Result<()> {
+        let path = self.index_defs_path();
+        if !path.exists() {
+            return Ok(());
+        }
+        let data = std::fs::read(path)?;
+        let state: PersistedIndexState =
+            serde_json::from_slice(&data).unwrap_or_else(|_| PersistedIndexState::default());
+
+        for (collection, fields) in state.secondary {
+            for field in fields {
+                let _ = self.create_index(&collection, &field);
+            }
+        }
+        for (collection, fields) in state.fts {
+            for field in fields {
+                let _ = self.create_fts_index(&collection, &field);
+            }
+        }
+        for def in state.composite {
+            let fields: Vec<(String, SortDirection)> = def
+                .fields
+                .into_iter()
+                .map(|(field, dir)| {
+                    let direction = if dir.eq_ignore_ascii_case("desc") {
+                        SortDirection::Desc
+                    } else {
+                        SortDirection::Asc
+                    };
+                    (field, direction)
+                })
+                .collect();
+            if !fields.is_empty() {
+                let _ = self.create_composite_index(&def.collection, fields);
+            }
+        }
+        Ok(())
+    }
+
     pub fn list_indexes(&self, collection: Option<&str>) -> IndexList {
         let mgr = self.indexes.read().unwrap();
 
@@ -1186,6 +1299,16 @@ impl FireLite {
             let mut fields: Vec<String> = fields_map.keys().cloned().collect();
             fields.sort();
             secondary.insert(col.clone(), fields);
+        }
+
+        let mut fts: HashMap<String, Vec<String>> = HashMap::new();
+        for (col, fields_map) in &mgr.fts {
+            if collection.map_or(false, |want| want != col) {
+                continue;
+            }
+            let mut fields: Vec<String> = fields_map.keys().cloned().collect();
+            fields.sort();
+            fts.insert(col.clone(), fields);
         }
 
         let mut composite = Vec::new();
@@ -1224,6 +1347,7 @@ impl FireLite {
         IndexList {
             simple,
             secondary,
+            fts,
             composite,
         }
     }
@@ -1293,6 +1417,7 @@ impl FireLite {
             }
         });
 
+        let _ = self.persist_index_defs();
         Ok(())
     }
 
@@ -1354,10 +1479,27 @@ impl FireLite {
             }
         });
 
+        let _ = self.persist_index_defs();
         Ok(())
     }
 
     pub fn create_composite_index(&self, col: &str, fields: Vec<(String, SortDirection)>) -> u32 {
+        {
+            let mgr = self.indexes.read().unwrap();
+            for idx in mgr.indexes_for_collection(col) {
+                let same = idx.definition.fields.len() == fields.len()
+                    && idx
+                        .definition
+                        .fields
+                        .iter()
+                        .zip(fields.iter())
+                        .all(|(a, b)| a.field == b.0 && a.direction == b.1);
+                if same {
+                    return idx.definition.id;
+                }
+            }
+        }
+
         let def = CompositeIndexDefinition::new(col).with_fields(fields);
         let index_id = self.indexes.write().unwrap().create_index(def);
 
@@ -1419,6 +1561,7 @@ impl FireLite {
             }
         });
 
+        let _ = self.persist_index_defs();
         index_id
     }
 
