@@ -22,8 +22,12 @@ pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
         }
 
         if matches_filters_view(&bytes, &task.plan, Some(&task.catalog)) {
-            // OPTIMIZATION: Use decode_projected instead of decode
-            if let Some(doc) = FireLiteDoc::decode_projected(&bytes, projection) {
+            let decoded = if projection.is_empty() {
+                FireLiteDoc::decode(&bytes, Some(&task.catalog))
+            } else {
+                FireLiteDoc::decode_projected(&bytes, projection, Some(&task.catalog))
+            };
+            if let Some(doc) = decoded {
                 out.push((id, doc));
             }
         }
