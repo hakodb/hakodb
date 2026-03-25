@@ -24,6 +24,7 @@ type FireLiteOp =
   | { op: 'delete'; collection: string; docId: string }
   | { op: 'createIndex'; collection: string; field: string }      // NEW
   | { op: 'createFtsIndex'; collection: string; field: string }   // NEW
+  | { op: 'createCompositeIndex'; collection: string; fields: { field: string; desc?: boolean }[] }
   | {
       op: 'query';
       collection: string;
@@ -140,6 +141,13 @@ export class TauriFireLite {
     await exec({ op: 'createFtsIndex', collection, field });
   }
 
+  async createCompositeIndex(
+    collection: string,
+    fields: { field: string; desc?: boolean }[]
+  ): Promise<void> {
+    await exec({ op: 'createCompositeIndex', collection, fields });
+  }
+
   async query(
     collection: string,
     filters: FilterInput[],
@@ -232,6 +240,10 @@ export class TauriCollectionReference {
 
   async createIndex(field: string): Promise<void> {
     await new TauriFireLite().createIndex(this._collection, field);
+  }
+
+  async createCompositeIndex(fields: { field: string; desc?: boolean }[]): Promise<void> {
+    await new TauriFireLite().createCompositeIndex(this._collection, fields);
   }
 
   async createFtsIndex(field: string): Promise<void> {

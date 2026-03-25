@@ -6,11 +6,11 @@ It runs in-process (no external service), stores typed binary documents, and pro
 
 ---
 
-## Current Status (v0.5.10 - High Velocity)
+## Current Status (v0.5.12 - High Velocity)
 
 FireLite has evolved from a foundation stage into a **Production-Candidate** engine. The core architecture now supports physical data sharding and near-instant recovery, capable of **20,000+ TPS** and sub-millisecond query responses on standard hardware.
 
-### 🚀 New in v0.5.10
+### 🚀 New in v0.5.12
 
 - **Zero-Copy Projection Pipeline**
   - Queries no longer "inflate" full document objects. 
@@ -63,8 +63,8 @@ FireLite has evolved from a foundation stage into a **Production-Candidate** eng
   - Inverted indexes for FTS.
 - Composite indexes
   - index definitions and manager
-  - planner hook for equality composite scans
-  - executor candidate pruning via exact-match composite lookup
+  - planner hook for equality and inequality composite range scans (`Gt/Gte/Lt/Lte/Ne`)
+  - executor support for bounded composite range scans (including dual-range `Ne`)
 - Real-time local watch streams
   - `watch_collection` with change events (`Put` / `Delete`)
 - Subcollections
@@ -201,7 +201,7 @@ FireLite now includes an optional Tauri bridge that routes all operations throug
 ### Enable feature
 
 ```toml
-firelite = { version = "0.5.10", features = ["tauri-gateway"] }
+firelite = { version = "0.5.12", features = ["tauri-gateway"] }
 ```
 
 ### Rust bridge surface

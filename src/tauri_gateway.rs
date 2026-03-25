@@ -11,6 +11,7 @@ use tauri::{command, Runtime, State, Window};
 use crate::document::firelite_doc::FireLiteDoc;
 use crate::document::value::Value;
 use crate::engine::{BatchMutation, FireLite};
+use crate::index::composite::definition::SortDirection;
 use crate::query::filter::Operator;
 use crate::query::query::Query;
 
@@ -37,6 +38,10 @@ pub enum FireLiteOp {
     CreateFtsIndex {
         collection: String,
         field: String,
+    },
+    CreateCompositeIndex {
+        collection: String,
+        fields: Vec<CompositeFieldInput>,
     },
     Query {
         collection: String,
@@ -139,6 +144,14 @@ pub enum AggregateKind {
     Count,
     Sum,
     Avg,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompositeFieldInput {
+    pub field: String,
+    #[serde(default)]
+    pub desc: bool,
 }
 
 #[derive(Clone)]
@@ -326,6 +339,23 @@ pub fn firelite_exec<R: Runtime>(
                 .db
                 .create_fts_index(&collection, &field)
                 .map_err(|e| e.to_string())?;
+            Ok(FireLiteResponse::Ok)
+        }
+        FireLiteOp::CreateCompositeIndex { collection, fields } => {
+            let parsed_fields = fields
+                .into_iter()
+                .map(|f| {
+                    (
+                        f.field,
+                        if f.desc {
+                            SortDirection::Desc
+                        } else {
+                            SortDirection::Asc
+                        },
+                    )
+                })
+                .collect();
+            state.db.create_composite_index(&collection, parsed_fields);
             Ok(FireLiteResponse::Ok)
         }
         FireLiteOp::Query {
@@ -602,7 +632,10 @@ fn value_to_json(v: &Value) -> Result<serde_json::Value, String> {
         )),
         Value::Reference { collection, doc_id } => {
             let mut map = serde_json::Map::new();
-            map.insert("__ref__".to_string(), serde_json::Value::String(format!("{collection}/{doc_id}")));
+            map.insert(
+                "__ref__".to_string(),
+                serde_json::Value::String(format!("{collection}/{doc_id}")),
+            );
             Ok(serde_json::Value::Object(map))
         }
         Value::Timestamp(micros) => Ok(serde_json::Value::Number((*micros).into())),
@@ -615,7 +648,10 @@ fn value_to_json(v: &Value) -> Result<serde_json::Value, String> {
             Ok(serde_json::Value::Object(map))
         }
         Value::Array(values) => Ok(serde_json::Value::Array(
-            values.iter().map(value_to_json).collect::<Result<Vec<_>, _>>()?,
+            values
+                .iter()
+                .map(value_to_json)
+                .collect::<Result<Vec<_>, _>>()?,
         )),
     }
 }

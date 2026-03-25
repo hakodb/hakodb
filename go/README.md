@@ -1,4 +1,4 @@
-# FireLite Go Gateway SDK (v0.5.10)
+# FireLite Go Gateway SDK (v0.5.12)
 
 A complete Go SDK over the FireLite C-FFI surface, with a Firestore-style ergonomic layer.
 

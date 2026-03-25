@@ -115,6 +115,26 @@ int32_t fl_query_where_eq_str(FL_Query *query, const char *field, const char *va
 
 int32_t fl_query_where_eq_int(FL_Query *query, const char *field, int64_t value);
 
+int32_t fl_query_where_ne_str(FL_Query *query, const char *field, const char *value);
+
+int32_t fl_query_where_ne_int(FL_Query *query, const char *field, int64_t value);
+
+int32_t fl_query_where_gt_str(FL_Query *query, const char *field, const char *value);
+
+int32_t fl_query_where_gt_int(FL_Query *query, const char *field, int64_t value);
+
+int32_t fl_query_where_gte_str(FL_Query *query, const char *field, const char *value);
+
+int32_t fl_query_where_gte_int(FL_Query *query, const char *field, int64_t value);
+
+int32_t fl_query_where_lt_str(FL_Query *query, const char *field, const char *value);
+
+int32_t fl_query_where_lt_int(FL_Query *query, const char *field, int64_t value);
+
+int32_t fl_query_where_lte_str(FL_Query *query, const char *field, const char *value);
+
+int32_t fl_query_where_lte_int(FL_Query *query, const char *field, int64_t value);
+
 int32_t fl_query_where_array_contains(FL_Query *query, const char *field, const char *value);
 
 int32_t fl_query_where_array_contains_any(FL_Query *query, const char *field, FL_Array *array);

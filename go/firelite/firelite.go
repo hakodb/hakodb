@@ -462,6 +462,66 @@ func (q *Query) WhereEqInt(field string, value int64) error {
 	defer ff()
 	return checkStatus("fl_query_where_eq_int", C.fl_query_where_eq_int(q.ptr, cf, C.int64_t(value)))
 }
+func (q *Query) WhereNeString(field, value string) error {
+	cf, ff := cString(field)
+	cv, fv := cString(value)
+	defer ff()
+	defer fv()
+	return checkStatus("fl_query_where_ne_str", C.fl_query_where_ne_str(q.ptr, cf, cv))
+}
+func (q *Query) WhereNeInt(field string, value int64) error {
+	cf, ff := cString(field)
+	defer ff()
+	return checkStatus("fl_query_where_ne_int", C.fl_query_where_ne_int(q.ptr, cf, C.int64_t(value)))
+}
+func (q *Query) WhereGtString(field, value string) error {
+	cf, ff := cString(field)
+	cv, fv := cString(value)
+	defer ff()
+	defer fv()
+	return checkStatus("fl_query_where_gt_str", C.fl_query_where_gt_str(q.ptr, cf, cv))
+}
+func (q *Query) WhereGtInt(field string, value int64) error {
+	cf, ff := cString(field)
+	defer ff()
+	return checkStatus("fl_query_where_gt_int", C.fl_query_where_gt_int(q.ptr, cf, C.int64_t(value)))
+}
+func (q *Query) WhereGteString(field, value string) error {
+	cf, ff := cString(field)
+	cv, fv := cString(value)
+	defer ff()
+	defer fv()
+	return checkStatus("fl_query_where_gte_str", C.fl_query_where_gte_str(q.ptr, cf, cv))
+}
+func (q *Query) WhereGteInt(field string, value int64) error {
+	cf, ff := cString(field)
+	defer ff()
+	return checkStatus("fl_query_where_gte_int", C.fl_query_where_gte_int(q.ptr, cf, C.int64_t(value)))
+}
+func (q *Query) WhereLtString(field, value string) error {
+	cf, ff := cString(field)
+	cv, fv := cString(value)
+	defer ff()
+	defer fv()
+	return checkStatus("fl_query_where_lt_str", C.fl_query_where_lt_str(q.ptr, cf, cv))
+}
+func (q *Query) WhereLtInt(field string, value int64) error {
+	cf, ff := cString(field)
+	defer ff()
+	return checkStatus("fl_query_where_lt_int", C.fl_query_where_lt_int(q.ptr, cf, C.int64_t(value)))
+}
+func (q *Query) WhereLteString(field, value string) error {
+	cf, ff := cString(field)
+	cv, fv := cString(value)
+	defer ff()
+	defer fv()
+	return checkStatus("fl_query_where_lte_str", C.fl_query_where_lte_str(q.ptr, cf, cv))
+}
+func (q *Query) WhereLteInt(field string, value int64) error {
+	cf, ff := cString(field)
+	defer ff()
+	return checkStatus("fl_query_where_lte_int", C.fl_query_where_lte_int(q.ptr, cf, C.int64_t(value)))
+}
 func (q *Query) WhereOrString(field, value string) error {
 	cf, ff := cString(field)
 	cv, fv := cString(value)
@@ -741,6 +801,28 @@ func (q *QueryRef) Where(field, op string, value any) *QueryRef {
 			default:
 				return fmt.Errorf("unsupported == type %T", value)
 			}
+		case "!=", ">", ">=", "<", "<=":
+			switch v := value.(type) {
+			case string:
+				switch op {
+				case "!=":
+					return raw.WhereNeString(field, v)
+				case ">":
+					return raw.WhereGtString(field, v)
+				case ">=":
+					return raw.WhereGteString(field, v)
+				case "<":
+					return raw.WhereLtString(field, v)
+				default:
+					return raw.WhereLteString(field, v)
+				}
+			case int:
+				return applyNumericWhere(raw, field, op, int64(v))
+			case int64:
+				return applyNumericWhere(raw, field, op, v)
+			default:
+				return fmt.Errorf("unsupported %s type %T", op, value)
+			}
 		case "in", "not-in", "array-contains-any":
 			arr, err := anyToArray(value)
 			if err != nil {
@@ -767,6 +849,21 @@ func (q *QueryRef) Where(field, op string, value any) *QueryRef {
 		}
 	})
 	return q
+}
+
+func applyNumericWhere(raw *Query, field, op string, value int64) error {
+	switch op {
+	case "!=":
+		return raw.WhereNeInt(field, value)
+	case ">":
+		return raw.WhereGtInt(field, value)
+	case ">=":
+		return raw.WhereGteInt(field, value)
+	case "<":
+		return raw.WhereLtInt(field, value)
+	default:
+		return raw.WhereLteInt(field, value)
+	}
 }
 
 func (q *QueryRef) OrderBy(field string, ascending bool) *QueryRef {
