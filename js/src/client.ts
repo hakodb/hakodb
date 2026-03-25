@@ -33,7 +33,7 @@ export interface FireLiteClientOptions {
 // 2. FIXED: Added 'in' to the interface to match the Query class
 export interface QueryConstraint {
   field: string;
-  op: '==' | 'match' | 'contains' | 'startsWith' | 'in' | 'not-in' | 'array-contains' | 'array-contains-any';
+  op: '==' | '!=' | '>' | '>=' | '<' | '<=' | 'match' | 'contains' | 'startsWith' | 'in' | 'not-in' | 'array-contains' | 'array-contains-any';
   value: any; // Use any because 'in' takes an array
 }
 
@@ -296,7 +296,7 @@ export class CollectionReference {
   }
 
   // 3. FIXED: Updated 'op' signature to include 'in'
-  where(field: string, op: '==' | 'match' | 'contains' | 'startsWith' | 'in' | 'not-in' | 'array-contains' | 'array-contains-any', value: any): Query {
+  where(field: string, op: '==' | '!=' | '>' | '>=' | '<' | '<=' | 'match' | 'contains' | 'startsWith' | 'in' | 'not-in' | 'array-contains' | 'array-contains-any', value: any): Query {
     return new Query(this.client, this.name).where(field, op, value);
   }
 
@@ -358,7 +358,7 @@ export class Query {
 
   constructor(private readonly client: FireLiteClient, private readonly collection: string) { }
 
-  where(field: string, op: '==' | 'match' | 'contains' | 'startsWith' | 'in' | 'not-in' | 'array-contains' | 'array-contains-any', value: any): Query {
+  where(field: string, op: '==' | '!=' | '>' | '>=' | '<' | '<=' | 'match' | 'contains' | 'startsWith' | 'in' | 'not-in' | 'array-contains' | 'array-contains-any', value: any): Query {
     this.filters.push({ field, op, value });
     return this;
   }
@@ -416,6 +416,25 @@ export class Query {
               ensureOk(native.queryWhereEqStr(handle, filter.field, filter.value), native, 'queryWhereEqStr');
             } else {
               ensureOk(native.queryWhereEqInt(handle, filter.field, filter.value), native, 'queryWhereEqInt');
+            }
+            break;
+          case '!=':
+          case '>':
+          case '>=':
+          case '<':
+          case '<=':
+            if (typeof filter.value === 'string') {
+              if (filter.op === '!=') ensureOk(native.queryWhereNeStr(handle, filter.field, filter.value), native, 'queryWhereNeStr');
+              else if (filter.op === '>') ensureOk(native.queryWhereGtStr(handle, filter.field, filter.value), native, 'queryWhereGtStr');
+              else if (filter.op === '>=') ensureOk(native.queryWhereGteStr(handle, filter.field, filter.value), native, 'queryWhereGteStr');
+              else if (filter.op === '<') ensureOk(native.queryWhereLtStr(handle, filter.field, filter.value), native, 'queryWhereLtStr');
+              else ensureOk(native.queryWhereLteStr(handle, filter.field, filter.value), native, 'queryWhereLteStr');
+            } else {
+              if (filter.op === '!=') ensureOk(native.queryWhereNeInt(handle, filter.field, filter.value), native, 'queryWhereNeInt');
+              else if (filter.op === '>') ensureOk(native.queryWhereGtInt(handle, filter.field, filter.value), native, 'queryWhereGtInt');
+              else if (filter.op === '>=') ensureOk(native.queryWhereGteInt(handle, filter.field, filter.value), native, 'queryWhereGteInt');
+              else if (filter.op === '<') ensureOk(native.queryWhereLtInt(handle, filter.field, filter.value), native, 'queryWhereLtInt');
+              else ensureOk(native.queryWhereLteInt(handle, filter.field, filter.value), native, 'queryWhereLteInt');
             }
             break;
           case 'match':

@@ -1,6 +1,6 @@
+use crate::document::value::Value;
 use smallvec::SmallVec;
 use std::ops::Bound;
-use crate::document::value::Value;
 
 use super::filter::Filter;
 use super::order::OrderBy;
@@ -12,14 +12,26 @@ pub enum ScanType {
         fields: Vec<String>,
         values: Vec<Value>,
     },
+    CompositeIndexRange {
+        index_id: u32,
+        ranges: Vec<(Bound<SmallVec<[u8; 32]>>, Bound<SmallVec<[u8; 32]>>)>,
+    },
     // CursorIndex { start_key: SmallVec<[u8; 32]> },
-    SecondaryIndex { field: String, value: Vec<u8> },
-    UnionIndex { scans: Vec<ScanType> },
-    InvertedIndex { field: String, query: String },
+    SecondaryIndex {
+        field: String,
+        value: Vec<u8>,
+    },
+    UnionIndex {
+        scans: Vec<ScanType>,
+    },
+    InvertedIndex {
+        field: String,
+        query: String,
+    },
     // UPDATED: CursorIndex now defines a strict range
-    CursorIndex { 
-        start: Bound<SmallVec<[u8; 32]>>, 
-        end: Bound<SmallVec<[u8; 32]>>
+    CursorIndex {
+        start: Bound<SmallVec<[u8; 32]>>,
+        end: Bound<SmallVec<[u8; 32]>>,
     },
 }
 
@@ -31,7 +43,7 @@ pub struct QueryPlan {
     pub or_groups: Vec<Vec<crate::query::filter::Filter>>, // <--- ADD THIS
     pub order_by: Option<OrderBy>,
     pub limit: Option<usize>,
-    pub offset: Option<usize>, 
+    pub offset: Option<usize>,
     pub projection: Vec<String>,
     pub scan_limit: Option<usize>,
 }

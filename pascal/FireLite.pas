@@ -118,7 +118,7 @@ type
     FDB: TFireLite;
     FCollection: string;
     FWhereStr: array of record Field, Value, Op: string; end;
-    FWhereInt: array of record Field: string; Value: Int64; end;
+    FWhereInt: array of record Field: string; Value: Int64; Op: string; end;
     FWhereIn: array of record Field: string; Data: TJSONArray; end;
     FWhereNotIn: array of record Field: string; Data: TJSONArray; end;
     FWhereArrayContainsAny: array of record Field: string; Data: TJSONArray; end;
@@ -137,6 +137,16 @@ type
 
     function WhereEqStr(const Field, Value: string): TFLQuery;
     function WhereEqInt(const Field: string; Value: Int64): TFLQuery;
+    function WhereNeStr(const Field, Value: string): TFLQuery;
+    function WhereNeInt(const Field: string; Value: Int64): TFLQuery;
+    function WhereGtStr(const Field, Value: string): TFLQuery;
+    function WhereGtInt(const Field: string; Value: Int64): TFLQuery;
+    function WhereGteStr(const Field, Value: string): TFLQuery;
+    function WhereGteInt(const Field: string; Value: Int64): TFLQuery;
+    function WhereLtStr(const Field, Value: string): TFLQuery;
+    function WhereLtInt(const Field: string; Value: Int64): TFLQuery;
+    function WhereLteStr(const Field, Value: string): TFLQuery;
+    function WhereLteInt(const Field: string; Value: Int64): TFLQuery;
     function WhereIn(const Field: string; const Values: array of const): TFLQuery;
     function WhereNotIn(const Field: string; const Values: array of const): TFLQuery;
     function ArrayContains(const Field, Value: string): TFLQuery;
@@ -438,7 +448,37 @@ function TFLQuery.WhereEqStr(const Field, Value: string): TFLQuery;
 var L: Integer; begin L := Length(FWhereStr); SetLength(FWhereStr, L + 1); FWhereStr[L].Field := Field; FWhereStr[L].Value := Value; FWhereStr[L].Op := '=='; Result := Self; end;
 
 function TFLQuery.WhereEqInt(const Field: string; Value: Int64): TFLQuery;
-var L: Integer; begin L := Length(FWhereInt); SetLength(FWhereInt, L + 1); FWhereInt[L].Field := Field; FWhereInt[L].Value := Value; Result := Self; end;
+var L: Integer; begin L := Length(FWhereInt); SetLength(FWhereInt, L + 1); FWhereInt[L].Field := Field; FWhereInt[L].Value := Value; FWhereInt[L].Op := 'eq'; Result := Self; end;
+
+function TFLQuery.WhereNeStr(const Field, Value: string): TFLQuery;
+var L: Integer; begin L := Length(FWhereStr); SetLength(FWhereStr, L + 1); FWhereStr[L].Field := Field; FWhereStr[L].Value := Value; FWhereStr[L].Op := 'ne'; Result := Self; end;
+
+function TFLQuery.WhereNeInt(const Field: string; Value: Int64): TFLQuery;
+var L: Integer; begin L := Length(FWhereInt); SetLength(FWhereInt, L + 1); FWhereInt[L].Field := Field; FWhereInt[L].Value := Value; FWhereInt[L].Op := 'ne'; Result := Self; end;
+
+function TFLQuery.WhereGtStr(const Field, Value: string): TFLQuery;
+var L: Integer; begin L := Length(FWhereStr); SetLength(FWhereStr, L + 1); FWhereStr[L].Field := Field; FWhereStr[L].Value := Value; FWhereStr[L].Op := 'gt'; Result := Self; end;
+
+function TFLQuery.WhereGtInt(const Field: string; Value: Int64): TFLQuery;
+var L: Integer; begin L := Length(FWhereInt); SetLength(FWhereInt, L + 1); FWhereInt[L].Field := Field; FWhereInt[L].Value := Value; FWhereInt[L].Op := 'gt'; Result := Self; end;
+
+function TFLQuery.WhereGteStr(const Field, Value: string): TFLQuery;
+var L: Integer; begin L := Length(FWhereStr); SetLength(FWhereStr, L + 1); FWhereStr[L].Field := Field; FWhereStr[L].Value := Value; FWhereStr[L].Op := 'gte'; Result := Self; end;
+
+function TFLQuery.WhereGteInt(const Field: string; Value: Int64): TFLQuery;
+var L: Integer; begin L := Length(FWhereInt); SetLength(FWhereInt, L + 1); FWhereInt[L].Field := Field; FWhereInt[L].Value := Value; FWhereInt[L].Op := 'gte'; Result := Self; end;
+
+function TFLQuery.WhereLtStr(const Field, Value: string): TFLQuery;
+var L: Integer; begin L := Length(FWhereStr); SetLength(FWhereStr, L + 1); FWhereStr[L].Field := Field; FWhereStr[L].Value := Value; FWhereStr[L].Op := 'lt'; Result := Self; end;
+
+function TFLQuery.WhereLtInt(const Field: string; Value: Int64): TFLQuery;
+var L: Integer; begin L := Length(FWhereInt); SetLength(FWhereInt, L + 1); FWhereInt[L].Field := Field; FWhereInt[L].Value := Value; FWhereInt[L].Op := 'lt'; Result := Self; end;
+
+function TFLQuery.WhereLteStr(const Field, Value: string): TFLQuery;
+var L: Integer; begin L := Length(FWhereStr); SetLength(FWhereStr, L + 1); FWhereStr[L].Field := Field; FWhereStr[L].Value := Value; FWhereStr[L].Op := 'lte'; Result := Self; end;
+
+function TFLQuery.WhereLteInt(const Field: string; Value: Int64): TFLQuery;
+var L: Integer; begin L := Length(FWhereInt); SetLength(FWhereInt, L + 1); FWhereInt[L].Field := Field; FWhereInt[L].Value := Value; FWhereInt[L].Op := 'lte'; Result := Self; end;
 
 function TFLQuery.Match(const Field, Value: string): TFLQuery;
 var L: Integer; begin L := Length(FWhereStr); SetLength(FWhereStr, L + 1); FWhereStr[L].Field := Field; FWhereStr[L].Value := Value; FWhereStr[L].Op := 'match'; Result := Self; end;
@@ -547,10 +587,22 @@ begin
       if FWhereStr[I].Op = 'match' then fl_query_where_match(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value))
       else if FWhereStr[I].Op = 'contains' then fl_query_where_contains(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value))
       else if FWhereStr[I].Op = 'starts_with' then fl_query_where_starts_with(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value))
+      else if FWhereStr[I].Op = 'ne' then fl_query_where_ne_str(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value))
+      else if FWhereStr[I].Op = 'gt' then fl_query_where_gt_str(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value))
+      else if FWhereStr[I].Op = 'gte' then fl_query_where_gte_str(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value))
+      else if FWhereStr[I].Op = 'lt' then fl_query_where_lt_str(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value))
+      else if FWhereStr[I].Op = 'lte' then fl_query_where_lte_str(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value))
       else if FWhereStr[I].Op = 'array_contains' then fl_query_where_array_contains(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value))
       else fl_query_where_eq_str(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value));
     end;
-    for I := Low(FWhereInt) to High(FWhereInt) do fl_query_where_eq_int(Result, PChar(FWhereInt[I].Field), FWhereInt[I].Value);
+    for I := Low(FWhereInt) to High(FWhereInt) do begin
+      if FWhereInt[I].Op = 'ne' then fl_query_where_ne_int(Result, PChar(FWhereInt[I].Field), FWhereInt[I].Value)
+      else if FWhereInt[I].Op = 'gt' then fl_query_where_gt_int(Result, PChar(FWhereInt[I].Field), FWhereInt[I].Value)
+      else if FWhereInt[I].Op = 'gte' then fl_query_where_gte_int(Result, PChar(FWhereInt[I].Field), FWhereInt[I].Value)
+      else if FWhereInt[I].Op = 'lt' then fl_query_where_lt_int(Result, PChar(FWhereInt[I].Field), FWhereInt[I].Value)
+      else if FWhereInt[I].Op = 'lte' then fl_query_where_lte_int(Result, PChar(FWhereInt[I].Field), FWhereInt[I].Value)
+      else fl_query_where_eq_int(Result, PChar(FWhereInt[I].Field), FWhereInt[I].Value);
+    end;
     for I := Low(FWhereIn) to High(FWhereIn) do begin
       TmpArr := fl_array_new;
       for J := 0 to FWhereIn[I].Data.Count-1 do

@@ -63,6 +63,16 @@ export interface NativeBindings {
   queryFree(query: Handle): void;
   queryWhereEqStr(query: Handle, field: string, value: string): number;
   queryWhereEqInt(query: Handle, field: string, value: number | bigint): number;
+  queryWhereNeStr(query: Handle, field: string, value: string): number;
+  queryWhereNeInt(query: Handle, field: string, value: number | bigint): number;
+  queryWhereGtStr(query: Handle, field: string, value: string): number;
+  queryWhereGtInt(query: Handle, field: string, value: number | bigint): number;
+  queryWhereGteStr(query: Handle, field: string, value: string): number;
+  queryWhereGteInt(query: Handle, field: string, value: number | bigint): number;
+  queryWhereLtStr(query: Handle, field: string, value: string): number;
+  queryWhereLtInt(query: Handle, field: string, value: number | bigint): number;
+  queryWhereLteStr(query: Handle, field: string, value: string): number;
+  queryWhereLteInt(query: Handle, field: string, value: number | bigint): number;
   queryOrderBy(query: Handle, field: string, ascending: boolean): number;
   queryLimit(query: Handle, limit: number): number;
   queryOffset(query: Handle, offset: number): number;
@@ -173,6 +183,16 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     fl_query_free: { args: [FFIType.ptr], returns: FFIType.void },
     fl_query_where_eq_str: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
     fl_query_where_eq_int: { args: [FFIType.ptr, FFIType.cstring, FFIType.i64], returns: FFIType.i32 },
+    fl_query_where_ne_str: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
+    fl_query_where_ne_int: { args: [FFIType.ptr, FFIType.cstring, FFIType.i64], returns: FFIType.i32 },
+    fl_query_where_gt_str: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
+    fl_query_where_gt_int: { args: [FFIType.ptr, FFIType.cstring, FFIType.i64], returns: FFIType.i32 },
+    fl_query_where_gte_str: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
+    fl_query_where_gte_int: { args: [FFIType.ptr, FFIType.cstring, FFIType.i64], returns: FFIType.i32 },
+    fl_query_where_lt_str: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
+    fl_query_where_lt_int: { args: [FFIType.ptr, FFIType.cstring, FFIType.i64], returns: FFIType.i32 },
+    fl_query_where_lte_str: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
+    fl_query_where_lte_int: { args: [FFIType.ptr, FFIType.cstring, FFIType.i64], returns: FFIType.i32 },
     fl_query_where_match: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
     fl_query_where_contains: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
     fl_query_where_starts_with: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
@@ -278,6 +298,16 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     queryFree: (query) => symbols.fl_query_free(query),
     queryWhereEqStr: (query, field, value) => symbols.fl_query_where_eq_str(query, toC(field), toC(value)),
     queryWhereEqInt: (query, field, value) => symbols.fl_query_where_eq_int(query, toC(field), BigInt(value)),
+    queryWhereNeStr: (query, field, value) => symbols.fl_query_where_ne_str(query, toC(field), toC(value)),
+    queryWhereNeInt: (query, field, value) => symbols.fl_query_where_ne_int(query, toC(field), BigInt(value)),
+    queryWhereGtStr: (query, field, value) => symbols.fl_query_where_gt_str(query, toC(field), toC(value)),
+    queryWhereGtInt: (query, field, value) => symbols.fl_query_where_gt_int(query, toC(field), BigInt(value)),
+    queryWhereGteStr: (query, field, value) => symbols.fl_query_where_gte_str(query, toC(field), toC(value)),
+    queryWhereGteInt: (query, field, value) => symbols.fl_query_where_gte_int(query, toC(field), BigInt(value)),
+    queryWhereLtStr: (query, field, value) => symbols.fl_query_where_lt_str(query, toC(field), toC(value)),
+    queryWhereLtInt: (query, field, value) => symbols.fl_query_where_lt_int(query, toC(field), BigInt(value)),
+    queryWhereLteStr: (query, field, value) => symbols.fl_query_where_lte_str(query, toC(field), toC(value)),
+    queryWhereLteInt: (query, field, value) => symbols.fl_query_where_lte_int(query, toC(field), BigInt(value)),
     queryWhereMatch: (query, field, value) => symbols.fl_query_where_match(query, toC(field), toC(value)),
     queryWhereContains: (query, field, value) => symbols.fl_query_where_contains(query, toC(field), toC(value)),
     queryWhereStartsWith: (query, field, value) => symbols.fl_query_where_starts_with(query, toC(field), toC(value)),
@@ -379,6 +409,16 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_query_free: lib.func('void fl_query_free(FL_Query* query)'),
     fl_query_where_eq_str: lib.func('int fl_query_where_eq_str(FL_Query* query, const char* field, const char* value)'),
     fl_query_where_eq_int: lib.func('int fl_query_where_eq_int(FL_Query* query, const char* field, int64_t value)'),
+    fl_query_where_ne_str: lib.func('int fl_query_where_ne_str(FL_Query* query, const char* field, const char* value)'),
+    fl_query_where_ne_int: lib.func('int fl_query_where_ne_int(FL_Query* query, const char* field, int64_t value)'),
+    fl_query_where_gt_str: lib.func('int fl_query_where_gt_str(FL_Query* query, const char* field, const char* value)'),
+    fl_query_where_gt_int: lib.func('int fl_query_where_gt_int(FL_Query* query, const char* field, int64_t value)'),
+    fl_query_where_gte_str: lib.func('int fl_query_where_gte_str(FL_Query* query, const char* field, const char* value)'),
+    fl_query_where_gte_int: lib.func('int fl_query_where_gte_int(FL_Query* query, const char* field, int64_t value)'),
+    fl_query_where_lt_str: lib.func('int fl_query_where_lt_str(FL_Query* query, const char* field, const char* value)'),
+    fl_query_where_lt_int: lib.func('int fl_query_where_lt_int(FL_Query* query, const char* field, int64_t value)'),
+    fl_query_where_lte_str: lib.func('int fl_query_where_lte_str(FL_Query* query, const char* field, const char* value)'),
+    fl_query_where_lte_int: lib.func('int fl_query_where_lte_int(FL_Query* query, const char* field, int64_t value)'),
     fl_query_where_match: lib.func('int fl_query_where_match(FL_Query* query, const char* field, const char* value)'),
     fl_query_where_contains: lib.func('int fl_query_where_contains(FL_Query* query, const char* field, const char* value)'),
     fl_query_where_starts_with: lib.func('int fl_query_where_starts_with(FL_Query* query, const char* field, const char* value)'),
@@ -479,6 +519,16 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     queryFree: (query) => fn.fl_query_free(query),
     queryWhereEqStr: (query, field, value) => fn.fl_query_where_eq_str(query, field, value),
     queryWhereEqInt: (query, field, value) => fn.fl_query_where_eq_int(query, field, value),
+    queryWhereNeStr: (query, field, value) => fn.fl_query_where_ne_str(query, field, value),
+    queryWhereNeInt: (query, field, value) => fn.fl_query_where_ne_int(query, field, value),
+    queryWhereGtStr: (query, field, value) => fn.fl_query_where_gt_str(query, field, value),
+    queryWhereGtInt: (query, field, value) => fn.fl_query_where_gt_int(query, field, value),
+    queryWhereGteStr: (query, field, value) => fn.fl_query_where_gte_str(query, field, value),
+    queryWhereGteInt: (query, field, value) => fn.fl_query_where_gte_int(query, field, value),
+    queryWhereLtStr: (query, field, value) => fn.fl_query_where_lt_str(query, field, value),
+    queryWhereLtInt: (query, field, value) => fn.fl_query_where_lt_int(query, field, value),
+    queryWhereLteStr: (query, field, value) => fn.fl_query_where_lte_str(query, field, value),
+    queryWhereLteInt: (query, field, value) => fn.fl_query_where_lte_int(query, field, value),
     queryWhereMatch: (query, field, value) => fn.fl_query_where_match(query, field, value),
     queryWhereContains: (query, field, value) => fn.fl_query_where_contains(query, field, value),
     queryWhereStartsWith: (query, field, value) => fn.fl_query_where_starts_with(query, field, value),
