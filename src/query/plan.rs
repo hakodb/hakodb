@@ -33,4 +33,5 @@ pub struct QueryPlan {
     pub limit: Option<usize>,
     pub offset: Option<usize>, 
     pub projection: Vec<String>,
+    pub scan_limit: Option<usize>,
 }

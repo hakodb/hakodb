@@ -135,7 +135,8 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Map(fields) => {
             let mut map = serde_json::Map::new();
             for (k, sv) in fields {
-                map.insert(k.clone(), value_to_json(sv));
+                // FIX: Use .to_string() to convert Arc<str> to String
+                map.insert(k.to_string(), value_to_json(sv));
             }
             serde_json::Value::Object(map)
         },
@@ -153,7 +154,7 @@ fn doc_to_json(doc: &FireLiteDoc) -> Result<String, String> {
 
         let mut map = serde_json::Map::new();
         for (k, v) in &doc.fields {
-            map.insert(k.clone(), value_to_json(v));
+            map.insert(k.to_string(), value_to_json(v));
         }
         serde_json::to_string(&serde_json::Value::Object(map)).map_err(|e| e.to_string())
     })
@@ -1267,9 +1268,14 @@ pub extern "C" fn fl_engine_patch(
         let col = match cstr_to_string(collection) { Ok(v) => v, Err(e) => return set_last_error(e) };
         let id = match cstr_to_string(doc_id) { Ok(v) => v, Err(e) => return set_last_error(e) };
         let update_doc = unsafe { &*updates };
+
+        let mut updates_vec: Vec<(String, Value)> = Vec::new();
+        for (k, v) in &update_doc.doc.fields {
+            updates_vec.push((k.to_string(), v.clone()));
+        }
     
         // FIX: Access .db and ensure set_last_error returns correctly
-        match engine.db.patch(&col, &id, update_doc.doc.fields.clone()) {
+        match engine.db.patch(&col, &id, updates_vec) {
             Ok(_) => 0,
             Err(e) => {
                 set_last_error(e.to_string());

@@ -428,23 +428,51 @@ fn bench_pagination_cursor(db: &FireLite, page_size: usize, pages: usize) -> Sce
 
 fn bench_index_costs(db: &FireLite) -> (f64, f64) {
     let build_t0 = Instant::now();
-    db.create_index(COLLECTION, "age")
-        .expect("create simple index");
-    let _ = db.create_composite_index(
+    
+    // Trigger creation
+    db.create_index(COLLECTION, "age").expect("create index");
+    db.create_composite_index(
         COLLECTION,
         vec![
             ("tenant".to_string(), SortDirection::Asc),
             ("score".to_string(), SortDirection::Desc),
         ],
     );
-    let build_ms = build_t0.elapsed().as_secs_f64() * 1_000.0;
 
-    let q = Query::new(COLLECTION)
+    let q_probe = Query::new(COLLECTION)
+        .where_filter("age", Operator::Eq, Value::Int(25))
+        .limit(1);
+
+    // READINESS POLLING
+    loop {
+        let start_check = Instant::now();
+        
+        // Instead of a specific age, we query the composite index 
+        // we just created to see if it has ANY data yet.
+        let q_probe = Query::new(COLLECTION).limit(1);
+        let res = db.query(q_probe).unwrap();
+        
+        // If the index manager returns data and it's fast (< 2ms), it's ready.
+        if !res.is_empty() && start_check.elapsed() < Duration::from_millis(2) {
+            break;
+        }
+        
+        if build_t0.elapsed() > Duration::from_secs(20) { // Bumped to 20s for slow disks
+            panic!("Benchmark failed: Indexes never finished background population");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let build_ms = build_t0.elapsed().as_secs_f64() * 1000.0;
+
+    // Final Measurement
+    let q_lookup = Query::new(COLLECTION)
         .where_filter("tenant", Operator::Eq, Value::String("tenant-1".into()))
         .order_by("score", false)
         .limit(50);
+        
     let lookup_t0 = Instant::now();
-    let rows = db.query(q).expect("indexed lookup");
+    let rows = db.query(q_lookup).expect("indexed lookup");
     black_box(rows.len());
     let lookup_us = lookup_t0.elapsed().as_secs_f64() * 1_000_000.0;
 
@@ -768,8 +796,33 @@ fn criterion_microbenchmarks(c: &mut Criterion) {
     read_group.finish();
 
     let mut query_group = c.benchmark_group("queries_and_pagination");
+    
+
+    // 1. PREPARATION: Create all indexes needed for this group ONCE.
+    // This happens before any benchmarks in this group run.
+    db.create_index(COLLECTION, "age").expect("index age");
+    db.create_index(COLLECTION, "score").expect("index score");
+    db.create_index(COLLECTION, "id").expect("index id");
+
+    // create index runnin on async worker, to be fair need to wait for index ready before bencmarking
+    let probe_start = Instant::now();
+    loop {
+        let t0 = Instant::now();
+        let q = Query::new(COLLECTION).where_filter("id", Operator::Eq, Value::Int(500)).limit(1);
+        let res = db.query(q).unwrap();
+        
+        // If query took < 1ms and found the doc, the index is ready!
+        if !res.is_empty() && t0.elapsed() < Duration::from_millis(1) {
+            break;
+        }
+        
+        if probe_start.elapsed() > Duration::from_secs(10) {
+            panic!("Benchmark failed: Indexes never finished background population");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
     query_group.bench_function("query_indexed", |b| {
-        db.create_index(COLLECTION, "age").expect("index age");
         b.iter(|| {
             let q = Query::new(COLLECTION)
                 .where_filter("age", Operator::Gte, Value::Int(32))

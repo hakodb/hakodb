@@ -13,10 +13,19 @@ pub struct ScanRange {
 }
 
 pub fn build_prefix_range(def: &CompositeIndexDefinition, values: &[Value]) -> ScanRange {
-    let mut start = encode_composite_key(def, values, "");
+    let mut start: SmallVec<[u8; 32]> = SmallVec::new();
+    
+    // 1. Write Index ID
+    start.extend_from_slice(&def.id.to_be_bytes());
+    
+    // 2. Write exactly the prefix values (NO doc_id or trailing lengths)
+    for (value, field) in values.iter().zip(def.fields.iter()) {
+        crate::index::composite::key_encoder::encode_value(value, &field.direction, &mut start);
+    }
+    
     let mut end = start.clone();
-    end.push(0xFF);
-    start.truncate(start.len().saturating_sub(2));
+    end.push(0xFF); // Upper bound for the prefix search
+    
     ScanRange { start, end }
 }
 
@@ -25,13 +34,8 @@ pub fn build_cursor_range(
     cursor_values: &[Value],
     is_after: bool
 ) -> SmallVec<[u8; 32]> {
-    // We encode the cursor values just like a standard index key
-    // We leave the doc_id empty for the start bound
     let mut key = encode_composite_key(def, cursor_values, "");
-    
     if is_after {
-        // To start "after", we append a high-byte to ensure the 
-        // B-Tree search lands strictly past the exact match
         key.push(0xFF);
     }
     key

@@ -24,12 +24,12 @@ impl IndexStorage {
         })
     }
 
-    pub fn insert(&mut self, index_id: u32, key: Vec<u8>, doc: String) -> std::io::Result<()> {
-        if let Some(index) = self.manager.get_mut(index_id) {
-            // index.tree.insert(key.clone(), doc.clone());
-            index.tree.insert(key.clone().into(), doc.clone().into());
-        }
-        self.log.append(INSERT, index_id, &key, &doc)
+    pub fn insert(&mut self, index_id: u32, key: Vec<u8>, doc_id: String) -> std::io::Result<()> {
+        // if let Some(index) = self.manager.get_mut(index_id) {
+        //     // index.tree.insert(key.clone(), doc.clone());
+        //     index.tree.insert(key.clone().into(), doc.clone().into());
+        // }
+        self.log.append(INSERT, index_id, &key, &doc_id)
     }
 
     pub fn delete(&mut self, index_id: u32, key: Vec<u8>, doc: String) -> std::io::Result<()> {

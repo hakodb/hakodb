@@ -3,12 +3,14 @@ use std::sync::{RwLock, atomic::{AtomicU32, AtomicU16, Ordering}};
 use std::path::{Path, PathBuf};
 use std::io::{Read, Write};
 use std::fs;
+use std::sync::Arc;
 
 pub struct Catalog {
     path: PathBuf,
     pub(crate) root_path: PathBuf,
     // Unified map: "c:name" -> col_id, "k:name" -> key_id
     data: RwLock<HashMap<String, u32>>,
+    rev_keys: RwLock<HashMap<u16, Arc<str>>>,
     next_col_id: AtomicU32,
     next_key_id: AtomicU16,
 }
@@ -30,38 +32,18 @@ impl Catalog {
             }
         }
 
-        // 2. RECOVERY & GHOST CLEANUP
-        // Scan physical folders to see if they match the catalog
-        // if let Ok(entries) = fs::read_dir(root) {
-        //     for entry in entries.flatten() {
-        //         let path = entry.path();
-        //         if path.is_dir() {
-        //             let folder_name = entry.file_name().to_string_lossy().to_string();
-        //             if folder_name.starts_with('c') {
-        //                 let id_str = &folder_name[1..];
-        //                 if let Ok(id) = id_str.parse::<u32>() {
-        //                     // Check if this folder has an identity file
-        //                     let ident_path = path.join("identity.bin");
-        //                     if let Ok(real_name) = fs::read_to_string(&ident_path) {
-        //                         let key = format!("c:{}", real_name);
-        //                         // If catalog missed it, recover it
-        //                         map.entry(key).or_insert(id);
-        //                         if id >= max_c { max_c = id + 1; }
-        //                     } else {
-        //                         // GHOST DETECTED: Folder exists but has no identity.
-        //                         // We don't delete here for safety, but we ignore it.
-        //                         eprintln!("[firelite] Ignoring ghost folder: {}", folder_name);
-        //                     }
-        //                 }
-        //             }
-        //         }
-        //     }
-        // }
+        let mut rev_keys = HashMap::new();
+        for (name, id) in &map {
+            if name.starts_with("k:") {
+                rev_keys.insert(*id as u16, Arc::from(&name[2..]));
+            }
+        }
 
         Self {
             path,
             root_path: root.to_path_buf(),
             data: RwLock::new(map),
+            rev_keys: RwLock::new(rev_keys),
             next_col_id: AtomicU32::new(max_c),
             next_key_id: AtomicU16::new(max_k),
         }
@@ -173,15 +155,22 @@ impl Catalog {
         let key = format!("k:{}", field_name);
         {
             let read = self.data.read().unwrap();
-            if let Some(id) = read.get(&key) {
-                return *id as u16;
-            }
+            if let Some(id) = read.get(&key) { return *id as u16; }
         }
-        
         let mut write = self.data.write().unwrap();
-        let id = self.next_key_id.fetch_add(1, Ordering::SeqCst);
+        let id = self.next_key_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         write.insert(key, id as u32);
+        self.rev_keys.write().unwrap().insert(id, Arc::from(field_name));
         id
+    }
+
+    // NEW: Fast resolution that returns a shared pointer
+    pub fn resolve_key_shared(&self, id: u16) -> Arc<str> {
+        if let Some(existing) = self.rev_keys.read().unwrap().get(&id) {
+            return Arc::clone(existing);
+        }
+        // Fallback for unknown IDs
+        Arc::from(format!("$id:{}", id))
     }
 
     pub fn resolve_key(&self, id: u16) -> Option<String> {

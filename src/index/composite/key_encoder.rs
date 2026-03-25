@@ -115,7 +115,7 @@ pub fn encode_composite_key(
     out
 }
 
-fn encode_value(
+pub(crate) fn encode_value(
     value: &Value,
     direction: &SortDirection,
     out: &mut SmallVec<[u8; 32]>,

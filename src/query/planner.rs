@@ -15,105 +15,96 @@ impl QueryPlanner {
         collection_rows: usize,
         worker_count: usize 
     ) -> QueryPlan {
-        
-        
+        let work_per_thread = collection_rows / worker_count.max(1);
+        let use_index_heuristic = work_per_thread > 500; 
+
         // 1. PRIORITY 1: Full-Text Search (Match operator)
-        // This is prioritized because it is usually the most selective index.
         for filter in &query.filters {
             if matches!(filter.op, Operator::Match) {
                 if let Value::String(q_text) = &filter.value {
                     if indexes.fts.get(&query.collection).map_or(false, |m| m.contains_key(&filter.field)) {
                         return Self::make_plan(query, ScanType::InvertedIndex { 
-                            field: filter.field.clone(), 
-                            query: q_text.clone() 
-                        });
+                            field: filter.field.clone(), query: q_text.clone() 
+                        }, query.limit); // Limit safe here if no order_by
                     }
                 }
             }
         }
 
-        // 2. PRIORITY 2: Range/Cursor Detection (v0.7.5 Update)
-        // If the user provided any start/end bounds, we MUST use a CursorIndex scan 
-        // to avoid O(N) performance degradation on large datasets.
+        // 2. PRIORITY 2: Range/Cursor Detection
         if let Some(order) = &query.order_by {
-            let has_start = query.start_at.is_some() || query.start_after.is_some();
-            let has_end = query.end_at.is_some() || query.end_before.is_some();
-
-            if has_start || has_end {
-                // Find an index that starts with the field we are ordering by
+            let has_bounds = query.start_at.is_some() || query.start_after.is_some() || 
+                             query.end_at.is_some() || query.end_before.is_some();
+            if has_bounds {
                 for idx in indexes.indexes_for_collection(&query.collection) {
                     if !idx.definition.fields.is_empty() && idx.definition.fields[0].field == order.field {
-                        
-                        // Calculate Start Bound
                         let start = match (&query.start_at, &query.start_after) {
                             (Some(v), _) => Bound::Included(build_cursor_range(&idx.definition, v, false)),
                             (_, Some(v)) => Bound::Excluded(build_cursor_range(&idx.definition, v, false)),
-                            _ => Bound::Unbounded, // Start from the beginning
+                            _ => Bound::Unbounded,
                         };
-
-                        // Calculate End Bound
                         let end = match (&query.end_at, &query.end_before) {
                             (Some(v), _) => Bound::Included(build_cursor_range(&idx.definition, v, false)),
                             (_, Some(v)) => Bound::Excluded(build_cursor_range(&idx.definition, v, false)),
-                            _ => Bound::Unbounded, // Go up to the end
+                            _ => Bound::Unbounded,
                         };
-
-                        return Self::make_plan(query, ScanType::CursorIndex { start, end });
+                        return Self::make_plan(query, ScanType::CursorIndex { start, end }, query.limit);
                     }
                 }
             }
         }
 
-        // 3. INTELLIGENCE: Cost-Based Heuristic
-        // If the work per thread is low, we ignore standard indexes and use parallel full scan.
-        let work_per_thread = collection_rows / worker_count.max(1);
-        let use_index_heuristic = work_per_thread > 1000 && collection_rows > 15000;
+        // 3. PRIORITY 3: Composite Index (Filters + OrderBy)
+        if use_index_heuristic {
+            let mut target_fields = query.composite_fields();
+            if let Some(order) = &query.order_by {
+                target_fields.push(order.field.clone());
+            }
+
+            // Checks if index covers both filters and sort
+            if indexes.has_index(&query.collection, &target_fields) {
+                let is_eq_only = query.filters.iter().all(|f| matches!(f.op, Operator::Eq));
+                if is_eq_only {
+                    // FIX: We only extract values for the FILTER fields, not the OrderBy field
+                    let values: Vec<_> = query.filters.iter().map(|f| f.value.clone()).collect();
+                    return Self::make_plan(query, ScanType::CompositeIndex { 
+                        fields: target_fields, 
+                        values 
+                    }, query.limit); // Limit safe because B-Tree natively sorts
+                }
+            }
+        }
 
         // 4. Try Union/OR/IN Logic
         if !query.or_groups.is_empty() || query.filters.iter().any(|f| matches!(f.op, Operator::In)) {
             if let Some(union_scan) = Self::try_plan_union(query, indexes) {
-                return Self::make_plan(query, union_scan);
+                let safe_limit = if query.order_by.is_some() { None } else { query.limit };
+                return Self::make_plan(query, union_scan, safe_limit);
             }
         }
 
-        // 5. Conditional Secondary Index (Equality)
+        // 5. PRIORITY 4: Secondary Index (Equality)
+        // Ensure we DO NOT pass the limit down to the scan if we have an ORDER BY
+        let safe_limit = if query.order_by.is_some() { None } else { query.limit };
+
         if use_index_heuristic {
             for filter in &query.filters {
                 if matches!(filter.op, Operator::Eq) {
-                    if indexes.secondary.get(&query.collection)
-                        .map_or(false, |m| m.contains_key(&filter.field)) 
-                    {
+                    if indexes.secondary.get(&query.collection).map_or(false, |m| m.contains_key(&filter.field)) {
                         let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
                         return Self::make_plan(query, ScanType::SecondaryIndex { 
-                            field: filter.field.clone(), 
-                            value: val_bytes 
-                        });
+                            field: filter.field.clone(), value: val_bytes 
+                        }, safe_limit);
                     }
                 }
             }
         }
 
-        // 6. Default: Composite Index check or Full Scan
-        let fields = query.composite_fields();
-        let is_index_compatible = query.filters.iter().all(|f| {
-            matches!(f.op, Operator::Eq | Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte)
-        });
-
-        let scan = if is_index_compatible && use_index_heuristic {
-            let values: Vec<_> = query.filters.iter().map(|f| f.value.clone()).collect();
-            if indexes.has_index(&query.collection, &fields) {
-                ScanType::CompositeIndex { fields, values }
-            } else {
-                ScanType::FullCollection
-            }
-        } else {
-            ScanType::FullCollection
-        };
-
-        Self::make_plan(query, scan)
+        // 6. Default: Full Scan
+        Self::make_plan(query, ScanType::FullCollection, safe_limit)
     }
     
-    fn make_plan(query: &Query, scan: ScanType) -> QueryPlan {
+    fn make_plan(query: &Query, scan: ScanType, scan_limit: Option<usize>) -> QueryPlan {
         QueryPlan {
             collection: query.collection.clone(),
             scan,
@@ -121,6 +112,7 @@ impl QueryPlanner {
             or_groups: query.or_groups.clone(),
             order_by: query.order_by.clone(),
             limit: query.limit,
+            scan_limit, // Used specifically for disk retrieval
             offset: query.offset,
             projection: query.projection.clone(),
         }

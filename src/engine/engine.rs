@@ -116,24 +116,20 @@ impl FireLite {
         let root_path = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&root_path)?;
 
-        // ccatalog
+        // 1. Initialize Catalog
         let catalog = Arc::new(crate::util::catalog::Catalog::load(&root_path));
-        let catalog_for_thread = Arc::clone(&catalog);
-        let config_clone = config.clone();
-
-        // 1. Initialize Global Shared State & Channels (ONCE)
-        let indexes = Arc::new(RwLock::new(IndexManager::default()));
         
+        // 2. Initialize Global Shared State & Channels
+        let indexes = Arc::new(RwLock::new(IndexManager::default()));
         let (index_tx, index_rx) = channel::<IndexOp>();
         let (audit_tx, audit_rx) = channel::<AuditEntry>();
         let (blob_tx, blob_rx) = std::sync::mpsc::sync_channel::<BlobWork>(5000);
-        // let (blob_tx, blob_rx) = std::sync::mpsc::sync_channel::<BlobWork>(1000);
 
         let shared_blob_rx = Arc::new(Mutex::new(blob_rx));
         let audit_data = Arc::new(RwLock::new(Vec::new()));
         let (audit_stop_tx, audit_stop_rx) = channel::<()>(); 
 
-        // 2. Initialize Index Persistence
+        // 3. Initialize Index Persistence
         let index_dir = root_path.join("_indices");
         let index_log_path = index_dir.join("index.log").to_string_lossy().to_string();
         let snapshot_dir = index_dir.join("snapshots").to_string_lossy().to_string();
@@ -143,67 +139,64 @@ impl FireLite {
                 .map_err(|e| FireLiteError::Io(e))?
         ));
 
-        // 3. Spawn Persistent Index Worker
-        // This handles both memory updates AND physical logging
+        // 4. Spawn Persistent Index Worker (Handles ongoing writes)
         let idx_clone = Arc::clone(&indexes);
         let storage_persist = Arc::clone(&index_storage);
-        
         thread::spawn(move || {
             while let Ok(op) = index_rx.recv() {
                 match op {
                     IndexOp::Update { collection, puts, deletes } => {
-
-                        let mut mgr = match idx_clone.write() {
-                            Ok(guard) => guard,
-                            Err(_) => break, 
-                        };
-                        let mut persist = match storage_persist.lock() {
-                            Ok(guard) => guard,
-                            Err(_) => break,
-                        };
+                        let mut mgr = match idx_clone.write() { Ok(g) => g, Err(_) => break };
+                        let mut persist = match storage_persist.lock() { Ok(g) => g, Err(_) => break };
 
                         for (id, doc) in puts {
+                            // 1. Update ALL RAM Indexes (Composite, FTS, and Secondary)
+                            // This single call handles all memory B-Trees automatically.
                             mgr.index_document(&collection, &id, &doc);
                             
-                            // 2. NEW: Update Secondary Indexes (Single Field)
-                            if let Some(sec_map) = mgr.secondary.get_mut(&collection) {
-                                for (field, index) in sec_map.iter_mut() {
-                                    if let Some(val) = doc.get(field) {
-                                        let key = crate::index::index_key::encode_scalar(val);
-                                        // Use id.clone() here so 'id' stays alive for the next call
-                                        index.insert(key, id.clone()); 
-                                    }
+                            // 2. Persist ALL Composite Indexes to the Disk Log
+                            // Instead of hardcoding '1', we loop through every index for this collection
+                            for idx in mgr.indexes_for_collection(&collection) {
+                                if let Some(vals) = idx.document_values(&doc) {
+                                    let key_bytes = crate::index::composite::key_encoder::encode_composite_key(
+                                        &idx.definition, &vals, &id
+                                    );
+                                    // Persist using the dynamic index ID
+                                    let _ = persist.insert(idx.definition.id, key_bytes.to_vec(), id.clone());
                                 }
                             }
-
-                            // Log to Disk (Survivability)
-                            let _ = persist.insert(1, doc.encode(), id);
                         }
 
                         for (id, doc) in deletes {
+                            // 1. Remove from ALL RAM Indexes
                             mgr.remove_document(&collection, &id, &doc);
-                            // Log to Disk (Survivability)
-                            let _ = persist.delete(1, doc.encode(), id);
+                            
+                            // 2. Remove from ALL Composite Disk Logs
+                            for idx in mgr.indexes_for_collection(&collection) {
+                                if let Some(vals) = idx.document_values(&doc) {
+                                    let key_bytes = crate::index::composite::key_encoder::encode_composite_key(
+                                        &idx.definition, &vals, &id
+                                    );
+                                    let _ = persist.delete(idx.definition.id, key_bytes.to_vec(), id.clone());
+                                }
+                            }
                         }
                     }
                 }
             }
         });
 
-        // 4. Spawn Audit Worker Implementation
+        // 5. Spawn Audit Worker
         let log_path = config.audit_log_path.clone().unwrap_or_else(|| {
             root_path.join("audit.log").to_string_lossy().to_string()
         });
         let mut audit_file = if config.enable_audit_log {
             Some(std::fs::OpenOptions::new().create(true).append(true).open(log_path)?)
-        } else {
-            None
-        };
+        } else { None };
 
         let audit_data_clone = Arc::clone(&audit_data);
         let audit_handle_inner = thread::spawn(move || {
             loop {
-                // Use recv_timeout so the thread can check the stop signal frequently
                 match audit_rx.recv_timeout(Duration::from_millis(500)) {
                     Ok(entry) => {
                         if let Ok(mut history) = audit_data_clone.write() { history.push(entry.clone()); }
@@ -212,22 +205,19 @@ impl FireLite {
                                 SystemTime::now(), entry.op, entry.collection, entry.doc_id.as_deref().unwrap_or("<none>"), entry.ok);
                         }
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        // Check if we were told to stop
-                        if audit_stop_rx.try_recv().is_ok() { break; }
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { if audit_stop_rx.try_recv().is_ok() { break; } }
+                    Err(_) => break,
                 }
             }
         });
 
-        // 5. Assemble the Engine Instance
+        // 6. Assemble the Engine Instance
         let db = Self {
             root_path: root_path.clone(),
             config: config.clone(),
             shards: Arc::new(RwLock::new(HashMap::new())),
-            index_storage,
-            indexes,
+            index_storage: Arc::clone(&index_storage),
+            indexes: Arc::clone(&indexes),
             executor: ParallelQueryExecutor::new(config.query_workers, Arc::clone(&catalog)),
             tx_lock: Mutex::new(()),
             listeners: Mutex::new(HashMap::new()),
@@ -238,13 +228,95 @@ impl FireLite {
             index_tx,
             blob_tx: blob_tx.clone(),
             audit_data,
-            audit_stop: Mutex::new(Some(audit_stop_tx)), // <--- INITIALIZE
-            audit_handle: Mutex::new(Some(audit_handle_inner)), // <--- INITIALIZE
+            audit_stop: Mutex::new(Some(audit_stop_tx)),
+            audit_handle: Mutex::new(Some(audit_handle_inner)),
             maintenance_stop: Mutex::new(None),
             maintenance_handle: Mutex::new(None),
-            catalog
+            catalog: Arc::clone(&catalog),
         };
 
+        // 7. ORCHESTRATED BACKGROUND RECOVERY & SYNC
+        let shards_ptr = Arc::clone(&db.shards);
+        let indexes_ptr = Arc::clone(&db.indexes);
+        let persist_ptr = Arc::clone(&db.index_storage);
+        let catalog_ptr = Arc::clone(&db.catalog);
+        let config_thread = config.clone();
+        let blob_tx_thread = db.blob_tx.clone();
+
+        thread::spawn(move || {
+            // STEP A: Discover and Load Shards
+            let discovered = catalog_ptr.recover_from_disk();
+            for (col_name, _) in discovered {
+                let path = catalog_ptr.get_collection_path(&col_name);
+                if let Ok(mut storage) = StorageEngine::open(path, &config_thread) {
+                    storage.blob_tx = Some(blob_tx_thread.clone());
+                    if let Ok(mut shards) = shards_ptr.write() {
+                        shards.insert(col_name, Arc::new(RwLock::new(storage)));
+                    }
+                }
+            }
+
+            // STEP B: Load Index from Persistent Storage
+            {
+                let mut mgr = indexes_ptr.write().unwrap();
+                let mut persist = persist_ptr.lock().unwrap();
+                mgr.composite = std::mem::take(&mut persist.manager);
+            }
+
+            // STEP C: Catch-up Scan (Ensure indexes match disk)
+            let is_empty = {
+                let mgr = indexes_ptr.read().unwrap();
+                mgr.composite.get(1).map_or(true, |idx| idx.tree.is_empty())
+            };
+
+            if is_empty {
+                // Full rebuild if no snapshot exists
+                let shards = shards_ptr.read().unwrap();
+                    for (col, shard) in shards.iter() {
+                        let storage = shard.read().unwrap();
+                        if let Ok(data) = storage.scan_prefix("") {
+                            // OPTIMIZATION: Process in chunks and yield the lock
+                            for chunk in data.chunks(100) {
+                                let mut mgr = indexes_ptr.write().unwrap();
+                                for (key, bytes) in chunk {
+                                    if let Some((_, doc_id)) = key.split_once(':') {
+                                        if let Some(doc) = FireLiteDoc::decode(&bytes, Some(&catalog_ptr)) {
+                                            mgr.index_document(col, doc_id, &doc);
+                                        }
+                                    }
+                                }
+                                drop(mgr); // Release lock
+                                thread::yield_now(); // Let the query thread run!
+                            }
+                        }
+                    }
+            } else {
+                // Incremental catch-up
+                let shards = shards_ptr.read().unwrap();
+                let mut mgr = indexes_ptr.write().unwrap();
+                for (col, shard) in shards.iter() {
+                    let storage = shard.read().unwrap();
+                    let physical_count = storage.count_prefix("");
+                    let indexed_count = mgr.composite.exact_match_doc_ids(col, &[], &[]).map_or(0, |v| v.len());
+                    
+                    if physical_count > indexed_count {
+                        if let Ok(data) = storage.scan_prefix("") {
+                            for (key, bytes) in data {
+                                if let Some((_, doc_id)) = key.split_once(':') {
+                                    if let Some(doc) = FireLiteDoc::decode(&bytes, Some(&catalog_ptr)) {
+                                        mgr.composite.index_document(col, doc_id, &doc);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catalog_ptr.save();
+        });
+
+
+        // blob workers
         let shards_ptr = Arc::clone(&db.shards);
         let encryption_key = config.encryption_key.clone();
         
@@ -306,30 +378,30 @@ impl FireLite {
         // 6. Recovery & Sync
         // db.recover_existing_shards()?;
         // 2. Spawn Background Recovery Worker
-        let db_weak_shards = Arc::clone(&db.shards);
-        let blob_tx_clone = db.blob_tx.clone();
+        // let db_weak_shards = Arc::clone(&db.shards);
+        // let blob_tx_clone = db.blob_tx.clone();
 
-        thread::spawn(move || {
-            // A. Scan disk and update Catalog memory
-            let discovered = catalog_for_thread.recover_from_disk();
+        // thread::spawn(move || {
+        //     // A. Scan disk and update Catalog memory
+        //     let discovered = catalog_for_thread.recover_from_disk();
 
-            // B. Open StorageEngines for found collections
-            for (col_name, _id) in discovered {
-                let path = catalog_for_thread.get_collection_path(&col_name);
+        //     // B. Open StorageEngines for found collections
+        //     for (col_name, _id) in discovered {
+        //         let path = catalog_for_thread.get_collection_path(&col_name);
                 
-                if let Ok(mut storage) = StorageEngine::open(path, &config_clone) {
-                    storage.blob_tx = Some(blob_tx_clone.clone());
+        //         if let Ok(mut storage) = StorageEngine::open(path, &config_clone) {
+        //             storage.blob_tx = Some(blob_tx_clone.clone());
                     
-                    let mut shards = db_weak_shards.write().unwrap();
-                    shards.insert(col_name, Arc::new(RwLock::new(storage)));
-                }
-            }
+        //             let mut shards = db_weak_shards.write().unwrap();
+        //             shards.insert(col_name, Arc::new(RwLock::new(storage)));
+        //         }
+        //     }
             
-            // C. Final Catalog Save (to persist recovered mappings)
-            catalog_for_thread.save();
-        });
+        //     // C. Final Catalog Save (to persist recovered mappings)
+        //     catalog_for_thread.save();
+        // });
 
-        db.sync_indexes_with_persistence()?; 
+        // db.sync_indexes_with_persistence()?; 
 
         let (stop_tx, stop_rx) = channel::<()>();
         let shards_ptr = Arc::clone(&db.shards);
@@ -378,23 +450,68 @@ impl FireLite {
     //     Ok(())
     // }
 
-    fn rebuild_indexes_from_shards(&self) -> Result<()> {
-        let shards = self.shards.read().unwrap();
-        let mut indexes = self.indexes.write().unwrap();
-        let mut versions = self.doc_versions.write().unwrap();
-        for (col, shard) in shards.iter() {
-            let storage = shard.read().unwrap();
-            for (key, bytes) in storage.scan_prefix("")? {
-                if let Some((_, doc_id)) = key.split_once(':') {
-                    if let Some(doc) = FireLiteDoc::decode(&bytes, Some(&self.catalog)) {
-                        indexes.index_document(col, doc_id, &doc);
-                        versions.insert(key, self.global_version.fetch_add(1, Ordering::SeqCst));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
+    // fn rebuild_indexes_from_shards(&self) -> Result<()> {
+    //     let shards = self.shards.read().unwrap();
+    //     let mut indexes = self.indexes.write().unwrap();
+    //     let mut versions = self.doc_versions.write().unwrap();
+    //     for (col, shard) in shards.iter() {
+    //         let storage = shard.read().unwrap();
+    //         for (key, bytes) in storage.scan_prefix("")? {
+    //             if let Some((_, doc_id)) = key.split_once(':') {
+    //                 if let Some(doc) = FireLiteDoc::decode(&bytes, Some(&self.catalog)) {
+    //                     indexes.index_document(col, doc_id, &doc);
+    //                     versions.insert(key, self.global_version.fetch_add(1, Ordering::SeqCst));
+    //                 }
+    //             }
+    //         }
+    //     }
+    //     Ok(())
+    // }
+
+    // fn sync_indexes_with_persistence(&self) -> Result<()> {
+    //     // 1. Load from Persistent Storage (Fast)
+    //     {
+    //         let mut mgr = self.indexes.write().unwrap();
+    //         let mut persist = self.index_storage.lock().unwrap();
+    //         mgr.composite = std::mem::take(&mut persist.manager);
+    //     }
+
+    //     // 2. Check if the index is actually empty
+    //     // (This happens on a fresh install or if snapshots are missing)
+    //     let is_empty = {
+    //         let mgr = self.indexes.read().unwrap();
+    //         // Check if there are any IDs in any collection in the B-Tree
+    //         // Using an empty scan to check for any existence
+    //         mgr.composite.get(1).map_or(true, |idx| idx.tree.is_empty())
+    //     };
+
+    //     if is_empty {
+    //         // FALLBACK: If no snapshot was found, do the full scan once.
+    //         // This resolves the "dead_code" warning for this method.
+    //         self.rebuild_indexes_from_shards()?;
+    //     } else {
+    //         // CATCH-UP: Only scan shards for documents added since the last snapshot
+    //         let shards = self.shards.read().unwrap();
+    //         let mut mgr = self.indexes.write().unwrap();
+    //         for (col_name, shard) in shards.iter() {
+    //             let storage = shard.read().unwrap();
+    //             let physical_count = storage.count_prefix("");
+    //             let indexed_count = mgr.composite.exact_match_doc_ids(col_name, &[], &[]).map_or(0, |v| v.len());
+                
+    //             if physical_count > indexed_count {
+    //                 // Shard has new data: scan and update index
+    //                 for (key, bytes) in storage.scan_prefix("")? {
+    //                     if let Some((_, doc_id)) = key.split_once(':') {
+    //                         if let Some(doc) = FireLiteDoc::decode(&bytes, Some(&self.catalog)) {
+    //                             mgr.composite.index_document(col_name, doc_id, &doc);
+    //                         }
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
+    //     Ok(())
+    // }
 
     fn get_shard(&self, collection: &str) -> Arc<RwLock<StorageEngine>> {
         if let Some(s) = self.shards.read().unwrap().get(collection) { return Arc::clone(s); }
@@ -689,7 +806,7 @@ impl FireLite {
     }
 
     pub fn begin_serializable_transaction(&self) -> SerializableTransaction { SerializableTransaction { reads: HashMap::new(), mutations: Vec::new() } }
-    pub fn create_composite_index(&self, col: &str, f: Vec<(String, SortDirection)>) -> u32 { self.indexes.write().unwrap().create_index(CompositeIndexDefinition::new(col).with_fields(f)) }
+    
     pub fn watch_collection(&self, col: &str) -> Receiver<ChangeEvent> {
         let (tx, rx) = channel();
         self.listeners.lock().unwrap().entry(col.to_string()).or_default().push(tx);
@@ -750,53 +867,8 @@ impl FireLite {
         let _ = self.audit_tx.send(entry);
     }
 
-    fn sync_indexes_with_persistence(&self) -> Result<()> {
-        // 1. Load from Persistent Storage (Fast)
-        {
-            let mut mgr = self.indexes.write().unwrap();
-            let mut persist = self.index_storage.lock().unwrap();
-            mgr.composite = std::mem::take(&mut persist.manager);
-        }
-
-        // 2. Check if the index is actually empty
-        // (This happens on a fresh install or if snapshots are missing)
-        let is_empty = {
-            let mgr = self.indexes.read().unwrap();
-            // Check if there are any IDs in any collection in the B-Tree
-            // Using an empty scan to check for any existence
-            mgr.composite.get(1).map_or(true, |idx| idx.tree.is_empty())
-        };
-
-        if is_empty {
-            // FALLBACK: If no snapshot was found, do the full scan once.
-            // This resolves the "dead_code" warning for this method.
-            self.rebuild_indexes_from_shards()?;
-        } else {
-            // CATCH-UP: Only scan shards for documents added since the last snapshot
-            let shards = self.shards.read().unwrap();
-            let mut mgr = self.indexes.write().unwrap();
-            for (col_name, shard) in shards.iter() {
-                let storage = shard.read().unwrap();
-                let physical_count = storage.count_prefix("");
-                let indexed_count = mgr.composite.exact_match_doc_ids(col_name, &[], &[]).map_or(0, |v| v.len());
-                
-                if physical_count > indexed_count {
-                    // Shard has new data: scan and update index
-                    for (key, bytes) in storage.scan_prefix("")? {
-                        if let Some((_, doc_id)) = key.split_once(':') {
-                            if let Some(doc) = FireLiteDoc::decode(&bytes, Some(&self.catalog)) {
-                                mgr.composite.index_document(col_name, doc_id, &doc);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
     pub fn create_index(&self, collection: &str, field: &str) -> Result<()> {
-        // 1. Check if the index already exists to avoid double-work
+        // 1. Check if it exists
         {
             let mgr = self.indexes.read().unwrap();
             if mgr.secondary.get(collection).map_or(false, |m| m.contains_key(field)) {
@@ -804,13 +876,13 @@ impl FireLite {
             }
         }
 
-        // 2. Register the empty index in the manager
+        // 2. Register the empty index
         {
             let mut mgr = self.indexes.write().unwrap();
             mgr.create_secondary_index(collection, field);
         }
 
-        // 3. Spawn background thread for backfilling
+        // 3. Prepare for background backfilling
         let shard_arc = self.get_shard(collection);
         let idx_mgr = Arc::clone(&self.indexes);
         let f_name = field.to_string();
@@ -818,28 +890,23 @@ impl FireLite {
         let catalog_clone = Arc::clone(&self.catalog); 
 
         thread::spawn(move || {
-            // Step A: Lock, take a snapshot of the pointers, then release IMMEDIATELY
             let pointers = {
                 let storage = shard_arc.read().unwrap();
                 storage.get_physical_index_snapshot()
             };
 
-            // Step B: Process documents in chunks
-            for chunk in pointers.chunks(100) {
+            // Process in chunks to avoid blocking
+            for chunk in pointers.chunks(200) {
                 let mut resolved_docs = Vec::new();
-
-                // Briefly lock to read bytes, then release
                 {
                     let storage = shard_arc.read().unwrap();
                     for (key, ptr) in chunk {
-                        // Use the internal reader (uncached for indexing)
                         if let Ok(Some(bytes)) = storage.read_pointer_internal(ptr, false) {
                             resolved_docs.push((key.clone(), bytes));
                         }
                     }
-                } // Lock released here!
+                }
 
-                // Step C: Slow CPU work (Decoding/Indexing) happens while Shard is UNLOCKED
                 let mut mgr = idx_mgr.write().unwrap();
                 if let Some(sec_map) = mgr.secondary.get_mut(&col_name) {
                     if let Some(index) = sec_map.get_mut(&f_name) {
@@ -855,7 +922,7 @@ impl FireLite {
                         }
                     }
                 }
-                // Blob workers can now acquire the Write Lock here because we are between chunks
+                thread::yield_now();
             }
         });
 
@@ -916,6 +983,65 @@ impl FireLite {
         });
 
         Ok(())
+    }
+
+    pub fn create_composite_index(&self, col: &str, fields: Vec<(String, SortDirection)>) -> u32 {
+        let def = CompositeIndexDefinition::new(col).with_fields(fields);
+        let index_id = self.indexes.write().unwrap().create_index(def);
+
+        let shard_arc = self.get_shard(col);
+        let idx_mgr = Arc::clone(&self.indexes);
+        let catalog_clone = Arc::clone(&self.catalog);
+        let persist_ptr = Arc::clone(&self.index_storage); // <--- Required for persistence
+
+        thread::spawn(move || {
+            let pointers = {
+                let storage = shard_arc.read().unwrap();
+                storage.get_physical_index_snapshot()
+            };
+
+            for chunk in pointers.chunks(500) {
+                let mut resolved_data = Vec::new();
+                {
+                    let storage = shard_arc.read().unwrap();
+                    for (key, ptr) in chunk {
+                        if let Ok(Some(bytes)) = storage.read_pointer_internal(ptr, false) {
+                            resolved_data.push((key.clone(), bytes));
+                        }
+                    }
+                }
+
+                let mut mgr = idx_mgr.write().unwrap();
+                let mut persist = persist_ptr.lock().unwrap();
+
+                if let Some(composite_idx) = mgr.composite.get_mut(index_id) {
+                    for (full_key, bytes) in resolved_data {
+                        if let Some(doc) = FireLiteDoc::decode(&bytes, Some(&catalog_clone)) {
+                            if let Some((_, doc_id)) = full_key.split_once(':') {
+                                
+                                // 1. Insert into RAM
+                                composite_idx.index_document(doc_id, &doc);
+                                
+                                // 2. Insert LEAN KEY into index.log
+                                if let Some(vals) = composite_idx.document_values(&doc) {
+                                    let key_bytes = crate::index::composite::key_encoder::encode_composite_key(
+                                        &composite_idx.definition, &vals, doc_id
+                                    );
+                                    let _ = persist.insert(index_id, key_bytes.to_vec(), doc_id.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Release locks to allow benchmark/queries to slip in!
+                drop(persist);
+                drop(mgr);
+                thread::yield_now();
+            }
+        });
+
+        index_id
     }
 
     /// Explicitly trigger a snapshot (called by Maintenance Thread or FFI)

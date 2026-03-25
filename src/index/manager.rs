@@ -32,14 +32,21 @@ impl IndexManager {
     }
 
     pub fn has_index(&self, collection: &str, fields: &[String]) -> bool {
+        if fields.is_empty() { return false; }
+        
         self.composite
             .indexes_for_collection(collection)
             .any(|idx| {
-                idx.definition
-                    .fields
-                    .iter()
-                    .map(|f| f.field.as_str())
-                    .eq(fields.iter().map(String::as_str))
+                let idx_fields: Vec<&str> = idx.definition.fields.iter()
+                    .map(|f| f.field.as_str()).collect();
+
+                if idx_fields.len() < fields.len() {
+                    return false;
+                }
+
+                // FIX: Check if every field required by the query exists in the index's prefix.
+                let prefix = &idx_fields[0..fields.len()];
+                fields.iter().all(|f| prefix.contains(&f.as_str()))
             })
     }
 
@@ -55,12 +62,23 @@ impl IndexManager {
     }
 
     pub fn index_document(&mut self, collection: &str, doc_id: &str, doc: &FireLiteDoc) {
+        // 1. Update Composite
         self.composite.index_document(collection, doc_id, doc);
-        // Update FTS Indexes
+        
+        // 2. Update FTS
         if let Some(fields) = self.fts.get_mut(collection) {
             for (field_name, index) in fields.iter_mut() {
                 if let Some(Value::String(text)) = doc.get(field_name) {
                     index.insert(text, doc_id.to_string());
+                }
+            }
+        }
+
+        // 3. ADD THIS: Update Secondary Indexes automatically
+        if let Some(sec_map) = self.secondary.get_mut(collection) {
+            for (field_name, index) in sec_map.iter_mut() {
+                if let Some(val) = doc.get(field_name) {
+                    index.insert(crate::index::index_key::encode_scalar(val), doc_id.to_string());
                 }
             }
         }

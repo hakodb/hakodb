@@ -12,6 +12,7 @@ use crate::storage::engine::StorageEngine;
 
 use super::worker::{matches_filters_view, run_task, run_task_projected};
 use super::super::plan::QueryPlan;
+use super::task::QueryTask;
 use super::result_stream::QueryResults;
 use super::scheduler::shard_tasks;
 
@@ -41,29 +42,51 @@ impl ParallelQueryExecutor {
                 ScanType::UnionIndex { scans } => {
                     let mut union_map = HashMap::new();
                     for scan in scans {
-                        // Pass plan.limit here to ensure each branch is optimized
-                        let branch_docs = self.execute_single_scan(&storage, indexes, scan, &plan.collection, plan.limit)?;
+                        // Pass plan.scan_limit here to ensure each branch is optimized safely
+                        let branch_docs = self.execute_single_scan(&storage, indexes, scan, &plan.collection, plan.scan_limit)?;
                         for (key, raw) in branch_docs {
                             union_map.insert(key, raw);
                         }
                     }
                     union_map.into_iter().collect()
                 }
-                _ => self.execute_single_scan(&storage, indexes, &plan.scan, &plan.collection, plan.limit)?,
+                _ => self.execute_single_scan(&storage, indexes, &plan.scan, &plan.collection, plan.scan_limit)?,
             }
         };
 
-        let tasks = shard_tasks(docs, self.workers, plan.clone(), Some(storage_arc.clone()), self.catalog.clone());
-        let mut handles = Vec::new();
-        for task in tasks {
-            handles.push(thread::spawn(move || run_task(task)));
-        }
-
         let mut results: QueryResults = Vec::new();
-        for handle in handles {
-            results.extend(handle.join().unwrap_or_default());
+        let doc_count = docs.len();
+
+        // ---------------------------------------------------------
+        // ADAPTIVE THREADING LOGIC
+        // ---------------------------------------------------------
+        if doc_count < 1000 || self.workers <= 1 {
+            // FAST PATH: Run sequentially on the current thread
+            let task = QueryTask {
+                docs,
+                plan: plan.clone(),
+                storage: Some(storage_arc.clone()),
+                catalog: self.catalog.clone(),
+            };
+            results = run_task(task);
+        } else {
+            // SCALED PATH: Spawn threads, capped by config limit
+            let optimal_workers = self.workers.min((doc_count / 500).max(1));
+            let tasks = shard_tasks(docs, optimal_workers, plan.clone(), Some(storage_arc.clone()), self.catalog.clone());
+            
+            let mut handles = Vec::new();
+            for task in tasks {
+                handles.push(thread::spawn(move || run_task(task)));
+            }
+
+            for handle in handles {
+                results.extend(handle.join().unwrap_or_default());
+            }
         }
 
+        // ---------------------------------------------------------
+        // SORTING & LIMITS
+        // ---------------------------------------------------------
         if let Some(order) = &plan.order_by {
             results.sort_by(|(_, a), (_, b)| {
                 let av = a.get(&order.field);
@@ -96,50 +119,45 @@ impl ParallelQueryExecutor {
         
         let docs = {
             let storage = storage_arc.read().unwrap();
-            // Use plan.limit
-            self.execute_single_scan(&storage, indexes, &plan.scan, &plan.collection, plan.limit)?
+            self.execute_single_scan(&storage, indexes, &plan.scan, &plan.collection, plan.scan_limit)?
         };
 
-        let tasks = shard_tasks(docs, self.workers, plan.clone(), Some(storage_arc.clone()), self.catalog.clone());
-        let (tx, rx) = std::sync::mpsc::channel();
+        let doc_count = docs.len();
+        let mut final_results: HashMap<String, f64> = HashMap::new();
 
-        for task in tasks {
-            let thread_tx = tx.clone();
-            let thread_ops = ops.to_vec();
-            
-            thread::spawn(move || {
-                let mut partial_results = HashMap::new();
-                for (id, mut bytes) in task.docs {
-                    if bytes.is_empty() {
-                        if let Some(storage_lock) = &task.storage {
-                            if let Ok(storage) = storage_lock.read() {
-                                if let Ok(Some(data)) = storage.read_pointer_uncached_by_key(&id) {
-                                    bytes = data;
-                                }
+        // Helper closure to process chunks cleanly without duplicating logic
+        let process_task = |task: QueryTask, thread_ops: Vec<AggregateOp>| -> HashMap<String, f64> {
+            let mut partial_results = HashMap::new();
+            for (id, mut bytes) in task.docs {
+                if bytes.is_empty() {
+                    if let Some(storage_lock) = &task.storage {
+                        if let Ok(storage) = storage_lock.read() {
+                            if let Ok(Some(data)) = storage.read_pointer_uncached_by_key(&id) {
+                                bytes = data;
                             }
                         }
                     }
-                    if bytes.is_empty() { continue; }
+                }
+                if bytes.is_empty() { continue; }
 
-                    if let Some(view) = FireLiteDocView::new(&bytes) {
-                        if matches_filters_view(&bytes, &task.plan) {
-                            for op in &thread_ops {
-                                match op {
-                                    AggregateOp::Count => {
-                                        *partial_results.entry("count".to_string()).or_insert(0.0) += 1.0;
-                                    }
-                                    AggregateOp::Sum(field) | AggregateOp::Avg(field) => {
-                                        if let Some(borrowed) = view.get_field_value(field) {
-                                            if let Some(num) = borrowed.as_f64() {
-                                                let key = if matches!(op, AggregateOp::Sum(_)) { 
-                                                    format!("sum_{}", field) 
-                                                } else { 
-                                                    format!("avg_tmp_{}", field) 
-                                                };
-                                                *partial_results.entry(key).or_insert(0.0) += num;
-                                                if matches!(op, AggregateOp::Avg(_)) {
-                                                    *partial_results.entry(format!("avg_cnt_{}", field)).or_insert(0.0) += 1.0;
-                                                }
+                if let Some(view) = FireLiteDocView::new(&bytes) {
+                    if matches_filters_view(&bytes, &task.plan, Some(&task.catalog)) {
+                        for op in &thread_ops {
+                            match op {
+                                AggregateOp::Count => {
+                                    *partial_results.entry("count".to_string()).or_insert(0.0) += 1.0;
+                                }
+                                AggregateOp::Sum(field) | AggregateOp::Avg(field) => {
+                                    if let Some(borrowed) = view.get_field_value(field, Some(&task.catalog)) {
+                                        if let Some(num) = borrowed.as_f64() {
+                                            let key = if matches!(op, AggregateOp::Sum(_)) { 
+                                                format!("sum_{}", field) 
+                                            } else { 
+                                                format!("avg_tmp_{}", field) 
+                                            };
+                                            *partial_results.entry(key).or_insert(0.0) += num;
+                                            if matches!(op, AggregateOp::Avg(_)) {
+                                                *partial_results.entry(format!("avg_cnt_{}", field)).or_insert(0.0) += 1.0;
                                             }
                                         }
                                     }
@@ -148,17 +166,42 @@ impl ParallelQueryExecutor {
                         }
                     }
                 }
-                let _ = thread_tx.send(partial_results);
-            });
+            }
+            partial_results
+        };
+
+        // ---------------------------------------------------------
+        // ADAPTIVE THREADING LOGIC
+        // ---------------------------------------------------------
+        if doc_count < 1000 || self.workers <= 1 {
+            let task = QueryTask {
+                docs,
+                plan: plan.clone(),
+                storage: Some(storage_arc.clone()),
+                catalog: self.catalog.clone(),
+            };
+            final_results = process_task(task, ops.to_vec());
+        } else {
+            let optimal_workers = self.workers.min((doc_count / 500).max(1));
+            let tasks = shard_tasks(docs, optimal_workers, plan.clone(), Some(storage_arc.clone()), self.catalog.clone());
+            let (tx, rx) = std::sync::mpsc::channel();
+
+            for task in tasks {
+                let thread_tx = tx.clone();
+                let thread_ops = ops.to_vec();
+                thread::spawn(move || {
+                    let partial = process_task(task, thread_ops);
+                    let _ = thread_tx.send(partial);
+                });
+            }
+            drop(tx); 
+
+            while let Ok(partial) = rx.recv() {
+                for (k, v) in partial { *final_results.entry(k).or_insert(0.0) += v; }
+            }
         }
 
-        drop(tx); 
-
-        let mut final_results: HashMap<String, f64> = HashMap::new();
-        while let Ok(partial) = rx.recv() {
-            for (k, v) in partial { *final_results.entry(k).or_insert(0.0) += v; }
-        }
-
+        // Finalize averages
         let keys: Vec<String> = final_results.keys().cloned().collect();
         for k in keys {
             if k.starts_with("avg_tmp_") {
@@ -181,21 +224,40 @@ impl ParallelQueryExecutor {
         
         let docs = {
             let storage = storage_arc.read().unwrap();
-            // Use plan.limit
-            self.execute_single_scan(&storage, indexes, &plan.scan, &plan.collection, plan.limit)?
+            self.execute_single_scan(&storage, indexes, &plan.scan, &plan.collection, plan.scan_limit)?
         };
         
-        let tasks = shard_tasks(docs, self.workers, plan.clone(), Some(storage_arc.clone()), self.catalog.clone());
-        let mut handles = Vec::new();
-        for task in tasks {
-            handles.push(thread::spawn(move || run_task_projected(task)));
-        }
-
         let mut results: Vec<(String, Vec<(String, Value)>)> = Vec::new();
-        for handle in handles {
-            results.extend(handle.join().unwrap_or_default());
+        let doc_count = docs.len();
+
+        // ---------------------------------------------------------
+        // ADAPTIVE THREADING LOGIC
+        // ---------------------------------------------------------
+        if doc_count < 1000 || self.workers <= 1 {
+            let task = QueryTask {
+                docs,
+                plan: plan.clone(),
+                storage: Some(storage_arc.clone()),
+                catalog: self.catalog.clone(),
+            };
+            results = run_task_projected(task);
+        } else {
+            let optimal_workers = self.workers.min((doc_count / 500).max(1));
+            let tasks = shard_tasks(docs, optimal_workers, plan.clone(), Some(storage_arc.clone()), self.catalog.clone());
+            
+            let mut handles = Vec::new();
+            for task in tasks {
+                handles.push(thread::spawn(move || run_task_projected(task)));
+            }
+
+            for handle in handles {
+                results.extend(handle.join().unwrap_or_default());
+            }
         }
 
+        // ---------------------------------------------------------
+        // SORTING & LIMITS
+        // ---------------------------------------------------------
         if let Some(order) = &plan.order_by {
             results.sort_by(|(_, a), (_, b)| {
                 let av = a.iter().find(|(k,_)| k == &order.field).map(|(_,v)| v);
@@ -224,15 +286,13 @@ impl ParallelQueryExecutor {
         indexes: &IndexManager, 
         scan: &ScanType, 
         collection: &str,
-        limit: Option<usize> // Passed here to allow recursive UnionIndex optimization
+        limit: Option<usize>
     ) -> Result<Vec<(String, Vec<u8>)>> {
         let max_ids = limit.unwrap_or(usize::MAX);
 
         match scan {
             ScanType::FullCollection => {
                 let keys = storage.scan_prefix_keys(&format!("{}:", collection));
-                // We don't apply limit here for FullCollection because we want workers 
-                // to handle it to support filters. 
                 Ok(keys.into_iter().map(|k| (k, Vec::new())).collect())
             }
             
@@ -272,8 +332,6 @@ impl ParallelQueryExecutor {
                     for doc_id in doc_ids {
                         let key = format!("{}:{}", collection, doc_id);
                         
-                        // Use 'storage' (the parameter) to resolve the pointer immediately
-                        // while we are already holding the read lock.
                         if let Some(pointer) = storage.index.get(&key) {
                             if let Ok(Some(bytes)) = storage.read_pointer_internal(pointer, true) {
                                 out.push((key, bytes));
