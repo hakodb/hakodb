@@ -6,6 +6,7 @@ use firelite::config::{DurabilityMode, FireLiteConfig};
 use firelite::document::firelite_doc::FireLiteDoc;
 use firelite::document::value::Value;
 use firelite::engine::FireLite;
+use firelite::index::composite::definition::SortDirection;
 use firelite::query::filter::Operator;
 use firelite::query::query::{AggregateOp, Query};
 use serde_json::{json, Map, Value as JsonValue};
@@ -50,9 +51,15 @@ enum Commands {
         /// Repeated filter: field:op:value (e.g. age:gte:21, tags:in:[\"a\",\"b\"])
         #[arg(long = "where")]
         filters: Vec<String>,
+        /// Repeated AND filter alias: field:op:value
+        #[arg(long = "and")]
+        and_filters: Vec<String>,
         /// Repeated OR filter: field:op:value
         #[arg(long = "or")]
         or_filters: Vec<String>,
+        /// Full-text search shortcut: field:text (equivalent to field:match:text)
+        #[arg(long)]
+        fts: Option<String>,
         /// order format: field[:asc|desc]
         #[arg(long)]
         order: Option<String>,
@@ -60,6 +67,18 @@ enum Commands {
         limit: Option<usize>,
         #[arg(long)]
         offset: Option<usize>,
+        /// Cursor start_at values (comma-separated literals)
+        #[arg(long)]
+        start_at: Option<String>,
+        /// Cursor start_after values (comma-separated literals)
+        #[arg(long)]
+        start_after: Option<String>,
+        /// Cursor end_at values (comma-separated literals)
+        #[arg(long)]
+        end_at: Option<String>,
+        /// Cursor end_before values (comma-separated literals)
+        #[arg(long)]
+        end_before: Option<String>,
         /// comma separated projection fields
         #[arg(long)]
         select: Option<String>,
@@ -76,10 +95,21 @@ enum Commands {
     },
     /// Watch changes in a collection
     Watch { collection: String },
+    /// Seed a collection with random-ish complex JSON docs (max: 500)
+    Seed {
+        collection: String,
+        docsize: usize,
+    },
     /// Index operations
     Index {
         #[command(subcommand)]
         command: IndexCommands,
+    },
+    /// Serializable transaction helper (single-doc set)
+    TxSet {
+        path: String,
+        #[arg(long)]
+        data: String,
     },
     /// Print internal stats
     Stats,
@@ -99,7 +129,17 @@ enum Commands {
 #[derive(Subcommand, Debug)]
 enum IndexCommands {
     Create { collection: String, field: String },
+    CreateComposite {
+        collection: String,
+        /// Comma separated list: field[:asc|desc],field[:asc|desc]
+        #[arg(long)]
+        fields: String,
+    },
     CreateFts { collection: String, field: String },
+    List {
+        /// Optional collection filter
+        collection: Option<String>,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -122,12 +162,33 @@ fn main() -> Result<()> {
         Commands::Query {
             collection,
             filters,
+            and_filters,
             or_filters,
+            fts,
             order,
             limit,
             offset,
+            start_at,
+            start_after,
+            end_at,
+            end_before,
             select,
-        } => run_query(&db, &collection, &filters, &or_filters, order.as_deref(), limit, offset, select.as_deref())?,
+        } => run_query(
+            &db,
+            &collection,
+            &filters,
+            &and_filters,
+            &or_filters,
+            fts.as_deref(),
+            order.as_deref(),
+            limit,
+            offset,
+            start_at.as_deref(),
+            start_after.as_deref(),
+            end_at.as_deref(),
+            end_before.as_deref(),
+            select.as_deref(),
+        )?,
         Commands::Aggregate {
             collection,
             kind,
@@ -135,16 +196,30 @@ fn main() -> Result<()> {
             filters,
         } => run_aggregate(&db, &collection, kind, field.as_deref(), &filters)?,
         Commands::Watch { collection } => watch_collection(&db, &collection)?,
+        Commands::Seed {
+            collection,
+            docsize,
+        } => seed_collection(&db, &collection, docsize)?,
         Commands::Index { command } => match command {
             IndexCommands::Create { collection, field } => {
                 db.create_index(&collection, &field)?;
                 println!("OK: created index on {collection}.{field}");
             }
+            IndexCommands::CreateComposite { collection, fields } => {
+                let parts = parse_composite_fields(&fields)?;
+                let index_id = db.create_composite_index(&collection, parts);
+                println!("OK: created composite index #{index_id} on {collection}");
+            }
             IndexCommands::CreateFts { collection, field } => {
                 db.create_fts_index(&collection, &field)?;
                 println!("OK: created FTS index on {collection}.{field}");
             }
+            IndexCommands::List { collection } => {
+                let out = db.list_indexes(collection.as_deref());
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            }
         },
+        Commands::TxSet { path, data } => run_tx_set(&db, &path, &data)?,
         Commands::Stats => println!("{}", serde_json::to_string_pretty(&db.get_stats())?),
         Commands::Compact => {
             db.compact()?;
@@ -224,14 +299,65 @@ fn delete_doc(db: &FireLite, path: &str) -> Result<()> {
     Ok(())
 }
 
+fn run_tx_set(db: &FireLite, path: &str, data: &str) -> Result<()> {
+    let (collection, doc_id) = split_doc_path(path)?;
+    let payload: JsonValue = serde_json::from_str(data).context("data must be valid JSON")?;
+    let obj = payload
+        .as_object()
+        .ok_or_else(|| anyhow!("data must be a JSON object"))?;
+
+    let mut doc = FireLiteDoc::default();
+    for (k, v) in obj {
+        doc.insert(k.clone(), json_to_fire(v.clone())?);
+    }
+
+    let mut tx = db.begin_serializable_transaction();
+    tx.get(db, collection, doc_id)?;
+    tx.put(collection, doc_id, doc);
+    tx.commit(db)?;
+    println!("OK: transaction committed for {collection}/{doc_id}");
+    Ok(())
+}
+
+fn parse_composite_fields(input: &str) -> Result<Vec<(String, SortDirection)>> {
+    let mut out = Vec::new();
+    for raw in input.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let mut parts = raw.split(':');
+        let field = parts
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("invalid composite field spec: {raw}"))?;
+        let direction = match parts.next().map(str::trim).unwrap_or("asc") {
+            "asc" => SortDirection::Asc,
+            "desc" => SortDirection::Desc,
+            other => bail!("invalid direction '{other}' in composite field spec: {raw}"),
+        };
+        if parts.next().is_some() {
+            bail!("invalid composite field spec: {raw}");
+        }
+        out.push((field.to_string(), direction));
+    }
+    if out.is_empty() {
+        bail!("composite fields cannot be empty");
+    }
+    Ok(out)
+}
+
 fn run_query(
     db: &FireLite,
     collection: &str,
     filters: &[String],
+    and_filters: &[String],
     or_filters: &[String],
+    fts: Option<&str>,
     order: Option<&str>,
     limit: Option<usize>,
     offset: Option<usize>,
+    start_at: Option<&str>,
+    start_after: Option<&str>,
+    end_at: Option<&str>,
+    end_before: Option<&str>,
     select: Option<&str>,
 ) -> Result<()> {
     let mut q = Query::new(collection);
@@ -240,9 +366,17 @@ fn run_query(
         let parsed = parse_filter(f)?;
         q = q.where_filter(&parsed.field, parsed.op, parsed.value);
     }
+    for f in and_filters {
+        let parsed = parse_filter(f)?;
+        q = q.where_filter(&parsed.field, parsed.op, parsed.value);
+    }
     for f in or_filters {
         let parsed = parse_filter(f)?;
         q = q.or_where(&parsed.field, parsed.op, parsed.value);
+    }
+    if let Some(fts) = fts {
+        let (field, text) = parse_fts(fts)?;
+        q = q.where_filter(field, Operator::Match, Value::String(text.to_string()));
     }
 
     if let Some(order) = order {
@@ -254,6 +388,18 @@ fn run_query(
     }
     if let Some(offset) = offset {
         q = q.offset(offset);
+    }
+    if let Some(v) = start_at {
+        q.start_at = Some(parse_cursor_values(v)?);
+    }
+    if let Some(v) = start_after {
+        q.start_after = Some(parse_cursor_values(v)?);
+    }
+    if let Some(v) = end_at {
+        q.end_at = Some(parse_cursor_values(v)?);
+    }
+    if let Some(v) = end_before {
+        q.end_before = Some(parse_cursor_values(v)?);
     }
 
     if let Some(select) = select {
@@ -315,6 +461,80 @@ fn watch_collection(db: &FireLite, collection: &str) -> Result<()> {
     Ok(())
 }
 
+fn seed_collection(db: &FireLite, collection: &str, docsize: usize) -> Result<()> {
+    if docsize == 0 {
+        bail!("docsize must be > 0");
+    }
+    if docsize > 500 {
+        bail!("docsize max is 500");
+    }
+
+    for i in 0..docsize {
+        let mut doc = FireLiteDoc::default();
+        let id = format!("{}", 19800000 + i as i64);
+        let valid = i % 2 == 0;
+        let status = if i % 3 == 0 { "active" } else { "idle" };
+        let score = ((i * 37) % 1000) as i64;
+
+        doc.insert(
+            "data".to_string(),
+            Value::String(if valid { "valid" } else { "invalid" }.to_string()),
+        );
+        doc.insert("status".to_string(), Value::String(status.to_string()));
+        doc.insert("score".to_string(), Value::Int(score));
+        doc.insert(
+            "description".to_string(),
+            Value::String(format!(
+                "seeded firelite document {} with {} state and score {}",
+                i, status, score
+            )),
+        );
+        doc.insert(
+            "tags".to_string(),
+            Value::Array(vec![
+                Value::String(format!("group_{}", i % 10)),
+                Value::String(if valid { "valid" } else { "invalid" }.to_string()),
+                Value::String(status.to_string()),
+            ]),
+        );
+        doc.insert(
+            "profile".to_string(),
+            Value::Map(vec![
+                ("level".into(), Value::Int((i % 7) as i64)),
+                (
+                    "country".into(),
+                    Value::String(if i % 2 == 0 { "US" } else { "CA" }.to_string()),
+                ),
+                ("flags".into(), Value::Array(vec![Value::Bool(valid), Value::Bool(i % 5 == 0)])),
+            ]),
+        );
+
+        db.put(collection, &id, &doc)?;
+    }
+
+    // Example indexes for all 3 index modes
+    db.create_index(collection, "data")?;
+    db.create_fts_index(collection, "description")?;
+    let _ = db.create_composite_index(
+        collection,
+        vec![
+            ("data".to_string(), SortDirection::Asc),
+            ("score".to_string(), SortDirection::Desc),
+        ],
+    );
+
+    println!("OK: seeded {docsize} docs into '{collection}'");
+    println!("OK: created sample indexes:");
+    println!("  - simple/secondary: {collection}.data");
+    println!("  - fts: {collection}.description");
+    println!("  - composite: (data asc, score desc)");
+    println!("Try:");
+    println!("  firelite-cli --db <db> query {collection} --where data:eq:valid");
+    println!("  firelite-cli --db <db> query {collection} --where description:match:seeded");
+    println!("  firelite-cli --db <db> query {collection} --where data:eq:valid --order score:desc --limit 5");
+    Ok(())
+}
+
 fn run_rest(
     db: &FireLite,
     method: &str,
@@ -327,7 +547,10 @@ fn run_rest(
             let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
             match parts.len() {
                 0 => list_collections(db),
-                1 => run_query(db, parts[0], filters, &[], None, None, None, None),
+                1 => run_query(
+                    db, parts[0], filters, &[], &[], None, None, None, None, None, None, None,
+                    None, None,
+                ),
                 2 => get_doc(db, path),
                 _ => bail!("unsupported path depth for GET"),
             }
@@ -360,9 +583,12 @@ fn parse_filter(input: &str) -> Result<ParsedFilter> {
     if parts.len() != 3 {
         bail!("invalid filter '{input}', expected field:op:value");
     }
-    let field = parts[0].to_string();
+    let field = strip_wrapping_quotes(parts[0]).trim().to_string();
+    if field.is_empty() {
+        bail!("filter field cannot be empty");
+    }
     let op = parse_operator(parts[1])?;
-    let value = parse_literal(parts[2])?;
+    let value = parse_literal(strip_wrapping_quotes(parts[2]).trim())?;
     Ok(ParsedFilter { field, op, value })
 }
 
@@ -399,6 +625,27 @@ fn parse_operator(input: &str) -> Result<Operator> {
     }
 }
 
+fn parse_fts(input: &str) -> Result<(&str, &str)> {
+    let mut parts = input.splitn(2, ':');
+    let field = parts.next().unwrap_or_default().trim();
+    let text = parts.next().unwrap_or_default().trim();
+    if field.is_empty() || text.is_empty() {
+        bail!("invalid --fts format, expected field:text");
+    }
+    Ok((field, strip_wrapping_quotes(text)))
+}
+
+fn parse_cursor_values(input: &str) -> Result<Vec<Value>> {
+    let mut out = Vec::new();
+    for token in input.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+        out.push(parse_literal(strip_wrapping_quotes(token))?);
+    }
+    if out.is_empty() {
+        bail!("cursor values cannot be empty");
+    }
+    Ok(out)
+}
+
 fn parse_literal(input: &str) -> Result<Value> {
     let lower = input.to_ascii_lowercase();
     if lower == "null" {
@@ -423,6 +670,19 @@ fn parse_literal(input: &str) -> Result<Value> {
         return json_to_fire(json);
     }
     Ok(Value::String(input.to_string()))
+}
+
+fn strip_wrapping_quotes(input: &str) -> &str {
+    let trimmed = input.trim();
+    if trimmed.len() >= 2 {
+        let b = trimmed.as_bytes();
+        let first = b[0];
+        let last = b[trimmed.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &trimmed[1..trimmed.len() - 1];
+        }
+    }
+    trimmed
 }
 
 fn json_to_fire(v: JsonValue) -> Result<Value> {
@@ -455,7 +715,7 @@ fn json_to_fire(v: JsonValue) -> Result<Value> {
             }
             Ok(Value::Map(
                 map.into_iter()
-                    .map(|(k, v)| Ok((k, json_to_fire(v)?)))
+                    .map(|(k, v)| Ok((k.into(), json_to_fire(v)?)))
                     .collect::<Result<Vec<_>>>()?,
             ))
         }
@@ -476,7 +736,7 @@ fn fire_to_json(v: &Value) -> JsonValue {
         Value::Map(fields) => JsonValue::Object(
             fields
                 .iter()
-                .map(|(k, v)| (k.clone(), fire_to_json(v)))
+                .map(|(k, v)| (k.to_string(), fire_to_json(v)))
                 .collect::<Map<_, _>>(),
         ),
         Value::Array(items) => JsonValue::Array(items.iter().map(fire_to_json).collect()),
@@ -487,7 +747,7 @@ fn doc_to_json(id: &str, doc: &FireLiteDoc) -> JsonValue {
     let mut map = Map::new();
     map.insert("_id".to_string(), json!(id));
     for (k, v) in &doc.fields {
-        map.insert(k.clone(), fire_to_json(v));
+        map.insert(k.to_string(), fire_to_json(v));
     }
     JsonValue::Object(map)
 }

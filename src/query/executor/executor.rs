@@ -371,6 +371,10 @@ impl ParallelQueryExecutor {
                         }
                     }
                 }
+                if out.is_empty() {
+                    let keys = storage.scan_prefix_keys(&format!("{}:", collection));
+                    return Ok(keys.into_iter().map(|k| (k, Vec::new())).collect());
+                }
                 Ok(out)
             }
 
@@ -383,6 +387,10 @@ impl ParallelQueryExecutor {
                             out.push((key, raw));
                         }
                     }
+                }
+                if out.is_empty() {
+                    let keys = storage.scan_prefix_keys(&format!("{}:", collection));
+                    return Ok(keys.into_iter().map(|k| (k, Vec::new())).collect());
                 }
                 Ok(out)
             }
