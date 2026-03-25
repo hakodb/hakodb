@@ -83,6 +83,16 @@ impl QueryPlanner {
         }
 
         // 3. PRIORITY 3: Composite Index (Filters + OrderBy)
+        // Equality-prefix composite lookups are always worth using, regardless of collection size.
+        if let Some(eq_scan) = Self::try_plan_composite_eq(query, indexes) {
+            let safe_limit = if query.order_by.is_some() {
+                None
+            } else {
+                query.limit
+            };
+            return Self::make_plan(query, eq_scan, safe_limit);
+        }
+
         if use_index_heuristic {
             if let Some(range_scan) = Self::try_plan_composite_range(query, indexes) {
                 let safe_limit = if query.order_by.is_some() {
@@ -91,28 +101,6 @@ impl QueryPlanner {
                     query.limit
                 };
                 return Self::make_plan(query, range_scan, safe_limit);
-            }
-
-            let mut target_fields = query.composite_fields();
-            if let Some(order) = &query.order_by {
-                target_fields.push(order.field.clone());
-            }
-
-            // Checks if index covers both filters and sort
-            if indexes.has_index(&query.collection, &target_fields) {
-                let is_eq_only = query.filters.iter().all(|f| matches!(f.op, Operator::Eq));
-                if is_eq_only {
-                    // FIX: We only extract values for the FILTER fields, not the OrderBy field
-                    let values: Vec<_> = query.filters.iter().map(|f| f.value.clone()).collect();
-                    return Self::make_plan(
-                        query,
-                        ScanType::CompositeIndex {
-                            fields: target_fields,
-                            values,
-                        },
-                        query.limit,
-                    ); // Limit safe because B-Tree natively sorts
-                }
             }
         }
 
@@ -324,6 +312,32 @@ impl QueryPlanner {
 
         None
     }
+
+    fn try_plan_composite_eq(query: &Query, indexes: &IndexManager) -> Option<ScanType> {
+        if query.filters.is_empty() || !query.filters.iter().all(|f| matches!(f.op, Operator::Eq)) {
+            return None;
+        }
+
+        for idx in indexes.indexes_for_collection(&query.collection) {
+            let mut fields = Vec::new();
+            let mut values = Vec::new();
+
+            for field in &idx.definition.fields {
+                if let Some(filter) = query.filters.iter().find(|f| f.field == field.field) {
+                    fields.push(field.field.clone());
+                    values.push(filter.value.clone());
+                } else {
+                    break;
+                }
+            }
+
+            if !fields.is_empty() && fields.len() == query.filters.len() {
+                return Some(ScanType::CompositeIndex { fields, values });
+            }
+        }
+
+        None
+    }
 }
 
 #[cfg(test)]
@@ -335,17 +349,23 @@ mod tests {
     #[test]
     fn plans_composite_range_for_neq() {
         let mut indexes = IndexManager::default();
-        indexes.create_index(
-            CompositeIndexDefinition::new("users").with_fields(vec![
-                ("status".to_string(), SortDirection::Asc),
-                ("age".to_string(), SortDirection::Asc),
-            ]),
-        );
+        indexes.create_index(CompositeIndexDefinition::new("users").with_fields(vec![
+            ("status".to_string(), SortDirection::Asc),
+            ("age".to_string(), SortDirection::Asc),
+        ]));
 
         let mut query = Query::new("users");
         query.filters = vec![
-            Filter { field: "status".to_string(), op: Operator::Eq, value: Value::String("active".to_string()) },
-            Filter { field: "age".to_string(), op: Operator::Ne, value: Value::Int(30) },
+            Filter {
+                field: "status".to_string(),
+                op: Operator::Eq,
+                value: Value::String("active".to_string()),
+            },
+            Filter {
+                field: "age".to_string(),
+                op: Operator::Ne,
+                value: Value::Int(30),
+            },
         ];
 
         let plan = QueryPlanner::plan(&query, &indexes, 10_000, 4);
@@ -356,13 +376,45 @@ mod tests {
     fn plans_composite_range_for_gte() {
         let mut indexes = IndexManager::default();
         indexes.create_index(
-            CompositeIndexDefinition::new("users").with_fields(vec![("age".to_string(), SortDirection::Asc)]),
+            CompositeIndexDefinition::new("users")
+                .with_fields(vec![("age".to_string(), SortDirection::Asc)]),
         );
 
         let mut query = Query::new("users");
-        query.filters = vec![Filter { field: "age".to_string(), op: Operator::Gte, value: Value::Int(21) }];
+        query.filters = vec![Filter {
+            field: "age".to_string(),
+            op: Operator::Gte,
+            value: Value::Int(21),
+        }];
 
         let plan = QueryPlanner::plan(&query, &indexes, 10_000, 4);
         assert!(matches!(plan.scan, ScanType::CompositeIndexRange { .. }));
+    }
+
+    #[test]
+    fn plans_composite_eq_without_heuristic_and_with_reordered_filters() {
+        let mut indexes = IndexManager::default();
+        indexes.create_index(CompositeIndexDefinition::new("users").with_fields(vec![
+            ("country".to_string(), SortDirection::Asc),
+            ("age".to_string(), SortDirection::Asc),
+        ]));
+
+        let mut query = Query::new("users");
+        query.filters = vec![
+            Filter {
+                field: "age".to_string(),
+                op: Operator::Eq,
+                value: Value::Int(30),
+            },
+            Filter {
+                field: "country".to_string(),
+                op: Operator::Eq,
+                value: Value::String("US".to_string()),
+            },
+        ];
+
+        // work_per_thread = 2, so the normal index heuristic is intentionally disabled.
+        let plan = QueryPlanner::plan(&query, &indexes, 8, 4);
+        assert!(matches!(plan.scan, ScanType::CompositeIndex { .. }));
     }
 }
