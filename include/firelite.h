@@ -209,6 +209,8 @@ int32_t fl_engine_create_simple_index(FL_Engine *engine, const char *collection,
 
 int32_t fl_engine_create_fts_index(FL_Engine *engine, const char *collection, const char *field);
 
+char *fl_engine_list_indexes(FL_Engine *engine, const char *collection);
+
 FL_Transaction *fl_transaction_begin(FL_Engine *engine);
 
 FL_Doc *fl_transaction_get(FL_Engine *engine,

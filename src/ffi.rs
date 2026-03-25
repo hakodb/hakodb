@@ -1644,6 +1644,39 @@ pub extern "C" fn fl_engine_create_fts_index(
     }
 }
 
+#[no_mangle]
+pub extern "C" fn fl_engine_list_indexes(
+    engine: *mut FL_Engine,
+    collection: *const c_char,
+) -> *mut c_char {
+    safety_shield!(ptr::null_mut(), {
+        if engine.is_null() {
+            return ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let collection = if collection.is_null() {
+            None
+        } else {
+            match cstr_to_string(collection) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    set_last_error(e);
+                    return ptr::null_mut();
+                }
+            }
+        };
+
+        let indexes = engine.db.list_indexes(collection.as_deref());
+        match serde_json::to_string(&indexes)
+            .ok()
+            .and_then(|s| CString::new(s).ok())
+        {
+            Some(json) => json.into_raw(),
+            None => ptr::null_mut(),
+        }
+    })
+}
+
 // --- 2. SERIALIZABLE TRANSACTIONS (Read-Modify-Write) ---
 
 #[no_mangle]
