@@ -10,6 +10,7 @@ use firelite::index::composite::definition::SortDirection;
 use firelite::query::filter::Operator;
 use firelite::query::query::{AggregateOp, Query};
 use serde_json::{json, Map, Value as JsonValue};
+use std::io::Read;
 
 #[derive(Parser, Debug)]
 #[command(name = "firelite")]
@@ -38,11 +39,32 @@ enum Commands {
     /// List collections
     Collections,
     /// Get one document by path: <collection>/<doc_id>
-    Get { path: String },
+    Get {
+        path: String,
+        /// Write JSON output to file path
+        #[arg(long)]
+        output: Option<String>,
+    },
     /// Create/replace a document from JSON object
-    Set { path: String, #[arg(long)] data: String },
+    Set {
+        path: String,
+        /// Inline JSON payload
+        #[arg(long)]
+        data: Option<String>,
+        /// Read JSON payload from file
+        #[arg(long)]
+        fromfile: Option<String>,
+    },
     /// Patch/update fields of an existing document (or create if missing)
-    Update { path: String, #[arg(long)] data: String },
+    Update {
+        path: String,
+        /// Inline JSON payload
+        #[arg(long)]
+        data: Option<String>,
+        /// Read JSON payload from file
+        #[arg(long)]
+        fromfile: Option<String>,
+    },
     /// Delete one document by path: <collection>/<doc_id>
     Delete { path: String },
     /// Query documents in a collection
@@ -82,6 +104,9 @@ enum Commands {
         /// comma separated projection fields
         #[arg(long)]
         select: Option<String>,
+        /// Write JSON output to file path
+        #[arg(long)]
+        output: Option<String>,
     },
     /// Aggregations: count | sum | avg
     Aggregate {
@@ -109,7 +134,13 @@ enum Commands {
     TxSet {
         path: String,
         #[arg(long)]
+<<<<<<< 74u1a0-codex/fix-composite-index-query-performance
+        data: Option<String>,
+        #[arg(long)]
+        fromfile: Option<String>,
+=======
         data: String,
+>>>>>>> codex
     },
     /// Print internal stats
     Stats,
@@ -155,9 +186,23 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Collections => list_collections(&db)?,
-        Commands::Get { path } => get_doc(&db, &path)?,
-        Commands::Set { path, data } => set_doc(&db, &path, &data, false)?,
-        Commands::Update { path, data } => set_doc(&db, &path, &data, true)?,
+        Commands::Get { path, output } => get_doc(&db, &path, output.as_deref())?,
+        Commands::Set {
+            path,
+            data,
+            fromfile,
+        } => {
+            let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
+            set_doc(&db, &path, &payload, false)?
+        }
+        Commands::Update {
+            path,
+            data,
+            fromfile,
+        } => {
+            let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
+            set_doc(&db, &path, &payload, true)?
+        }
         Commands::Delete { path } => delete_doc(&db, &path)?,
         Commands::Query {
             collection,
@@ -173,6 +218,10 @@ fn main() -> Result<()> {
             end_at,
             end_before,
             select,
+<<<<<<< 74u1a0-codex/fix-composite-index-query-performance
+            output,
+=======
+>>>>>>> codex
         } => run_query(
             &db,
             &collection,
@@ -188,6 +237,10 @@ fn main() -> Result<()> {
             end_at.as_deref(),
             end_before.as_deref(),
             select.as_deref(),
+<<<<<<< 74u1a0-codex/fix-composite-index-query-performance
+            output.as_deref(),
+=======
+>>>>>>> codex
         )?,
         Commands::Aggregate {
             collection,
@@ -219,7 +272,18 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&out)?);
             }
         },
+<<<<<<< 74u1a0-codex/fix-composite-index-query-performance
+        Commands::TxSet {
+            path,
+            data,
+            fromfile,
+        } => {
+            let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
+            run_tx_set(&db, &path, &payload)?
+        }
+=======
         Commands::TxSet { path, data } => run_tx_set(&db, &path, &data)?,
+>>>>>>> codex
         Commands::Stats => println!("{}", serde_json::to_string_pretty(&db.get_stats())?),
         Commands::Compact => {
             db.compact()?;
@@ -247,6 +311,34 @@ fn open_db(path: &str, durability: DurabilityArg) -> Result<FireLite> {
     FireLite::open(path, cfg).with_context(|| format!("failed to open db at {path}"))
 }
 
+fn read_payload_input(data: Option<&str>, fromfile: Option<&str>) -> Result<String> {
+    if let Some(path) = fromfile {
+        return std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read input file: {path}"));
+    }
+    if let Some(inline) = data {
+        return Ok(inline.to_string());
+    }
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .context("failed to read stdin payload")?;
+    if buf.trim().is_empty() {
+        bail!("no input data provided (use --data, --fromfile, or stdin)");
+    }
+    Ok(buf)
+}
+
+fn emit_json(value: &JsonValue, output: Option<&str>) -> Result<()> {
+    let rendered = serde_json::to_string_pretty(value)?;
+    if let Some(path) = output {
+        std::fs::write(path, rendered).with_context(|| format!("failed to write output file: {path}"))?;
+    } else {
+        println!("{rendered}");
+    }
+    Ok(())
+}
+
 fn list_collections(db: &FireLite) -> Result<()> {
     let cols = db.list_collections()?;
     println!("{}", serde_json::to_string_pretty(&cols)?);
@@ -254,37 +346,73 @@ fn list_collections(db: &FireLite) -> Result<()> {
 }
 
 fn split_doc_path(path: &str) -> Result<(&str, &str)> {
-    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.len() != 2 {
+    let (collection, doc_id, fields) = split_doc_path_with_fields(path)?;
+    if !fields.is_empty() {
         bail!("expected path format: <collection>/<doc_id>");
     }
-    Ok((parts[0], parts[1]))
+    Ok((collection, doc_id))
 }
 
-fn get_doc(db: &FireLite, path: &str) -> Result<()> {
-    let (collection, doc_id) = split_doc_path(path)?;
-    let out = db
-        .get(collection, doc_id)?
-        .map(|doc| doc_to_json(doc_id, &doc))
-        .unwrap_or(JsonValue::Null);
-    println!("{}", serde_json::to_string_pretty(&out)?);
+fn split_doc_path_with_fields(path: &str) -> Result<(&str, &str, Vec<String>)> {
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() < 2 {
+        bail!("expected path format: <collection>/<doc_id>[/field[/field...]]");
+    }
+    Ok((
+        parts[0],
+        parts[1],
+        parts[2..].iter().map(|s| s.to_string()).collect(),
+    ))
+}
+
+fn get_doc(db: &FireLite, path: &str, output: Option<&str>) -> Result<()> {
+    let (collection, doc_id, fields) = split_doc_path_with_fields(path)?;
+    let out = if fields.is_empty() {
+        db.get(collection, doc_id)?
+            .map(|doc| doc_to_json(doc_id, &doc))
+            .unwrap_or(JsonValue::Null)
+    } else {
+        db.get(collection, doc_id)?
+            .map(|doc| {
+                let selected: Vec<(String, Value)> = fields
+                    .iter()
+                    .filter_map(|f| doc.get(f).cloned().map(|v| (f.clone(), v)))
+                    .collect();
+                projected_to_json(doc_id, selected)
+            })
+            .unwrap_or(JsonValue::Null)
+    };
+    emit_json(&out, output)?;
     Ok(())
 }
 
 fn set_doc(db: &FireLite, path: &str, data: &str, merge: bool) -> Result<()> {
-    let (collection, doc_id) = split_doc_path(path)?;
+    let (collection, doc_id, fields) = split_doc_path_with_fields(path)?;
     let payload: JsonValue = serde_json::from_str(data).context("data must be valid JSON")?;
-    let obj = payload
-        .as_object()
-        .ok_or_else(|| anyhow!("data must be a JSON object"))?;
-
     let mut doc = if merge {
         db.get(collection, doc_id)?.unwrap_or_default()
     } else {
         FireLiteDoc::default()
     };
-    for (k, v) in obj {
-        doc.insert(k.clone(), json_to_fire(v.clone())?);
+
+    if fields.is_empty() {
+        let obj = payload
+            .as_object()
+            .ok_or_else(|| anyhow!("data must be a JSON object"))?;
+        for (k, v) in obj {
+            doc.insert(k.clone(), json_to_fire(v.clone())?);
+        }
+    } else if fields.len() == 1 && !payload.is_object() {
+        doc.insert(fields[0].clone(), json_to_fire(payload)?);
+    } else {
+        let obj = payload
+            .as_object()
+            .ok_or_else(|| anyhow!("data must be a JSON object when multiple path fields are provided"))?;
+        for field in fields {
+            if let Some(v) = obj.get(&field) {
+                doc.insert(field, json_to_fire(v.clone())?);
+            }
+        }
     }
 
     db.put(collection, doc_id, &doc)?;
@@ -359,6 +487,7 @@ fn run_query(
     end_at: Option<&str>,
     end_before: Option<&str>,
     select: Option<&str>,
+    output: Option<&str>,
 ) -> Result<()> {
     let mut q = Query::new(collection);
 
@@ -414,14 +543,14 @@ fn run_query(
             .into_iter()
             .map(|(id, fields)| projected_to_json(&id, fields))
             .collect();
-        println!("{}", serde_json::to_string_pretty(&json_rows)?);
+        emit_json(&JsonValue::Array(json_rows), output)?;
     } else {
         let rows = db.query(q)?;
         let json_rows: Vec<JsonValue> = rows
             .into_iter()
             .map(|(id, doc)| doc_to_json(&id, &doc))
             .collect();
-        println!("{}", serde_json::to_string_pretty(&json_rows)?);
+        emit_json(&JsonValue::Array(json_rows), output)?;
     }
     Ok(())
 }
@@ -549,9 +678,15 @@ fn run_rest(
                 0 => list_collections(db),
                 1 => run_query(
                     db, parts[0], filters, &[], &[], None, None, None, None, None, None, None,
+<<<<<<< 74u1a0-codex/fix-composite-index-query-performance
+                    None, None, None,
+                ),
+                2 => get_doc(db, path, None),
+=======
                     None, None,
                 ),
                 2 => get_doc(db, path),
+>>>>>>> codex
                 _ => bail!("unsupported path depth for GET"),
             }
         }
@@ -588,7 +723,11 @@ fn parse_filter(input: &str) -> Result<ParsedFilter> {
         bail!("filter field cannot be empty");
     }
     let op = parse_operator(parts[1])?;
+<<<<<<< 74u1a0-codex/fix-composite-index-query-performance
+    let value = parse_literal_for_operator(&op, strip_wrapping_quotes(parts[2]).trim())?;
+=======
     let value = parse_literal(strip_wrapping_quotes(parts[2]).trim())?;
+>>>>>>> codex
     Ok(ParsedFilter { field, op, value })
 }
 
@@ -646,6 +785,18 @@ fn parse_cursor_values(input: &str) -> Result<Vec<Value>> {
     Ok(out)
 }
 
+<<<<<<< 74u1a0-codex/fix-composite-index-query-performance
+fn parse_literal_for_operator(op: &Operator, input: &str) -> Result<Value> {
+    match op {
+        Operator::Contains | Operator::StartsWith | Operator::Match => {
+            Ok(Value::String(input.to_string()))
+        }
+        _ => parse_literal(input),
+    }
+}
+
+=======
+>>>>>>> codex
 fn parse_literal(input: &str) -> Result<Value> {
     let lower = input.to_ascii_lowercase();
     if lower == "null" {
