@@ -134,13 +134,9 @@ enum Commands {
     TxSet {
         path: String,
         #[arg(long)]
-<<<<<<< 74u1a0-codex/fix-composite-index-query-performance
         data: Option<String>,
         #[arg(long)]
         fromfile: Option<String>,
-=======
-        data: String,
->>>>>>> codex
     },
     /// Print internal stats
     Stats,
@@ -218,10 +214,7 @@ fn main() -> Result<()> {
             end_at,
             end_before,
             select,
-<<<<<<< 74u1a0-codex/fix-composite-index-query-performance
             output,
-=======
->>>>>>> codex
         } => run_query(
             &db,
             &collection,
@@ -237,10 +230,7 @@ fn main() -> Result<()> {
             end_at.as_deref(),
             end_before.as_deref(),
             select.as_deref(),
-<<<<<<< 74u1a0-codex/fix-composite-index-query-performance
             output.as_deref(),
-=======
->>>>>>> codex
         )?,
         Commands::Aggregate {
             collection,
@@ -272,7 +262,6 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&out)?);
             }
         },
-<<<<<<< 74u1a0-codex/fix-composite-index-query-performance
         Commands::TxSet {
             path,
             data,
@@ -281,9 +270,6 @@ fn main() -> Result<()> {
             let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
             run_tx_set(&db, &path, &payload)?
         }
-=======
-        Commands::TxSet { path, data } => run_tx_set(&db, &path, &data)?,
->>>>>>> codex
         Commands::Stats => println!("{}", serde_json::to_string_pretty(&db.get_stats())?),
         Commands::Compact => {
             db.compact()?;
@@ -677,16 +663,9 @@ fn run_rest(
             match parts.len() {
                 0 => list_collections(db),
                 1 => run_query(
-                    db, parts[0], filters, &[], &[], None, None, None, None, None, None, None,
-<<<<<<< 74u1a0-codex/fix-composite-index-query-performance
-                    None, None, None,
+                    db, parts[0], filters, &[], &[], None, None, None, None, None, None, None, None, None, None,
                 ),
                 2 => get_doc(db, path, None),
-=======
-                    None, None,
-                ),
-                2 => get_doc(db, path),
->>>>>>> codex
                 _ => bail!("unsupported path depth for GET"),
             }
         }
@@ -723,11 +702,7 @@ fn parse_filter(input: &str) -> Result<ParsedFilter> {
         bail!("filter field cannot be empty");
     }
     let op = parse_operator(parts[1])?;
-<<<<<<< 74u1a0-codex/fix-composite-index-query-performance
     let value = parse_literal_for_operator(&op, strip_wrapping_quotes(parts[2]).trim())?;
-=======
-    let value = parse_literal(strip_wrapping_quotes(parts[2]).trim())?;
->>>>>>> codex
     Ok(ParsedFilter { field, op, value })
 }
 
@@ -785,7 +760,6 @@ fn parse_cursor_values(input: &str) -> Result<Vec<Value>> {
     Ok(out)
 }
 
-<<<<<<< 74u1a0-codex/fix-composite-index-query-performance
 fn parse_literal_for_operator(op: &Operator, input: &str) -> Result<Value> {
     match op {
         Operator::Contains | Operator::StartsWith | Operator::Match => {
@@ -795,8 +769,6 @@ fn parse_literal_for_operator(op: &Operator, input: &str) -> Result<Value> {
     }
 }
 
-=======
->>>>>>> codex
 fn parse_literal(input: &str) -> Result<Value> {
     let lower = input.to_ascii_lowercase();
     if lower == "null" {
