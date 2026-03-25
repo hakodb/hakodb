@@ -74,6 +74,26 @@ pub struct AuditEntry {
     pub ok: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CompositeIndexFieldInfo {
+    pub field: String,
+    pub direction: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CompositeIndexInfo {
+    pub id: u32,
+    pub collection: String,
+    pub fields: Vec<CompositeIndexFieldInfo>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IndexList {
+    pub simple: HashMap<String, Vec<String>>,
+    pub secondary: HashMap<String, Vec<String>>,
+    pub composite: Vec<CompositeIndexInfo>,
+}
+
 pub struct Transaction {
     pub mutations: Vec<BatchMutation>,
 }
@@ -1153,6 +1173,59 @@ impl FireLite {
 
     fn record_audit(&self, entry: AuditEntry) {
         let _ = self.audit_tx.send(entry);
+    }
+
+    pub fn list_indexes(&self, collection: Option<&str>) -> IndexList {
+        let mgr = self.indexes.read().unwrap();
+
+        let mut secondary: HashMap<String, Vec<String>> = HashMap::new();
+        for (col, fields_map) in &mgr.secondary {
+            if collection.map_or(false, |want| want != col) {
+                continue;
+            }
+            let mut fields: Vec<String> = fields_map.keys().cloned().collect();
+            fields.sort();
+            secondary.insert(col.clone(), fields);
+        }
+
+        let mut composite = Vec::new();
+        let collections: Vec<String> = if let Some(col) = collection {
+            vec![col.to_string()]
+        } else {
+            self.catalog.get_all_collections()
+        };
+        for col in collections {
+            for idx in mgr.indexes_for_collection(&col) {
+                composite.push(CompositeIndexInfo {
+                    id: idx.definition.id,
+                    collection: idx.definition.collection.clone(),
+                    fields: idx
+                        .definition
+                        .fields
+                        .iter()
+                        .map(|f| CompositeIndexFieldInfo {
+                            field: f.field.clone(),
+                            direction: match f.direction {
+                                SortDirection::Asc => "asc".to_string(),
+                                SortDirection::Desc => "desc".to_string(),
+                            },
+                        })
+                        .collect(),
+                });
+            }
+        }
+        composite.sort_by(|a, b| {
+            a.collection
+                .cmp(&b.collection)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        let simple = secondary.clone();
+        IndexList {
+            simple,
+            secondary,
+            composite,
+        }
     }
 
     pub fn create_index(&self, collection: &str, field: &str) -> Result<()> {
