@@ -16,7 +16,7 @@ use crate::query::filter::Operator;
 use crate::query::query::Query;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "camelCase")]
+#[serde(tag = "op", rename_all = "snake_case")]
 pub enum FireLiteOp {
     Get { collection: String, doc_id: String },
     Set { collection: String, doc_id: String, data: serde_json::Value },
@@ -78,7 +78,7 @@ pub enum FireLiteOp {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum FireLiteResponse {
     Ok,
     Document { data: Option<serde_json::Value> },
@@ -93,7 +93,7 @@ pub enum FireLiteResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct FilterInput {
     pub field: String,
     pub op: FilterOperator,
@@ -101,14 +101,14 @@ pub struct FilterInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct OrderByInput {
     pub field: String,
     pub ascending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct BatchInput {
     pub mutation: BatchMutationKind,
     pub collection: String,
@@ -117,21 +117,21 @@ pub struct BatchInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum BatchMutationKind { Set, Patch, Delete }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum FilterOperator {
     Eq, Ne, Gt, Gte, Lt, Lte, Match, Contains, StartsWith, In, NotIn, ArrayContains, ArrayContainsAny,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum AggregateKind { Count, Sum, Avg }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct CompositeFieldInput {
     pub field: String,
     #[serde(default)]
@@ -253,7 +253,7 @@ struct QueryInput {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 struct SubscriptionPayload {
     listener_id: String,
     rows: Vec<serde_json::Value>,
@@ -296,6 +296,7 @@ pub fn firelite_exec<R: Runtime>(
         FireLiteOp::CreateCompositeIndex { collection, fields } => {
             let parsed_fields = fields.into_iter().map(|f| (f.field, if f.desc { SortDirection::Desc } else { SortDirection::Asc })).collect();
             state.db.create_composite_index(&collection, parsed_fields);
+            state.db.persist_index_defs().map_err(|e| e.to_string())?;
             Ok(FireLiteResponse::Ok)
         }
         FireLiteOp::Query { collection, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before } => {

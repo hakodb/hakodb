@@ -528,34 +528,6 @@ impl FireLite {
             });
         }
 
-        // 6. Recovery & Sync
-        // db.recover_existing_shards()?;
-        // 2. Spawn Background Recovery Worker
-        // let db_weak_shards = Arc::clone(&db.shards);
-        // let blob_tx_clone = db.blob_tx.clone();
-
-        // thread::spawn(move || {
-        //     // A. Scan disk and update Catalog memory
-        //     let discovered = catalog_for_thread.recover_from_disk();
-
-        //     // B. Open StorageEngines for found collections
-        //     for (col_name, _id) in discovered {
-        //         let path = catalog_for_thread.get_collection_path(&col_name);
-
-        //         if let Ok(mut storage) = StorageEngine::open(path, &config_clone) {
-        //             storage.blob_tx = Some(blob_tx_clone.clone());
-
-        //             let mut shards = db_weak_shards.write().unwrap();
-        //             shards.insert(col_name, Arc::new(RwLock::new(storage)));
-        //         }
-        //     }
-
-        //     // C. Final Catalog Save (to persist recovered mappings)
-        //     catalog_for_thread.save();
-        // });
-
-        // db.sync_indexes_with_persistence()?;
-
         let (stop_tx, stop_rx) = channel::<()>();
         let shards_ptr = Arc::clone(&db.shards);
         let index_storage_ptr = Arc::clone(&db.index_storage);
@@ -592,86 +564,6 @@ impl FireLite {
 
         Ok(db)
     }
-
-    // fn recover_existing_shards(&self) -> Result<()> {
-    //     let mut shards = self.shards.write().unwrap();
-    //     let collections = self.catalog.get_all_collections();
-
-    //     for col_name in collections {
-    //         let folder_name = self.catalog.get_folder_name(&col_name);
-    //         let path = self.root_path.join(folder_name);
-
-    //         if path.exists() {
-    //             let mut storage = StorageEngine::open(path, &self.config)?;
-    //             storage.blob_tx = Some(self.blob_tx.clone());
-    //             shards.insert(col_name, Arc::new(RwLock::new(storage)));
-    //         }
-    //     }
-    //     Ok(())
-    // }
-
-    // fn rebuild_indexes_from_shards(&self) -> Result<()> {
-    //     let shards = self.shards.read().unwrap();
-    //     let mut indexes = self.indexes.write().unwrap();
-    //     let mut versions = self.doc_versions.write().unwrap();
-    //     for (col, shard) in shards.iter() {
-    //         let storage = shard.read().unwrap();
-    //         for (key, bytes) in storage.scan_prefix("")? {
-    //             if let Some((_, doc_id)) = key.split_once(':') {
-    //                 if let Some(doc) = FireLiteDoc::decode(&bytes, Some(&self.catalog)) {
-    //                     indexes.index_document(col, doc_id, &doc);
-    //                     versions.insert(key, self.global_version.fetch_add(1, Ordering::SeqCst));
-    //                 }
-    //             }
-    //         }
-    //     }
-    //     Ok(())
-    // }
-
-    // fn sync_indexes_with_persistence(&self) -> Result<()> {
-    //     // 1. Load from Persistent Storage (Fast)
-    //     {
-    //         let mut mgr = self.indexes.write().unwrap();
-    //         let mut persist = self.index_storage.lock().unwrap();
-    //         mgr.composite = std::mem::take(&mut persist.manager);
-    //     }
-
-    //     // 2. Check if the index is actually empty
-    //     // (This happens on a fresh install or if snapshots are missing)
-    //     let is_empty = {
-    //         let mgr = self.indexes.read().unwrap();
-    //         // Check if there are any IDs in any collection in the B-Tree
-    //         // Using an empty scan to check for any existence
-    //         mgr.composite.get(1).map_or(true, |idx| idx.tree.is_empty())
-    //     };
-
-    //     if is_empty {
-    //         // FALLBACK: If no snapshot was found, do the full scan once.
-    //         // This resolves the "dead_code" warning for this method.
-    //         self.rebuild_indexes_from_shards()?;
-    //     } else {
-    //         // CATCH-UP: Only scan shards for documents added since the last snapshot
-    //         let shards = self.shards.read().unwrap();
-    //         let mut mgr = self.indexes.write().unwrap();
-    //         for (col_name, shard) in shards.iter() {
-    //             let storage = shard.read().unwrap();
-    //             let physical_count = storage.count_prefix("");
-    //             let indexed_count = mgr.composite.exact_match_doc_ids(col_name, &[], &[]).map_or(0, |v| v.len());
-
-    //             if physical_count > indexed_count {
-    //                 // Shard has new data: scan and update index
-    //                 for (key, bytes) in storage.scan_prefix("")? {
-    //                     if let Some((_, doc_id)) = key.split_once(':') {
-    //                         if let Some(doc) = FireLiteDoc::decode(&bytes, Some(&self.catalog)) {
-    //                             mgr.composite.index_document(col_name, doc_id, &doc);
-    //                         }
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //     }
-    //     Ok(())
-    // }
 
     fn get_shard(&self, collection: &str) -> Arc<RwLock<StorageEngine>> {
         if let Some(s) = self.shards.read().unwrap().get(collection) {
@@ -1237,7 +1129,7 @@ impl FireLite {
         self.root_path.join("_indices").join("definitions.json")
     }
 
-    fn persist_index_defs(&self) -> Result<()> {
+    pub(crate) fn persist_index_defs(&self) -> Result<()> {
         let mgr = self.indexes.read().unwrap();
         let mut secondary: HashMap<String, Vec<String>> = HashMap::new();
         let mut fts: HashMap<String, Vec<String>> = HashMap::new();
