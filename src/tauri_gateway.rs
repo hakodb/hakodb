@@ -262,191 +262,16 @@ struct SubscriptionPayload {
     rows: Vec<serde_json::Value>,
 }
 
-// #[command]
-// pub async fn firelite_exec<R: Runtime>(
-//     window: Window<R>,
-//     state: State<'_, FireLiteGateway>,
-//     op: FireLiteOp,
-// ) -> Result<FireLiteResponse, String> {
-//     tokio::task::spawn_blocking(move || {
-//         match op {
-//             FireLiteOp::Get { collection, doc_id } => {
-//                 let doc = state.db.get(&collection, &doc_id).map_err(|e| e.to_string())?;
-//                 let data = doc.map(|d| doc_to_json_value(&d)).transpose()?;
-//                 Ok(FireLiteResponse::Document { data })
-//             }
-//             FireLiteOp::Set { collection, doc_id, data } => {
-//                 let doc = json_to_doc(&data)?;
-//                 state.db.put(&collection, &doc_id, &doc).map_err(|e| e.to_string())?;
-//                 Ok(FireLiteResponse::Ok)
-//             }
-//             FireLiteOp::Patch { collection, doc_id, data } => {
-//                 let updates = json_to_vec(&data)?;
-//                 state.db.patch(&collection, &doc_id, updates).map_err(|e| e.to_string())?;
-//                 Ok(FireLiteResponse::Ok)
-//             }
-//             FireLiteOp::Delete { collection, doc_id } => {
-//                 state.db.delete(&collection, &doc_id).map_err(|e| e.to_string())?;
-//                 Ok(FireLiteResponse::Ok)
-//             }
-//             FireLiteOp::CreateIndex { collection, field } => {
-//                 state.db.create_index(&collection, &field).map_err(|e| e.to_string())?;
-//                 Ok(FireLiteResponse::Ok)
-//             }
-//             FireLiteOp::CreateFtsIndex { collection, field } => {
-//                 state.db.create_fts_index(&collection, &field).map_err(|e| e.to_string())?;
-//                 Ok(FireLiteResponse::Ok)
-//             }
-//             FireLiteOp::CreateCompositeIndex { collection, fields } => {
-//                 let parsed_fields = fields.into_iter().map(|f| (f.field, if f.desc { SortDirection::Desc } else { SortDirection::Asc })).collect();
-//                 state.db.create_composite_index(&collection, parsed_fields);
-//                 state.db.persist_index_defs().map_err(|e| e.to_string())?;
-//                 Ok(FireLiteResponse::Ok)
-//             }
-//             FireLiteOp::Query { collection, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before } => {
-//                 let rows = execute_query_input(&state.db, &QueryInput { 
-//                     collection, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before 
-//                 })?;
-//                 Ok(FireLiteResponse::QueryResult { rows })
-//             }
-//             FireLiteOp::Batch { mutations } => {
-//                 let mut batch = Vec::with_capacity(mutations.len());
-//                 for item in mutations {
-//                     match item.mutation {
-//                         BatchMutationKind::Set => {
-//                             let data = item.data.ok_or("missing data")?;
-//                             batch.push(BatchMutation::Put { collection: item.collection, doc_id: item.doc_id, doc: json_to_doc(&data)? });
-//                         }
-//                         BatchMutationKind::Patch => {
-//                             let data = item.data.ok_or("missing data")?;
-//                             batch.push(BatchMutation::Patch { collection: item.collection, doc_id: item.doc_id, updates: json_to_vec(&data)? });
-//                         }
-//                         BatchMutationKind::Delete => {
-//                             batch.push(BatchMutation::Delete { collection: item.collection, doc_id: item.doc_id });
-//                         }
-//                     }
-//                 }
-//                 state.db.write_batch(batch).map_err(|e| e.to_string())?;
-//                 Ok(FireLiteResponse::Ok)
-//             }
-//             // FIX: Included or_groups in pattern (Error E0027/E0425)
-//             FireLiteOp::Aggregate { collection, filters, or_groups, kind, field } => {
-//                 let mut query = Query::new(&collection);
-//                 for filter in filters {
-//                     query = query.where_filter(&filter.field, map_operator(&filter.op), json_value_to_value(&filter.value)?);
-//                 }
-//                 if let Some(groups) = or_groups {
-//                     for group in groups {
-//                         // FIX: Explicit Type for collect (Error E0282)
-//                         let filters: Vec<crate::query::filter::Filter> = group.iter()
-//                             .map(|f: &FilterInput| -> Result<crate::query::filter::Filter, String> { 
-//                                 Ok(crate::query::filter::Filter { 
-//                                     field: f.field.clone(), 
-//                                     op: map_operator(&f.op), 
-//                                     value: json_value_to_value(&f.value)? 
-//                                 })
-//                             })
-//                             .collect::<Result<Vec<_>, String>>()?;
-//                         query.or_groups.push(filters);
-//                     }
-//                 }
-//                 use crate::query::query::AggregateOp;
-//                 query = match kind {
-//                     AggregateKind::Count => query.aggregate(AggregateOp::Count),
-//                     AggregateKind::Sum => query.aggregate(AggregateOp::Sum(field.ok_or("missing field")?)),
-//                     AggregateKind::Avg => query.aggregate(AggregateOp::Avg(field.ok_or("missing field")?)),
-//                 };
-//                 let result = state.db.execute_aggregation(query).map_err(|e| e.to_string())?;
-//                 let val = *result.values().next().unwrap_or(&0.0);
-//                 Ok(FireLiteResponse::AggregateResult { value: val })
-//             }
-//             FireLiteOp::Subscribe { listener_id, collection, filters, or_groups, order_by, limit, offset, projection, event_name, start_at, start_after, end_at, end_before } => {
-//                 state.register_subscription(
-//                     window,
-//                     listener_id.clone(),
-//                     QueryInput { collection, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before },
-//                     event_name.unwrap_or_else(|| "firelite://snapshot".to_string()),
-//                 )?;
-//                 Ok(FireLiteResponse::SubscriptionAck { listener_id })
-//             }
-//             FireLiteOp::Unsubscribe { listener_id } => {
-//                 state.unsubscribe(&listener_id);
-//                 Ok(FireLiteResponse::Unsubscribed { listener_id })
-//             }
-//             FireLiteOp::GetStats => {
-//                 let stats = state.db.get_stats();
-//                 Ok(FireLiteResponse::Stats { details: serde_json::to_value(stats).unwrap() })
-//             }
-//             FireLiteOp::ListCollections => {
-//                 let names = state.db.list_collections().map_err(|e| e.to_string())?;
-//                 Ok(FireLiteResponse::Collections { names })
-//             }
-//             FireLiteOp::Compact => {
-//                 state.db.compact().map_err(|e| e.to_string())?;
-//                 Ok(FireLiteResponse::Ok)
-//             }
-//             FireLiteOp::Backup { path } => {
-//                 state.db.backup(path).map_err(|e| e.to_string())?;
-//                 Ok(FireLiteResponse::Ok)
-//             }
-//             FireLiteOp::ListIndexes { collection } => {
-//                 let list = state.db.list_indexes(collection.as_deref());
-//                 Ok(FireLiteResponse::Indexes { list: serde_json::to_value(list).unwrap() })
-//             }
-//             FireLiteOp::SnapshotIndices => {
-//                 state.db.save_index_snapshots().map_err(|e| e.to_string())?;
-//                 Ok(FireLiteResponse::Ok)
-//             }
-//             FireLiteOp::GetAuditLog => {
-//                 let entries = state.db.audit_entries();
-//                 Ok(FireLiteResponse::AuditLog { entries })
-//             }
-//             FireLiteOp::SetDurability { mode } => {
-//                 use crate::config::DurabilityMode;
-//                 let d_mode = match mode {
-//                     1 => DurabilityMode::Interval,
-//                     2 => DurabilityMode::Manual,
-//                     3 => DurabilityMode::OnCommit,
-//                     _ => DurabilityMode::Always,
-//                 };
-                
-//                 // FIX: Assumes engine.rs change (Error E0616/E0282)
-//                 let shards = state.db.shards.read().unwrap();
-//                 for shard in shards.values() {
-//                     if let Ok(mut s) = shard.write() {
-//                         s.set_durability_mode(d_mode);
-//                     }
-//                 }
-//                 Ok(FireLiteResponse::Ok)
-//             }
-//             FireLiteOp::SetCompression { enabled, level: _ } => {
-//                 let shards = state.db.shards.read().unwrap();
-//                 for shard in shards.values() {
-//                     if let Ok(mut _s) = shard.write() {
-//                         // Logic here once setter is added to StorageEngine
-//                     }
-//                 }
-//                 Ok(FireLiteResponse::Ok)
-//             }
-//         }
-//     })
-//     .await
-//     .unwrap_or_else(|e| Err(format!("Tokio Task Error: {}", e))) 
-// }
-
 #[command]
 pub async fn firelite_exec<R: Runtime>(
     window: Window<R>,
     state: State<'_, FireLiteGateway>,
     op: FireLiteOp,
 ) -> Result<FireLiteResponse, String> {
-    // CLONE the gateway here. 
-    // This is cheap because it only clones the Arcs (pointers).
-    // This gives us an owned 'gateway' that can be moved into the 'static thread.
-    let gateway = state.inner().clone();
 
-    tokio::task::spawn_blocking(move || -> Result<FireLiteResponse, String> {
-        // Use 'gateway' instead of 'state' throughout this block
+    let gateway = state.inner().clone();
+    
+    tokio::task::spawn_blocking(move || {
         match op {
             FireLiteOp::Get { collection, doc_id } => {
                 let doc = gateway.db.get(&collection, &doc_id).map_err(|e| e.to_string())?;
@@ -507,6 +332,7 @@ pub async fn firelite_exec<R: Runtime>(
                 gateway.db.write_batch(batch).map_err(|e| e.to_string())?;
                 Ok(FireLiteResponse::Ok)
             }
+            // FIX: Included or_groups in pattern (Error E0027/E0425)
             FireLiteOp::Aggregate { collection, filters, or_groups, kind, field } => {
                 let mut query = Query::new(&collection);
                 for filter in filters {
@@ -514,6 +340,7 @@ pub async fn firelite_exec<R: Runtime>(
                 }
                 if let Some(groups) = or_groups {
                     for group in groups {
+                        // FIX: Explicit Type for collect (Error E0282)
                         let filters: Vec<crate::query::filter::Filter> = group.iter()
                             .map(|f: &FilterInput| -> Result<crate::query::filter::Filter, String> { 
                                 Ok(crate::query::filter::Filter { 
@@ -586,6 +413,7 @@ pub async fn firelite_exec<R: Runtime>(
                     _ => DurabilityMode::Always,
                 };
                 
+                // FIX: Assumes engine.rs change (Error E0616/E0282)
                 let shards = gateway.db.shards.read().unwrap();
                 for shard in shards.values() {
                     if let Ok(mut s) = shard.write() {
@@ -595,7 +423,6 @@ pub async fn firelite_exec<R: Runtime>(
                 Ok(FireLiteResponse::Ok)
             }
             FireLiteOp::SetCompression { enabled: _, level: _ } => {
-                // Fixed the 'enabled' warning by prefixing with underscore
                 let shards = gateway.db.shards.read().unwrap();
                 for shard in shards.values() {
                     if let Ok(mut _s) = shard.write() {
@@ -607,9 +434,8 @@ pub async fn firelite_exec<R: Runtime>(
         }
     })
     .await
-    .unwrap_or_else(|e| Err(format!("Tokio Task Error: {}", e)))
+    .unwrap_or_else(|e| Err(format!("Tokio Task Error: {}", e))) 
 }
-
 
 fn execute_query_input(db: &FireLite, input: &QueryInput) -> Result<Vec<serde_json::Value>, String> {
     let mut query = Query::new(&input.collection);
