@@ -17,6 +17,13 @@ export type FilterOperator =
 
 export type AggregateKind = 'count' | 'sum' | 'avg';
 
+export interface AuditEntry {
+    op: string;
+    collection: string;
+    docId?: string;
+    ok: boolean;
+}
+
 // --- Internal Utilities ---
 
 function generateId() {
@@ -42,9 +49,7 @@ async function exec(op: any): Promise<any> {
 
 // --- Firestore Core Classes ---
 
-export class FireLite {
-    // Placeholder for db instance
-}
+export class FireLite {}
 
 export class DocumentReference {
     constructor(public readonly collectionPath: string, public readonly id: string) {}
@@ -177,6 +182,18 @@ export const getCountFromServer = async (q: Query) => {
     return { data: () => ({ count: res.aggregateResult.value }) };
 };
 
+export const getSumFromServer = async (q: Query, field: string) => {
+    const params = buildQueryParams(q);
+    const res = await exec({ op: 'aggregate', kind: 'sum', field, ...params });
+    return { data: () => ({ value: res.aggregateResult.value }) };
+};
+
+export const getAverageFromServer = async (q: Query, field: string) => {
+    const params = buildQueryParams(q);
+    const res = await exec({ op: 'aggregate', kind: 'avg', field, ...params });
+    return { data: () => ({ value: res.aggregateResult.value }) };
+};
+
 // --- Real-time Snapshots ---
 
 export const onSnapshot = (q: Query, callback: (snapshot: QuerySnapshot) => void) => {
@@ -251,6 +268,27 @@ export const runTransaction = async (db: FireLite, updateFunction: (transaction:
     return result;
 };
 
+// --- Indexing ----
+export const createIndex = async (collection: string, field: string) =>
+    exec({ op: 'createIndex', collection, field });
+
+export const createFtsIndex = async (collection: string, field: string) =>
+    exec({ op: 'createFtsIndex', collection, field });
+
+export const createCompositeIndex = async (
+    collection: string,
+    fields: { field: string, desc?: boolean }[]
+) => exec({ op: 'createCompositeIndex', collection, fields });
+
+export const listIndexes = async (collection?: string) => {
+    const res = await exec({ op: 'listIndexes', collection });
+    return res.indexes.list;
+};
+
+export const snapshotIndices = async () =>
+    exec({ op: 'snapshotIndices' });
+
+
 // --- Engine / Admin Operations ---
 
 export const listCollections = async () => {
@@ -263,12 +301,24 @@ export const getStats = async () => {
     return res.stats.details;
 };
 
-export const compactEngine = async () => {
-    await exec({ op: 'compact' });
-};
+export const compactEngine = async () => exec({ op: 'compact' });
 
 export const backupEngine = async (path: string) => {
     await exec({ op: 'backup', path });
+};
+
+export const getAuditLog = async (): Promise<AuditEntry[]> => {
+    const res = await exec({ op: 'getAuditLog' });
+    return res.auditLog.entries;
+};
+
+export const setDurabilityMode = async (mode: 'Always' | 'Interval' | 'Manual' | 'OnCommit') => {
+    const map = { Interval: 1, Manual: 2, OnCommit: 3, Always: 0 };
+    await exec({ op: 'setDurability', mode: map[mode] });
+};
+
+export const setCompression = async (enabled: boolean, level: number = 3) => {
+    await exec({ op: 'setCompression', enabled, level });
 };
 
 // --- Private Helpers ---

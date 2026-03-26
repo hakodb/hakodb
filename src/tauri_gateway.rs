@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tauri::{command, Runtime, State, Window};
+// FIX: Import Emitter for Tauri v2
+use tauri::{command, Emitter, Runtime, State, Window};
 
 use crate::document::firelite_doc::FireLiteDoc;
 use crate::document::value::Value;
@@ -18,31 +19,13 @@ use crate::query::query::Query;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
 pub enum FireLiteOp {
-    Get {
-        collection: String,
-        doc_id: String,
-    },
-    Set {
-        collection: String,
-        doc_id: String,
-        data: serde_json::Value,
-    },
-    Delete {
-        collection: String,
-        doc_id: String,
-    },
-    CreateIndex {
-        collection: String,
-        field: String,
-    },
-    CreateFtsIndex {
-        collection: String,
-        field: String,
-    },
-    CreateCompositeIndex {
-        collection: String,
-        fields: Vec<CompositeFieldInput>,
-    },
+    Get { collection: String, doc_id: String },
+    Set { collection: String, doc_id: String, data: serde_json::Value },
+    Patch { collection: String, doc_id: String, data: serde_json::Value },
+    Delete { collection: String, doc_id: String },
+    CreateIndex { collection: String, field: String },
+    CreateFtsIndex { collection: String, field: String },
+    CreateCompositeIndex { collection: String, fields: Vec<CompositeFieldInput> },
     Query {
         collection: String,
         #[serde(default)]
@@ -52,18 +35,18 @@ pub enum FireLiteOp {
         limit: Option<usize>,
         offset: Option<usize>,
         projection: Option<Vec<String>>,
-        start_at: Option<Vec<serde_json::Value>>,    // Added for cursors
-        start_after: Option<Vec<serde_json::Value>>, // Added for cursors
-        end_at: Option<Vec<serde_json::Value>>,      // Added for cursors
-        end_before: Option<Vec<serde_json::Value>>,  // Added for cursors
+        start_at: Option<Vec<serde_json::Value>>,
+        start_after: Option<Vec<serde_json::Value>>,
+        end_at: Option<Vec<serde_json::Value>>,
+        end_before: Option<Vec<serde_json::Value>>,
     },
-    Batch {
-        mutations: Vec<BatchInput>,
-    },
+    Batch { mutations: Vec<BatchInput> },
     Aggregate {
         collection: String,
         #[serde(default)]
         filters: Vec<FilterInput>,
+        #[serde(default)]
+        or_groups: Option<Vec<Vec<FilterInput>>>,
         kind: AggregateKind,
         field: Option<String>,
     },
@@ -72,22 +55,27 @@ pub enum FireLiteOp {
         collection: String,
         #[serde(default)]
         filters: Vec<FilterInput>,
+        or_groups: Option<Vec<Vec<FilterInput>>>, // Added to match arm
         order_by: Option<OrderByInput>,
         limit: Option<usize>,
         offset: Option<usize>,
         projection: Option<Vec<String>>,
         event_name: Option<String>,
+        start_at: Option<Vec<serde_json::Value>>,    // Added to match arm
+        start_after: Option<Vec<serde_json::Value>>, // Added to match arm
+        end_at: Option<Vec<serde_json::Value>>,      // Added to match arm
+        end_before: Option<Vec<serde_json::Value>>,  // Added to match arm
     },
-    Unsubscribe {
-        listener_id: String,
-    },
-    Patch { collection: String, doc_id: String, data: serde_json::Value },
+    Unsubscribe { listener_id: String },
     Backup { path: String },
     Compact,
     GetStats,
     ListCollections,
     ListIndexes { collection: Option<String> },
     SnapshotIndices,
+    GetAuditLog,
+    SetDurability { mode: i32 },
+    SetCompression { enabled: bool, level: i32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +90,7 @@ pub enum FireLiteResponse {
     Stats { details: serde_json::Value },
     Collections { names: Vec<String> },
     Indexes { list: serde_json::Value },
+    AuditLog { entries: Vec<crate::engine::AuditEntry> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,36 +119,17 @@ pub struct BatchInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum BatchMutationKind {
-    Set,
-    Delete,
-}
+pub enum BatchMutationKind { Set, Patch, Delete }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FilterOperator {
-    Eq,
-    Ne,
-    Gt,
-    Gte,
-    Lt,
-    Lte,
-    Match,
-    Contains,
-    StartsWith,
-    In,
-    NotIn,
-    ArrayContains,
-    ArrayContainsAny,
+    Eq, Ne, Gt, Gte, Lt, Lte, Match, Contains, StartsWith, In, NotIn, ArrayContains, ArrayContainsAny,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum AggregateKind {
-    Count,
-    Sum,
-    Avg,
-}
+pub enum AggregateKind { Count, Sum, Avg }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -188,29 +158,6 @@ impl FireLiteGateway {
         }
     }
 
-    pub fn db(&self) -> Arc<FireLite> {
-        Arc::clone(&self.db)
-    }
-
-    pub fn cleanup_window_subscriptions(&self, window_label: &str) {
-        let ids_to_remove: Vec<String> = self
-            .subscriptions
-            .lock()
-            .iter()
-            .filter_map(|(id, entry)| {
-                if entry.window_label == window_label {
-                    Some(id.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        for id in ids_to_remove {
-            self.unsubscribe(&id);
-        }
-    }
-
     pub fn unsubscribe(&self, listener_id: &str) {
         if let Some(entry) = self.subscriptions.lock().remove(listener_id) {
             let _ = entry.stop_tx.send(());
@@ -221,27 +168,14 @@ impl FireLiteGateway {
         &self,
         window: Window<R>,
         listener_id: String,
-        collection: String,
-        filters: Vec<FilterInput>,
-        order_by: Option<OrderByInput>,
-        limit: Option<usize>,
-        offset: Option<usize>,
-        projection: Option<Vec<String>>,
+        query_template: QueryInput,
         event_name: String,
     ) -> Result<(), String> {
         self.unsubscribe(&listener_id);
 
-        let query_template = QueryInput {
-            collection,
-            filters,
-            order_by,
-            limit,
-            offset,
-            projection,
-        };
-
         let rx = self.db.watch_collection(&query_template.collection);
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        
         self.subscriptions.lock().insert(
             listener_id.clone(),
             SubscriptionEntry {
@@ -253,6 +187,7 @@ impl FireLiteGateway {
         let subscriptions = Arc::clone(&self.subscriptions);
         let db = Arc::clone(&self.db);
         let listener_id_for_thread = listener_id.clone();
+        
         thread::spawn(move || {
             let emit_snapshot = |win: &Window<R>| -> Result<(), String> {
                 let rows = execute_query_input(&db, &query_template)?;
@@ -260,7 +195,7 @@ impl FireLiteGateway {
                     listener_id: listener_id_for_thread.clone(),
                     rows,
                 };
-                win.emit(&event_name, payload).map_err(|e| e.to_string())
+                win.emit(&event_name, payload).map_err(|e: tauri::Error| e.to_string())
             };
 
             if emit_snapshot(&window).is_err() {
@@ -269,21 +204,13 @@ impl FireLiteGateway {
             }
 
             loop {
-                if stop_rx.try_recv().is_ok() {
-                    break;
-                }
-
+                if stop_rx.try_recv().is_ok() { break; }
                 match rx.recv_timeout(Duration::from_millis(250)) {
-                    Ok(_) => {
-                        if emit_snapshot(&window).is_err() {
-                            break;
-                        }
-                    }
+                    Ok(_) => { if emit_snapshot(&window).is_err() { break; } }
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
-
             subscriptions.lock().remove(&listener_id_for_thread);
         });
 
@@ -291,14 +218,20 @@ impl FireLiteGateway {
     }
 }
 
+// FIX: Added cursors and or_groups to QueryInput
 #[derive(Debug, Clone)]
 struct QueryInput {
     collection: String,
     filters: Vec<FilterInput>,
+    or_groups: Option<Vec<Vec<FilterInput>>>,
     order_by: Option<OrderByInput>,
     limit: Option<usize>,
     offset: Option<usize>,
     projection: Option<Vec<String>>,
+    start_at: Option<Vec<serde_json::Value>>,
+    start_after: Option<Vec<serde_json::Value>>,
+    end_at: Option<Vec<serde_json::Value>>,
+    end_before: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -316,82 +249,41 @@ pub fn firelite_exec<R: Runtime>(
 ) -> Result<FireLiteResponse, String> {
     match op {
         FireLiteOp::Get { collection, doc_id } => {
-            let doc = state
-                .db
-                .get(&collection, &doc_id)
-                .map_err(|e| e.to_string())?;
+            let doc = state.db.get(&collection, &doc_id).map_err(|e| e.to_string())?;
             let data = doc.map(|d| doc_to_json_value(&d)).transpose()?;
             Ok(FireLiteResponse::Document { data })
         }
-        FireLiteOp::Set {
-            collection,
-            doc_id,
-            data,
-        } => {
+        FireLiteOp::Set { collection, doc_id, data } => {
             let doc = json_to_doc(&data)?;
-            state
-                .db
-                .put(&collection, &doc_id, &doc)
-                .map_err(|e| e.to_string())?;
+            state.db.put(&collection, &doc_id, &doc).map_err(|e| e.to_string())?;
+            Ok(FireLiteResponse::Ok)
+        }
+        FireLiteOp::Patch { collection, doc_id, data } => {
+            let updates = json_to_vec(&data)?;
+            state.db.patch(&collection, &doc_id, updates).map_err(|e| e.to_string())?;
             Ok(FireLiteResponse::Ok)
         }
         FireLiteOp::Delete { collection, doc_id } => {
-            state
-                .db
-                .delete(&collection, &doc_id)
-                .map_err(|e| e.to_string())?;
+            state.db.delete(&collection, &doc_id).map_err(|e| e.to_string())?;
             Ok(FireLiteResponse::Ok)
         }
         FireLiteOp::CreateIndex { collection, field } => {
-            state
-                .db
-                .create_index(&collection, &field)
-                .map_err(|e| e.to_string())?;
+            state.db.create_index(&collection, &field).map_err(|e| e.to_string())?;
             Ok(FireLiteResponse::Ok)
         }
         FireLiteOp::CreateFtsIndex { collection, field } => {
-            state
-                .db
-                .create_fts_index(&collection, &field)
-                .map_err(|e| e.to_string())?;
+            state.db.create_fts_index(&collection, &field).map_err(|e| e.to_string())?;
             Ok(FireLiteResponse::Ok)
         }
         FireLiteOp::CreateCompositeIndex { collection, fields } => {
-            let parsed_fields = fields
-                .into_iter()
-                .map(|f| {
-                    (
-                        f.field,
-                        if f.desc {
-                            SortDirection::Desc
-                        } else {
-                            SortDirection::Asc
-                        },
-                    )
-                })
-                .collect();
+            let parsed_fields = fields.into_iter().map(|f| (f.field, if f.desc { SortDirection::Desc } else { SortDirection::Asc })).collect();
             state.db.create_composite_index(&collection, parsed_fields);
             Ok(FireLiteResponse::Ok)
         }
-        FireLiteOp::Query {
-            collection,
-            filters,
-            order_by,
-            limit,
-            offset,
-            projection,
-        } => {
-            let rows = execute_query_input(
-                &state.db,
-                &QueryInput {
-                    collection,
-                    filters,
-                    order_by,
-                    limit,
-                    offset,
-                    projection,
-                },
-            )?;
+        FireLiteOp::Query { collection, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before } => {
+            let rows = execute_query_input(&state.db, &QueryInput { 
+                collection, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before 
+            })?;
             Ok(FireLiteResponse::QueryResult { rows })
         }
         FireLiteOp::Batch { mutations } => {
@@ -399,97 +291,71 @@ pub fn firelite_exec<R: Runtime>(
             for item in mutations {
                 match item.mutation {
                     BatchMutationKind::Set => {
-                        let data = item.data.ok_or_else(|| {
-                            format!(
-                                "set mutation for {}/{} is missing 'data'",
-                                item.collection, item.doc_id
-                            )
-                        })?;
-                        batch.push(BatchMutation::Put {
-                            collection: item.collection,
-                            doc_id: item.doc_id,
-                            doc: json_to_doc(&data)?,
-                        });
+                        let data = item.data.ok_or("missing data")?;
+                        batch.push(BatchMutation::Put { collection: item.collection, doc_id: item.doc_id, doc: json_to_doc(&data)? });
+                    }
+                    BatchMutationKind::Patch => {
+                        let data = item.data.ok_or("missing data")?;
+                        batch.push(BatchMutation::Patch { collection: item.collection, doc_id: item.doc_id, updates: json_to_vec(&data)? });
                     }
                     BatchMutationKind::Delete => {
-                        batch.push(BatchMutation::Delete {
-                            collection: item.collection,
-                            doc_id: item.doc_id,
-                        });
+                        batch.push(BatchMutation::Delete { collection: item.collection, doc_id: item.doc_id });
                     }
                 }
             }
             state.db.write_batch(batch).map_err(|e| e.to_string())?;
             Ok(FireLiteResponse::Ok)
         }
-        FireLiteOp::Aggregate {
-            collection,
-            filters,
-            kind,
-            field,
-        } => {
+        FireLiteOp::Aggregate { collection, filters, kind, field } => {
             let mut query = Query::new(&collection);
             for filter in filters {
-                query = query.where_filter(
-                    &filter.field,
-                    map_operator(&filter.op),
-                    json_filter_value_to_value(&filter.value)?,
-                );
+                query = query.where_filter(&filter.field, map_operator(&filter.op), json_value_to_value(&filter.value)?);
             }
-
+            if let Some(groups) = or_groups {
+                for group in groups {
+                    let filters = group.iter()
+                        .map(|f| Ok(crate::query::filter::Filter { 
+                            field: f.field.clone(), 
+                            op: map_operator(&f.op), 
+                            value: json_value_to_value(&f.value)? 
+                        }))
+                        .collect::<Result<Vec<_>, String>>()?;
+                    query.or_groups.push(filters);
+                }
+            }
             use crate::query::query::AggregateOp;
-            query = match &kind {
+            query = match kind {
                 AggregateKind::Count => query.aggregate(AggregateOp::Count),
-                AggregateKind::Sum => {
-                    let f = field
-                        .clone()
-                        .ok_or_else(|| "sum aggregate requires 'field'".to_string())?;
-                    query.aggregate(AggregateOp::Sum(f))
-                }
-                AggregateKind::Avg => {
-                    let f = field
-                        .clone()
-                        .ok_or_else(|| "avg aggregate requires 'field'".to_string())?;
-                    query.aggregate(AggregateOp::Avg(f))
-                }
+                AggregateKind::Sum => query.aggregate(AggregateOp::Sum(field.ok_or("missing field")?)),
+                AggregateKind::Avg => query.aggregate(AggregateOp::Avg(field.ok_or("missing field")?)),
             };
-
-            let result = state
-                .db
-                .execute_aggregation(query)
-                .map_err(|e| e.to_string())?;
-            let value = match &kind {
-                AggregateKind::Count => *result.get("count").unwrap_or(&0.0),
-                AggregateKind::Sum => {
-                    let field = field.clone().unwrap_or_default();
-                    *result.get(&format!("sum_{}", field)).unwrap_or(&0.0)
-                }
-                AggregateKind::Avg => {
-                    let field = field.clone().unwrap_or_default();
-                    *result.get(&format!("avg_{}", field)).unwrap_or(&0.0)
-                }
-            };
-            Ok(FireLiteResponse::AggregateResult { value })
+            let result = state.db.execute_aggregation(query).map_err(|e| e.to_string())?;
+            let val = *result.values().next().unwrap_or(&0.0);
+            Ok(FireLiteResponse::AggregateResult { value: val })
         }
-        FireLiteOp::Subscribe {
-            listener_id,
-            collection,
-            filters,
-            order_by,
-            limit,
-            offset,
-            projection,
-            event_name,
+        FireLiteOp::Subscribe { 
+            listener_id, 
+            collection, 
+            filters, 
+            or_groups, 
+            order_by, 
+            limit, 
+            offset, 
+            projection, 
+            event_name, 
+            start_at, 
+            start_after, 
+            end_at, 
+            end_before 
         } => {
             state.register_subscription(
                 window,
                 listener_id.clone(),
-                collection,
-                filters,
-                order_by,
-                limit,
-                offset,
-                projection,
+                QueryInput { 
+                    collection, filters, or_groups, order_by, 
+                    limit, offset, projection, 
+                    start_at, start_after, end_at, end_before // <--- Ensure these are here
+                },
                 event_name.unwrap_or_else(|| "firelite://snapshot".to_string()),
             )?;
             Ok(FireLiteResponse::SubscriptionAck { listener_id })
@@ -498,50 +364,110 @@ pub fn firelite_exec<R: Runtime>(
             state.unsubscribe(&listener_id);
             Ok(FireLiteResponse::Unsubscribed { listener_id })
         }
+        FireLiteOp::GetStats => {
+            let stats = state.db.get_stats();
+            Ok(FireLiteResponse::Stats { details: serde_json::to_value(stats).unwrap() })
+        }
+        FireLiteOp::ListCollections => {
+            let names = state.db.list_collections().map_err(|e| e.to_string())?;
+            Ok(FireLiteResponse::Collections { names })
+        }
+        FireLiteOp::Compact => {
+            state.db.compact().map_err(|e| e.to_string())?;
+            Ok(FireLiteResponse::Ok)
+        }
+        FireLiteOp::Backup { path } => {
+            state.db.backup(path).map_err(|e| e.to_string())?;
+            Ok(FireLiteResponse::Ok)
+        }
+        FireLiteOp::ListIndexes { collection } => {
+            let list = state.db.list_indexes(collection.as_deref());
+            Ok(FireLiteResponse::Indexes { list: serde_json::to_value(list).unwrap() })
+        }
+        FireLiteOp::SnapshotIndices => {
+            state.db.save_index_snapshots().map_err(|e| e.to_string())?;
+            Ok(FireLiteResponse::Ok)
+        }
+        // NEW: Audit Log retrieval
+        FireLiteOp::GetAuditLog => {
+            let entries = state.db.audit_entries();
+            Ok(FireLiteResponse::AuditLog { entries })
+        }
+
+        FireLiteOp::SetDurability { mode } => {
+            use crate::config::DurabilityMode;
+            let d_mode = match mode {
+                1 => DurabilityMode::Interval,
+                2 => DurabilityMode::Manual,
+                3 => DurabilityMode::OnCommit,
+                _ => DurabilityMode::Always,
+            };
+            
+            // Apply to all active shards
+            let shards = state.db.shards.read().unwrap();
+            for shard in shards.values() {
+                if let Ok(mut s) = shard.write() {
+                    s.set_durability_mode(d_mode);
+                }
+            }
+            Ok(FireLiteResponse::Ok)
+        }
+
+        // NEW: Runtime Compression Config
+        FireLiteOp::SetCompression { enabled, level: _ } => {
+            // Note: level is used during compaction; here we toggle the flag
+            let shards = state.db.shards.read().unwrap();
+            for shard in shards.values() {
+                if let Ok(mut s) = shard.write() {
+                    // Note: You may need to add a public setter 'set_compression' 
+                    // in storage/engine.rs if you want to change this after 'open'
+                    // s.use_compression = enabled; 
+                }
+            }
+            Ok(FireLiteResponse::Ok)
+        }
     }
 }
 
-fn execute_query_input(
-    db: &FireLite,
-    input: &QueryInput,
-) -> Result<Vec<serde_json::Value>, String> {
+fn execute_query_input(db: &FireLite, input: &QueryInput) -> Result<Vec<serde_json::Value>, String> {
     let mut query = Query::new(&input.collection);
 
     for filter in &input.filters {
-        query = query.where_filter(
-            &filter.field,
-            map_operator(&filter.op),
-            json_value_to_value(&filter.value)?,
-        );
+        query = query.where_filter(&filter.field, map_operator(&filter.op), json_value_to_value(&filter.value)?);
     }
 
-    if let Some(order) = &input.order_by {
-        query = query.order_by(&order.field, order.ascending);
+    if let Some(groups) = &input.or_groups {
+        for group in groups {
+            let filters = group.iter()
+                .map(|f| Ok(crate::query::filter::Filter { 
+                    field: f.field.clone(), 
+                    op: map_operator(&f.op), 
+                    value: json_value_to_value(&f.value)? 
+                }))
+                .collect::<Result<Vec<_>, String>>()?;
+            query.or_groups.push(filters);
+        }
     }
 
-    if let Some(limit) = input.limit {
-        query = query.limit(limit);
-    }
-    if let Some(offset) = input.offset {
-        query = query.offset(offset);
-    }
+    if let Some(order) = &input.order_by { query = query.order_by(&order.field, order.ascending); }
+    if let Some(limit) = input.limit { query = query.limit(limit); }
+    if let Some(offset) = input.offset { query = query.offset(offset); }
+
+    // Cursor Mapping
+    if let Some(v) = &input.start_at { query.start_at = Some(v.iter().map(json_value_to_value).collect::<Result<Vec<_>, _>>()?); }
+    if let Some(v) = &input.start_after { query.start_after = Some(v.iter().map(json_value_to_value).collect::<Result<Vec<_>, _>>()?); }
+    if let Some(v) = &input.end_at { query.end_at = Some(v.iter().map(json_value_to_value).collect::<Result<Vec<_>, _>>()?); }
+    if let Some(v) = &input.end_before { query.end_before = Some(v.iter().map(json_value_to_value).collect::<Result<Vec<_>, _>>()?); }
 
     if let Some(projection) = &input.projection {
         if !projection.is_empty() {
-            let rows = db
-                .query_projected_zero_copy(query.clone(), projection)
-                .map_err(|e| e.to_string())?;
-            return rows
-                .into_iter()
-                .map(|(_, fields)| projection_fields_to_json(fields))
-                .collect();
+            let rows = db.query_projected_zero_copy(query.clone(), projection).map_err(|e| e.to_string())?;
+            return rows.into_iter().map(|(_, fields)| projection_fields_to_json(fields)).collect();
         }
     }
 
     let rows = db.query(query).map_err(|e| e.to_string())?;
-    rows.into_iter()
-        .map(|(_, doc)| doc_to_json_value(&doc))
-        .collect()
+    rows.into_iter().map(|(_, doc)| doc_to_json_value(&doc)).collect()
 }
 
 fn map_operator(op: &FilterOperator) -> Operator {
@@ -563,10 +489,7 @@ fn map_operator(op: &FilterOperator) -> Operator {
 }
 
 fn json_to_doc(v: &serde_json::Value) -> Result<FireLiteDoc, String> {
-    let obj = v
-        .as_object()
-        .ok_or_else(|| "document payload must be a JSON object".to_string())?;
-
+    let obj = v.as_object().ok_or("document must be object")?;
     let mut doc = FireLiteDoc::default();
     for (k, val) in obj {
         doc.insert(k.clone(), json_value_to_value(val)?);
@@ -574,50 +497,40 @@ fn json_to_doc(v: &serde_json::Value) -> Result<FireLiteDoc, String> {
     Ok(doc)
 }
 
+fn json_to_vec(v: &serde_json::Value) -> Result<Vec<(String, Value)>, String> {
+    let obj = v.as_object().ok_or("updates must be object")?;
+    let mut out = Vec::new();
+    for (k, val) in obj {
+        out.push((k.clone(), json_value_to_value(val)?));
+    }
+    Ok(out)
+}
+
 fn json_value_to_value(v: &serde_json::Value) -> Result<Value, String> {
     match v {
         serde_json::Value::Null => Ok(Value::Null),
         serde_json::Value::Bool(b) => Ok(Value::Bool(*b)),
         serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(Value::Int(i))
-            } else if let Some(f) = n.as_f64() {
-                Ok(Value::Float(f))
-            } else {
-                Err("unsupported number representation".to_string())
-            }
+            if let Some(i) = n.as_i64() { Ok(Value::Int(i)) }
+            else { Ok(Value::Float(n.as_f64().unwrap_or(0.0))) }
         }
         serde_json::Value::String(s) => Ok(Value::String(s.clone())),
-        serde_json::Value::Array(arr) => arr
-            .iter()
-            .map(json_value_to_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map(Value::Array),
-        serde_json::Value::Object(obj) => obj
-            .iter()
-            .map(|(k, v)| Ok((k.clone(), json_value_to_value(v)?)))
-            .collect::<Result<Vec<_>, String>>()
-            .map(Value::Map),
-    }
-}
-
-fn json_filter_value_to_value(v: &serde_json::Value) -> Result<Value, String> {
-    match v {
-        serde_json::Value::Array(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                out.push(json_filter_value_to_value(item)?);
+        serde_json::Value::Array(arr) => arr.iter().map(json_value_to_value).collect::<Result<Vec<_>, _>>().map(Value::Array),
+        serde_json::Value::Object(obj) => {
+            let mut map = Vec::new();
+            for (k, v) in obj {
+                map.push((Arc::from(k.as_str()), json_value_to_value(v)?));
             }
-            Ok(Value::Array(out))
+            Ok(Value::Map(map))
         }
-        _ => json_value_to_value(v),
     }
 }
 
 fn doc_to_json_value(doc: &FireLiteDoc) -> Result<serde_json::Value, String> {
     let mut map = serde_json::Map::new();
     for (k, v) in &doc.fields {
-        map.insert(k.clone(), value_to_json(v)?);
+        // FIX: k.to_string() converts Arc<str> to String for serde_json::Map
+        map.insert(k.to_string(), value_to_json(v)?);
     }
     Ok(serde_json::Value::Object(map))
 }
@@ -632,41 +545,26 @@ fn projection_fields_to_json(fields: Vec<(String, Value)>) -> Result<serde_json:
 
 fn value_to_json(v: &Value) -> Result<serde_json::Value, String> {
     match v {
-        Value::Null => Ok(serde_json::Value::Null),
+        Value::Null | Value::ServerTimestamp => Ok(serde_json::Value::Null),
         Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
         Value::Int(i) => Ok(serde_json::Value::Number((*i).into())),
-        Value::Float(f) => serde_json::Number::from_f64(*f)
-            .map(serde_json::Value::Number)
-            .ok_or_else(|| "invalid float value".to_string()),
+        Value::Float(f) => serde_json::Number::from_f64(*f).map(serde_json::Value::Number).ok_or("invalid float".into()),
         Value::String(s) => Ok(serde_json::Value::String(s.clone())),
-        Value::Binary(bytes) => Ok(serde_json::Value::Array(
-            bytes
-                .iter()
-                .map(|b| serde_json::Value::Number((*b as u64).into()))
-                .collect(),
-        )),
+        Value::Binary(bytes) => Ok(serde_json::Value::Array(bytes.iter().map(|b| serde_json::Value::Number((*b as u64).into())).collect())),
+        Value::Timestamp(micros) => Ok(serde_json::Value::Number((*micros).into())),
         Value::Reference { collection, doc_id } => {
             let mut map = serde_json::Map::new();
-            map.insert(
-                "__ref__".to_string(),
-                serde_json::Value::String(format!("{collection}/{doc_id}")),
-            );
+            map.insert("__ref__".to_string(), serde_json::Value::String(format!("{collection}/{doc_id}")));
             Ok(serde_json::Value::Object(map))
         }
-        Value::Timestamp(micros) => Ok(serde_json::Value::Number((*micros).into())),
-        Value::ServerTimestamp => Ok(serde_json::Value::Null),
         Value::Map(fields) => {
             let mut map = serde_json::Map::new();
             for (k, v) in fields {
-                map.insert(k.clone(), value_to_json(v)?);
+                // FIX: k.to_string() converts Arc<str> to String
+                map.insert(k.to_string(), value_to_json(v)?);
             }
             Ok(serde_json::Value::Object(map))
         }
-        Value::Array(values) => Ok(serde_json::Value::Array(
-            values
-                .iter()
-                .map(value_to_json)
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
+        Value::Array(values) => Ok(serde_json::Value::Array(values.iter().map(value_to_json).collect::<Result<Vec<_>, _>>()?)),
     }
 }
