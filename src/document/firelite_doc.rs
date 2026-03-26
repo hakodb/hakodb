@@ -48,7 +48,7 @@ impl FireLiteDoc {
         for (k, v) in &self.fields {
             out.push(k.len() as u8);
             out.extend(k.as_bytes());
-            let (tag, bytes) = encode_value(v);
+            let (tag, bytes) = encode_value(v, None);
             out.push(tag);
             out.extend((bytes.len() as u32).to_le_bytes());
             out.extend(bytes);
@@ -137,7 +137,7 @@ impl FireLiteDoc {
             out.push(TAG_POOLED_KEY);
             out.extend(catalog.get_key_id(k).to_le_bytes());
 
-            let (tag, bytes) = encode_value(v);
+            let (tag, bytes) = encode_value(v, Some(catalog));
             out.push(tag);
             out.extend((bytes.len() as u32).to_le_bytes());
             out.extend(bytes);
@@ -309,7 +309,7 @@ impl<'a> Iterator for FireLiteDocIter<'a> {
     }
 }
 
-fn encode_value(v: &Value) -> (u8, Vec<u8>) {
+fn encode_value(v: &Value, catalog: Option<&crate::util::catalog::Catalog>) -> (u8, Vec<u8>) {
     match v {
         Value::Null => (1, vec![]),
         Value::Bool(v) => (2, vec![*v as u8]),
@@ -323,12 +323,20 @@ fn encode_value(v: &Value) -> (u8, Vec<u8>) {
             let mut out = vec![];
             out.extend((fields.len() as u16).to_le_bytes()); // Number of sub-fields
             for (k, v) in fields {
-                let k_str: &str = &*k;
-                out.push(k_str.len() as u8);
-                out.extend(k_str.as_bytes());
-                // out.push(k.len() as u8);
-                // out.extend(k.as_bytes());
-                let (tag, bytes) = encode_value(v); // RECURSION
+                // let k_str: &str = &*k;
+                // out.push(k_str.len() as u8);
+                // out.extend(k_str.as_bytes());
+                if let Some(cat) = catalog {
+                    // Use Key Pooling for nested maps too!
+                    out.push(TAG_POOLED_KEY);
+                    out.extend(cat.get_key_id(k).to_le_bytes());
+                } else {
+                    let k_str: &str = &*k;
+                    out.push(k_str.len() as u8);
+                    out.extend(k_str.as_bytes());
+                }
+                let (tag, bytes) = encode_value(v, catalog);
+                // let (tag, bytes) = encode_value(v); // RECURSION
                 out.push(tag);
                 out.extend((bytes.len() as u32).to_le_bytes());
                 out.extend(bytes);
@@ -339,7 +347,7 @@ fn encode_value(v: &Value) -> (u8, Vec<u8>) {
             let mut out = vec![];
             out.extend((items.len() as u32).to_le_bytes()); // Element count
             for item in items {
-                let (tag, bytes) = encode_value(item); // RECURSION
+                let (tag, bytes) = encode_value(item, catalog); // RECURSION
                 out.push(tag);
                 out.extend((bytes.len() as u32).to_le_bytes());
                 out.extend(bytes);

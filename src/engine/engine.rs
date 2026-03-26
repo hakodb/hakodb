@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hashbrown::HashMap;
 
-use crate::config::FireLiteConfig;
+use crate::config::{FireLiteConfig, DurabilityMode};
 use crate::document::firelite_doc::FireLiteDoc;
 use crate::document::value::Value;
 use crate::error::{FireLiteError, Result};
@@ -379,6 +379,7 @@ impl FireLite {
         let indexes_ptr = Arc::clone(&db.indexes);
         let persist_ptr = Arc::clone(&db.index_storage);
         let catalog_ptr = Arc::clone(&db.catalog);
+        let catalog_maintenance = Arc::clone(&db.catalog);
         let config_thread = config.clone();
         let blob_tx_thread = db.blob_tx.clone();
 
@@ -553,6 +554,7 @@ impl FireLite {
                             let _ = persist.reset_log();
                         }
                     }
+                    catalog_maintenance.save();
                 }
             }
         });
@@ -792,6 +794,10 @@ impl FireLite {
 
         for (_, (col, event)) in unique_events {
             self.notify_watchers(&col, event);
+        }
+        if self.config.durability_mode == DurabilityMode::Always || 
+            self.config.durability_mode == DurabilityMode::OnCommit {
+            self.catalog.save(); 
         }
 
         Ok(())
@@ -1064,6 +1070,7 @@ impl FireLite {
         for s in self.shards.read().unwrap().values() {
             s.write().unwrap().flush_all()?;
         }
+        self.catalog.save(); 
         Ok(())
     }
 
