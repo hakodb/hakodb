@@ -102,15 +102,12 @@ impl CompositeIndexManager {
         collection: &str,
         fields: &[String],
         values: &[Value],
-    // ) -> Option<Vec<String>> {
     ) -> Option<Vec<Arc<str>>> {
         for idx in self.indexes_for_collection(collection) {
-            let idx_fields: Vec<&str> = idx
-                .definition
-                .fields
-                .iter()
-                .map(|f| f.field.as_str())
-                .collect();
+            let idx_fields: Vec<&str> = idx.definition.fields.iter()
+                .map(|f| f.field.as_str()).collect();
+
+            // FIX: Ensure this uses >= and uses .take()
             if idx_fields.len() >= fields.len()
                 && idx_fields
                     .iter()

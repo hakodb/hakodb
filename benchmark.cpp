@@ -38,20 +38,35 @@ struct Report {
     BenchConfig cfg;
     double single_tps = 0;
     double batch_tps = 0;
-    double p_read_ms = 0;     // Parallel read latency
-    double s_read_ms = 0;     // Single read latency
+    double p_read_ms = 0;     
+    double s_read_ms = 0;     
+    double projection_ms = 0; // NEW
+    double snapshot_latency = 0; // NEW
     double offset_ms = 0;
     double cursor_ms = 0; 
-    double cursor_gain = 0;    // StartAt -> EndBefore Range
+    double cursor_gain = 0;    
     double agg_ms = 0;
-    double tx_ms = 0;         // Serializable transaction time
+    double adv_filter_ms = 0; // NEW
+    double comp_query_ms = 0;
+    double tx_ms = 0;         
     double bulk_upd_ms = 0;
     double bulk_del_ms = 0;
-    double startup_ms = 0;    // Index Rebuild
-    double shutdown_ms = 0;   // Flush
+    double startup_ms = 0;    
+    double shutdown_ms = 0;   
     double storage_mb = 0;
+    
+    // NEW: Query Stress Metrics
+    double stress_get_ms = 0;
+    double stress_query_ms = 0;
+
     bool success = true;
 };
+
+std::atomic<int> g_snapshot_received{0};
+
+extern "C" void bench_on_snapshot(const char* col, const char* path, int kind, void* user_data) {
+    g_snapshot_received++;
+}
 
 // ============================================================
 // UTILITIES
@@ -79,6 +94,25 @@ static uintmax_t get_dir_size(const string& path) {
     return total;
 }
 
+// Replicates the Rust make_doc structure
+FL_Doc* make_complex_doc(int i, const string& payload) {
+    FL_Doc* d = fl_doc_new();
+    fl_doc_insert_int(d, "id", i);
+    fl_doc_insert_str(d, "tenant", (string("tenant-") + to_string(i % 32)).c_str());
+    fl_doc_insert_int(d, "age", 18 + (i % 70));
+    fl_doc_insert_bool(d, "active", i % 3 != 0);
+    fl_doc_insert_float(d, "score", ((i % 10000) / 7.0) + 0.5);
+    fl_doc_insert_str(d, "description", (string("firelite v0.5.10 benchmark payload ") + to_string(i)).c_str());
+    
+    FL_Array* tags = fl_array_new();
+    fl_array_append_str(tags, (string("tag-") + to_string(i % 10)).c_str());
+    fl_array_append_str(tags, "bench");
+    fl_doc_insert_array(d, "tags", tags); // Note: FFI usually takes ownership
+
+    if (!payload.empty()) fl_doc_insert_str(d, "extra", payload.c_str());
+    return d;
+}
+
 FL_Config* create_config_ptr(const BenchConfig& cfg) {
     FL_Config* fcfg = fl_config_new();
     fl_config_set_durability(fcfg, cfg.durability);
@@ -95,6 +129,11 @@ void stage(const string& s) { cout << "\n      -> [STAGE] " << left << setw(28) 
 // CORE BENCHMARK CYCLE
 // ============================================================
 
+// This matches the index expected by the QueryPlanner for 
+// WHERE tenant == ? ORDER BY score DESC
+// const char* composite_index_json = 
+//     "[{\"field\": \"tenant\", \"desc\": false}, {\"field\": \"score\", \"desc\": true}]";
+
 Report run_benchmark(BenchConfig cfg) {
     Report res; res.cfg = cfg;
     string path = "./bench_data_" + cfg.name;
@@ -107,21 +146,38 @@ Report run_benchmark(BenchConfig cfg) {
     double t_start = now_ms();
     FL_Engine* db = fl_engine_open_with_config(path.c_str(), create_config_ptr(cfg));
     if (!db) { res.success = false; return res; }
-    // cout << "OK";
     cout << now_ms() - t_start;
+
+    // 1. SNAPSHOT SETUP
+    stage("Snapshot Setup (Watch)");
+    g_snapshot_received = 0;
+    FL_Watch* watcher = fl_engine_watch(db, "bench", bench_on_snapshot, nullptr);
+    cout << "ACTIVE";
+
+    stage("Indexing..");
+    // CREATE INDEXES UPFRONT ON EMPTY DB
+    fl_engine_create_simple_index(db, "bench", "id");
+    fl_engine_create_simple_index(db, "bench", "active"); 
+    fl_engine_create_simple_index(db, "bench", "tenant"); 
+    fl_engine_create_index(db, "bench", "[{\"field\": \"tenant\", \"desc\": false}, {\"field\": \"score\", \"desc\": true}]");
+
+    // NO READINESS PROBE NEEDED! The background threads will complete instantly
+    // because there is 0 bytes of data to scan.
+    cout << "Ready";
 
     // 1. WRITE TEST (Single vs Batch)
     stage("Single Write Latency");
     t_start = now_ms();
     for (int i = 0; i < 100; i++) {
-        FL_Doc* d = fl_doc_new();
-        fl_doc_insert_int(d, "id", i);
-        fl_doc_insert_str(d, "payload", payload.c_str());
+        // FL_Doc* d = fl_doc_new();
+        // fl_doc_insert_int(d, "id", i);
+        // fl_doc_insert_str(d, "payload", payload.c_str());
+        // fl_engine_insert(db, "bench", (string("s_") + to_string(i)).c_str(), d);
+        FL_Doc* d = make_complex_doc(i, payload.c_str());
         fl_engine_insert(db, "bench", (string("s_") + to_string(i)).c_str(), d);
         fl_doc_free(d);
     }
     res.single_tps = 100.0 / ((now_ms() - t_start) / 1000.0);
-    // cout << "OK";
     cout << res.single_tps;
 
     stage("Batch Write Throughput");
@@ -131,9 +187,11 @@ Report run_benchmark(BenchConfig cfg) {
         FL_Batch* b = fl_batch_new();
         int chunk = min(cfg.batch_size, b_total - i);
         for (int j = 0; j < chunk; j++) {
-            FL_Doc* d = fl_doc_new();
-            fl_doc_insert_int(d, "id", i + j + 100);
-            fl_doc_insert_str(d, "payload", payload.c_str());
+            // FL_Doc* d = fl_doc_new();
+            // fl_doc_insert_int(d, "id", i + j + 100);
+            // fl_doc_insert_str(d, "payload", payload.c_str());
+            int int_id = i + j + 100;
+            FL_Doc* d = make_complex_doc(int_id, payload.c_str());
             fl_batch_set(b, "bench", (string("b_") + to_string(i + j)).c_str(), d);
             fl_doc_free(d);
         }
@@ -141,8 +199,11 @@ Report run_benchmark(BenchConfig cfg) {
         fl_batch_free(b);
     }
     res.batch_tps = (double)b_total / ((now_ms() - t_start) / 1000.0);
-    // cout << "OK";
     cout << res.batch_tps;
+
+    stage("Waiting 2 secs for indexs..");
+    this_thread::sleep_for(chrono::milliseconds(2000));
+    cout << "Done";
 
     // 2. READ TEST (Single vs Parallel)
     stage("Point Read (Sequential)");
@@ -152,13 +213,11 @@ Report run_benchmark(BenchConfig cfg) {
         if (d) fl_doc_free(d);
     }
     res.s_read_ms = (now_ms() - t_start) / 200.0;
-    // cout << "OK";
     cout << res.s_read_ms;
 
     stage("Point Read (Parallel)");
     t_start = now_ms();
     vector<thread> pool;
-    mutex read_mtx;
     for(int t=0; t<cfg.threads; t++) {
         pool.emplace_back([&](){
             for(int i=0; i<50; i++) {
@@ -169,7 +228,6 @@ Report run_benchmark(BenchConfig cfg) {
     }
     for(auto& t : pool) t.join();
     res.p_read_ms = (now_ms() - t_start) / (cfg.threads * 50.0);
-    // cout << "OK";
     cout << res.p_read_ms;
 
     // 3. BULK UPDATE & SERIALIZABLE TX
@@ -182,7 +240,6 @@ Report run_benchmark(BenchConfig cfg) {
     }
     res.bulk_upd_ms = now_ms() - t_start;
     fl_doc_free(upd);
-    // cout << "OK";
     cout << res.bulk_upd_ms;
 
     stage("Serializable Transactions");
@@ -198,17 +255,10 @@ Report run_benchmark(BenchConfig cfg) {
         } else { fl_transaction_free(tx); }
     }
     res.tx_ms = now_ms() - t_start;
-    // cout << "OK";
     cout << res.tx_ms;
 
     // 4. RANGE QUERY (Offset vs Cursor)
     stage("Range Query (Off vs Cur)");
-    fl_engine_create_simple_index(db, "bench", "id");
-
-    // this_thread::sleep_for(chrono::milliseconds(500));
-    int backfill_wait = cfg.large_docs ? 2000 : 500; 
-    this_thread::sleep_for(chrono::milliseconds(backfill_wait));
-    // cout << "OK";
     
     int mid = b_total / 2;
     FL_Query* q_off = fl_query_new("bench");
@@ -223,40 +273,81 @@ Report run_benchmark(BenchConfig cfg) {
     fl_query_end_before(q_cur, end_doc);
     t_start = now_ms(); fl_string_free(fl_query_execute(db, q_cur)); res.cursor_ms = now_ms() - t_start;
     res.cursor_gain = res.offset_ms / (res.cursor_ms > 0 ? res.cursor_ms : 0.1);
-    // cout << "OK";
     cout << res.cursor_gain;
 
-    // 5. AGGREGATION
+    // 5. QUERY STRESS TEST (NEW)
+    // Compares direct Point Read (Get) vs Index-based Column Query
+    stage("Query Stress (Get vs Query)");
+    // A. Point Read Stress
+    double t_get_stress = now_ms();
+    for(int i=0; i<300; i++) {
+        string key = "b_" + to_string(i + 300);
+        FL_Doc* d = fl_engine_get(db, "bench", key.c_str());
+        if(d) fl_doc_free(d);
+    }
+    res.stress_get_ms = (now_ms() - t_get_stress) / 300.0;
+
+    // B. Query Stress
+    double t_query_stress = now_ms();
+    for(int i=0; i<300; i++) {
+        FL_Query* q = fl_query_new("bench");
+        fl_query_where_eq_int(q, "active", 1);
+        // Non-indexed filters force the single-pass worker
+        // fl_query_where_eq_str(q, "tenant", "tenant-5");
+        fl_query_limit(q, 50);
+        fl_string_free(fl_query_execute(db, q));
+        fl_query_free(q);
+    }
+    res.stress_query_ms = (now_ms() - t_query_stress) / 300.0;
+    cout << fixed << setprecision(4) << res.stress_get_ms << " / " << res.stress_query_ms;
+
+    stage("Composite Query Stress");
+    double t_comp_stress = now_ms();
+    for(int i=0; i<300; i++) {
+        FL_Query* q = fl_query_new("bench");
+        // These two fields together match our Composite Index exactly
+        fl_query_where_eq_str(q, "tenant", "tenant-2");
+        fl_query_order_by(q, "score", true); 
+        
+        fl_query_limit(q, 20);
+        // Only get the ID and Score to test Projection Pushdown too
+        fl_query_select_field(q, "id");
+        fl_query_select_field(q, "score");
+
+        char* json = fl_query_execute(db, q);
+        fl_string_free(json);
+        fl_query_free(q);
+    }
+    res.comp_query_ms = (now_ms() - t_comp_stress) / 300.0;
+    cout << res.comp_query_ms << "ms";
+
+    // 6. AGGREGATION
     stage("Aggregation (Parallel Sum)");
     FL_Query* aq = fl_query_new("bench");
     fl_query_aggregate_sum(aq, "id");
     t_start = now_ms(); 
     fl_string_free(fl_query_execute_aggregation(db, aq)); 
     res.agg_ms = now_ms() - t_start;
-    // cout << "OK";
     cout << res.agg_ms;
 
-    // 6. BULK DELETE
+    // 7. BULK DELETE
     stage("Bulk Delete");
     t_start = now_ms();
     for(int i=0; i<100; i++) fl_engine_delete(db, "bench", (string("b_") + to_string(i+500)).c_str());
     res.bulk_del_ms = now_ms() - t_start;
-    // cout << "OK";
     cout << res.bulk_del_ms;
 
-    // 7. SHUTDOWN & STARTUP
+    // 8. SHUTDOWN & STARTUP
     stage("Shutdown (Flush)");
     t_start = now_ms();
     fl_engine_free(db);
     res.shutdown_ms = now_ms() - t_start;
-    // cout << "OK";
     cout << res.shutdown_ms;
 
     stage("Startup (Index Rebuild)");
     t_start = now_ms();
     FL_Engine* db2 = fl_engine_open_with_config(path.c_str(), create_config_ptr(cfg));
     res.startup_ms = now_ms() - t_start;
-    // cout << "OK";
     cout << res.startup_ms;
     
     res.storage_mb = (double)get_dir_size(path) / (1024.0 * 1024.0);
@@ -279,16 +370,16 @@ int main(int argc, char** argv) {
     vector<BenchConfig> suite = {
         {"Strict_Sync",  g_docs, 100, 0, 4, false, false, 0,  false},
         {"Turbo_RAM",    g_docs, 500, 2, 8, false, false, 60, false},
-        {"Cloud_Bal",    g_docs, 200, 3, 8, true,  false, 2,  false},
+        {"Cloud_Bal",    g_docs, 200, 1, 8, true,  false, 2,  false},
         {"Secure_Small", g_docs, 100, 3, 4, false, true,  10, false},
-        {"Large_Zip",    g_docs, 50,  3, 8, true,  false, 2,  true},
+        {"Large_Zip",    g_docs, 500,  3, 8, true,  false, 2,  true},
         {"Large_Secure", g_docs, 50,  3, 8, true,  true,  10, true},
-        {"Parallel_Max", g_docs, 500, 2, 32,false, false, 60, false},
+        {"Parallel_Max", g_docs, 100, 2, 32,false, false, 60, false},
         {"Safety_Max",   g_docs, 100, 0, 8, true,  true,  0,  true}
     };
 
     cout << "==========================================================================================\n";
-    cout << " FIRE LITE ARCHITECTURAL DEEP-DIVE (v0.8.0) | Total Docs: " << g_docs << "\n";
+    cout << " FIRE LITE ARCHITECTURAL DEEP-DIVE (v0.5.10) | Total Docs: " << g_docs << "\n";
     cout << "==========================================================================================\n";
 
     vector<Report> results;
@@ -301,39 +392,42 @@ int main(int argc, char** argv) {
     }
 
     // CONCLUSION TABLE
-    cout << "\n\n" << string(140, '=') << "\n";
-    cout << " FINAL PERFORMANCE MATRIX\n";
-    cout << string(140, '-') << "\n";
+    cout << "\n\n" << string(155, '=') << "\n";
+    cout << " FINAL PERFORMANCE MATRIX (v0.5.10)\n";
+    cout << string(155, '-') << "\n";
     cout << left << setw(14) << "Profile" << " | "
-         << setw(13) << "S/B TPS" << " | "
-         << setw(15) << "Read(S/P)" << " | "
+         << setw(11) << "S/B TPS" << " | "
+         << setw(13) << "Read(S/P)" << " | "
+         << setw(20) << "Get/Query/Comp" << " | "  // Added comparison
          << setw(13) << "Off/Cur ms" << " | "
-         << setw(9) << "Agg(ms)" << " | "
+         << setw(8) << "Agg(ms)" << " | "
          << setw(8) << "Tx(ms)" << " | "
          << setw(12) << "Upd/Del ms" << " | "
          << setw(15) << "Startup/Flush" << " | "
          << "Size\n";
-    cout << string(140, '-') << "\n";
+    cout << string(155, '-') << "\n";
 
     for (const auto& r : results) {
-        stringstream ss_tps, ss_read, ss_query, ss_maint, ss_bulk;
+        stringstream ss_tps, ss_read, ss_stress, ss_query, ss_maint, ss_bulk;
         ss_tps << (int)r.single_tps << "/" << (int)r.batch_tps;
         ss_read << fixed << setprecision(4) << r.s_read_ms << "/" << r.p_read_ms;
+        ss_stress << fixed << setprecision(4) << r.stress_get_ms << "/" << r.stress_query_ms << "/" << r.comp_query_ms;
         ss_query << fixed << setprecision(1) << r.offset_ms << "/" << r.cursor_ms;
         ss_bulk << (int)r.bulk_upd_ms << "/" << (int)r.bulk_del_ms;
         ss_maint << (int)r.startup_ms << "/" << (int)r.shutdown_ms;
 
         cout << left << setw(14) << r.cfg.name << " | "
-             << left << setw(13) << ss_tps.str() << " | "
-             << left << setw(15) << ss_read.str() << " | "
+             << left << setw(11) << ss_tps.str() << " | "
+             << left << setw(13) << ss_read.str() << " | "
+             << left << setw(20) << ss_stress.str() << " | "
              << left << setw(13) << ss_query.str() << " | "
-             << fixed << setprecision(0) << setw(9) << r.agg_ms << " | "
+             << fixed << setprecision(0) << setw(8) << r.agg_ms << " | "
              << setw(8) << r.tx_ms << " | "
              << left << setw(12) << ss_bulk.str() << " | "
              << left << setw(15) << ss_maint.str() << " | "
              << setprecision(1) << r.storage_mb << "MB\n";
     }
-    cout << string(140, '=') << endl;
+    cout << string(155, '=') << endl;
 
     return 0;
 }
