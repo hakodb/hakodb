@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{BufReader, Read};
+use std::sync::Arc;
 
 use crate::index::composite::manager::CompositeIndexManager;
 
@@ -42,7 +43,8 @@ pub fn replay_log(path: &str, manager: &mut CompositeIndexManager) -> std::io::R
             match op[0] {
                 INSERT => {
                     // index.tree.insert(key, doc_id);
-                    index.tree.insert(key.into(), doc_id.into());
+                    // index.tree.insert(key.into(), doc_id.into());
+                    index.tree.insert(key.into(), Arc::from(doc_id));
                 }
                 DELETE => {
                     // index.tree.remove(&key);

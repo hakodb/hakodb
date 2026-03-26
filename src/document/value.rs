@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
@@ -12,7 +13,8 @@ pub enum Value {
     Reference { collection: String, doc_id: String },
     Timestamp(i64), 
     ServerTimestamp,
-    Map(Vec<(String, Value)>),
+    // Map(Vec<(String, Value)>),
+    Map(#[serde(with = "serde_arc_str_map")] Vec<(Arc<str>, Value)>), 
     Array(Vec<Value>),
 }
 
@@ -56,6 +58,24 @@ impl PartialEq for Value {
 
 impl Eq for Value {}
 
+// Add this module at the bottom of src/document/value.rs
+mod serde_arc_str_map {
+    use super::*;
+    use serde::{Serializer, Deserializer, Deserialize}; // <--- ADD THIS
+    // use serde::ser::SerializeSeq;
+
+    pub fn serialize<S>(vec: &[(Arc<str>, Value)], s: S) -> Result<S::Ok, S::Error> where S: Serializer {
+        use serde::ser::SerializeSeq;
+        let mut seq = s.serialize_seq(Some(vec.len()))?;
+        for (k, v) in vec { seq.serialize_element(&(k.to_string(), v))? }
+        seq.end()
+    }
+    pub fn deserialize<'de, D>(d: D) -> Result<Vec<(Arc<str>, Value)>, D::Error> where D: Deserializer<'de> {
+        let raw: Vec<(String, Value)> = Deserialize::deserialize(d)?;
+        Ok(raw.into_iter().map(|(k, v)| (Arc::from(k), v)).collect())
+    }
+}
+
 impl PartialOrd for Value {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -91,13 +111,11 @@ impl Ord for Value {
             
             (Value::Map(a), Value::Map(b)) => {
                 // Compare Map lengths, then lexicographically by fields
-                let len_cmp = a.len().cmp(&b.len());
-                if len_cmp != Ordering::Equal {
-                    return len_cmp;
-                }
-                // Recursively compare key-value pairs
+                let res = a.len().cmp(&b.len());
+                if res != Ordering::Equal { return res; }
                 for ((k1, v1), (k2, v2)) in a.iter().zip(b.iter()) {
-                    let k_cmp = k1.cmp(k2);
+                    // HELP THE COMPILER WITH TYPES
+                    let k_cmp = k1.as_ref().cmp(k2.as_ref());
                     if k_cmp != Ordering::Equal { return k_cmp; }
                     let v_cmp = v1.cmp(v2);
                     if v_cmp != Ordering::Equal { return v_cmp; }

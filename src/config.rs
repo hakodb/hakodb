@@ -28,7 +28,7 @@ impl Default for FireLiteConfig {
         Self {
             mmap_size: 256 * 1024 * 1024,
             page_size: 4096,
-            page_cache_capacity: 1024,
+            page_cache_capacity: 8192,
             query_workers: 4,
             auto_compaction_threshold_bytes: 8 * 1024 * 1024,
             durability_mode: DurabilityMode::Interval,
