@@ -1,5 +1,5 @@
 use hashbrown::HashMap;
-use std::sync::{RwLock, atomic::{AtomicU32, AtomicU16, Ordering}};
+use std::sync::{RwLock, atomic::{AtomicU32, AtomicU16, Ordering, AtomicBool}};
 use std::path::{Path, PathBuf};
 use std::io::{Read, Write};
 use std::fs;
@@ -8,11 +8,11 @@ use std::sync::Arc;
 pub struct Catalog {
     path: PathBuf,
     pub(crate) root_path: PathBuf,
-    // Unified map: "c:name" -> col_id, "k:name" -> key_id
     data: RwLock<HashMap<String, u32>>,
     rev_keys: RwLock<HashMap<u16, Arc<str>>>,
     next_col_id: AtomicU32,
     next_key_id: AtomicU16,
+    dirty: AtomicBool,
 }
 
 impl Catalog {
@@ -46,6 +46,7 @@ impl Catalog {
             rev_keys: RwLock::new(rev_keys),
             next_col_id: AtomicU32::new(max_c),
             next_key_id: AtomicU16::new(max_k),
+            dirty: AtomicBool::new(false),
         }
     }
 
@@ -164,6 +165,11 @@ impl Catalog {
         let id = self.next_key_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         write.insert(key, id as u32);
         self.rev_keys.write().unwrap().insert(id, Arc::from(field_name));
+
+        // drop(write); // Release lock before saving to avoid deadlocks
+        // self.save(); 
+        self.dirty.store(true, Ordering::SeqCst);
+
         id
     }
 
@@ -195,6 +201,9 @@ impl Catalog {
     }
 
     pub fn save(&self) {
+        if !self.dirty.swap(false, Ordering::SeqCst) {
+            return; 
+        }
         let tmp_path = self.path.with_extension("tmp");
         if let Ok(mut file) = fs::File::create(&tmp_path) {
             let map = self.data.read().unwrap();
