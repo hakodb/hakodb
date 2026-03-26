@@ -66,10 +66,15 @@ pub struct StorageEngine {
     pub index: HashMap<String, Pointer>,
     pub(crate) blob_file: Option<File>,
     pub(crate) blob_tx: Option<SyncSender<BlobWork>>,
+    pub logical_name: String,
 }
 
 impl StorageEngine {
-    pub fn open(base_dir: impl AsRef<Path>, cfg: &FireLiteConfig) -> Result<Self> {
+    pub fn open(
+        base_dir: impl AsRef<Path>, 
+        cfg: &FireLiteConfig,
+        logical_name: String
+    ) -> Result<Self> {
         let base_path = base_dir.as_ref().to_path_buf(); 
         std::fs::create_dir_all(&base_path)?;
         // std::fs::create_dir_all(base_dir.as_ref())?;
@@ -149,6 +154,7 @@ impl StorageEngine {
             mmap_size: cfg.mmap_size,
             blob_file: Some(blob_file),
             blob_tx: None,
+            logical_name,
         };
 
         engine.recover()?;
@@ -328,7 +334,8 @@ impl StorageEngine {
 
                         // Hand off to the background thread
                         blob_work_todo.push(BlobWork::Put {
-                            collection: self.base_dir.file_name().unwrap().to_str().unwrap().to_string(),
+                            // collection: self.base_dir.file_name().unwrap().to_str().unwrap().to_string(),
+                            collection: self.logical_name.clone(),
                             key: key.clone(),
                             data: arc_data,
                         });
@@ -880,7 +887,7 @@ mod tests {
         };
 
         {
-            let mut engine = StorageEngine::open(&path, &cfg).expect("engine open should succeed");
+            let mut engine = StorageEngine::open(&path, &cfg, "test_collection".to_string()).expect("engine open should succeed");
             engine
                 .put("k1".to_string(), b"value-1")
                 .expect("first put should succeed");
@@ -890,7 +897,7 @@ mod tests {
             let _ = engine.flush_wal();
         }
 
-        let mut reopened = StorageEngine::open(&path, &cfg).expect("reopen should succeed");
+        let mut reopened = StorageEngine::open(&path, &cfg, "test_collection".to_string()).expect("reopen should succeed");
         assert_eq!(
             reopened.get("k1").expect("read should succeed"),
             Some(b"value-1".to_vec())
@@ -907,7 +914,7 @@ mod tests {
     fn compact_returns_when_no_same_level_merge_candidate_exists() {
         let path = temp_path("firelite-storage-compact");
         let cfg = FireLiteConfig::default();
-        let mut engine = StorageEngine::open(&path, &cfg).expect("engine open should succeed");
+        let mut engine = StorageEngine::open(&path, &cfg, "test_collection".to_string()).expect("engine open should succeed");
 
         engine
             .put("k1".to_string(), b"value-1")

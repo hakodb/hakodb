@@ -145,7 +145,11 @@ impl FireLiteDoc {
         out
     }
 
-    pub fn apply_patch_binary(old_bytes: &[u8], updates: &[(String, Value)]) -> Option<Vec<u8>> {
+    pub fn apply_patch_binary(
+        old_bytes: &[u8], 
+        updates: &[(String, Value)],
+        catalog: &crate::util::catalog::Catalog
+    ) -> Option<Vec<u8>> {
         let view = FireLiteDocView::new(old_bytes)?;
         let mut final_fields: Vec<(Arc<str>, Value)> = Vec::new();
 
@@ -153,7 +157,7 @@ impl FireLiteDoc {
         let mut applied_updates = vec![false; updates.len()];
 
         // 1. Iterate through existing fields
-        for (key, borrowed_val) in view.iter(None) {
+        for (key, borrowed_val) in view.iter(Some(catalog)) {
             let update_idx = updates.iter().position(|(uk, _)| uk == &*key);
             if let Some(idx) = update_idx {
                 final_fields.push((Arc::from(&*key), updates[idx].1.clone()));
@@ -174,7 +178,7 @@ impl FireLiteDoc {
         let new_doc = FireLiteDoc {
             fields: final_fields,
         };
-        Some(new_doc.encode())
+        Some(new_doc.encode_compact(catalog))
     }
 }
 

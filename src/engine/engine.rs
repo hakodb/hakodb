@@ -387,7 +387,7 @@ impl FireLite {
             let discovered = catalog_ptr.recover_from_disk();
             for (col_name, _) in discovered {
                 let path = catalog_ptr.get_collection_path(&col_name);
-                if let Ok(mut storage) = StorageEngine::open(path, &config_thread) {
+                if let Ok(mut storage) = StorageEngine::open(path, &config_thread, col_name.clone()) {
                     storage.blob_tx = Some(blob_tx_thread.clone());
                     if let Ok(mut shards) = shards_ptr.write() {
                         shards.insert(col_name, Arc::new(RwLock::new(storage)));
@@ -685,7 +685,7 @@ impl FireLite {
                 let folder_name = self.catalog.get_folder_name(collection);
                 let path = self.root_path.join(folder_name);
 
-                let mut storage = StorageEngine::open(path, &self.config).expect("Shard fail");
+                let mut storage = StorageEngine::open(path, &self.config, collection.to_string()).expect("Shard fail");
                 storage.blob_tx = Some(self.blob_tx.clone());
                 Arc::new(RwLock::new(storage))
             })
@@ -822,7 +822,7 @@ impl FireLite {
                             index_dels.entry(collection.clone()).or_default().push((doc_id.clone(), old_doc));
                             
                             // 2. Apply patch to get the NEW doc
-                            if let Some(new_bytes) = FireLiteDoc::apply_patch_binary(&old_bytes, updates) {
+                            if let Some(new_bytes) = FireLiteDoc::apply_patch_binary(&old_bytes, updates, &self.catalog) {
                                 if let Some(new_doc) = FireLiteDoc::decode(&new_bytes, Some(&self.catalog)) {
                                     // 3. Prepare for Index Put (New state)
                                     index_puts.entry(collection.clone()).or_default().push((doc_id.clone(), new_doc));
@@ -1025,27 +1025,32 @@ impl FireLite {
             return Err(FireLiteError::Corrupt("Denied".into()));
         }
 
-        let shard = self.get_shard(col);
-        let key = doc_key(col, id);
-        let res = (|| -> Result<()> {
-            let new_bytes = {
-                let storage = shard.read().unwrap();
-                let old = storage
-                    .get(&key)?
-                    .ok_or_else(|| FireLiteError::Corrupt("Not found".into()))?;
-                FireLiteDoc::apply_patch_binary(&old, &updates)
-                    .ok_or_else(|| FireLiteError::Corrupt("Patch fail".into()))?
-            };
-            shard.write().unwrap().put(key.clone(), &new_bytes)?;
-            self.notify_watchers(
-                col,
-                ChangeEvent {
-                    path: key,
-                    kind: ChangeKind::Put,
-                },
-            );
-            Ok(())
-        })();
+        let res = self.write_batch(vec![BatchMutation::Patch {
+            collection: col.to_string(),
+            doc_id: id.to_string(),
+            updates,
+        }]);
+        // let shard = self.get_shard(col);
+        // let key = doc_key(col, id);
+        // let res = (|| -> Result<()> {
+        //     let new_bytes = {
+        //         let storage = shard.read().unwrap();
+        //         let old = storage
+        //             .get(&key)?
+        //             .ok_or_else(|| FireLiteError::Corrupt("Not found".into()))?;
+        //         FireLiteDoc::apply_patch_binary(&old, &updates, &catalog)
+        //             .ok_or_else(|| FireLiteError::Corrupt("Patch fail".into()))?
+        //     };
+        //     shard.write().unwrap().put(key.clone(), &new_bytes)?;
+        //     self.notify_watchers(
+        //         col,
+        //         ChangeEvent {
+        //             path: key,
+        //             kind: ChangeKind::Put,
+        //         },
+        //     );
+        //     Ok(())
+        // })();
 
         // AUDIT RESULT
         self.record_audit(AuditEntry {
