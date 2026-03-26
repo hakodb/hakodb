@@ -140,7 +140,7 @@ pub struct CompositeFieldInput {
 
 #[derive(Clone)]
 pub struct FireLiteGateway {
-    db: Arc<FireLite>,
+    pub db: Arc<FireLite>,
     subscriptions: Arc<Mutex<HashMap<String, SubscriptionEntry>>>,
 }
 
