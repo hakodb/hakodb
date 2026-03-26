@@ -640,7 +640,8 @@ impl FireLite {
         let mut shard_groups: HashMap<String, Vec<StorageMutation>> = HashMap::new();
         let mut index_puts: HashMap<String, Vec<(String, FireLiteDoc)>> = HashMap::new();
         let mut index_dels: HashMap<String, Vec<(String, FireLiteDoc)>> = HashMap::new();
-        let mut change_events: Vec<(String, ChangeEvent)> = Vec::new();
+        // let mut change_events: Vec<(String, ChangeEvent)> = Vec::new();
+        let mut unique_events: HashMap<String, (String, ChangeEvent)> = HashMap::new();
 
         for m in &mut mutations {
             match m {
@@ -669,12 +670,16 @@ impl FireLite {
                         .entry(collection.clone())
                         .or_default()
                         .push((doc_id.clone(), doc.clone()));
-                    change_events.push((
+                    // change_events.push((
+                    //     collection.clone(),
+                    //     ChangeEvent {
+                    //         path: key,
+                    //         kind: ChangeKind::Put,
+                    //     },
+                    // ));
+                    unique_events.insert(key.clone(), (
                         collection.clone(),
-                        ChangeEvent {
-                            path: key,
-                            kind: ChangeKind::Put,
-                        },
+                        ChangeEvent { path: key, kind: ChangeKind::Put }
                     ));
                 }
                 BatchMutation::Delete { collection, doc_id } => {
@@ -693,12 +698,16 @@ impl FireLite {
                         .entry(collection.clone())
                         .or_default()
                         .push(StorageMutation::Delete { key: key.clone() });
-                    change_events.push((
+                    // change_events.push((
+                    //     collection.clone(),
+                    //     ChangeEvent {
+                    //         path: key,
+                    //         kind: ChangeKind::Delete,
+                    //     },
+                    // ));
+                    unique_events.insert(key.clone(), (
                         collection.clone(),
-                        ChangeEvent {
-                            path: key,
-                            kind: ChangeKind::Delete,
-                        },
+                        ChangeEvent { path: key, kind: ChangeKind::Delete }
                     ));
                 }
 
@@ -727,7 +736,11 @@ impl FireLite {
                             }
                         }
                     }
-                    change_events.push((collection.clone(), ChangeEvent { path: key, kind: ChangeKind::Put }));
+                    // change_events.push((collection.clone(), ChangeEvent { path: key, kind: ChangeKind::Put }));
+                    unique_events.insert(key.clone(), (
+                        collection.clone(),
+                        ChangeEvent { path: key, kind: ChangeKind::Put }
+                    ));
                 }
             }
         }
@@ -772,7 +785,12 @@ impl FireLite {
                 deletes,
             });
         }
-        for (col, event) in change_events {
+        
+        // for (col, event) in change_events {
+        //     self.notify_watchers(&col, event);
+        // }
+
+        for (_, (col, event)) in unique_events {
             self.notify_watchers(&col, event);
         }
 
