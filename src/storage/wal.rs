@@ -182,7 +182,8 @@ impl Wal {
             self.write_buffer.clear();
         }
 
-        self.file.sync_data()?;
+        // self.file.sync_data()?;
+        self.file.sync_all()?; 
 
         self.pending_ops_since_sync = 0;
         self.last_sync = now;
@@ -191,11 +192,15 @@ impl Wal {
     }
 
     pub fn replay(&mut self) -> Result<Vec<WalOp>> {
+        use std::io::Seek; // Ensure Seek is in scope
         self.file.seek(SeekFrom::Start(0))?;
         let mut raw_ops = Vec::new();
-        loop {
+        let mut last_valid_pos = 0;
 
+        loop {
             let mut len_buf = [0u8; 4];
+            
+            // 1. Try read length
             match self.file.read_exact(&mut len_buf) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
@@ -203,16 +208,26 @@ impl Wal {
             }
 
             let len = u32::from_le_bytes(len_buf) as usize;
-
             let mut crc_buf = [0u8; 4];
-            self.file.read_exact(&mut crc_buf)?;
+            
+            // 2. Try read CRC
+            if let Err(e) = self.file.read_exact(&mut crc_buf) {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof { break; }
+                return Err(e.into());
+            }
+            
             let expected = u32::from_le_bytes(crc_buf);
-
             let mut payload = vec![0; len];
-            self.file.read_exact(&mut payload)?;
+            
+            // 3. Try read Payload
+            if let Err(e) = self.file.read_exact(&mut payload) {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof { break; }
+                return Err(e.into());
+            }
 
+            // 4. Validate Checksum
             if crc32fast::hash(&payload) != expected {
-                return Err(FireLiteError::Corrupt("wal checksum mismatch".into()));
+                break; 
             }
 
             if let Some(enc) = &self.encryption {
@@ -220,7 +235,13 @@ impl Wal {
             }
 
             raw_ops.push(decode(&payload)?);
+            
+            // 5. Update the position of the end of the last complete record
+            last_valid_pos = self.file.stream_position()?;
         }
+
+        // Repair the file and seek to end for new writes
+        self.file.set_len(last_valid_pos)?;
         self.file.seek(SeekFrom::End(0))?;
 
         Ok(filter_committed_ops(raw_ops))

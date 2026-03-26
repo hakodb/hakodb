@@ -140,7 +140,10 @@ impl Catalog {
         let _ = fs::create_dir_all(&folder_path);
         // 2. Write identity.bin IMMEDIATELY
         let ident_path = folder_path.join("identity.bin");
-        let _ = fs::write(ident_path, collection);
+        let tmp_ident = folder_path.join("~identity.tmp"); 
+        // let _ = fs::write(ident_path, collection);
+        let _ = fs::write(&tmp_ident, collection);
+        let _ = fs::rename(tmp_ident, ident_path); 
 
         write.insert(key, id);
         
