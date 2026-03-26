@@ -183,7 +183,7 @@ enum IndexOp {
 pub struct FireLite {
     root_path: PathBuf,
     config: FireLiteConfig,
-    shards: Arc<RwLock<HashMap<String, Arc<RwLock<StorageEngine>>>>>, // The only storage
+    pub(crate) shards: Arc<RwLock<HashMap<String, Arc<RwLock<StorageEngine>>>>>, // The only storage
 
     index_storage: Arc<Mutex<IndexStorage>>,
 
