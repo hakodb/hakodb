@@ -47,10 +47,15 @@ pub enum FireLiteOp {
         collection: String,
         #[serde(default)]
         filters: Vec<FilterInput>,
+        or_groups: Option<Vec<Vec<FilterInput>>>,
         order_by: Option<OrderByInput>,
         limit: Option<usize>,
         offset: Option<usize>,
         projection: Option<Vec<String>>,
+        start_at: Option<Vec<serde_json::Value>>,    // Added for cursors
+        start_after: Option<Vec<serde_json::Value>>, // Added for cursors
+        end_at: Option<Vec<serde_json::Value>>,      // Added for cursors
+        end_before: Option<Vec<serde_json::Value>>,  // Added for cursors
     },
     Batch {
         mutations: Vec<BatchInput>,
@@ -76,6 +81,13 @@ pub enum FireLiteOp {
     Unsubscribe {
         listener_id: String,
     },
+    Patch { collection: String, doc_id: String, data: serde_json::Value },
+    Backup { path: String },
+    Compact,
+    GetStats,
+    ListCollections,
+    ListIndexes { collection: Option<String> },
+    SnapshotIndices,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +99,9 @@ pub enum FireLiteResponse {
     AggregateResult { value: f64 },
     SubscriptionAck { listener_id: String },
     Unsubscribed { listener_id: String },
+    Stats { details: serde_json::Value },
+    Collections { names: Vec<String> },
+    Indexes { list: serde_json::Value },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
