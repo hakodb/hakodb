@@ -157,6 +157,26 @@ impl FireLiteGateway {
         }
     }
 
+    // --- ADD THIS METHOD ---
+    pub fn cleanup_window_subscriptions(&self, window_label: &str) {
+        let mut subs = self.subscriptions.lock();
+        
+        // Find all listener IDs belonging to the closed window
+        let ids_to_remove: Vec<String> = subs
+            .iter()
+            .filter(|(_, entry)| entry.window_label == window_label)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        // Stop the threads and remove from the map
+        for id in ids_to_remove {
+            if let Some(entry) = subs.remove(&id) {
+                // Sending this signal causes the loop in the thread to break
+                let _ = entry.stop_tx.send(());
+            }
+        }
+    }
+
     pub fn unsubscribe(&self, listener_id: &str) {
         if let Some(entry) = self.subscriptions.lock().remove(listener_id) {
             let _ = entry.stop_tx.send(());
