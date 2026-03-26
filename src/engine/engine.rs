@@ -36,6 +36,11 @@ pub enum BatchMutation {
         collection: String,
         doc_id: String,
     },
+    Patch { 
+        collection: String, 
+        doc_id: String, 
+        updates: Vec<(String, Value)> 
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -804,6 +809,34 @@ impl FireLite {
                         },
                     ));
                 }
+
+                BatchMutation::Patch { collection, doc_id, updates } => {
+                    let key = doc_key(collection, doc_id);
+                    let shard = self.get_shard(collection);
+                    
+                    // We need the OLD doc to update the index and merge fields
+                    let storage = shard.read().unwrap();
+                    if let Some(old_bytes) = storage.get(&key)? {
+                        if let Some(old_doc) = FireLiteDoc::decode(&old_bytes, Some(&self.catalog)) {
+                            // 1. Prepare for Index Deletion (Old state)
+                            index_dels.entry(collection.clone()).or_default().push((doc_id.clone(), old_doc));
+                            
+                            // 2. Apply patch to get the NEW doc
+                            if let Some(new_bytes) = FireLiteDoc::apply_patch_binary(&old_bytes, updates) {
+                                if let Some(new_doc) = FireLiteDoc::decode(&new_bytes, Some(&self.catalog)) {
+                                    // 3. Prepare for Index Put (New state)
+                                    index_puts.entry(collection.clone()).or_default().push((doc_id.clone(), new_doc));
+                                    
+                                    // 4. Add to storage group
+                                    shard_groups.entry(collection.clone()).or_default().push(
+                                        StorageMutation::Put { key: key.clone(), value: new_bytes }
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    change_events.push((collection.clone(), ChangeEvent { path: key, kind: ChangeKind::Put }));
+                }
             }
         }
 
@@ -1060,6 +1093,7 @@ impl FireLite {
         match m {
             BatchMutation::Put { collection, .. } => collection,
             BatchMutation::Delete { collection, .. } => collection,
+            BatchMutation::Patch { collection, .. } => collection,
         }
     }
 
@@ -1075,6 +1109,9 @@ impl FireLite {
                     collection, doc_id, ..
                 } => doc_key(collection, doc_id),
                 BatchMutation::Delete { collection, doc_id } => doc_key(collection, doc_id),
+                BatchMutation::Patch { collection, doc_id, .. } => {
+                    doc_key(collection, doc_id)
+                }
             };
             versions.insert(key, self.global_version.fetch_add(1, Ordering::SeqCst));
         }

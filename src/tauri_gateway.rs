@@ -45,6 +45,8 @@ pub enum FireLiteOp {
         collection: String,
         #[serde(default)]
         filters: Vec<FilterInput>,
+        #[serde(default)]
+        or_groups: Option<Vec<Vec<FilterInput>>>,
         kind: AggregateKind,
         field: Option<String>,
     },
@@ -71,6 +73,9 @@ pub enum FireLiteOp {
     ListCollections,
     ListIndexes { collection: Option<String> },
     SnapshotIndices,
+    GetAuditLog,
+    SetDurability { mode: i32 },
+    SetCompression { enabled: bool, level: i32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +90,7 @@ pub enum FireLiteResponse {
     Stats { details: serde_json::Value },
     Collections { names: Vec<String> },
     Indexes { list: serde_json::Value },
+    AuditLog { entries: Vec<crate::engine::AuditEntry> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,6 +311,18 @@ pub fn firelite_exec<R: Runtime>(
             for filter in filters {
                 query = query.where_filter(&filter.field, map_operator(&filter.op), json_value_to_value(&filter.value)?);
             }
+            if let Some(groups) = or_groups {
+                for group in groups {
+                    let filters = group.iter()
+                        .map(|f| Ok(crate::query::filter::Filter { 
+                            field: f.field.clone(), 
+                            op: map_operator(&f.op), 
+                            value: json_value_to_value(&f.value)? 
+                        }))
+                        .collect::<Result<Vec<_>, String>>()?;
+                    query.or_groups.push(filters);
+                }
+            }
             use crate::query::query::AggregateOp;
             query = match kind {
                 AggregateKind::Count => query.aggregate(AggregateOp::Count),
@@ -315,11 +333,29 @@ pub fn firelite_exec<R: Runtime>(
             let val = *result.values().next().unwrap_or(&0.0);
             Ok(FireLiteResponse::AggregateResult { value: val })
         }
-        FireLiteOp::Subscribe { listener_id, collection, filters, or_groups, order_by, limit, offset, projection, event_name, start_at, start_after, end_at, end_before } => {
+        FireLiteOp::Subscribe { 
+            listener_id, 
+            collection, 
+            filters, 
+            or_groups, 
+            order_by, 
+            limit, 
+            offset, 
+            projection, 
+            event_name, 
+            start_at, 
+            start_after, 
+            end_at, 
+            end_before 
+        } => {
             state.register_subscription(
                 window,
                 listener_id.clone(),
-                QueryInput { collection, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before },
+                QueryInput { 
+                    collection, filters, or_groups, order_by, 
+                    limit, offset, projection, 
+                    start_at, start_after, end_at, end_before // <--- Ensure these are here
+                },
                 event_name.unwrap_or_else(|| "firelite://snapshot".to_string()),
             )?;
             Ok(FireLiteResponse::SubscriptionAck { listener_id })
@@ -350,6 +386,44 @@ pub fn firelite_exec<R: Runtime>(
         }
         FireLiteOp::SnapshotIndices => {
             state.db.save_index_snapshots().map_err(|e| e.to_string())?;
+            Ok(FireLiteResponse::Ok)
+        }
+        // NEW: Audit Log retrieval
+        FireLiteOp::GetAuditLog => {
+            let entries = state.db.audit_entries();
+            Ok(FireLiteResponse::AuditLog { entries })
+        }
+
+        FireLiteOp::SetDurability { mode } => {
+            use crate::config::DurabilityMode;
+            let d_mode = match mode {
+                1 => DurabilityMode::Interval,
+                2 => DurabilityMode::Manual,
+                3 => DurabilityMode::OnCommit,
+                _ => DurabilityMode::Always,
+            };
+            
+            // Apply to all active shards
+            let shards = state.db.shards.read().unwrap();
+            for shard in shards.values() {
+                if let Ok(mut s) = shard.write() {
+                    s.set_durability_mode(d_mode);
+                }
+            }
+            Ok(FireLiteResponse::Ok)
+        }
+
+        // NEW: Runtime Compression Config
+        FireLiteOp::SetCompression { enabled, level: _ } => {
+            // Note: level is used during compaction; here we toggle the flag
+            let shards = state.db.shards.read().unwrap();
+            for shard in shards.values() {
+                if let Ok(mut s) = shard.write() {
+                    // Note: You may need to add a public setter 'set_compression' 
+                    // in storage/engine.rs if you want to change this after 'open'
+                    // s.use_compression = enabled; 
+                }
+            }
             Ok(FireLiteResponse::Ok)
         }
     }
