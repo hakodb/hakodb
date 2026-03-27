@@ -16,6 +16,8 @@ use super::scheduler::shard_tasks;
 use super::task::QueryTask;
 use super::worker::{matches_filters_view, run_task, run_task_projected};
 
+use crate::index::index_key::decode_scalar_as_f64;
+
 pub struct ParallelQueryExecutor {
     workers: usize,
 }
@@ -91,13 +93,17 @@ impl ParallelQueryExecutor {
             }
         }
 
-        if let Some(order) = &plan.order_by {
-            results.sort_by(|(_, a), (_, b)| {
-                let av = a.get(&order.field);
-                let bv = b.get(&order.field);
-                let cmp = av.cmp(&bv);
-                if order.ascending { cmp } else { cmp.reverse() }
-            });
+        // ONLY SORT IF NOT SATISFIED BY INDEX
+        if !plan.order_by_satisfied {
+            if let Some(order) = &plan.order_by {
+                // This block is very expensive for large documents!
+                results.sort_by(|(_, a), (_, b)| {
+                    let av = a.get(&order.field);
+                    let bv = b.get(&order.field);
+                    let cmp = av.cmp(&bv);
+                    if order.ascending { cmp } else { cmp.reverse() }
+                });
+            }
         }
 
         let mut final_results = if let Some(offset) = plan.offset {
@@ -120,6 +126,49 @@ impl ParallelQueryExecutor {
         plan: QueryPlan,
         ops: &[AggregateOp],
     ) -> Result<HashMap<String, f64>> {
+
+        if ops.len() == 1 && plan.or_groups.is_empty() {
+            if let AggregateOp::Sum(ref sum_field) = ops[0] {
+                let mut filter_ids: Option<hashbrown::HashSet<String>> = None;
+                let mut can_use_index_filter = true;
+
+                for filter in &plan.filters {
+                    if filter.op == crate::query::filter::Operator::Eq {
+                        let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
+                        if let Some(ids) = indexes.lookup_secondary(&plan.collection, &filter.field, &val_bytes) {
+                            let id_set: hashbrown::HashSet<_> = ids.into_iter().collect();
+                            if let Some(ref mut existing_set) = filter_ids {
+                                existing_set.retain(|id| id_set.contains(id));
+                            } else {
+                                filter_ids = Some(id_set);
+                            }
+                        } else { can_use_index_filter = false; break; }
+                    } else { can_use_index_filter = false; break; }
+                }
+
+                if can_use_index_filter {
+                    if let Some(sec_map) = indexes.secondary.get(&plan.collection) {
+                        if let Some(sum_index) = sec_map.get(sum_field) {
+                            let mut total = 0.0;
+                            for (val_bytes, doc_ids) in sum_index.get_map() {
+                                if let Some(val) = decode_scalar_as_f64(val_bytes) {
+                                    let match_count = if let Some(ref allowed_ids) = filter_ids {
+                                        doc_ids.iter().filter(|id| allowed_ids.contains(*id)).count()
+                                    } else {
+                                        doc_ids.len()
+                                    };
+                                    total += val * (match_count as f64);
+                                }
+                            }
+                            let mut res = HashMap::new();
+                            res.insert(format!("sum_{}", sum_field), total);
+                            return Ok(res);
+                        }
+                    }
+                }
+            }
+        }
+
         let docs = {
             let storage = storage_arc.read().unwrap();
             self.execute_single_scan(
@@ -298,6 +347,12 @@ impl ParallelQueryExecutor {
         Ok(final_results)
     }
 
+
+    #[inline]
+    fn make_key(collection: &str, doc_id: &str) -> String {
+        format!("{}:{}", collection, doc_id)
+    }
+
     fn execute_single_scan(
         &self,
         storage: &StorageEngine,
@@ -311,103 +366,117 @@ impl ParallelQueryExecutor {
         match scan {
             ScanType::FullCollection => {
                 let keys = storage.scan_prefix_keys(&format!("{}:", collection));
-                Ok(keys.into_iter().map(|k| (k, Vec::new())).collect())
+                Ok(keys
+                    .into_iter()
+                    .take(max_ids)
+                    .map(|k| (k, Vec::new()))
+                    .collect())
             }
 
             ScanType::SecondaryIndex { field, value } => {
                 let mut out = Vec::new();
+
                 if let Some(sec_map) = indexes.secondary.get(collection) {
                     if let Some(index) = sec_map.get(field) {
-                        for doc_id in index.range_scan(value, value).iter().take(max_ids) {
-                            let key = format!("{}:{}", collection, doc_id);
-                            if let Some(raw) = storage.get(&key)? {
-                                out.push((key, raw));
-                            }
-                        }
+                        out.extend(
+                            index
+                                .range_scan(value, value)
+                                .iter()
+                                .take(max_ids)
+                                .map(|doc_id| (Self::make_key(collection, doc_id), Vec::new()))
+                        );
                     }
                 }
-                if out.is_empty() {
-                    let keys = storage.scan_prefix_keys(&format!("{}:", collection));
-                    return Ok(keys.into_iter().map(|k| (k, Vec::new())).collect());
+
+                Ok(out)
+            }
+
+            ScanType::CompositeIndex { fields, values, reverse } => {
+                let mut out = Vec::new();
+                if let Some(doc_ids) = indexes.exact_match_doc_ids(collection, fields, values) {
+                    // Apply the reverse logic if the planner requested it
+                    let iter: Box<dyn Iterator<Item = _>> = if *reverse {
+                        Box::new(doc_ids.iter().rev())
+                    } else {
+                        Box::new(doc_ids.iter())
+                    };
+
+                    for doc_id in iter.take(max_ids) {
+                        let key = format!("{}:{}", collection, doc_id);
+                        // Return empty bytes to let parallel workers handle decryption/decompression
+                        out.push((key, Vec::new()));
+                    }
                 }
                 Ok(out)
             }
 
-            ScanType::CompositeIndex { fields, values } => {
-                let mut out = Vec::new();
-                if let Some(doc_ids) = indexes.exact_match_doc_ids(collection, fields, values) {
-                    for doc_id in doc_ids.iter().take(max_ids) {
-                        let key = format!("{}:{}", collection, doc_id);
-                        if let Some(raw) = storage.get(&key)? {
-                            out.push((key, raw));
-                        }
-                    }
-                }
-                if out.is_empty() {
-                    let keys = storage.scan_prefix_keys(&format!("{}:", collection));
-                    return Ok(keys.into_iter().map(|k| (k, Vec::new())).collect());
-                }
-                Ok(out)
-            }
             ScanType::CompositeIndexRange { index_id, ranges } => {
                 let mut out = Vec::new();
+
                 if let Some(idx) = indexes.composite.get(*index_id) {
                     for (start, end) in ranges {
-                        let doc_ids: Vec<_> = idx
-                            .tree
-                            .range((start.clone(), end.clone()))
-                            .map(|(_, id)| id.clone())
-                            .collect();
-                        for doc_id in doc_ids {
-                            if out.len() >= max_ids { break; }
-                            let key = format!("{}:{}", collection, doc_id);
-                            if let Some(raw) = storage.get(&key)? {
-                                out.push((key, raw));
-                            }
+                        let remaining = max_ids.saturating_sub(out.len());
+
+                        if remaining == 0 {
+                            break;
                         }
-                        if out.len() >= max_ids { break; }
+
+                        out.extend(
+                            idx.tree
+                                .range((start.clone(), end.clone()))
+                                .take(remaining)
+                                .map(|(_, doc_id)| (Self::make_key(collection, doc_id), Vec::new()))
+                        );
                     }
                 }
+
                 Ok(out)
             }
 
             ScanType::CursorIndex { start, end } => {
                 let mut out = Vec::new();
-                for idx in indexes.indexes_for_collection(collection) {
-                    let doc_ids: Vec<_> = idx
-                        .tree
-                        .range((start.clone(), end.clone()))
-                        .map(|(_, id)| id.clone())
-                        .take(max_ids)
-                        .collect();
 
-                    for doc_id in doc_ids {
-                        let key = format!("{}:{}", collection, doc_id);
-                        if let Some(pointer) = storage.index.get(&key) {
-                            if let Ok(Some(bytes)) = storage.read_pointer_internal(pointer, true) {
-                                out.push((key, bytes));
-                            }
-                        }
+                for idx in indexes.indexes_for_collection(collection) {
+                    let remaining = max_ids.saturating_sub(out.len());
+
+                    if remaining == 0 {
+                        break;
                     }
-                    if !out.is_empty() { break; }
+
+                    out.extend(
+                        idx.tree
+                            .range((start.clone(), end.clone()))
+                            .take(remaining)
+                            .map(|(_, doc_id)| (Self::make_key(collection, doc_id), Vec::new()))
+                    );
+
+                    if !out.is_empty() {
+                        break;
+                    }
                 }
+
                 Ok(out)
             }
 
             ScanType::InvertedIndex { field, query } => {
                 let mut out = Vec::new();
+
                 if let Some(fts_map) = indexes.fts.get(collection) {
                     if let Some(index) = fts_map.get(field) {
                         if let Some(doc_ids) = index.search(query) {
-                            for doc_id in doc_ids.iter().take(max_ids) {
-                                let key = format!("{}:{}", collection, doc_id);
-                                out.push((key, Vec::new()));
-                            }
+                            out.extend(
+                                doc_ids
+                                    .iter()
+                                    .take(max_ids)
+                                    .map(|doc_id| (Self::make_key(collection, doc_id), Vec::new()))
+                            );
                         }
                     }
                 }
+
                 Ok(out)
             }
+
             ScanType::UnionIndex { .. } => Ok(vec![]),
         }
     }

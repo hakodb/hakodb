@@ -6,6 +6,11 @@ pub struct SecondaryIndex {
 }
 
 impl SecondaryIndex {
+
+    pub fn get_map(&self) -> &BTreeMap<Vec<u8>, BTreeSet<String>> {
+        &self.map
+    }
+
     pub fn insert(&mut self, key: Vec<u8>, doc_id: String) {
         self.map.entry(key).or_default().insert(doc_id);
     }

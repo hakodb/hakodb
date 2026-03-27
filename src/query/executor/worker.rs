@@ -6,28 +6,28 @@ use crate::query::filter::Operator;
 /// Standard worker: Decodes full or projected documents.
 pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
     let mut out = Vec::new();
-    let projection = &task.plan.projection;
-    
+    let skip_filter_step = task.plan.filters_satisfied_by_index;
+
     for (id, mut bytes) in task.docs {
-        if bytes.is_empty() {
-            if let Some(storage_lock) = &task.storage {
-                if let Ok(storage) = storage_lock.read() {
-                    if let Ok(Some(data)) = storage.get(&id) {
-                        bytes = data;
-                    }
+        if !skip_filter_step {
+            // Only load and check filters if the index didn't already do it
+            if bytes.is_empty() {
+                if let Ok(storage) = task.storage.as_ref().unwrap().read() {
+                    if let Ok(Some(data)) = storage.get(&id) { bytes = data; }
                 }
             }
+            if bytes.is_empty() || !matches_filters_view(&bytes, &task.plan) { continue; }
         }
-        if bytes.is_empty() { continue; }
 
-        // PERFORMANCE: Filter first using raw bytes
-        if matches_filters_view(&bytes, &task.plan) {
-            let decoded = if projection.is_empty() {
-                FireLiteDoc::decode(&bytes)
-            } else {
-                FireLiteDoc::decode_projected(&bytes, projection)
-            };
-            if let Some(doc) = decoded {
+        // Load the final document only for those that pass (or were pre-passed)
+        if bytes.is_empty() {
+            if let Ok(storage) = task.storage.as_ref().unwrap().read() {
+                if let Ok(Some(data)) = storage.get(&id) { bytes = data; }
+            }
+        }
+
+        if !bytes.is_empty() {
+            if let Some(doc) = FireLiteDoc::decode(&bytes) {
                 out.push((id, doc));
             }
         }

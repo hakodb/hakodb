@@ -19,7 +19,7 @@ use crate::index::storage::index_storage::IndexStorage;
 use crate::query::executor::executor::ParallelQueryExecutor;
 use crate::query::planner::QueryPlanner;
 use crate::query::query::Query;
-use crate::storage::engine::{BlobWork, StorageEngine, StorageMutation};
+use crate::storage::engine::{BlobWork, StorageEngine, StorageMutation, Pointer};
 
 use crate::util::lock::SafeLock;
 
@@ -364,31 +364,87 @@ impl FireLite {
         let shards_ptr = Arc::clone(&db.shards);
         let encryption_key = config.encryption_key.clone();
 
+        // for _ in 0..4 {
+        //     let rx = Arc::clone(&shared_blob_rx);
+        //     let s_ptr = Arc::clone(&shards_ptr);
+        //     let enc_key = encryption_key.clone();
+
+        //     thread::spawn(move || {
+        //         let enc_ctx = enc_key.map(|k| crate::storage::crypto::EncryptionContext::from_secret(&k));
+        //         loop {
+        //             let work = rx.lock().unwrap().recv().unwrap();
+        //             let BlobWork::Put { collection, key, data } = work;
+                    
+        //             // 1. Encrypt OUTSIDE the lock
+        //             let payload = if let Some(ref enc) = enc_ctx { ... };
+
+        //             // 2. Perform Disk I/O using a localized lock on the FILE only
+        //             let (offset, len) = {
+        //                 let shards = s_ptr.read().unwrap();
+        //                 let shard_arc = shards.get(&collection).unwrap();
+        //                 let shard_guard = shard_arc.read().unwrap(); // Use READ lock to get the file
+        //                 let mut file = shard_guard.blob_file.lock().unwrap();
+                        
+        //                 let pos = file.seek(SeekFrom::End(0)).unwrap();
+        //                 file.write_all(&payload).unwrap();
+        //                 (pos, payload.len() as u32)
+        //             };
+
+        //             // 3. Update the index only (Very fast lock)
+        //             let shards = s_ptr.read().unwrap();
+        //             if let Some(shard_arc) = shards.get(&collection) {
+        //                 let mut shard = shard_arc.write().unwrap(); 
+        //                 shard.index.insert(key, Pointer::Blob { offset, len });
+        //             }
+        //         }
+        //     });
+        // }
+        // In FireLite::open inside src/engine/engine.rs
+
         for _ in 0..4 {
             let rx = Arc::clone(&shared_blob_rx);
             let s_ptr = Arc::clone(&shards_ptr);
             let enc_key = encryption_key.clone();
 
             thread::spawn(move || {
+                use std::io::{Seek, SeekFrom, Write};
                 let enc_ctx = enc_key.map(|k| crate::storage::crypto::EncryptionContext::from_secret(&k));
+                
                 loop {
                     let work = {
-                        let lock = match rx.lock() { Ok(guard) => guard, Err(_) => break };
+                        let lock = match rx.lock() { Ok(g) => g, Err(_) => break };
                         match lock.recv() { Ok(w) => w, Err(_) => break }
                     };
 
-                    let crate::storage::engine::BlobWork::Put { collection, key, data } = work;
-                    let payload = if let Some(ref enc) = enc_ctx { enc.encrypt(&data).unwrap_or_else(|_| data.to_vec()) } else { data.to_vec() };
+                    let BlobWork::Put { collection, key, data } = work;
+                    let payload = if let Some(ref enc) = enc_ctx {
+                        enc.encrypt(&data).unwrap_or_else(|_| data.to_vec())
+                    } else {
+                        data.to_vec()
+                    };
 
-                    let shards = s_ptr.read().unwrap();
-                    if let Some(shard_lock) = shards.get(&collection) {
-                        if let Ok(mut shard) = shard_lock.write() {
-                            if let Some(file) = shard.blob_file.as_mut() {
-                                use std::io::{Seek, SeekFrom, Write};
-                                let offset = file.seek(SeekFrom::End(0)).unwrap();
-                                let len = payload.len() as u32;
-                                file.write_all(&payload).unwrap();
-                                shard.index.insert(key, crate::storage::engine::Pointer::Blob { offset, len });
+                    // FIX: Correctly extract the Arc<Mutex<File>> from the Shard
+                    let file_mutex_opt = {
+                        let shards = s_ptr.read().unwrap();
+                        shards.get(&collection).and_then(|shard_arc| {
+                            let shard_guard = shard_arc.read().ok()?;
+                            shard_guard.blob_file.clone() // This is Option<Arc<Mutex<File>>>
+                        })
+                    };
+
+                    if let Some(file_mutex) = file_mutex_opt {
+                        let (offset, len) = {
+                            let mut file = file_mutex.lock().unwrap();
+                            let pos = file.seek(SeekFrom::End(0)).unwrap();
+                            file.write_all(&payload).unwrap();
+                            (pos, payload.len() as u32)
+                        };
+
+                        // Update index
+                        let shards = s_ptr.read().unwrap();
+                        if let Some(shard_arc) = shards.get(&collection) {
+                            if let Ok(mut shard) = shard_arc.write() {
+                                shard.index.insert(key, Pointer::Blob { offset, len });
                             }
                         }
                     }
@@ -619,8 +675,23 @@ impl FireLite {
             }
         }
 
+        // for work in all_blob_work {
+        //     let _ = self.blob_tx.send(work);
+        // }
+
         for work in all_blob_work {
-            let _ = self.blob_tx.send(work);
+            if let Err(e) = self.blob_tx.try_send(work) {
+                // Extract the work from the error enum
+                let work_to_retry = match e {
+                    std::sync::mpsc::TrySendError::Full(w) => w,
+                    std::sync::mpsc::TrySendError::Disconnected(w) => w,
+                };
+
+                let tx_clone = self.blob_tx.clone();
+                thread::spawn(move || {
+                    let _ = tx_clone.send(work_to_retry);
+                });
+            }
         }
 
         // 2. METADATA & ASYNC TASKS
