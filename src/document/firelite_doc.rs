@@ -24,16 +24,19 @@ impl FireLiteDoc {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![MAGIC, VERSION];
-        out.extend((self.fields.len() as u16).to_le_bytes());
-        for (k, v) in &self.fields {
-            out.push(k.len() as u8);
-            out.extend_from_slice(k.as_bytes());
-            let (tag, bytes) = encode_value(v);
-            out.push(tag);
-            out.extend((bytes.len() as u32).to_le_bytes());
-            out.extend_from_slice(&bytes);
-        }
+        // let mut out = vec![MAGIC, VERSION];
+        // out.extend((self.fields.len() as u16).to_le_bytes());
+        // for (k, v) in &self.fields {
+        //     out.push(k.len() as u8);
+        //     out.extend_from_slice(k.as_bytes());
+        //     let (tag, bytes) = encode_value(v);
+        //     out.push(tag);
+        //     out.extend((bytes.len() as u32).to_le_bytes());
+        //     out.extend_from_slice(&bytes);
+        // }
+        // out
+        let mut out = Vec::with_capacity(128); // Pre-allocate sensible default
+        self.encode_into(&mut out);
         out
     }
 
@@ -77,11 +80,91 @@ impl FireLiteDoc {
         Some(doc)
     }
 
+    /// Encodes the document into the provided buffer without new allocations.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        out.push(MAGIC);
+        out.push(VERSION);
+        out.extend_from_slice(&(self.fields.len() as u16).to_le_bytes());
+        
+        for (key, value) in &self.fields {
+            // Encode Key
+            out.push(key.len() as u8);
+            out.extend_from_slice(key.as_bytes());
+            
+            // Encode Value
+            Self::encode_value_to(value, out);
+        }
+    }
+
+    fn encode_value_to(v: &Value, out: &mut Vec<u8>) {
+        match v {
+            Value::Null | Value::ServerTimestamp => out.push(1),
+            Value::Bool(b) => {
+                out.push(2);
+                out.push(*b as u8);
+            }
+            Value::Int(v) => {
+                out.push(3);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Value::Float(v) => {
+                out.push(4);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Value::String(v) => {
+                out.push(5);
+                // The decoder expects u32 length for the value body
+                out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                out.extend_from_slice(v.as_bytes());
+            }
+            Value::Binary(v) => {
+                out.push(6);
+                out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                out.extend_from_slice(v);
+            }
+            Value::Timestamp(v) => {
+                out.push(7);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Value::Map(fields) => {
+                out.push(8);
+                // Decoder for Map expects u16 field count
+                out.extend_from_slice(&(fields.len() as u16).to_le_bytes());
+                for (k, v) in fields {
+                    out.push(k.len() as u8);
+                    out.extend_from_slice(k.as_bytes());
+                    Self::encode_value_to(v, out); // RECURSIVE
+                }
+            }
+            Value::Array(items) => {
+                out.push(9);
+                // Decoder for Array expects u32 item count
+                out.extend_from_slice(&(items.len() as u32).to_le_bytes());
+                for item in items {
+                    Self::encode_value_to(item, out); // RECURSIVE
+                }
+            }
+            Value::Reference { collection, doc_id } => {
+                out.push(10);
+                out.push(collection.len() as u8);
+                out.extend_from_slice(collection.as_bytes());
+                out.push(doc_id.len() as u8);
+                out.extend_from_slice(doc_id.as_bytes());
+            }
+        }
+    }
+
     pub fn apply_patch_binary(old_bytes: &[u8], updates: &[(String, Value)]) -> Option<Vec<u8>> {
+        // let mut doc = Self::decode(old_bytes)?;
+        // for (k, v) in updates {
+        //     doc.insert(k.clone(), v.clone());
+        // }
+        // Some(doc.encode())
         let mut doc = Self::decode(old_bytes)?;
         for (k, v) in updates {
             doc.insert(k.clone(), v.clone());
         }
+        // This now uses the unified encode() logic
         Some(doc.encode())
     }
 }
@@ -159,49 +242,49 @@ impl<'a> Iterator for FireLiteDocIter<'a> {
     }
 }
 
-fn encode_value(v: &Value) -> (u8, Vec<u8>) {
-    match v {
-        Value::Null | Value::ServerTimestamp => (1, vec![]),
-        Value::Bool(v) => (2, vec![*v as u8]),
-        Value::Int(v) => (3, v.to_le_bytes().to_vec()),
-        Value::Float(v) => (4, v.to_le_bytes().to_vec()),
-        Value::String(v) => (5, v.as_bytes().to_vec()),
-        Value::Binary(v) => (6, v.clone()),
-        Value::Timestamp(v) => (7, v.to_le_bytes().to_vec()),
-        Value::Map(fields) => {
-            let mut out = vec![];
-            out.extend((fields.len() as u16).to_le_bytes());
-            for (k, v) in fields {
-                out.push(k.len() as u8);
-                out.extend_from_slice(k.as_bytes());
-                let (tag, bytes) = encode_value(v);
-                out.push(tag);
-                out.extend((bytes.len() as u32).to_le_bytes());
-                out.extend_from_slice(&bytes);
-            }
-            (8, out)
-        }
-        Value::Array(items) => {
-            let mut out = vec![];
-            out.extend((items.len() as u32).to_le_bytes());
-            for item in items {
-                let (tag, bytes) = encode_value(item);
-                out.push(tag);
-                out.extend((bytes.len() as u32).to_le_bytes());
-                out.extend_from_slice(&bytes);
-            }
-            (9, out)
-        }
-        Value::Reference { collection, doc_id } => {
-            let mut out = vec![];
-            out.push(collection.len() as u8);
-            out.extend_from_slice(collection.as_bytes());
-            out.push(doc_id.len() as u8);
-            out.extend_from_slice(doc_id.as_bytes());
-            (10, out)
-        }
-    }
-}
+// fn encode_value(v: &Value) -> (u8, Vec<u8>) {
+//     match v {
+//         Value::Null | Value::ServerTimestamp => (1, vec![]),
+//         Value::Bool(v) => (2, vec![*v as u8]),
+//         Value::Int(v) => (3, v.to_le_bytes().to_vec()),
+//         Value::Float(v) => (4, v.to_le_bytes().to_vec()),
+//         Value::String(v) => (5, v.as_bytes().to_vec()),
+//         Value::Binary(v) => (6, v.clone()),
+//         Value::Timestamp(v) => (7, v.to_le_bytes().to_vec()),
+//         Value::Map(fields) => {
+//             let mut out = vec![];
+//             out.extend((fields.len() as u16).to_le_bytes());
+//             for (k, v) in fields {
+//                 out.push(k.len() as u8);
+//                 out.extend_from_slice(k.as_bytes());
+//                 let (tag, bytes) = encode_value(v);
+//                 out.push(tag);
+//                 out.extend((bytes.len() as u32).to_le_bytes());
+//                 out.extend_from_slice(&bytes);
+//             }
+//             (8, out)
+//         }
+//         Value::Array(items) => {
+//             let mut out = vec![];
+//             out.extend((items.len() as u32).to_le_bytes());
+//             for item in items {
+//                 let (tag, bytes) = encode_value(item);
+//                 out.push(tag);
+//                 out.extend((bytes.len() as u32).to_le_bytes());
+//                 out.extend_from_slice(&bytes);
+//             }
+//             (9, out)
+//         }
+//         Value::Reference { collection, doc_id } => {
+//             let mut out = vec![];
+//             out.push(collection.len() as u8);
+//             out.extend_from_slice(collection.as_bytes());
+//             out.push(doc_id.len() as u8);
+//             out.extend_from_slice(doc_id.as_bytes());
+//             (10, out)
+//         }
+//     }
+// }
 
 pub(crate) fn decode_value(tag: u8, bytes: &[u8]) -> Option<Value> {
     match tag {

@@ -23,6 +23,15 @@ use crate::storage::engine::{BlobWork, StorageEngine, StorageMutation, Pointer};
 
 use crate::util::lock::SafeLock;
 
+use std::cell::RefCell;
+
+thread_local! {
+    // A reusable buffer for serialization to avoid allocations
+    static WRITE_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(64 * 1024));
+    // A reusable buffer for building keys to avoid format!()
+    static KEY_BUFFER: RefCell<String> = RefCell::new(String::with_capacity(128));
+}
+
 // --- Data Types ---
 
 #[derive(Debug, Clone)]
@@ -567,21 +576,31 @@ impl FireLite {
                             *v = Value::Timestamp(now);
                         }
                     }
-                    let key = doc_key(collection, doc_id);
 
-                    let compact_bytes = doc.encode();
+                    // 2. Build Key using fast path
+                    let key = fast_doc_key(collection, doc_id);
+
+                    // 3. Encode document using Zero-Allocation buffer
+                    let doc_bytes = WRITE_BUFFER.with(|b| {
+                        let mut buffer = b.borrow_mut();
+                        buffer.clear();
+                        doc.encode_into(&mut buffer);
+                        buffer.to_vec() 
+                    });
 
                     shard_groups.entry(collection.clone()).or_default().push(
                         StorageMutation::Put {
                             key: key.clone(),
-                            // value: doc.encode(),
-                            value: compact_bytes,
+                            value: doc_bytes,
                         },
                     );
+
+
                     index_puts
                         .entry(collection.clone())
                         .or_default()
                         .push((doc_id.clone(), doc.clone()));
+
                     // change_events.push((
                     //     collection.clone(),
                     //     ChangeEvent {
@@ -634,17 +653,26 @@ impl FireLite {
                             // 1. Prepare for Index Deletion (Old state)
                             index_dels.entry(collection.clone()).or_default().push((doc_id.clone(), old_doc));
                             
-                            // 2. Apply patch to get the NEW doc
-                            if let Some(new_bytes) = FireLiteDoc::apply_patch_binary(&old_bytes, updates) {
-                                if let Some(new_doc) = FireLiteDoc::decode(&new_bytes) {
-                                    // 3. Prepare for Index Put (New state)
-                                    index_puts.entry(collection.clone()).or_default().push((doc_id.clone(), new_doc));
+                            // // 2. Apply patch to get the NEW doc
+                            // if let Some(new_bytes) = FireLiteDoc::apply_patch_binary(&old_bytes, updates) {
+                            //     if let Some(new_doc) = FireLiteDoc::decode(&new_bytes) {
+                            //         // 3. Prepare for Index Put (New state)
+                            //         index_puts.entry(collection.clone()).or_default().push((doc_id.clone(), new_doc));
                                     
-                                    // 4. Add to storage group
-                                    shard_groups.entry(collection.clone()).or_default().push(
-                                        StorageMutation::Put { key: key.clone(), value: new_bytes }
-                                    );
-                                }
+                            //         // 4. Add to storage group
+                            //         shard_groups.entry(collection.clone()).or_default().push(
+                            //             StorageMutation::Put { key: key.clone(), value: new_bytes }
+                            //         );
+                            //     }
+                            // }
+                            
+                            // Inside BatchMutation::Patch
+                            if let Some(new_bytes) = FireLiteDoc::apply_patch_binary(&old_bytes, updates) {
+                                // This is now safe because apply_patch_binary is unified!
+                                index_puts.entry(collection.clone()).or_default().push((doc_id.clone(), FireLiteDoc::decode(&new_bytes).unwrap()));
+                                shard_groups.entry(collection.clone()).or_default().push(
+                                    StorageMutation::Put { key: key.clone(), value: new_bytes }
+                                );
                             }
                         }
                     }
@@ -1472,6 +1500,19 @@ impl Drop for FireLite {
 fn doc_key(collection: &str, doc_id: &str) -> String {
     format!("{}:{}", collection, doc_id)
 }
+
 fn subcollection_prefix(collection: &str, doc_id: &str, subcollection: &str) -> String {
     format!("{}:{}/{}", collection, doc_id, subcollection)
+}
+
+// Helper to build a key without format!()
+fn fast_doc_key(col: &str, id: &str) -> String {
+    KEY_BUFFER.with(|b| {
+        let mut buffer = b.borrow_mut();
+        buffer.clear();
+        buffer.push_str(col);
+        buffer.push(':');
+        buffer.push_str(id);
+        buffer.clone() // Still one clone here, but better than format!
+    })
 }

@@ -1930,6 +1930,9 @@ pub extern "C" fn fl_query_start_after(query: *mut FL_Query, anchor_doc: *const 
 #[no_mangle]
 pub extern "C" fn fl_query_start_at(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> i32 {
     safety_shield!(-1, {
+        if query.is_null() || anchor_doc.is_null() {
+            return -1;
+        }
         let q = unsafe { &mut *query };
         let doc = unsafe { &*anchor_doc };
         if let Some(vals) = get_anchor_values(&q.query, &doc.doc) {
@@ -1945,6 +1948,9 @@ pub extern "C" fn fl_query_start_at(query: *mut FL_Query, anchor_doc: *const FL_
 #[no_mangle]
 pub extern "C" fn fl_query_end_at(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> i32 {
     safety_shield!(-1, {
+        if query.is_null() || anchor_doc.is_null() {
+            return -1;
+        }
         let q = unsafe { &mut *query };
         let doc = unsafe { &*anchor_doc };
         if let Some(vals) = get_anchor_values(&q.query, &doc.doc) {
@@ -1960,6 +1966,9 @@ pub extern "C" fn fl_query_end_at(query: *mut FL_Query, anchor_doc: *const FL_Do
 #[no_mangle]
 pub extern "C" fn fl_query_end_before(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> i32 {
     safety_shield!(-1, {
+        if query.is_null() || anchor_doc.is_null() {
+            return -1;
+        }
         let q = unsafe { &mut *query };
         let doc = unsafe { &*anchor_doc };
         if let Some(vals) = get_anchor_values(&q.query, &doc.doc) {

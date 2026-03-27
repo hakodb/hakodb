@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write, BufReader};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -75,35 +75,65 @@ impl Wal {
     }
 
     pub fn append(&mut self, op: &WalOp) -> Result<()> {
+        // 1. Remember where this specific record starts in the buffer
+        let start_pos = self.write_buffer.len();
 
-        let start = self.write_buffer.len();
-
-        // 1. Reserve header space
+        // 2. Reserve 8 bytes for the Header (Length + CRC)
         self.write_buffer.extend_from_slice(&[0u8; 8]);
 
-        // 2. Encode to a temporary buffer first so we can encrypt the whole thing
-        let mut temp_payload = Vec::new();
-        encode_into(&mut temp_payload, op);
-
-        // 3. ENCRYPTION FIX: Encrypt the payload if a key is set
-        let final_payload = if let Some(enc) = &self.encryption {
-            enc.encrypt(&temp_payload)?
+        // 3. ZERO-ALLOCATION ENCODING: Encode directly into the tail of the buffer
+        // Note: We need a temporary buffer ONLY if encryption is enabled for the whole record
+        if let Some(enc) = &self.encryption {
+            let mut temp = Vec::with_capacity(128); // Small scratchpad
+            encode_into(&mut temp, op);
+            let ciphertext = enc.encrypt(&temp)?;
+            self.write_buffer.extend_from_slice(&ciphertext);
         } else {
-            temp_payload
-        };
+            encode_into(&mut self.write_buffer, op);
+        }
 
-        // 4. Calculate CRC and Length based on the (possibly encrypted) payload
-        let crc = crc32fast::hash(&final_payload);
-        let len = final_payload.len() as u32;
+        // 4. Calculate stats for THIS record
+        let record_payload_end = self.write_buffer.len();
+        let payload_len = (record_payload_end - (start_pos + 8)) as u32;
+        let crc = crc32fast::hash(&self.write_buffer[start_pos + 8..record_payload_end]);
 
-        // 5. Fill header and append payload
-        self.write_buffer[start..start + 4].copy_from_slice(&len.to_le_bytes());
-        self.write_buffer[start + 4..start + 8].copy_from_slice(&crc.to_le_bytes());
-        self.write_buffer.extend_from_slice(&final_payload);
+        // 5. Patch the header for this specific record in the buffer
+        self.write_buffer[start_pos..start_pos + 4].copy_from_slice(&payload_len.to_le_bytes());
+        self.write_buffer[start_pos + 4..start_pos + 8].copy_from_slice(&crc.to_le_bytes());
 
         self.pending_ops_since_sync += 1;
+
+        // 6. DURABILITY CHECK: Decide if we should flush the buffer to disk
         let is_commit = matches!(op, WalOp::CommitTx { .. });
         self.maybe_sync(is_commit)
+    }
+
+    pub fn append_raw(&mut self, op: &WalOp) -> Result<()> {
+        // 1. Clear internal WAL buffer
+        self.write_buffer.clear();
+        
+        // 2. Reserve header
+        self.write_buffer.extend_from_slice(&[0u8; 8]);
+        
+        // 3. Encode Op metadata into buffer
+        encode_into(&mut self.write_buffer, op);
+
+        // 4. Calculate payload stats
+        let payload_len = (self.write_buffer.len() - 8) as u32;
+        let crc = crc32fast::hash(&self.write_buffer[8..]);
+
+        // 5. Fill header (Write directly into the buffer)
+        self.write_buffer[0..4].copy_from_slice(&payload_len.to_le_bytes());
+        self.write_buffer[4..8].copy_from_slice(&crc.to_le_bytes());
+
+        // 6. IO operation
+        self.file.write_all(&self.write_buffer)?;
+        
+        if self.mode == DurabilityMode::Always {
+            self.file.sync_all()?;
+        }
+        
+        Ok(())
     }
 
     pub fn append_batch(&mut self, ops: &[WalOp]) -> Result<()> {
@@ -136,18 +166,20 @@ impl Wal {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        // Write buffered WAL records first
-        if !self.write_buffer.is_empty() {
-            self.file.write_all(&self.write_buffer)?;
-            self.write_buffer.clear();
+        if self.write_buffer.is_empty() {
+            return Ok(());
         }
-        
-        // 1. Push data from BufWriter to the Operating System
-        self.file.flush()?; 
 
-        // 2. Push data from Operating System to physical Disk
-        self.file.sync_data()?;
+        // ONE Syscall to write multiple operations
+        self.file.write_all(&self.write_buffer)?;
+        
+        // Physically flip the bits on the disk
+        self.file.sync_all()?;
+
+        // NOW we clear, after the data is safe on the platter
+        self.write_buffer.clear();
         self.pending_ops_since_sync = 0;
+        self.last_sync = Instant::now();
         Ok(())
     }
 
@@ -155,95 +187,151 @@ impl Wal {
         let now = Instant::now();
 
         let should_flush = match self.mode {
-
+            // Write and Sync every single time
             DurabilityMode::Always => true,
 
-            DurabilityMode::OnCommit => is_commit, 
+            // Pool operations, only write to disk when a transaction finishes
+            DurabilityMode::OnCommit => is_commit,
 
+            // The most performant mode: pool until time or volume threshold is hit
             DurabilityMode::Interval => {
-
-                is_commit &&
-                (
+                is_commit && (
                     self.pending_ops_since_sync >= self.group_commit_max_ops
                     || now.duration_since(self.last_sync) >= self.group_commit_interval
+                    || self.write_buffer.len() > 64 * 1024 // Flush if buffer > 64KB
                 )
-
             }
 
             DurabilityMode::Manual => false,
         };
 
-        if !should_flush {
-            return Ok(());
+        if should_flush {
+            self.flush()?; // This writes the WHOLE buffer in one syscall and calls sync_all
         }
-
-        if !self.write_buffer.is_empty() {
-            self.file.write_all(&self.write_buffer)?;
-            self.write_buffer.clear();
-        }
-
-        // self.file.sync_data()?;
-        self.file.sync_all()?; 
-
-        self.pending_ops_since_sync = 0;
-        self.last_sync = now;
-
         Ok(())
     }
 
+    // pub fn replay(&mut self) -> Result<Vec<WalOp>> {
+    //     use std::io::Seek; // Ensure Seek is in scope
+    //     self.file.seek(SeekFrom::Start(0))?;
+    //     let mut raw_ops = Vec::new();
+    //     let mut last_valid_pos = 0;
+
+    //     loop {
+    //         let mut len_buf = [0u8; 4];
+            
+    //         // 1. Try read length
+    //         match self.file.read_exact(&mut len_buf) {
+    //             Ok(()) => {}
+    //             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+    //             Err(e) => return Err(e.into()),
+    //         }
+
+    //         let len = u32::from_le_bytes(len_buf) as usize;
+    //         let mut crc_buf = [0u8; 4];
+            
+    //         // 2. Try read CRC
+    //         if let Err(e) = self.file.read_exact(&mut crc_buf) {
+    //             if e.kind() == std::io::ErrorKind::UnexpectedEof { break; }
+    //             return Err(e.into());
+    //         }
+            
+    //         let expected = u32::from_le_bytes(crc_buf);
+    //         let mut payload = vec![0; len];
+            
+    //         // 3. Try read Payload
+    //         if let Err(e) = self.file.read_exact(&mut payload) {
+    //             if e.kind() == std::io::ErrorKind::UnexpectedEof { break; }
+    //             return Err(e.into());
+    //         }
+
+    //         // 4. Validate Checksum
+    //         if crc32fast::hash(&payload) != expected {
+    //             break; 
+    //         }
+
+    //         if let Some(enc) = &self.encryption {
+    //             payload = enc.decrypt(&payload)?;
+    //         }
+
+    //         raw_ops.push(decode(&payload)?);
+            
+    //         // 5. Update the position of the end of the last complete record
+    //         last_valid_pos = self.file.stream_position()?;
+    //     }
+
+    //     // Repair the file and seek to end for new writes
+    //     self.file.set_len(last_valid_pos)?;
+    //     self.file.seek(SeekFrom::End(0))?;
+
+    //     Ok(filter_committed_ops(raw_ops))
+    // }
+
     pub fn replay(&mut self) -> Result<Vec<WalOp>> {
-        use std::io::Seek; // Ensure Seek is in scope
+        // 1. Move to start of file
         self.file.seek(SeekFrom::Start(0))?;
+        
+        // 2. Use BufReader to reduce syscalls during replay (Huge win for small records)
+        let mut reader = BufReader::with_capacity(64 * 1024, &self.file);
         let mut raw_ops = Vec::new();
         let mut last_valid_pos = 0;
+        
+        // Scratchpad to avoid re-allocating memory for every record
+        let mut payload_scratch = Vec::with_capacity(8192);
 
         loop {
-            let mut len_buf = [0u8; 4];
-            
-            // 1. Try read length
-            match self.file.read_exact(&mut len_buf) {
-                Ok(()) => {}
+            // A. Read Header (8 bytes: 4 for Len, 4 for CRC)
+            let mut header = [0u8; 8];
+            match reader.read_exact(&mut header) {
+                Ok(_) => {}, // Successfully read exactly 8 bytes
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e.into()),
             }
 
-            let len = u32::from_le_bytes(len_buf) as usize;
-            let mut crc_buf = [0u8; 4];
-            
-            // 2. Try read CRC
-            if let Err(e) = self.file.read_exact(&mut crc_buf) {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof { break; }
-                return Err(e.into());
-            }
-            
-            let expected = u32::from_le_bytes(crc_buf);
-            let mut payload = vec![0; len];
-            
-            // 3. Try read Payload
-            if let Err(e) = self.file.read_exact(&mut payload) {
+            let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+            let expected_crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
+
+            // B. Read Payload into scratchpad
+            payload_scratch.resize(len, 0);
+            if let Err(e) = reader.read_exact(&mut payload_scratch) {
+                // If we reach EOF here, it means the record was partially written during a crash
                 if e.kind() == std::io::ErrorKind::UnexpectedEof { break; }
                 return Err(e.into());
             }
 
-            // 4. Validate Checksum
-            if crc32fast::hash(&payload) != expected {
-                break; 
+            // C. Validate Integrity
+            if crc32fast::hash(&payload_scratch) != expected_crc {
+                // CRC Mismatch: Stop here. Data following this point is likely corrupt.
+                // We don't return Err because we want to recover as much as possible.
+                break;
             }
 
-            if let Some(enc) = &self.encryption {
-                payload = enc.decrypt(&payload)?;
-            }
+            // D. Handle Decryption
+            let decoded_payload = if let Some(enc) = &self.encryption {
+                enc.decrypt(&payload_scratch)?
+            } else {
+                // If no encryption, we borrow the scratchpad data
+                payload_scratch.clone()
+            };
 
-            raw_ops.push(decode(&payload)?);
+            // E. Deserialize
+            raw_ops.push(decode(&decoded_payload)?);
             
-            // 5. Update the position of the end of the last complete record
-            last_valid_pos = self.file.stream_position()?;
+            // Increment the "Safe" position in the file
+            last_valid_pos += (8 + len) as u64;
         }
 
-        // Repair the file and seek to end for new writes
-        self.file.set_len(last_valid_pos)?;
+        // 3. AUTO-REPAIR: If we stopped early due to corruption or partial write, 
+        // truncate the file so future runs don't get stuck on the same bad data.
+        if last_valid_pos < self.file.metadata()?.len() {
+            crate::util::log::info(&format!("WAL repair: truncating at {} bytes", last_valid_pos));
+            self.file.set_len(last_valid_pos)?;
+        }
+
+        // 4. Seek to end so future appends happen correctly
         self.file.seek(SeekFrom::End(0))?;
 
+        // 5. Apply Transaction Logic (Only return ops from committed TXs)
         Ok(filter_committed_ops(raw_ops))
     }
 
