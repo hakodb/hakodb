@@ -7,7 +7,6 @@ pub fn shard_tasks(
     workers: usize,
     plan: super::super::plan::QueryPlan,
     storage: Option<Arc<RwLock<StorageEngine>>>, // NEW: Accept storage handle
-    catalog: Arc<crate::util::catalog::Catalog>,
 ) -> Vec<QueryTask> {
     let worker_count = workers.max(1);
     let chunk_size = (docs.len() / worker_count).max(1);
@@ -16,7 +15,6 @@ pub fn shard_tasks(
             docs: chunk.to_vec(),
             plan: plan.clone(),
             storage: storage.clone(),
-            catalog: catalog.clone(),
         })
         .collect()
 }
