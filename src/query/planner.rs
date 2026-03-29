@@ -7,6 +7,7 @@ use crate::index::composite::range_builder::{
     build_prefix_key, build_prefix_open_end, build_value_key, key_with_upper_sentinel,
 };
 use crate::index::manager::IndexManager;
+use crate::index::composite::definition::SortDirection;
 use std::ops::Bound; // Required for range definitions
 
 pub struct QueryPlanner;
@@ -21,7 +22,7 @@ impl QueryPlanner {
         let work_per_thread = collection_rows / worker_count.max(1);
         let use_index_heuristic = work_per_thread > 500;
 
-        // 1. PRIORITY 1: Full-Text Search (Match operator)
+        // 1. PRIORITY 1: Full-Text Search
         for filter in &query.filters {
             if matches!(filter.op, Operator::Match) {
                 if let Value::String(q_text) = &filter.value {
@@ -37,10 +38,18 @@ impl QueryPlanner {
                                 query: q_text.clone(),
                             },
                             query.limit,
-                        ); // Limit safe here if no order_by
+                            false,
+                            false,
+                        );
                     }
                 }
             }
+        }
+
+        // 3. PRIORITY 3: Composite Index (Filters + OrderBy)
+        if let Some((eq_scan, satisfied, filters_done)) = Self::try_plan_composite_eq(query, indexes) {
+            let safe_limit = if satisfied { query.limit } else { None };
+            return Self::make_plan(query, eq_scan, safe_limit, satisfied, filters_done);
         }
 
         // 2. PRIORITY 2: Range/Cursor Detection
@@ -55,92 +64,55 @@ impl QueryPlanner {
                         && idx.definition.fields[0].field == order.field
                     {
                         let start = match (&query.start_at, &query.start_after) {
-                            (Some(v), _) => {
-                                Bound::Included(build_cursor_range(&idx.definition, v, false))
-                            }
-                            (_, Some(v)) => {
-                                Bound::Excluded(build_cursor_range(&idx.definition, v, false))
-                            }
+                            (Some(v), _) => Bound::Included(build_cursor_range(&idx.definition, v, false)),
+                            (_, Some(v)) => Bound::Excluded(build_cursor_range(&idx.definition, v, false)),
                             _ => Bound::Unbounded,
                         };
                         let end = match (&query.end_at, &query.end_before) {
-                            (Some(v), _) => {
-                                Bound::Included(build_cursor_range(&idx.definition, v, false))
-                            }
-                            (_, Some(v)) => {
-                                Bound::Excluded(build_cursor_range(&idx.definition, v, false))
-                            }
+                            (Some(v), _) => Bound::Included(build_cursor_range(&idx.definition, v, false)),
+                            (_, Some(v)) => Bound::Excluded(build_cursor_range(&idx.definition, v, false)),
                             _ => Bound::Unbounded,
                         };
+                        // Cursors are inherently sorted by the index
                         return Self::make_plan(
                             query,
                             ScanType::CursorIndex { start, end },
                             query.limit,
+                            true,
+                            false
                         );
                     }
                 }
             }
         }
 
-        // 3. PRIORITY 3: Composite Index (Filters + OrderBy)
-        // Equality-prefix composite lookups are always worth using, regardless of collection size.
-        if let Some(eq_scan) = Self::try_plan_composite_eq(query, indexes) {
-            let safe_limit = if query.order_by.is_some() {
-                None
-            } else {
-                query.limit
-            };
-            return Self::make_plan(query, eq_scan, safe_limit);
-        }
+
 
         if use_index_heuristic {
             if let Some(range_scan) = Self::try_plan_composite_range(query, indexes) {
-                let safe_limit = if query.order_by.is_some() {
-                    None
-                } else {
-                    query.limit
-                };
-                return Self::make_plan(query, range_scan, safe_limit);
+                return Self::make_plan(query, range_scan, None, false, false);
             }
         }
 
         // 4. Try Union/OR/IN Logic
-        if !query.or_groups.is_empty() || query.filters.iter().any(|f| matches!(f.op, Operator::In))
-        {
+        if !query.or_groups.is_empty() || query.filters.iter().any(|f| matches!(f.op, Operator::In)) {
             if let Some(union_scan) = Self::try_plan_union(query, indexes) {
-                let safe_limit = if query.order_by.is_some() {
-                    None
-                } else {
-                    query.limit
-                };
-                return Self::make_plan(query, union_scan, safe_limit);
+                return Self::make_plan(query, union_scan, None, false,false);
             }
         }
 
         // 5. PRIORITY 4: Secondary Index (Equality)
-        // Ensure we DO NOT pass the limit down to the scan if we have an ORDER BY
-        let safe_limit = if query.order_by.is_some() {
-            None
-        } else {
-            query.limit
-        };
-
         if use_index_heuristic {
             for filter in &query.filters {
                 if matches!(filter.op, Operator::Eq) {
-                    if indexes
-                        .secondary
-                        .get(&query.collection)
-                        .map_or(false, |m| m.contains_key(&filter.field))
-                    {
+                    if indexes.secondary.get(&query.collection).map_or(false, |m| m.contains_key(&filter.field)) {
                         let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
                         return Self::make_plan(
                             query,
-                            ScanType::SecondaryIndex {
-                                field: filter.field.clone(),
-                                value: val_bytes,
-                            },
-                            safe_limit,
+                            ScanType::SecondaryIndex { field: filter.field.clone(), value: val_bytes },
+                            None,
+                            false,
+                            false
                         );
                     }
                 }
@@ -148,10 +120,18 @@ impl QueryPlanner {
         }
 
         // 6. Default: Full Scan
-        Self::make_plan(query, ScanType::FullCollection, safe_limit)
+        Self::make_plan(query, ScanType::FullCollection, None, false,false)
     }
 
-    fn make_plan(query: &Query, scan: ScanType, scan_limit: Option<usize>) -> QueryPlan {
+    /// Helper to build the plan object. 
+    /// Now takes 'order_satisfied' as an argument.
+    fn make_plan(
+        query: &Query, 
+        scan: ScanType, 
+        scan_limit: Option<usize>, 
+        order_satisfied: bool,
+        filters_satisfied: bool
+    ) -> QueryPlan {
         QueryPlan {
             collection: query.collection.clone(),
             scan,
@@ -159,9 +139,11 @@ impl QueryPlanner {
             or_groups: query.or_groups.clone(),
             order_by: query.order_by.clone(),
             limit: query.limit,
-            scan_limit, // Used specifically for disk retrieval
+            scan_limit,
             offset: query.offset,
             projection: query.projection.clone(),
+            order_by_satisfied: order_satisfied,
+            filters_satisfied_by_index: filters_satisfied,
         }
     }
 
@@ -222,6 +204,7 @@ impl QueryPlanner {
             return Some(ScanType::CompositeIndex {
                 fields: vec![field.to_string()],
                 values: vec![val.clone()],
+                reverse: false,
             });
         }
         None
@@ -313,29 +296,46 @@ impl QueryPlanner {
         None
     }
 
-    fn try_plan_composite_eq(query: &Query, indexes: &IndexManager) -> Option<ScanType> {
+    fn try_plan_composite_eq(query: &Query, indexes: &IndexManager) -> Option<(ScanType, bool, bool)> {
         if query.filters.is_empty() || !query.filters.iter().all(|f| matches!(f.op, Operator::Eq)) {
             return None;
         }
 
         for idx in indexes.indexes_for_collection(&query.collection) {
-            let mut fields = Vec::new();
-            let mut values = Vec::new();
+            let mut matched_fields = Vec::new();
+            let mut matched_values = Vec::new();
 
-            for field in &idx.definition.fields {
-                if let Some(filter) = query.filters.iter().find(|f| f.field == field.field) {
-                    fields.push(field.field.clone());
-                    values.push(filter.value.clone());
-                } else {
-                    break;
-                }
+            for idx_field in &idx.definition.fields {
+                if let Some(filter) = query.filters.iter().find(|f| f.field == idx_field.field) {
+                    matched_fields.push(idx_field.field.clone());
+                    matched_values.push(filter.value.clone());
+                } else { break; }
             }
 
-            if !fields.is_empty() && fields.len() == query.filters.len() {
-                return Some(ScanType::CompositeIndex { fields, values });
+            // Check if index prefix covers ALL filters
+            if !matched_fields.is_empty() && matched_fields.len() == query.filters.len() {
+                let mut order_satisfied = false;
+                let mut reverse_scan = false;
+
+                if let Some(order) = &query.order_by {
+                    if let Some(next_f) = idx.definition.fields.get(matched_fields.len()) {
+                        if next_f.field == order.field {
+                            order_satisfied = true;
+                            // If index is DESC and query is ASC (or vice versa), reverse the scan!
+                            if (next_f.direction == SortDirection::Asc) != order.ascending {
+                                reverse_scan = true;
+                            }
+                        }
+                    }
+                }
+
+                return Some((
+                    ScanType::CompositeIndex { fields: matched_fields, values: matched_values, reverse: reverse_scan },
+                    order_satisfied,
+                    true // Filters are fully handled by index
+                ));
             }
         }
-
         None
     }
 }

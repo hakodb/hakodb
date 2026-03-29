@@ -121,4 +121,8 @@ impl CompositeIndexManager {
         }
         None
     }
+
+    pub fn all_indexes(&self) -> impl Iterator<Item = &CompositeIndex> {
+        self.by_id.values()
+    }
 }

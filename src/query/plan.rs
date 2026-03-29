@@ -5,12 +5,13 @@ use std::ops::Bound;
 use super::filter::Filter;
 use super::order::OrderBy;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ScanType {
     FullCollection,
     CompositeIndex {
         fields: Vec<String>,
         values: Vec<Value>,
+        reverse: bool,
     },
     CompositeIndexRange {
         index_id: u32,
@@ -46,4 +47,6 @@ pub struct QueryPlan {
     pub offset: Option<usize>,
     pub projection: Vec<String>,
     pub scan_limit: Option<usize>,
+    pub order_by_satisfied: bool,
+    pub filters_satisfied_by_index: bool,
 }

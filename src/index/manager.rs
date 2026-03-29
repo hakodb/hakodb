@@ -43,20 +43,18 @@ impl IndexManager {
         self.composite
             .indexes_for_collection(collection)
             .any(|idx| {
-                let idx_fields: Vec<&str> = idx
-                    .definition
-                    .fields
-                    .iter()
-                    .map(|f| f.field.as_str())
-                    .collect();
-
-                if idx_fields.len() < fields.len() {
+                // An index can satisfy a query if the query fields 
+                // are the leading prefix of the index fields.
+                if idx.definition.fields.len() < fields.len() {
                     return false;
                 }
 
-                // FIX: Check if every field required by the query exists in the index's prefix.
-                let prefix = &idx_fields[0..fields.len()];
-                fields.iter().all(|f| prefix.contains(&f.as_str()))
+                for i in 0..fields.len() {
+                    if idx.definition.fields[i].field != fields[i] {
+                        return false;
+                    }
+                }
+                true
             })
     }
 

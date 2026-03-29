@@ -178,7 +178,7 @@ Report run_benchmark(BenchConfig cfg) {
         fl_doc_free(d);
     }
     res.single_tps = 100.0 / ((now_ms() - t_start) / 1000.0);
-    cout << res.single_tps;
+    cout << res.single_tps << "tps";
 
     stage("Batch Write Throughput");
     t_start = now_ms();
@@ -199,7 +199,7 @@ Report run_benchmark(BenchConfig cfg) {
         fl_batch_free(b);
     }
     res.batch_tps = (double)b_total / ((now_ms() - t_start) / 1000.0);
-    cout << res.batch_tps;
+    cout << res.batch_tps << "tps";
 
     stage("Waiting 2 secs for indexs..");
     this_thread::sleep_for(chrono::milliseconds(2000));
@@ -213,7 +213,7 @@ Report run_benchmark(BenchConfig cfg) {
         if (d) fl_doc_free(d);
     }
     res.s_read_ms = (now_ms() - t_start) / 200.0;
-    cout << res.s_read_ms;
+    cout << res.s_read_ms << "ms";
 
     stage("Point Read (Parallel)");
     t_start = now_ms();
@@ -228,7 +228,7 @@ Report run_benchmark(BenchConfig cfg) {
     }
     for(auto& t : pool) t.join();
     res.p_read_ms = (now_ms() - t_start) / (cfg.threads * 50.0);
-    cout << res.p_read_ms;
+    cout << res.p_read_ms << "ms";
 
     // 3. BULK UPDATE & SERIALIZABLE TX
     stage("Bulk Update (Patch)");
@@ -240,7 +240,7 @@ Report run_benchmark(BenchConfig cfg) {
     }
     res.bulk_upd_ms = now_ms() - t_start;
     fl_doc_free(upd);
-    cout << res.bulk_upd_ms;
+    cout << res.bulk_upd_ms << "ms";
 
     stage("Serializable Transactions");
     t_start = now_ms();
@@ -255,7 +255,7 @@ Report run_benchmark(BenchConfig cfg) {
         } else { fl_transaction_free(tx); }
     }
     res.tx_ms = now_ms() - t_start;
-    cout << res.tx_ms;
+    cout << res.tx_ms << "ms";
 
     // 4. RANGE QUERY (Offset vs Cursor)
     stage("Range Query (Off vs Cur)");
@@ -273,7 +273,7 @@ Report run_benchmark(BenchConfig cfg) {
     fl_query_end_before(q_cur, end_doc);
     t_start = now_ms(); fl_string_free(fl_query_execute(db, q_cur)); res.cursor_ms = now_ms() - t_start;
     res.cursor_gain = res.offset_ms / (res.cursor_ms > 0 ? res.cursor_ms : 0.1);
-    cout << res.cursor_gain;
+    cout << res.cursor_gain << "ms";
 
     // 5. QUERY STRESS TEST (NEW)
     // Compares direct Point Read (Get) vs Index-based Column Query
@@ -299,7 +299,7 @@ Report run_benchmark(BenchConfig cfg) {
         fl_query_free(q);
     }
     res.stress_query_ms = (now_ms() - t_query_stress) / 300.0;
-    cout << fixed << setprecision(4) << res.stress_get_ms << " / " << res.stress_query_ms;
+    cout << fixed << setprecision(4) << res.stress_get_ms << " / " << res.stress_query_ms << "ms";
 
     stage("Composite Query Stress");
     double t_comp_stress = now_ms();
@@ -307,7 +307,7 @@ Report run_benchmark(BenchConfig cfg) {
         FL_Query* q = fl_query_new("bench");
         // These two fields together match our Composite Index exactly
         fl_query_where_eq_str(q, "tenant", "tenant-2");
-        fl_query_order_by(q, "score", true); 
+        fl_query_order_by(q, "score", false); 
         
         fl_query_limit(q, 20);
         // Only get the ID and Score to test Projection Pushdown too
@@ -328,27 +328,27 @@ Report run_benchmark(BenchConfig cfg) {
     t_start = now_ms(); 
     fl_string_free(fl_query_execute_aggregation(db, aq)); 
     res.agg_ms = now_ms() - t_start;
-    cout << res.agg_ms;
+    cout << res.agg_ms << "ms";
 
     // 7. BULK DELETE
     stage("Bulk Delete");
     t_start = now_ms();
     for(int i=0; i<100; i++) fl_engine_delete(db, "bench", (string("b_") + to_string(i+500)).c_str());
     res.bulk_del_ms = now_ms() - t_start;
-    cout << res.bulk_del_ms;
+    cout << res.bulk_del_ms << "ms";
 
     // 8. SHUTDOWN & STARTUP
     stage("Shutdown (Flush)");
     t_start = now_ms();
     fl_engine_free(db);
     res.shutdown_ms = now_ms() - t_start;
-    cout << res.shutdown_ms;
+    cout << res.shutdown_ms << "ms";
 
     stage("Startup (Index Rebuild)");
     t_start = now_ms();
     FL_Engine* db2 = fl_engine_open_with_config(path.c_str(), create_config_ptr(cfg));
     res.startup_ms = now_ms() - t_start;
-    cout << res.startup_ms;
+    cout << res.startup_ms << "ms";
     
     res.storage_mb = (double)get_dir_size(path) / (1024.0 * 1024.0);
     
@@ -368,14 +368,14 @@ int main(int argc, char** argv) {
     if (argc > 1 && string(argv[1]).find("--docs=") == 0) g_docs = stoi(string(argv[1]).substr(7));
 
     vector<BenchConfig> suite = {
-        {"Strict_Sync",  g_docs, 100, 0, 4, false, false, 0,  false},
-        {"Turbo_RAM",    g_docs, 500, 2, 8, false, false, 60, false},
-        {"Cloud_Bal",    g_docs, 200, 1, 8, true,  false, 2,  false},
-        {"Secure_Small", g_docs, 100, 3, 4, false, true,  10, false},
-        {"Large_Zip",    g_docs, 500,  3, 8, true,  false, 2,  true},
-        {"Large_Secure", g_docs, 50,  3, 8, true,  true,  10, true},
-        {"Parallel_Max", g_docs, 100, 2, 32,false, false, 60, false},
-        {"Safety_Max",   g_docs, 100, 0, 8, true,  true,  0,  true}
+        {"Strict_Sync",  g_docs, 50, 0, 4, false, false, 0,  false},
+        {"Turbo_RAM",    g_docs, 100, 2, 8, false, false, 60, false},
+        {"Cloud_Bal",    g_docs, 100, 1, 8, true,  false, 2,  false},
+        {"Secure_Small", g_docs, 50, 3, 4, false, true,  10, false},
+        {"Large_Zip",    g_docs, 150,  3, 8, true,  false, 2,  true},
+        {"Large_Secure", g_docs, 150,  3, 8, true,  true,  10, true},
+        // {"Parallel_Max", g_docs, 100, 2, 32,false, false, 60, false},
+        // {"Safety_Max",   g_docs, 100, 0, 8, true,  true,  0,  true}
     };
 
     cout << "==========================================================================================\n";
@@ -421,8 +421,8 @@ int main(int argc, char** argv) {
              << left << setw(13) << ss_read.str() << " | "
              << left << setw(20) << ss_stress.str() << " | "
              << left << setw(13) << ss_query.str() << " | "
-             << fixed << setprecision(0) << setw(8) << r.agg_ms << " | "
-             << setw(8) << r.tx_ms << " | "
+             << fixed << setprecision(4) << setw(8) << r.agg_ms << " | "
+             << setprecision(4) << setw(8) << r.tx_ms << " | "
              << left << setw(12) << ss_bulk.str() << " | "
              << left << setw(15) << ss_maint.str() << " | "
              << setprecision(1) << r.storage_mb << "MB\n";

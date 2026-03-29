@@ -43,3 +43,18 @@ pub fn encode_scalar(value: &Value) -> Vec<u8> {
         },
     }
 }
+
+pub fn decode_scalar_as_f64(bytes: &[u8]) -> Option<f64> {
+    let tag = *bytes.first()?;
+    match tag {
+        2 => { // Int
+            let b: [u8; 8] = bytes.get(1..9)?.try_into().ok()?;
+            Some(i64::from_be_bytes(b) as f64)
+        }
+        3 => { // Float
+            let b: [u8; 8] = bytes.get(1..9)?.try_into().ok()?;
+            Some(f64::from_bits(u64::from_be_bytes(b)))
+        }
+        _ => None
+    }
+}

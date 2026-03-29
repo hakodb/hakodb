@@ -22,6 +22,7 @@ pub struct Segment {
     path: PathBuf,
     pub(crate) encryption: Option<EncryptionContext>,
     write_buffer: Vec<u8>,
+    pub(crate) current_size: u64
 }
 
 impl Segment {
@@ -43,6 +44,9 @@ impl Segment {
 
         // 2. Open MmapStore for READS (Performance)
         let store = Arc::new(MmapStore::open(&path_buf, mmap_size)?);
+        
+        // Track size in memory
+        let current_size = file.metadata()?.len();
 
         Ok(Self {
             store,
@@ -52,6 +56,7 @@ impl Segment {
             path: path_buf,
             encryption,
             write_buffer: Vec::with_capacity(64 * 1024),
+            current_size
         })
     }
 
@@ -79,7 +84,11 @@ impl Segment {
             };
             self.write_buffer.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             self.write_buffer.extend_from_slice(&payload);
+
+            let payload_size = (4 + payload.len()) as u64;
             results.push((current_offset, payload.len() as u32));
+            
+            self.current_size += payload_size;
             current_offset += 4 + payload.len() as u64;
         }
 
@@ -149,7 +158,8 @@ impl Segment {
     }
 
     pub fn size_bytes(&self) -> Result<u64> {
-        Ok(self.file.as_ref().unwrap().metadata()?.len())
+        // Ok(self.file.as_ref().unwrap().metadata()?.len())
+        Ok(self.current_size)
     }
 
     pub fn path(&self) -> &Path {

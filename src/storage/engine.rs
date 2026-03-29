@@ -1,6 +1,6 @@
 use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
-use std::fs::File;
+// use std::fs::File;
 
 use crate::config::{FireLiteConfig, DurabilityMode};
 use crate::error::{FireLiteError, Result};
@@ -64,7 +64,7 @@ pub struct StorageEngine {
     pub cache: Arc<Mutex<PageCache>>,
     pub mmap_size: usize, 
     pub index: HashMap<String, Pointer>,
-    pub(crate) blob_file: Option<File>,
+    pub(crate) blob_file: Option<Arc<std::sync::Mutex<std::fs::File>>>,
     pub(crate) blob_tx: Option<SyncSender<BlobWork>>,
     pub logical_name: String,
 }
@@ -98,9 +98,17 @@ impl StorageEngine {
         let mut max_id = 0;
         let mut active_segment_id = 0;
 
-        let blob_file = std::fs::OpenOptions::new()
-            .create(true).read(true).append(true)
+        // let blob_file = std::fs::OpenOptions::new()
+        //     .create(true).read(true).append(true)
+        //     .open(base_path.join("blobs.dat"))?;
+        let blob_file_raw = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
             .open(base_path.join("blobs.dat"))?;
+
+        let blob_file = Arc::new(Mutex::new(blob_file_raw));
+            
 
         for entry in std::fs::read_dir(base_dir.as_ref())? {
             let entry = entry?;
@@ -191,7 +199,8 @@ impl StorageEngine {
 
     fn update_index_entry(&mut self, key: String, new_pointer: Option<Pointer>) {
 
-        let collection_name = key.split_once(':').map(|(c, _)| c.to_string());
+        // let collection_name = key.split_once(':').map(|(c, _)| c.to_string());
+        let collection:&str = &self.logical_name.clone();
 
         // 1. If there was an old entry, subtract its size if it was inlined
         if let Some(old_p) = self.index.remove(&key) {
@@ -200,13 +209,8 @@ impl StorageEngine {
             }
 
             // DECREMENT count for this collection
-            if let Some(ref col) = collection_name {
-                if let Some(count) = self.collection_counts.get_mut(col) {
-                    *count = count.saturating_sub(1);
-                    // if *count == 0 {
-                    //     self.collection_counts.remove(col); // Collection officially "dies"
-                    // }
-                }
+            if let Some(count) = self.collection_counts.get_mut(collection) {
+                *count = count.saturating_sub(1);
             }
         }
 
@@ -217,10 +221,7 @@ impl StorageEngine {
             }
 
             // INCREMENT count for this collection
-            if let Some(ref col) = collection_name {
-                *self.collection_counts.entry(col.clone()).or_insert(0) += 1;
-            }
-
+            *self.collection_counts.entry(collection.to_string()).or_insert(0) += 1;
             self.index.insert(key, p);
         }
     }
@@ -334,8 +335,7 @@ impl StorageEngine {
 
                         // Hand off to the background thread
                         blob_work_todo.push(BlobWork::Put {
-                            // collection: self.base_dir.file_name().unwrap().to_str().unwrap().to_string(),
-                            collection: self.logical_name.clone(),
+                            collection: self.logical_name.clone(), // get collection name
                             key: key.clone(),
                             data: arc_data,
                         });
@@ -565,16 +565,19 @@ impl StorageEngine {
             Pointer::Inlined(data) => Ok(Some(data.clone())),
             Pointer::Blob { offset, len } => {
                 let mut buf = vec![0u8; *len as usize];
-                let file = self.blob_file.as_ref().ok_or_else(|| FireLiteError::StorageError("Blob file missing".into()))?;
                 
-                #[cfg(windows)] {
-                    use std::os::windows::fs::FileExt;
-                    file.seek_read(&mut buf, *offset)?;
-                }
-                #[cfg(unix)] {
-                    use std::os::unix::fs::FileExt;
-                    file.read_at(&mut buf, *offset)?;
-                }
+                // FIX: Properly access the Mutex inside the Option/Arc
+                let file_mutex = self.blob_file.as_ref()
+                    .ok_or_else(|| FireLiteError::StorageError("Blob file missing".into()))?;
+                
+                let mut file = file_mutex.lock()
+                    .map_err(|_| FireLiteError::LockPoisoned("Blob file lock poisoned".into()))?;
+                
+                // Note: Since we have a Mutex lock on the file, we can use standard Seek/Read
+                // instead of platform-specific FileExt for simpler code.
+                use std::io::{Read, Seek, SeekFrom};
+                file.seek(SeekFrom::Start(*offset))?;
+                file.read_exact(&mut buf)?;
 
                 if let Some(enc) = &self.encryption {
                     Ok(Some(enc.decrypt(&buf)?))
@@ -583,7 +586,6 @@ impl StorageEngine {
                 }
             },
             Pointer::Segment { segment_id, offset, len } => {
-                // Corrected hashmap access for u64 keys
                 let Some(meta) = self.segments.get(segment_id) else { return Ok(None); };
                 Ok(Some(meta.segment.read_at(*offset, *len, use_cache)?))
             }
