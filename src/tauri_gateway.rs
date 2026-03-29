@@ -27,6 +27,7 @@ pub enum FireLiteOp {
     CreateCompositeIndex { collection: String, fields: Vec<CompositeFieldInput> },
     Query {
         collection: String,
+        doc_id_filter: Option<String>,
         #[serde(default)]
         filters: Vec<FilterInput>,
         or_groups: Option<Vec<Vec<FilterInput>>>,
@@ -51,6 +52,7 @@ pub enum FireLiteOp {
     },
     Subscribe {
         listener_id: String,
+        doc_id_filter: Option<String>,
         collection: String,
         #[serde(default)]
         filters: Vec<FilterInput>,
@@ -204,63 +206,6 @@ impl FireLiteGateway {
         }
     }
 
-    // fn register_subscription<R: Runtime>(
-    //     &self,
-    //     window: Window<R>,
-    //     listener_id: String,
-    //     query_template: QueryInput,
-    //     event_name: String,
-    // ) -> Result<(), String> {
-    //     self.unsubscribe(&listener_id);
-
-    //     let rx = self.db.watch_collection(&query_template.collection);
-    //     let (stop_tx, stop_rx) = mpsc::channel::<()>();
-        
-    //     self.subscriptions.lock().insert(
-    //         listener_id.clone(),
-    //         SubscriptionEntry {
-    //             stop_tx,
-    //             window_label: window.label().to_string(),
-    //         },
-    //     );
-
-    //     let subscriptions = Arc::clone(&self.subscriptions);
-    //     let db = Arc::clone(&self.db);
-    //     let listener_id_for_thread = listener_id.clone();
-        
-    //     tokio::task::spawn_blocking(move || {
-    //         let emit_snapshot = |win: &Window<R>| -> Result<(), String> {
-    //             let rows = execute_query_input(&db, &query_template)?;
-    //             let payload = SubscriptionPayload {
-    //                 listener_id: listener_id_for_thread.clone(),
-    //                 rows,
-    //             };
-    //             win.emit(&event_name, payload).map_err(|e: tauri::Error| e.to_string())
-    //         };
-
-    //         if emit_snapshot(&window).is_err() {
-    //             subscriptions.lock().remove(&listener_id_for_thread);
-    //             return;
-    //         }
-
-    //         loop {
-    //             if stop_rx.try_recv().is_ok() { break; }
-    //             match rx.recv_timeout(Duration::from_millis(250)) {
-    //                 Ok(_) => { 
-    //                     while let Ok(_) = rx.try_recv() {} 
-    //                     if emit_snapshot(&window).is_err() { break; } 
-    //                 }
-    //                 Err(RecvTimeoutError::Timeout) => continue,
-    //                 Err(RecvTimeoutError::Disconnected) => break,
-    //             }
-    //         }
-    //         subscriptions.lock().remove(&listener_id_for_thread);
-    //     });
-
-    //     Ok(())
-    // }
-
-    // Update the register_subscription method logic
     fn register_subscription<R: Runtime>(
         &self,
         window: Window<R>,
@@ -281,15 +226,15 @@ impl FireLiteGateway {
         let db = Arc::clone(&self.db);
         let lid = listener_id.clone();
         let ename = event_name.clone();
+        let subscriptions = Arc::clone(&self.subscriptions);
         
         tokio::task::spawn_blocking(move || {
-            // --- 1. Send INITIAL BOOTSTRAP (Full Sync) ---
+            // --- 1. INITIAL BOOTSTRAP ---
             let initial_rows = match execute_query_input(&db, &query_template) {
                 Ok(rows) => rows,
                 Err(_) => Vec::new(),
             };
 
-            // FIX: Wrap the initial data into the 'changes' vector
             let _ = window.emit(&ename, DeltaPayload {
                 listener_id: lid.clone(),
                 changes: vec![DocumentChange {
@@ -299,36 +244,37 @@ impl FireLiteGateway {
                 }],
             });
 
-            // 2. Prepare Matcher Plan for deltas
-            // This allows us to check in Rust if a changed doc matches the JS 'where' filters
+            // --- 2. PREPARE MATCHER PLAN ---
             let mut base_query = crate::query::query::Query::new(&query_template.collection);
             for f in &query_template.filters {
-                base_query = base_query.where_filter(&f.field, map_operator(&f.op), json_value_to_value(&f.value).unwrap_or(crate::document::value::Value::Null));
+                base_query = base_query.where_filter(&f.field, map_operator(&f.op), json_value_to_value(&f.value).unwrap_or(Value::Null));
             }
             let filter_plan = {
                 let indexes = db.indexes.read().unwrap();
                 crate::query::planner::QueryPlanner::plan(&base_query, &indexes, 0, 1)
             };
 
-            // 3. Event Loop
+            // --- 3. EVENT LOOP ---
             loop {
                 if stop_rx.try_recv().is_ok() { break; }
 
-                // 1. Wait for at least one event
                 match rx.recv_timeout(Duration::from_millis(500)) {
                     Ok(first_event) => {
                         let mut events = vec![first_event];
-                        
-                        // 2. DRAIN: Catch all other events that happened at the same time
+                        // Drain all pending events to batch them
                         while let Ok(extra) = rx.try_recv() {
                             events.push(extra);
                         }
 
-                        // 3. Process the batch of events into lean deltas
                         let mut changes = Vec::new();
                         for event in events {
-                            let doc_id = event.path.split_once(':').map(|(_, id)| id).unwrap_or(&event.path).to_string();
+                            let doc_id = extract_id_from_path(&event.path);
                             
+                            // VARIANT 1: Single Document Filter
+                            if let Some(target_id) = &query_template.doc_id_filter {
+                                if &doc_id != target_id { continue; }
+                            }
+
                             match event.kind {
                                 crate::engine::ChangeKind::Delete => {
                                     changes.push(DocumentChange { kind: DeltaKind::Delete, doc_id, data: None });
@@ -341,6 +287,7 @@ impl FireLiteGateway {
                                     };
 
                                     if let Ok(Some(bytes)) = bytes_res {
+                                        // VARIANT 2 & 3: Filtered Query / DocChanges
                                         if crate::query::executor::worker::matches_filters_view(&bytes, &filter_plan) {
                                             let doc = if let Some(p) = &query_template.projection {
                                                 FireLiteDoc::decode_projected(&bytes, p)
@@ -355,7 +302,7 @@ impl FireLiteGateway {
                                                 });
                                             }
                                         } else {
-                                            // Document exists but no longer matches filter -> UI must Remove
+                                            // Exit Event: Doc updated but no longer matches query filters
                                             changes.push(DocumentChange { kind: DeltaKind::Delete, doc_id, data: None });
                                         }
                                     }
@@ -363,7 +310,7 @@ impl FireLiteGateway {
                             }
                         }
 
-                        // 4. Emit the entire batch in ONE IPC call
+                        // Emit batch only if there are relevant changes
                         if !changes.is_empty() {
                             let _ = window.emit(&ename, DeltaPayload {
                                 listener_id: lid.clone(),
@@ -375,10 +322,17 @@ impl FireLiteGateway {
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
+            subscriptions.lock().remove(&lid);
         });
 
         Ok(())
     }
+}
+
+fn extract_id_from_path(path: &str) -> String {
+    path.split_once(':')
+        .map(|(_, id)| id.to_string())
+        .unwrap_or_else(|| path.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -394,14 +348,8 @@ struct QueryInput {
     start_after: Option<Vec<serde_json::Value>>,
     end_at: Option<Vec<serde_json::Value>>,
     end_before: Option<Vec<serde_json::Value>>,
+    doc_id_filter: Option<String>,
 }
-
-// #[derive(Debug, Clone, Serialize)]
-// #[serde(rename_all = "snake_case")]
-// struct SubscriptionPayload {
-//     listener_id: String,
-//     rows: Vec<serde_json::Value>,
-// }
 
 #[command]
 pub async fn firelite_exec<R: Runtime>(
@@ -447,9 +395,9 @@ pub async fn firelite_exec<R: Runtime>(
                 gateway.db.persist_index_defs().map_err(|e| e.to_string())?;
                 Ok(FireLiteResponse::Ok)
             }
-            FireLiteOp::Query { collection, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before } => {
+            FireLiteOp::Query { collection, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before } => {
                 let rows = execute_query_input(&gateway.db, &QueryInput { 
-                    collection, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before 
+                    collection, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before 
                 })?;
                 Ok(FireLiteResponse::QueryResult { rows })
             }
@@ -504,11 +452,11 @@ pub async fn firelite_exec<R: Runtime>(
                 let val = *result.values().next().unwrap_or(&0.0);
                 Ok(FireLiteResponse::AggregateResult { value: val })
             }
-            FireLiteOp::Subscribe { listener_id, collection, filters, or_groups, order_by, limit, offset, projection, event_name, start_at, start_after, end_at, end_before } => {
+            FireLiteOp::Subscribe { listener_id, collection, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, event_name, start_at, start_after, end_at, end_before } => {
                 gateway.register_subscription(
                     window,
                     listener_id.clone(),
-                    QueryInput { collection, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before },
+                    QueryInput { collection, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before },
                     event_name.unwrap_or_else(|| "firelite://snapshot".to_string()),
                 )?;
                 Ok(FireLiteResponse::SubscriptionAck { listener_id })
