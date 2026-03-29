@@ -197,7 +197,7 @@ pub struct FireLite {
 
     index_storage: Arc<Mutex<IndexStorage>>,
 
-    indexes: Arc<RwLock<IndexManager>>,
+    pub(crate) indexes: Arc<RwLock<IndexManager>>,
     executor: ParallelQueryExecutor,
     tx_lock: Mutex<()>,
     listeners: Mutex<HashMap<String, Vec<Sender<ChangeEvent>>>>,
@@ -472,7 +472,7 @@ impl FireLite {
         Ok(db)
     }
 
-    fn get_shard(&self, collection: &str) -> Arc<RwLock<StorageEngine>> {
+    pub(crate) fn get_shard(&self, collection: &str) -> Arc<RwLock<StorageEngine>> {
         // Read lock check first (Fast Path)
         if let Some(s) = self.shards.read().unwrap().get(collection) {
             return Arc::clone(s);
