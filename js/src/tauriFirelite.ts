@@ -2,7 +2,6 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
 // --- Types & Interfaces ---
-
 export type FireLitePrimitive = 
   | string | number | boolean | null | Uint8Array | Date
   | { [key: string]: FireLitePrimitive } 
@@ -15,40 +14,66 @@ export type FilterOperator =
   | 'match' | 'contains' | 'startsWith' | 'in' | 'notIn' 
   | 'arrayContains' | 'arrayContainsAny';
 
+
+
 export type AggregateKind = 'count' | 'sum' | 'avg';
 
 export interface AuditEntry {
     op: string;
     collection: string;
-    docId?: string;
+    doc_id?: string; // Corrected to snake_case for Rust
     ok: boolean;
 }
 
-// --- Internal Utilities ---
+// --- Add these interfaces for the Delta Protocol ---
+interface DeltaChange {
+    kind: 'full' | 'update' | 'delete';
+    doc_id: string;
+    data?: any;
+}
 
+interface DeltaPayload {
+    listener_id: string;
+    changes: DeltaChange[];
+}
+
+function symToOp(sym: string): FilterOperator {
+    switch (sym) {
+        case '==': return 'eq';
+        case '!=': return 'ne';
+        case '>': return 'gt';
+        case '>=': return 'gte';
+        case '<': return 'lt';
+        case '<=': return 'lte';
+        default: return sym as FilterOperator;
+    }
+}
+
+// --- Internal Utilities ---
 function generateId() {
     return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
 }
 
 function normalizeValue(v: any): any {
     if (v instanceof Uint8Array) return Array.from(v);
-    if (v instanceof Date) return v.getTime() * 1000; // Convert to micros for Rust
+    if (v instanceof Date) return v.getTime() * 1000; 
     if (Array.isArray(v)) return v.map(normalizeValue);
     if (typeof v === 'object' && v !== null) {
-        if (v instanceof DocumentSnapshot) return v.data(); // Allow passing snapshots to cursors
+        if (v instanceof DocumentSnapshot) return v.data(); 
         return Object.fromEntries(Object.entries(v).map(([k, val]) => [k, normalizeValue(val)]));
     }
     return v;
 }
 
 async function exec(op: any): Promise<any> {
-    const res = await invoke('firelite_exec', { op });
+    // Note: The 'op' field inside the payload is the variant tag
+    // The other fields must match the Rust struct fields (snake_case)
+    const res = await invoke<any>('firelite_exec', { op });
     if (res?.error) throw new Error(res.error);
     return res;
 }
 
-// --- Firestore Core Classes ---
-
+// --- Core Classes ---
 export class FireLite {}
 
 export class DocumentReference {
@@ -57,7 +82,13 @@ export class DocumentReference {
 }
 
 export class CollectionReference {
+    readonly type = 'collection' as const;
     constructor(public readonly path: string) {}
+}
+
+export class CollectionGroupReference {
+    readonly type = 'collectionGroup' as const;
+    constructor(public readonly id: string) {}
 }
 
 export class DocumentSnapshot {
@@ -85,42 +116,35 @@ export class QuerySnapshot {
     forEach(callback: (doc: DocumentSnapshot) => void) { this.docs.forEach(callback); }
 }
 
-// --- Query Building ---
-
-export type QueryConstraintType = 'where' | 'orderBy' | 'limit' | 'offset' | 'select' | 'startAt' | 'startAfter' | 'endAt' | 'endBefore' | 'or';
+export type QueryConstraintType = 'where' | 'order_by' | 'limit' | 'offset' | 'select' | 'start_at' | 'start_after' | 'end_at' | 'end_before' | 'or';
 
 export class QueryConstraint {
-    constructor(
-        public readonly type: QueryConstraintType,
-        public readonly data: any
-    ) {}
+    constructor(public readonly type: QueryConstraintType, public readonly data: any) {}
 }
 
 export class Query {
+    readonly type = 'query' as const;
     constructor(
-        public readonly colRef: CollectionReference, 
+        public readonly colRef: CollectionReference | CollectionGroupReference, 
         public readonly constraints: QueryConstraint[] = []
     ) {}
 }
 
 // --- API Implementation ---
-
 export const getFirestore = () => new FireLite();
 
-export const collection = (db: FireLite | DocumentReference, path: string) => {
-    if (db instanceof DocumentReference) return new CollectionReference(`${db.path}/${path}`);
-    return new CollectionReference(path);
-};
+export const collection = (_db: any, path: string) => new CollectionReference(path);
 
-export const doc = (db: FireLite | CollectionReference, colOrId: string, id?: string) => {
-    if (db instanceof CollectionReference) return new DocumentReference(db.path, colOrId);
-    if (id) return new DocumentReference(colOrId, id);
-    const parts = colOrId.split('/');
-    return new DocumentReference(parts[0], parts[1]);
+export const doc = (_db: any, colOrPath: string | CollectionReference, id?: string) => {
+    if (typeof colOrPath === 'string') {
+        const segments = colOrPath.split('/').filter(Boolean);
+        if (id) return new DocumentReference(colOrPath, id);
+        return new DocumentReference(segments[0], segments[1]);
+    }
+    return new DocumentReference(colOrPath.path, id!);
 };
 
 // --- Write Operations ---
-
 export const addDoc = async (colRef: CollectionReference, data: FireLiteRecord) => {
     const id = generateId();
     const ref = new DocumentReference(colRef.path, id);
@@ -129,99 +153,136 @@ export const addDoc = async (colRef: CollectionReference, data: FireLiteRecord) 
 };
 
 export const setDoc = async (ref: DocumentReference, data: FireLiteRecord) => {
-    await exec({ op: 'set', collection: ref.collectionPath, docId: ref.id, data: normalizeValue(data) });
+    await exec({ op: 'set', collection: ref.collectionPath, doc_id: ref.id, data: normalizeValue(data) });
 };
 
 export const updateDoc = async (ref: DocumentReference, data: Partial<FireLiteRecord>) => {
-    await exec({ op: 'patch', collection: ref.collectionPath, docId: ref.id, data: normalizeValue(data) });
+    await exec({ op: 'patch', collection: ref.collectionPath, doc_id: ref.id, data: normalizeValue(data) });
 };
 
 export const deleteDoc = async (ref: DocumentReference) => {
-    await exec({ op: 'delete', collection: ref.collectionPath, docId: ref.id });
+    await exec({ op: 'delete', collection: ref.collectionPath, doc_id: ref.id });
 };
 
 export const getDoc = async (ref: DocumentReference) => {
-    const res = await exec({ op: 'get', collection: ref.collectionPath, docId: ref.id });
+    const res = await exec({ op: 'get', collection: ref.collectionPath, doc_id: ref.id });
     const data = res.document?.data;
     return new DocumentSnapshot(ref.id, !!data, data ?? undefined, ref);
 };
 
 // --- Querying ---
-
-export const query = (colRef: CollectionReference, ...constraints: QueryConstraint[]) => new Query(colRef, constraints);
+export const query = (colRef: CollectionReference | CollectionGroupReference, ...constraints: QueryConstraint[]) => 
+    new Query(colRef, constraints);
 
 export const where = (field: string, op: FilterOperator, value: any) => new QueryConstraint('where', { field, op, value });
-
 export const or = (...constraints: QueryConstraint[]) => new QueryConstraint('or', constraints);
-
-export const orderBy = (field: string, direction: 'asc' | 'desc' = 'asc') => new QueryConstraint('orderBy', { field, ascending: direction === 'asc' });
-
+export const orderBy = (field: string, direction: 'asc' | 'desc' = 'asc') => new QueryConstraint('order_by', { field, ascending: direction === 'asc' });
 export const limit = (n: number) => new QueryConstraint('limit', n);
-
 export const offset = (n: number) => new QueryConstraint('offset', n);
-
 export const select = (...fields: string[]) => new QueryConstraint('select', fields);
+export const startAt = (...values: any[]) => new QueryConstraint('start_at', values);
+export const startAfter = (...values: any[]) => new QueryConstraint('start_after', values);
+export const endAt = (...values: any[]) => new QueryConstraint('end_at', values);
+export const endBefore = (...values: any[]) => new QueryConstraint('end_before', values);
 
-export const startAt = (...values: any[]) => new QueryConstraint('startAt', values);
-export const startAfter = (...values: any[]) => new QueryConstraint('startAfter', values);
-export const endAt = (...values: any[]) => new QueryConstraint('endAt', values);
-export const endBefore = (...values: any[]) => new QueryConstraint('endBefore', values);
-
-export const getDocs = async (q: Query) => {
+export const getDocs = async (q: Query | CollectionReference | CollectionGroupReference) => {
     const params = buildQueryParams(q);
     const res = await exec({ op: 'query', ...params });
-    const docs = res.queryResult.rows.map((r: any) => new DocumentSnapshot(r.id || generateId(), true, r));
+    const docs = res.query_result.rows.map((r: any) => new DocumentSnapshot(r.id || generateId(), true, r));
     return new QuerySnapshot(docs);
 };
 
 // --- Aggregations ---
-
-export const getCountFromServer = async (q: Query) => {
+export const getCountFromServer = async (q: Query | CollectionReference | CollectionGroupReference) => {
     const params = buildQueryParams(q);
     const res = await exec({ op: 'aggregate', kind: 'count', ...params });
-    return { data: () => ({ count: res.aggregateResult.value }) };
+    return { data: () => ({ count: res.aggregate_result.value }) };
 };
 
-export const getSumFromServer = async (q: Query, field: string) => {
-    const params = buildQueryParams(q);
-    const res = await exec({ op: 'aggregate', kind: 'sum', field, ...params });
-    return { data: () => ({ value: res.aggregateResult.value }) };
-};
-
-export const getAverageFromServer = async (q: Query, field: string) => {
-    const params = buildQueryParams(q);
-    const res = await exec({ op: 'aggregate', kind: 'avg', field, ...params });
-    return { data: () => ({ value: res.aggregateResult.value }) };
-};
-
-// --- Real-time Snapshots ---
-
-export const onSnapshot = (q: Query, callback: (snapshot: QuerySnapshot) => void) => {
-    const listenerId = `fl_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    const eventName = `firelite://snapshot/${listenerId}`;
+// --- Updated onSnapshot Implementation ---
+export const onSnapshot = (
+    q: Query | CollectionReference | CollectionGroupReference, 
+    callback: (snapshot: QuerySnapshot) => void
+) => {
+    const listener_id = `fl_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const event_name = `firelite://snapshot/${listener_id}`;
     const params = buildQueryParams(q);
 
+    // This Map maintains the persistent state for this specific listener in JS memory
+    let localCache = new Map<string, any>();
     let unlisten: UnlistenFn;
-    let lastRowsJson = "[]";
 
     const start = async () => {
-        unlisten = await listen<{ rows: any[] }>(eventName, (event) => {
-            const rows = event.payload.rows || [];
-            const currentRowsJson = JSON.stringify(rows);
-            
-            // Basic change tracking
-            const oldRows = JSON.parse(lastRowsJson);
-            const changes = computeChanges(oldRows, rows);
-            
-            lastRowsJson = currentRowsJson;
-            const docs = rows.map(r => new DocumentSnapshot(r.id, true, r));
-            callback(new QuerySnapshot(docs, changes));
+        unlisten = await listen<DeltaPayload>(event_name, (event) => {
+            const { changes } = event.payload;
+            const documentChanges: DocumentChange[] = [];
+
+            changes.forEach(change => {
+                const { kind, doc_id, data } = change;
+
+                if (kind === 'full') {
+                    // Initial bootstrap: data is the full array of docs
+                    localCache.clear();
+                    const rows = data as any[];
+                    rows.forEach(r => {
+                        const id = r.id || doc_id; // Fallback to doc_id if id missing in data
+                        localCache.set(id, r);
+                        documentChanges.push({ 
+                            type: 'added', 
+                            doc: new DocumentSnapshot(id, true, r) 
+                        });
+                    });
+                } 
+                else if (kind === 'update') {
+                    // incremental add or modify
+                    const type = localCache.has(doc_id) ? 'modified' : 'added';
+                    localCache.set(doc_id, data);
+                    documentChanges.push({ 
+                        type, 
+                        doc: new DocumentSnapshot(doc_id, true, data) 
+                    });
+                } 
+                else if (kind === 'delete') {
+                    // incremental remove
+                    if (localCache.has(doc_id)) {
+                        const oldData = localCache.get(doc_id);
+                        localCache.delete(doc_id);
+                        documentChanges.push({ 
+                            type: 'removed', 
+                            doc: new DocumentSnapshot(doc_id, true, oldData) 
+                        });
+                    }
+                }
+            });
+
+            // 1. Convert Map to Array
+            let docs = Array.from(localCache.values()).map(r => 
+                new DocumentSnapshot(r.id || generateId(), true, r)
+            );
+
+            // 2. Client-side Sorting
+            // Because we only receive deltas, we must re-sort the local array 
+            // to ensure the UI remains in the correct order defined by the query.
+            if (params.order_by) {
+                const { field, ascending } = params.order_by;
+                docs.sort((a, b) => {
+                    const valA = a.data()?.[field] ?? '';
+                    const valB = b.data()?.[field] ?? '';
+                    if (valA === valB) return 0;
+                    const cmp = valA < valB ? -1 : 1;
+                    return ascending ? cmp : -cmp;
+                });
+            }
+
+            // 3. Trigger React Update
+            callback(new QuerySnapshot(docs, documentChanges));
         });
 
+        // Register the subscription in the Rust backend
         await exec({
             op: 'subscribe',
-            listenerId,
-            eventName,
+            listener_id,
+            event_name,
             ...params
         });
     };
@@ -230,160 +291,190 @@ export const onSnapshot = (q: Query, callback: (snapshot: QuerySnapshot) => void
 
     return () => {
         if (unlisten) unlisten();
-        exec({ op: 'unsubscribe', listenerId });
+        // Clean up the Rust-side thread and channel
+        exec({ op: 'unsubscribe', listener_id });
     };
 };
 
 // --- Transactions & Batches ---
-
 export const writeBatch = () => {
     const mutations: any[] = [];
     return {
-        set: (ref: DocumentReference, data: FireLiteRecord) => mutations.push({ mutation: 'set', collection: ref.collectionPath, docId: ref.id, data: normalizeValue(data) }),
-        update: (ref: DocumentReference, data: Partial<FireLiteRecord>) => mutations.push({ mutation: 'patch', collection: ref.collectionPath, docId: ref.id, data: normalizeValue(data) }),
-        delete: (ref: DocumentReference) => mutations.push({ mutation: 'delete', collection: ref.collectionPath, doc_id: ref.id }),
+        set: (ref: DocumentReference, data: FireLiteRecord) => 
+            mutations.push({ mutation: 'set', collection: ref.collectionPath, doc_id: ref.id, data: normalizeValue(data) }),
+        update: (ref: DocumentReference, data: Partial<FireLiteRecord>) => 
+            mutations.push({ mutation: 'patch', collection: ref.collectionPath, doc_id: ref.id, data: normalizeValue(data) }),
+        delete: (ref: DocumentReference) => 
+            mutations.push({ mutation: 'delete', collection: ref.collectionPath, doc_id: ref.id }),
         commit: async () => exec({ op: 'batch', mutations })
     };
 };
 
-export const runTransaction = async (db: FireLite, updateFunction: (transaction: any) => Promise<any>) => {
-    // Note: Rust side serializable transactions are more restrictive. 
-    // This implementation wraps the logic in a Batch for atomicity.
-    const reads: any[] = [];
-    const mutations: any[] = [];
-    
-    const transaction = {
-        get: async (ref: DocumentReference) => {
-            const doc = await getDoc(ref);
-            reads.push({ ref, version: Date.now() }); // Optimistic concurrency placeholder
-            return doc;
-        },
-        set: (ref: DocumentReference, data: any) => mutations.push({ mutation: 'set', collection: ref.collectionPath, docId: ref.id, data: normalizeValue(data) }),
-        update: (ref: DocumentReference, data: any) => mutations.push({ mutation: 'patch', collection: ref.collectionPath, docId: ref.id, data: normalizeValue(data) }),
-        delete: (ref: DocumentReference) => mutations.push({ mutation: 'delete', collection: ref.collectionPath, docId: ref.id })
-    };
+export const runTransaction = async (
+  _db: FireLite,
+  updateFunction: (transaction: any) => Promise<any>
+) => {
+  const mutations: any[] = [];
 
-    const result = await updateFunction(transaction);
-    await exec({ op: 'batch', mutations });
-    return result;
+  const transaction = {
+    get: async (ref: DocumentReference) => {
+      return await getDoc(ref);
+    },
+
+    set: (ref: DocumentReference, data: any) =>
+      mutations.push({
+        mutation: 'set',
+        collection: ref.collectionPath,
+        doc_id: ref.id,
+        data: normalizeValue(data)
+      }),
+
+    update: (ref: DocumentReference, data: any) =>
+      mutations.push({
+        mutation: 'patch',
+        collection: ref.collectionPath,
+        doc_id: ref.id,
+        data: normalizeValue(data)
+      }),
+
+    delete: (ref: DocumentReference) =>
+      mutations.push({
+        mutation: 'delete',
+        collection: ref.collectionPath,
+        doc_id: ref.id
+      })
+  };
+
+  const result = await updateFunction(transaction);
+
+  await exec({
+    op: 'batch',
+    mutations
+  });
+
+  return result;
 };
 
-// --- Indexing ----
-export const createIndex = async (collection: string, field: string) =>
-    exec({ op: 'createIndex', collection, field });
+// --- Indexing ---
+export const createIndex = async (colOrPath: string | CollectionReference, field: string) => {
+    const collection = typeof colOrPath === 'string' ? colOrPath : colOrPath.path;
+    return exec({ op: 'create_index', collection, field });
+};
 
-export const createFtsIndex = async (collection: string, field: string) =>
-    exec({ op: 'createFtsIndex', collection, field });
+export const createFtsIndex = async (colOrPath: string | CollectionReference, field: string) => {
+    const collection = typeof colOrPath === 'string' ? colOrPath : colOrPath.path;
+    return exec({ op: 'create_fts_index', collection, field });
+};
 
 export const createCompositeIndex = async (
-    collection: string,
-    fields: { field: string, desc?: boolean }[]
-) => exec({ op: 'createCompositeIndex', collection, fields });
+  colOrPath: string | CollectionReference,
+  fields: { field: string; desc?: boolean }[]
+) => {
+  const collection =
+    typeof colOrPath === 'string' ? colOrPath : colOrPath.path;
+
+  return exec({
+    op: 'create_composite_index',
+    collection,
+    fields
+  });
+};
 
 export const listIndexes = async (collection?: string) => {
-    const res = await exec({ op: 'listIndexes', collection });
-    return res.indexes.list;
+  const res = await exec({
+    op: 'list_indexes',
+    collection
+  });
+  return res.indexes.list;
 };
 
 export const snapshotIndices = async () =>
-    exec({ op: 'snapshotIndices' });
+  exec({ op: 'snapshot_indices' });
 
-
-// --- Engine / Admin Operations ---
-
+// --- Admin ---
 export const listCollections = async () => {
-    const res = await exec({ op: 'listCollections' });
+    const res = await exec({ op: 'list_collections' });
     return res.collections.names;
 };
 
 export const getStats = async () => {
-    const res = await exec({ op: 'getStats' });
+    const res = await exec({ op: 'get_stats' });
     return res.stats.details;
 };
 
-export const compactEngine = async () => exec({ op: 'compact' });
-
-export const backupEngine = async (path: string) => {
-    await exec({ op: 'backup', path });
-};
-
-export const getAuditLog = async (): Promise<AuditEntry[]> => {
-    const res = await exec({ op: 'getAuditLog' });
-    return res.auditLog.entries;
-};
-
-export const setDurabilityMode = async (mode: 'Always' | 'Interval' | 'Manual' | 'OnCommit') => {
-    const map = { Interval: 1, Manual: 2, OnCommit: 3, Always: 0 };
-    await exec({ op: 'setDurability', mode: map[mode] });
-};
-
-export const setCompression = async (enabled: boolean, level: number = 3) => {
-    await exec({ op: 'setCompression', enabled, level });
-};
-
 // --- Private Helpers ---
-
-function buildQueryParams(q: Query) {
+function buildQueryParams(q: Query | CollectionReference | CollectionGroupReference) {
+    // 1. Ensure we have a query-like structure even if a raw collection is passed
+    const queryObj = (q as any).constraints ? (q as Query) : new Query(q as any);
+    
     const filters: any[] = [];
-    const orGroups: any[][] = [];
-    let orderBy: any = undefined;
+    const or_groups: any[][] = [];
+    let order_by: any = undefined;
     let limit: number | undefined = undefined;
     let offset: number | undefined = undefined;
     let projection: string[] | undefined = undefined;
-    let startAt: any[] | undefined = undefined;
-    let startAfter: any[] | undefined = undefined;
-    let endAt: any[] | undefined = undefined;
-    let endBefore: any[] | undefined = undefined;
+    let start_at: any[] | undefined = undefined;
+    let start_after: any[] | undefined = undefined;
+    let end_at: any[] | undefined = undefined;
+    let end_before: any[] | undefined = undefined;
 
-    for (const c of q.constraints) {
+    // Use queryObj.constraints instead of q.constraints
+    for (const c of queryObj.constraints) {
         switch (c.type) {
-            case 'where': filters.push({ field: c.data.field, op: c.data.op, value: normalizeValue(c.data.value) }); break;
-            case 'or': orGroups.push(c.data.map((cc: any) => ({ field: cc.data.field, op: cc.data.op, value: normalizeValue(cc.data.value) }))); break;
-            case 'orderBy': orderBy = c.data; break;
+            case 'where': filters.push({ field: c.data.field, op: symToOp(c.data.op), value: normalizeValue(c.data.value) }); break;
+            case 'or': or_groups.push(c.data.map((cc: any) => ({ field: cc.data.field, op: symToOp(cc.data.op), value: normalizeValue(cc.data.value) }))); break;
+            case 'order_by': order_by = c.data; break;
             case 'limit': limit = c.data; break;
             case 'offset': offset = c.data; break;
             case 'select': projection = c.data; break;
-            case 'startAt': startAt = c.data.map(normalizeValue); break;
-            case 'startAfter': startAfter = c.data.map(normalizeValue); break;
-            case 'endAt': endAt = c.data.map(normalizeValue); break;
-            case 'endBefore': endBefore = c.data.map(normalizeValue); break;
+            case 'start_at': start_at = c.data.map(normalizeValue); break;
+            case 'start_after': start_after = c.data.map(normalizeValue); break;
+            case 'end_at': end_at = c.data.map(normalizeValue); break;
+            case 'end_before': end_before = c.data.map(normalizeValue); break;
         }
     }
 
+    const collection = queryObj.colRef instanceof CollectionReference ? queryObj.colRef.path : (queryObj.colRef as any).id;
+
     return {
-        collection: q.colRef.path,
+        collection,
         filters,
-        orGroups: orGroups.length > 0 ? orGroups : undefined,
-        orderBy,
+        or_groups: or_groups.length > 0 ? or_groups : undefined,
+        order_by,
         limit,
         offset,
         projection,
-        startAt,
-        startAfter,
-        endAt,
-        endBefore
+        start_at,
+        start_after,
+        end_at,
+        end_before
     };
 }
 
-function computeChanges(oldRows: any[], newRows: any[]): DocumentChange[] {
-    const changes: DocumentChange[] = [];
-    const oldMap = new Map(oldRows.map(r => [r.id, r]));
-    const newMap = new Map(newRows.map(r => [r.id, r]));
+export const getSumFromServer = async (
+  q: Query | CollectionReference | CollectionGroupReference,
+  field: string
+) => {
+  const params = buildQueryParams(q);
+  const res = await exec({
+    op: 'aggregate',
+    kind: 'sum',
+    field,
+    ...params
+  });
+  return { data: () => ({ value: res.aggregate_result.value }) };
+};
 
-    newMap.forEach((newDoc, id) => {
-        const oldDoc = oldMap.get(id);
-        if (!oldDoc) {
-            changes.push({ type: 'added', doc: new DocumentSnapshot(id, true, newDoc) });
-        } else if (JSON.stringify(oldDoc) !== JSON.stringify(newDoc)) {
-            changes.push({ type: 'modified', doc: new DocumentSnapshot(id, true, newDoc) });
-        }
-    });
-
-    oldMap.forEach((oldDoc, id) => {
-        if (!newMap.has(id)) {
-            changes.push({ type: 'removed', doc: new DocumentSnapshot(id, true, oldDoc) });
-        }
-    });
-
-    return changes;
-}
+export const getAverageFromServer = async (
+  q: Query | CollectionReference | CollectionGroupReference,
+  field: string
+) => {
+  const params = buildQueryParams(q);
+  const res = await exec({
+    op: 'aggregate',
+    kind: 'avg',
+    field,
+    ...params
+  });
+  return { data: () => ({ value: res.aggregate_result.value }) };
+};

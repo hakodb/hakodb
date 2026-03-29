@@ -144,6 +144,27 @@ pub struct FireLiteGateway {
     subscriptions: Arc<Mutex<HashMap<String, SubscriptionEntry>>>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeltaKind {
+    Full,    // Initial bootstrap
+    Update,  // Add or Modify
+    Delete,  // Removed or no longer matches filter
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DocumentChange {
+    pub kind: DeltaKind,
+    pub doc_id: String,
+    pub data: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeltaPayload {
+    pub listener_id: String,
+    pub changes: Vec<DocumentChange>, // The batch container
+}
+
 struct SubscriptionEntry {
     stop_tx: Sender<()>,
     window_label: String,
@@ -183,6 +204,63 @@ impl FireLiteGateway {
         }
     }
 
+    // fn register_subscription<R: Runtime>(
+    //     &self,
+    //     window: Window<R>,
+    //     listener_id: String,
+    //     query_template: QueryInput,
+    //     event_name: String,
+    // ) -> Result<(), String> {
+    //     self.unsubscribe(&listener_id);
+
+    //     let rx = self.db.watch_collection(&query_template.collection);
+    //     let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        
+    //     self.subscriptions.lock().insert(
+    //         listener_id.clone(),
+    //         SubscriptionEntry {
+    //             stop_tx,
+    //             window_label: window.label().to_string(),
+    //         },
+    //     );
+
+    //     let subscriptions = Arc::clone(&self.subscriptions);
+    //     let db = Arc::clone(&self.db);
+    //     let listener_id_for_thread = listener_id.clone();
+        
+    //     tokio::task::spawn_blocking(move || {
+    //         let emit_snapshot = |win: &Window<R>| -> Result<(), String> {
+    //             let rows = execute_query_input(&db, &query_template)?;
+    //             let payload = SubscriptionPayload {
+    //                 listener_id: listener_id_for_thread.clone(),
+    //                 rows,
+    //             };
+    //             win.emit(&event_name, payload).map_err(|e: tauri::Error| e.to_string())
+    //         };
+
+    //         if emit_snapshot(&window).is_err() {
+    //             subscriptions.lock().remove(&listener_id_for_thread);
+    //             return;
+    //         }
+
+    //         loop {
+    //             if stop_rx.try_recv().is_ok() { break; }
+    //             match rx.recv_timeout(Duration::from_millis(250)) {
+    //                 Ok(_) => { 
+    //                     while let Ok(_) = rx.try_recv() {} 
+    //                     if emit_snapshot(&window).is_err() { break; } 
+    //                 }
+    //                 Err(RecvTimeoutError::Timeout) => continue,
+    //                 Err(RecvTimeoutError::Disconnected) => break,
+    //             }
+    //         }
+    //         subscriptions.lock().remove(&listener_id_for_thread);
+    //     });
+
+    //     Ok(())
+    // }
+
+    // Update the register_subscription method logic
     fn register_subscription<R: Runtime>(
         &self,
         window: Window<R>,
@@ -197,43 +275,106 @@ impl FireLiteGateway {
         
         self.subscriptions.lock().insert(
             listener_id.clone(),
-            SubscriptionEntry {
-                stop_tx,
-                window_label: window.label().to_string(),
-            },
+            SubscriptionEntry { stop_tx, window_label: window.label().to_string() },
         );
 
-        let subscriptions = Arc::clone(&self.subscriptions);
         let db = Arc::clone(&self.db);
-        let listener_id_for_thread = listener_id.clone();
+        let lid = listener_id.clone();
+        let ename = event_name.clone();
         
         tokio::task::spawn_blocking(move || {
-            let emit_snapshot = |win: &Window<R>| -> Result<(), String> {
-                let rows = execute_query_input(&db, &query_template)?;
-                let payload = SubscriptionPayload {
-                    listener_id: listener_id_for_thread.clone(),
-                    rows,
-                };
-                win.emit(&event_name, payload).map_err(|e: tauri::Error| e.to_string())
+            // --- 1. Send INITIAL BOOTSTRAP (Full Sync) ---
+            let initial_rows = match execute_query_input(&db, &query_template) {
+                Ok(rows) => rows,
+                Err(_) => Vec::new(),
             };
 
-            if emit_snapshot(&window).is_err() {
-                subscriptions.lock().remove(&listener_id_for_thread);
-                return;
-            }
+            // FIX: Wrap the initial data into the 'changes' vector
+            let _ = window.emit(&ename, DeltaPayload {
+                listener_id: lid.clone(),
+                changes: vec![DocumentChange {
+                    kind: DeltaKind::Full,
+                    doc_id: "_all_".into(),
+                    data: Some(serde_json::Value::Array(initial_rows)),
+                }],
+            });
 
+            // 2. Prepare Matcher Plan for deltas
+            // This allows us to check in Rust if a changed doc matches the JS 'where' filters
+            let mut base_query = crate::query::query::Query::new(&query_template.collection);
+            for f in &query_template.filters {
+                base_query = base_query.where_filter(&f.field, map_operator(&f.op), json_value_to_value(&f.value).unwrap_or(crate::document::value::Value::Null));
+            }
+            let filter_plan = {
+                let indexes = db.indexes.read().unwrap();
+                crate::query::planner::QueryPlanner::plan(&base_query, &indexes, 0, 1)
+            };
+
+            // 3. Event Loop
             loop {
                 if stop_rx.try_recv().is_ok() { break; }
-                match rx.recv_timeout(Duration::from_millis(250)) {
-                    Ok(_) => { 
-                        while let Ok(_) = rx.try_recv() {} 
-                        if emit_snapshot(&window).is_err() { break; } 
+
+                // 1. Wait for at least one event
+                match rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(first_event) => {
+                        let mut events = vec![first_event];
+                        
+                        // 2. DRAIN: Catch all other events that happened at the same time
+                        while let Ok(extra) = rx.try_recv() {
+                            events.push(extra);
+                        }
+
+                        // 3. Process the batch of events into lean deltas
+                        let mut changes = Vec::new();
+                        for event in events {
+                            let doc_id = event.path.split_once(':').map(|(_, id)| id).unwrap_or(&event.path).to_string();
+                            
+                            match event.kind {
+                                crate::engine::ChangeKind::Delete => {
+                                    changes.push(DocumentChange { kind: DeltaKind::Delete, doc_id, data: None });
+                                }
+                                crate::engine::ChangeKind::Put => {
+                                    let shard = db.get_shard(&query_template.collection);
+                                    let bytes_res = {
+                                        let storage = shard.read().unwrap();
+                                        storage.get(&event.path)
+                                    };
+
+                                    if let Ok(Some(bytes)) = bytes_res {
+                                        if crate::query::executor::worker::matches_filters_view(&bytes, &filter_plan) {
+                                            let doc = if let Some(p) = &query_template.projection {
+                                                FireLiteDoc::decode_projected(&bytes, p)
+                                            } else {
+                                                FireLiteDoc::decode(&bytes)
+                                            };
+                                            if let Some(d) = doc {
+                                                changes.push(DocumentChange { 
+                                                    kind: DeltaKind::Update, 
+                                                    doc_id, 
+                                                    data: doc_to_json_value(&d).ok() 
+                                                });
+                                            }
+                                        } else {
+                                            // Document exists but no longer matches filter -> UI must Remove
+                                            changes.push(DocumentChange { kind: DeltaKind::Delete, doc_id, data: None });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // 4. Emit the entire batch in ONE IPC call
+                        if !changes.is_empty() {
+                            let _ = window.emit(&ename, DeltaPayload {
+                                listener_id: lid.clone(),
+                                changes,
+                            });
+                        }
                     }
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
-            subscriptions.lock().remove(&listener_id_for_thread);
         });
 
         Ok(())
@@ -255,12 +396,12 @@ struct QueryInput {
     end_before: Option<Vec<serde_json::Value>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
-struct SubscriptionPayload {
-    listener_id: String,
-    rows: Vec<serde_json::Value>,
-}
+// #[derive(Debug, Clone, Serialize)]
+// #[serde(rename_all = "snake_case")]
+// struct SubscriptionPayload {
+//     listener_id: String,
+//     rows: Vec<serde_json::Value>,
+// }
 
 #[command]
 pub async fn firelite_exec<R: Runtime>(
