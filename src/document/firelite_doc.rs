@@ -90,56 +90,89 @@ impl FireLiteDoc {
 
     fn encode_value_to(v: &Value, out: &mut Vec<u8>) {
         match v {
-            Value::Null | Value::ServerTimestamp => out.push(1),
+            Value::Null | Value::ServerTimestamp => {
+                out.push(1);
+                out.extend_from_slice(&0u32.to_le_bytes()); // Length: 0
+            }
             Value::Bool(b) => {
                 out.push(2);
+                out.extend_from_slice(&1u32.to_le_bytes()); // Length: 1
                 out.push(*b as u8);
             }
             Value::Int(v) => {
                 out.push(3);
+                out.extend_from_slice(&8u32.to_le_bytes()); // Length: 8
                 out.extend_from_slice(&v.to_le_bytes());
             }
             Value::Float(v) => {
                 out.push(4);
+                out.extend_from_slice(&8u32.to_le_bytes()); // Length: 8
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Value::Timestamp(v) => {
+                out.push(7);
+                out.extend_from_slice(&8u32.to_le_bytes()); // Length: 8
                 out.extend_from_slice(&v.to_le_bytes());
             }
             Value::String(v) => {
                 out.push(5);
-                // The decoder expects u32 length for the value body
-                out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(v.len() as u32).to_le_bytes()); // Length: N
                 out.extend_from_slice(v.as_bytes());
             }
             Value::Binary(v) => {
                 out.push(6);
-                out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(v.len() as u32).to_le_bytes()); // Length: N
                 out.extend_from_slice(v);
             }
-            Value::Timestamp(v) => {
-                out.push(7);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
             Value::Map(fields) => {
-                out.push(8);
-                // Decoder for Map expects u16 field count
-                out.extend_from_slice(&(fields.len() as u16).to_le_bytes());
+                out.push(8); // Tag
+                let mut body = Vec::with_capacity(128);
+                
+                // Write the number of fields (u16)
+                body.extend_from_slice(&(fields.len() as u16).to_le_bytes());
+                
                 for (k, v) in fields {
-                    out.push(k.len() as u8);
-                    out.extend_from_slice(k.as_bytes());
-                    Self::encode_value_to(v, out); // RECURSIVE
+                    // Encode Key: [u8 len] [bytes]
+                    body.push(k.len() as u8);
+                    body.extend_from_slice(k.as_bytes());
+                    
+                    // Recursive call: This will now correctly write [Tag][u32 Len][Data]
+                    Self::encode_value_to(v, &mut body);
                 }
+                
+                // Write the TOTAL size of the body to the main buffer
+                out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                // Write the body
+                out.extend_from_slice(&body);
             }
             Value::Array(items) => {
-                out.push(9);
-                // Decoder for Array expects u32 item count
-                out.extend_from_slice(&(items.len() as u32).to_le_bytes());
+                out.push(9); // Tag
+                let mut body = Vec::with_capacity(128);
+                
+                // Write the number of items (u32)
+                body.extend_from_slice(&(items.len() as u32).to_le_bytes());
+                
                 for item in items {
-                    Self::encode_value_to(item, out); // RECURSIVE
+                    // Recursive call handles the item's [Tag][u32 Len][Data]
+                    Self::encode_value_to(item, &mut body);
                 }
+                
+                // Write the TOTAL size of the body to the main buffer
+                out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                out.extend_from_slice(&body);
             }
             Value::Reference { collection, doc_id } => {
-                out.push(10);
+                out.push(10); // Tag
+                
+                // Length calculation: 1 (col_len) + collection + 1 (id_len) + doc_id
+                let total_len = (1 + collection.len() + 1 + doc_id.len()) as u32;
+                out.extend_from_slice(&total_len.to_le_bytes());
+                
+                // Write Collection
                 out.push(collection.len() as u8);
                 out.extend_from_slice(collection.as_bytes());
+                
+                // Write DocID
                 out.push(doc_id.len() as u8);
                 out.extend_from_slice(doc_id.as_bytes());
             }
@@ -147,11 +180,6 @@ impl FireLiteDoc {
     }
 
     pub fn apply_patch_binary(old_bytes: &[u8], updates: &[(String, Value)]) -> Option<Vec<u8>> {
-        // let mut doc = Self::decode(old_bytes)?;
-        // for (k, v) in updates {
-        //     doc.insert(k.clone(), v.clone());
-        // }
-        // Some(doc.encode())
         let mut doc = Self::decode(old_bytes)?;
         for (k, v) in updates {
             doc.insert(k.clone(), v.clone());

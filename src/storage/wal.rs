@@ -174,8 +174,8 @@ impl Wal {
         self.file.write_all(&self.write_buffer)?;
         
         // Physically flip the bits on the disk
-        // self.file.sync_all()?;
-        self.file.sync_data()?;
+        self.file.sync_all()?;
+        // self.file.sync_data()?;
 
         // NOW we clear, after the data is safe on the platter
         self.write_buffer.clear();
