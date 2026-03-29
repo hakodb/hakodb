@@ -199,7 +199,8 @@ impl StorageEngine {
 
     fn update_index_entry(&mut self, key: String, new_pointer: Option<Pointer>) {
 
-        let collection_name = key.split_once(':').map(|(c, _)| c.to_string());
+        // let collection_name = key.split_once(':').map(|(c, _)| c.to_string());
+        let collection:&str = &self.logical_name.clone();
 
         // 1. If there was an old entry, subtract its size if it was inlined
         if let Some(old_p) = self.index.remove(&key) {
@@ -208,13 +209,8 @@ impl StorageEngine {
             }
 
             // DECREMENT count for this collection
-            if let Some(ref col) = collection_name {
-                if let Some(count) = self.collection_counts.get_mut(col) {
-                    *count = count.saturating_sub(1);
-                    // if *count == 0 {
-                    //     self.collection_counts.remove(col); // Collection officially "dies"
-                    // }
-                }
+            if let Some(count) = self.collection_counts.get_mut(collection) {
+                *count = count.saturating_sub(1);
             }
         }
 
@@ -225,10 +221,7 @@ impl StorageEngine {
             }
 
             // INCREMENT count for this collection
-            if let Some(ref col) = collection_name {
-                *self.collection_counts.entry(col.clone()).or_insert(0) += 1;
-            }
-
+            *self.collection_counts.entry(collection.to_string()).or_insert(0) += 1;
             self.index.insert(key, p);
         }
     }
@@ -342,8 +335,7 @@ impl StorageEngine {
 
                         // Hand off to the background thread
                         blob_work_todo.push(BlobWork::Put {
-                            // collection: self.base_dir.file_name().unwrap().to_str().unwrap().to_string(),
-                            collection: self.logical_name.clone(),
+                            collection: self.logical_name.clone(), // get collection name
                             key: key.clone(),
                             data: arc_data,
                         });

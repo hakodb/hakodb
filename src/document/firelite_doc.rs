@@ -1,5 +1,6 @@
 use crate::document::value::Value;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 const MAGIC: u8 = 0xF1;
 const VERSION: u8 = 2; // Format version 2: No Catalog / Raw Strings
@@ -24,18 +25,9 @@ impl FireLiteDoc {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        // let mut out = vec![MAGIC, VERSION];
-        // out.extend((self.fields.len() as u16).to_le_bytes());
-        // for (k, v) in &self.fields {
-        //     out.push(k.len() as u8);
-        //     out.extend_from_slice(k.as_bytes());
-        //     let (tag, bytes) = encode_value(v);
-        //     out.push(tag);
-        //     out.extend((bytes.len() as u32).to_le_bytes());
-        //     out.extend_from_slice(&bytes);
-        // }
-        // out
-        let mut out = Vec::with_capacity(128); // Pre-allocate sensible default
+        static BUFFER_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+        let mut out = BUFFER_POOL.lock().unwrap().pop().unwrap_or_else(|| Vec::with_capacity(4096));
+        // let mut out = Vec::with_capacity(128); // Pre-allocate sensible default
         self.encode_into(&mut out);
         out
     }

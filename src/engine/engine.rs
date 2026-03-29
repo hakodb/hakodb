@@ -552,7 +552,7 @@ impl FireLite {
     }
 
     /// INTERNAL LOGIC: Handles Sharding, Durability, and Async Indexing.
-    fn write_batch_internal(&self, mut mutations: Vec<BatchMutation>) -> Result<()> {
+    fn write_batch_internal(&self, mutations: Vec<BatchMutation>) -> Result<()> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -561,169 +561,110 @@ impl FireLite {
         let mut shard_groups: HashMap<String, Vec<StorageMutation>> = HashMap::new();
         let mut index_puts: HashMap<String, Vec<(String, FireLiteDoc)>> = HashMap::new();
         let mut index_dels: HashMap<String, Vec<(String, FireLiteDoc)>> = HashMap::new();
-        // let mut change_events: Vec<(String, ChangeEvent)> = Vec::new();
         let mut unique_events: HashMap<String, (String, ChangeEvent)> = HashMap::new();
+        
+        // Track keys to update versions without re-iterating over mutations
+        let mut affected_keys = Vec::with_capacity(mutations.len());
 
-        for m in &mut mutations {
+        for m in mutations { // Consumes mutations
             match m {
-                BatchMutation::Put {
-                    collection,
-                    doc_id,
-                    doc,
-                } => {
+                BatchMutation::Put { collection, doc_id, mut doc } => {
                     for (_, v) in &mut doc.fields {
                         if matches!(v, Value::ServerTimestamp) {
                             *v = Value::Timestamp(now);
                         }
                     }
 
-                    // 2. Build Key using fast path
-                    let key = fast_doc_key(collection, doc_id);
+                    let key = fast_doc_key(&collection, &doc_id);
+                    affected_keys.push(key.clone()); // Store for versioning
 
-                    // 3. Encode document using Zero-Allocation buffer
-                    let doc_bytes = WRITE_BUFFER.with(|b| {
-                        let mut buffer = b.borrow_mut();
-                        buffer.clear();
-                        doc.encode_into(&mut buffer);
-                        buffer.to_vec() 
-                    });
-
+                    let doc_bytes = doc.encode(); 
                     shard_groups.entry(collection.clone()).or_default().push(
-                        StorageMutation::Put {
-                            key: key.clone(),
-                            value: doc_bytes,
-                        },
+                        StorageMutation::Put { key: key.clone(), value: doc_bytes }
                     );
 
+                    // MOVE doc_id and doc (Zero-Clone)
+                    index_puts.entry(collection.clone()).or_default().push((doc_id, doc));
 
-                    index_puts
-                        .entry(collection.clone())
-                        .or_default()
-                        .push((doc_id.clone(), doc.clone()));
-
-                    // change_events.push((
-                    //     collection.clone(),
-                    //     ChangeEvent {
-                    //         path: key,
-                    //         kind: ChangeKind::Put,
-                    //     },
-                    // ));
                     unique_events.insert(key.clone(), (
-                        collection.clone(),
+                        collection,
                         ChangeEvent { path: key, kind: ChangeKind::Put }
                     ));
                 }
+
                 BatchMutation::Delete { collection, doc_id } => {
-                    let key = doc_key(collection, doc_id);
-                    let shard = self.get_shard(collection);
-                    // Scope the read lock so it drops immediately
+                    let key = fast_doc_key(&collection, &doc_id);
+                    affected_keys.push(key.clone());
+
+                    let shard = self.get_shard(&collection);
                     if let Some(bytes) = shard.read().unwrap().get(&key)? {
                         if let Some(old_doc) = FireLiteDoc::decode(&bytes) {
-                            index_dels
-                                .entry(collection.clone())
-                                .or_default()
-                                .push((doc_id.clone(), old_doc));
+                            index_dels.entry(collection.clone()).or_default().push((doc_id, old_doc));
                         }
                     }
-                    shard_groups
-                        .entry(collection.clone())
-                        .or_default()
-                        .push(StorageMutation::Delete { key: key.clone() });
-                    // change_events.push((
-                    //     collection.clone(),
-                    //     ChangeEvent {
-                    //         path: key,
-                    //         kind: ChangeKind::Delete,
-                    //     },
-                    // ));
+                    
+                    shard_groups.entry(collection.clone()).or_default().push(
+                        StorageMutation::Delete { key: key.clone() }
+                    );
+                    
                     unique_events.insert(key.clone(), (
-                        collection.clone(),
+                        collection,
                         ChangeEvent { path: key, kind: ChangeKind::Delete }
                     ));
                 }
 
                 BatchMutation::Patch { collection, doc_id, updates } => {
-                    let key = doc_key(collection, doc_id);
-                    let shard = self.get_shard(collection);
-                    
-                    // We need the OLD doc to update the index and merge fields
+                    let key = fast_doc_key(&collection, &doc_id);
+                    affected_keys.push(key.clone());
+
+                    let shard = self.get_shard(&collection);
                     let storage = shard.read().unwrap();
                     if let Some(old_bytes) = storage.get(&key)? {
-                        if let Some(old_doc) = FireLiteDoc::decode(&old_bytes) {
-                            // 1. Prepare for Index Deletion (Old state)
-                            index_dels.entry(collection.clone()).or_default().push((doc_id.clone(), old_doc));
-                            
-                            // // 2. Apply patch to get the NEW doc
-                            // if let Some(new_bytes) = FireLiteDoc::apply_patch_binary(&old_bytes, updates) {
-                            //     if let Some(new_doc) = FireLiteDoc::decode(&new_bytes) {
-                            //         // 3. Prepare for Index Put (New state)
-                            //         index_puts.entry(collection.clone()).or_default().push((doc_id.clone(), new_doc));
-                                    
-                            //         // 4. Add to storage group
-                            //         shard_groups.entry(collection.clone()).or_default().push(
-                            //             StorageMutation::Put { key: key.clone(), value: new_bytes }
-                            //         );
-                            //     }
-                            // }
-                            
-                            // Inside BatchMutation::Patch
-                            if let Some(new_bytes) = FireLiteDoc::apply_patch_binary(&old_bytes, updates) {
-                                // This is now safe because apply_patch_binary is unified!
-                                index_puts.entry(collection.clone()).or_default().push((doc_id.clone(), FireLiteDoc::decode(&new_bytes).unwrap()));
-                                shard_groups.entry(collection.clone()).or_default().push(
-                                    StorageMutation::Put { key: key.clone(), value: new_bytes }
-                                );
+                        if let Some(mut doc) = FireLiteDoc::decode(&old_bytes) {
+                            let old_doc_for_index = doc.clone(); 
+                            for (k, v) in updates {
+                                doc.insert(k, v);
                             }
+                            let new_bytes = doc.encode();
+
+                            index_dels.entry(collection.clone()).or_default().push((doc_id.clone(), old_doc_for_index));
+                            index_puts.entry(collection.clone()).or_default().push((doc_id, doc));
+
+                            shard_groups.entry(collection.clone()).or_default().push(
+                                StorageMutation::Put { key: key.clone(), value: new_bytes }
+                            );
+
+                            unique_events.insert(key.clone(), (
+                                collection,
+                                ChangeEvent { path: key, kind: ChangeKind::Put }
+                            ));
                         }
                     }
-                    // change_events.push((collection.clone(), ChangeEvent { path: key, kind: ChangeKind::Put }));
-                    unique_events.insert(key.clone(), (
-                        collection.clone(),
-                        ChangeEvent { path: key, kind: ChangeKind::Put }
-                    ));
                 }
             }
         }
 
-        // 2. DETERMINISTIC LOCKING: Prevents Deadlocks between threads
+        // 2. DETERMINISTIC LOCKING (Alphabetical)
         let mut sorted_shards: Vec<_> = shard_groups.keys().cloned().collect();
-        sorted_shards.sort(); // Always lock in alphabetical order
+        sorted_shards.sort();
 
         let mut all_blob_work = Vec::new();
-
-        // 3. EXECUTION: Write to each shard folder
         for col_name in sorted_shards {
             if let Some(ops) = shard_groups.get(&col_name) {
                 let shard = self.get_shard(&col_name);
-                // Lock ONLY this shard. Thread B can simultaneously lock a different shard!
                 let mut storage = shard.write().unwrap();
-                // storage.apply_batch(ops)?;
                 let pending_blobs = storage.apply_batch(ops)?;
                 all_blob_work.extend(pending_blobs);
             }
         }
 
-        // for work in all_blob_work {
-        //     let _ = self.blob_tx.send(work);
-        // }
-
+        // Hand off blobs
         for work in all_blob_work {
-            if let Err(e) = self.blob_tx.try_send(work) {
-                // Extract the work from the error enum
-                let work_to_retry = match e {
-                    std::sync::mpsc::TrySendError::Full(w) => w,
-                    std::sync::mpsc::TrySendError::Disconnected(w) => w,
-                };
-
-                let tx_clone = self.blob_tx.clone();
-                thread::spawn(move || {
-                    let _ = tx_clone.send(work_to_retry);
-                });
-            }
+            let _ = self.blob_tx.try_send(work);
         }
 
-        // 2. METADATA & ASYNC TASKS
-        self.bump_versions_for_mutations(&mutations);
+        // 3. Update metadata using our collected keys (NEW)
+        self.bump_versions_by_keys(affected_keys);
 
         for (col, puts) in index_puts {
             let deletes = index_dels.remove(&col).unwrap_or_default();
@@ -950,21 +891,28 @@ impl FireLite {
         self.doc_versions.read().unwrap().get(key).cloned()
     }
 
-    fn bump_versions_for_mutations(&self, mutations: &[BatchMutation]) {
+    fn bump_versions_by_keys(&self, keys: Vec<String>) {
         let mut versions = self.doc_versions.write().unwrap();
-        for m in mutations {
-            let key = match m {
-                BatchMutation::Put {
-                    collection, doc_id, ..
-                } => doc_key(collection, doc_id),
-                BatchMutation::Delete { collection, doc_id } => doc_key(collection, doc_id),
-                BatchMutation::Patch { collection, doc_id, .. } => {
-                    doc_key(collection, doc_id)
-                }
-            };
+        for key in keys {
             versions.insert(key, self.global_version.fetch_add(1, Ordering::SeqCst));
         }
     }
+
+    // fn bump_versions_for_mutations(&self, mutations: &[BatchMutation]) {
+    //     let mut versions = self.doc_versions.write().unwrap();
+    //     for m in mutations {
+    //         let key = match m {
+    //             BatchMutation::Put {
+    //                 collection, doc_id, ..
+    //             } => doc_key(collection, doc_id),
+    //             BatchMutation::Delete { collection, doc_id } => doc_key(collection, doc_id),
+    //             BatchMutation::Patch { collection, doc_id, .. } => {
+    //                 doc_key(collection, doc_id)
+    //             }
+    //         };
+    //         versions.insert(key, self.global_version.fetch_add(1, Ordering::SeqCst));
+    //     }
+    // }
 
     pub fn begin_serializable_transaction(&self) -> SerializableTransaction {
         SerializableTransaction {
@@ -1507,12 +1455,17 @@ fn subcollection_prefix(collection: &str, doc_id: &str, subcollection: &str) -> 
 
 // Helper to build a key without format!()
 fn fast_doc_key(col: &str, id: &str) -> String {
-    KEY_BUFFER.with(|b| {
-        let mut buffer = b.borrow_mut();
-        buffer.clear();
-        buffer.push_str(col);
-        buffer.push(':');
-        buffer.push_str(id);
-        buffer.clone() // Still one clone here, but better than format!
-    })
+    // KEY_BUFFER.with(|b| {
+    //     let mut buffer = b.borrow_mut();
+    //     buffer.clear();
+    //     buffer.push_str(col);
+    //     buffer.push(':');
+    //     buffer.push_str(id);
+    //     buffer.clone() // Still one clone here, but better than format!
+    // })
+    let mut s = String::with_capacity(col.len() + id.len() + 1);
+    s.push_str(col);
+    s.push(':');
+    s.push_str(id);
+    s
 }

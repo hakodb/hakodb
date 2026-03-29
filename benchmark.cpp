@@ -421,8 +421,8 @@ int main(int argc, char** argv) {
              << left << setw(13) << ss_read.str() << " | "
              << left << setw(20) << ss_stress.str() << " | "
              << left << setw(13) << ss_query.str() << " | "
-             << fixed << setprecision(0) << setw(8) << r.agg_ms << " | "
-             << setw(8) << r.tx_ms << " | "
+             << fixed << setprecision(4) << setw(8) << r.agg_ms << " | "
+             << setprecision(4) << setw(8) << r.tx_ms << " | "
              << left << setw(12) << ss_bulk.str() << " | "
              << left << setw(15) << ss_maint.str() << " | "
              << setprecision(1) << r.storage_mb << "MB\n";
