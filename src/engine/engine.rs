@@ -118,6 +118,7 @@ struct PersistedIndexState {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PersistedCompositeIndex {
+    id: u32, 
     collection: String,
     fields: Vec<(String, String)>,
 }
@@ -314,22 +315,37 @@ impl FireLite {
             maintenance_handle: Mutex::new(None),
         };
 
-        // 6. ORCHESTRATED BACKGROUND RECOVERY (CATALOG-FREE)
+        let _ = db.restore_index_defs();
+
+        // 6. ORCHESTRATED BACKGROUND RECOVERY
         let shards_ptr = Arc::clone(&db.shards);
         let indexes_ptr = Arc::clone(&db.indexes);
         let persist_ptr = Arc::clone(&db.index_storage);
         let config_thread = config.clone();
         let blob_tx_thread = db.blob_tx.clone();
         let root_scan = root_path.clone();
+        let snapshot_path = root_path.join("_indices").join("ram_indexes.bin");
 
         thread::spawn(move || {
-            // STEP A: Discovery - Just scan directories in the root
+            // --- STEP A: Try to load RAM Snapshot FIRST ---
+            let mut snapshot_loaded = false;
+
+            if snapshot_path.exists() {
+                if let Ok(bytes) = std::fs::read(&snapshot_path) {
+                    let mut mgr = indexes_ptr.write().unwrap();
+                    // No version returned anymore
+                    if mgr.import_state(&bytes).is_ok() {
+                        snapshot_loaded = true;
+                    }
+                }
+            }
+
+            // --- STEP B: Discovery ---
             let mut discovered = Vec::new();
             if let Ok(entries) = std::fs::read_dir(&root_scan) {
                 for entry in entries.flatten() {
                     if entry.path().is_dir() {
                         let name = entry.file_name().to_string_lossy().to_string();
-                        // Ignore system folders like _indices and audit logs
                         if !name.starts_with('_') && name != "snapshots" {
                             discovered.push(name);
                         }
@@ -337,78 +353,47 @@ impl FireLite {
                 }
             }
 
-            // STEP B: Load Shards and RAM Indexes
+            // --- STEP C: Load Shards (and Rebuild if needed) ---
             for col_name in discovered {
                 let path = root_scan.join(&col_name);
                 if let Ok(mut storage) = StorageEngine::open(path, &config_thread, col_name.clone()) {
                     storage.blob_tx = Some(blob_tx_thread.clone());
                     
-                    // Rebuild RAM indexes for this collection
-                    if let Ok(data) = storage.scan_prefix("") {
-                        let mut mgr = indexes_ptr.write().unwrap();
-                        for (full_key, bytes) in data {
-                            if let Some((_, doc_id)) = full_key.split_once(':') {
-                                if let Some(doc) = FireLiteDoc::decode(&bytes) {
-                                    mgr.index_document(&col_name, doc_id, &doc);
+                    // REBUILD ONLY IF SNAPSHOT FAILED
+                    if !snapshot_loaded {
+                        if let Ok(data) = storage.scan_prefix("") {
+                            let mut mgr = indexes_ptr.write().unwrap();
+                            for (full_key, bytes) in data {
+                                if let Some((_, doc_id)) = full_key.split_once(':') {
+                                    if let Some(doc) = FireLiteDoc::decode(&bytes) {
+                                        mgr.index_document(&col_name, doc_id, &doc);
+                                    }
                                 }
                             }
                         }
                     }
 
                     if let Ok(mut shards) = shards_ptr.write() {
-                        shards.insert(col_name, Arc::new(RwLock::new(storage)));
+                        shards.insert(col_name.clone(), Arc::new(RwLock::new(storage)));
                     }
                 }
             }
 
-            // STEP C: Load Persistent Composite Index Manager state
+            // --- STEP D: Load Persistent Composite Index Manager state ---
             {
+                let log_path = {
+                    let persist = persist_ptr.lock().unwrap();
+                    persist.log_path().to_string() // Use the new getter
+                };
                 let mut mgr = indexes_ptr.write().unwrap();
-                let mut persist = persist_ptr.lock().unwrap();
-                mgr.composite = std::mem::take(&mut persist.manager);
+                // mgr.composite = std::mem::take(&mut persist.manager);
+                let _ = crate::index::storage::index_recovery::replay_log(&log_path, &mut mgr.composite);
             }
         });
 
         // 7. Blob Workers (4 Threads)
         let shards_ptr = Arc::clone(&db.shards);
         let encryption_key = config.encryption_key.clone();
-
-        // for _ in 0..4 {
-        //     let rx = Arc::clone(&shared_blob_rx);
-        //     let s_ptr = Arc::clone(&shards_ptr);
-        //     let enc_key = encryption_key.clone();
-
-        //     thread::spawn(move || {
-        //         let enc_ctx = enc_key.map(|k| crate::storage::crypto::EncryptionContext::from_secret(&k));
-        //         loop {
-        //             let work = rx.lock().unwrap().recv().unwrap();
-        //             let BlobWork::Put { collection, key, data } = work;
-                    
-        //             // 1. Encrypt OUTSIDE the lock
-        //             let payload = if let Some(ref enc) = enc_ctx { ... };
-
-        //             // 2. Perform Disk I/O using a localized lock on the FILE only
-        //             let (offset, len) = {
-        //                 let shards = s_ptr.read().unwrap();
-        //                 let shard_arc = shards.get(&collection).unwrap();
-        //                 let shard_guard = shard_arc.read().unwrap(); // Use READ lock to get the file
-        //                 let mut file = shard_guard.blob_file.lock().unwrap();
-                        
-        //                 let pos = file.seek(SeekFrom::End(0)).unwrap();
-        //                 file.write_all(&payload).unwrap();
-        //                 (pos, payload.len() as u32)
-        //             };
-
-        //             // 3. Update the index only (Very fast lock)
-        //             let shards = s_ptr.read().unwrap();
-        //             if let Some(shard_arc) = shards.get(&collection) {
-        //                 let mut shard = shard_arc.write().unwrap(); 
-        //                 shard.index.insert(key, Pointer::Blob { offset, len });
-        //             }
-        //         }
-        //     });
-        // }
-        // In FireLite::open inside src/engine/engine.rs
 
         for _ in 0..4 {
             let rx = Arc::clone(&shared_blob_rx);
@@ -484,7 +469,6 @@ impl FireLite {
         *db.maintenance_stop.lock().unwrap() = Some(stop_tx);
         *db.maintenance_handle.lock().unwrap() = Some(handle);
 
-        let _ = db.restore_index_defs();
         Ok(db)
     }
 
@@ -1034,95 +1018,94 @@ impl FireLite {
         self.root_path.join("_indices").join("definitions.json")
     }
 
+    // 1. The public version (used by create_index)
     pub(crate) fn persist_index_defs(&self) -> Result<()> {
         let mgr = self.indexes.read().unwrap();
+        self.persist_index_defs_with_guard(&mgr)
+    }
+
+    // 2. The internal version (used by Drop or Startup)
+    fn persist_index_defs_with_guard(&self, mgr: &crate::index::manager::IndexManager) -> Result<()> {
         let mut secondary: HashMap<String, Vec<String>> = HashMap::new();
         let mut fts: HashMap<String, Vec<String>> = HashMap::new();
         let mut composite: Vec<PersistedCompositeIndex> = Vec::new();
 
-        // 1. Process Secondary Indexes
         for (col, fields_map) in &mgr.secondary {
             let mut list: Vec<String> = fields_map.keys().cloned().collect();
             list.sort();
             secondary.insert(col.clone(), list);
         }
 
-        // 2. Process FTS Indexes
         for (col, fields_map) in &mgr.fts {
             let mut list: Vec<String> = fields_map.keys().cloned().collect();
             list.sort();
             fts.insert(col.clone(), list);
         }
 
-        // 3. Process Composite Indexes 
-        // We iterate through all indexes registered in the manager's internal map
         for idx in mgr.composite.all_indexes() { 
             composite.push(PersistedCompositeIndex {
+                id: idx.definition.id, // CRITICAL: Ensure 'id' is saved!
                 collection: idx.definition.collection.clone(),
                 fields: idx.definition.fields.iter().map(|f| {
-                    (
-                        f.field.clone(),
-                        match f.direction {
-                            SortDirection::Asc => "asc".to_string(),
-                            SortDirection::Desc => "desc".to_string(),
-                        },
-                    )
+                    (f.field.clone(), if matches!(f.direction, SortDirection::Desc) { "desc".to_string() } else { "asc".to_string() })
                 }).collect(),
             });
         }
 
-        let state = PersistedIndexState {
-            secondary,
-            fts,
-            composite,
-        };
-
+        let state = PersistedIndexState { secondary, fts, composite };
         let path = self.index_defs_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let json = serde_json::to_vec_pretty(&state)
-            .map_err(|e| FireLiteError::Corrupt(format!("index defs serialize failed: {e}")))?;
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+        let json = serde_json::to_vec_pretty(&state).map_err(|e| FireLiteError::Corrupt(e.to_string()))?;
         std::fs::write(path, json)?;
         Ok(())
     }
 
     fn restore_index_defs(&self) -> Result<()> {
         let path = self.index_defs_path();
-        if !path.exists() {
-            return Ok(());
-        }
+        if !path.exists() { return Ok(()); }
+        
         let data = std::fs::read(path)?;
-        let state: PersistedIndexState =
-            serde_json::from_slice(&data).unwrap_or_else(|_| PersistedIndexState::default());
+        let state: PersistedIndexState = serde_json::from_slice(&data).unwrap_or_default();
 
+        let mut mgr = self.indexes.write().unwrap();
+
+        // 1. Populate Secondary (Directly in manager, no public API call)
         for (collection, fields) in state.secondary {
             for field in fields {
-                let _ = self.create_index(&collection, &field);
+                mgr.secondary.entry(collection.clone()).or_default()
+                    .insert(field, crate::index::secondary_index::SecondaryIndex::default());
             }
         }
+
+        // 2. Populate FTS (Directly in manager)
         for (collection, fields) in state.fts {
             for field in fields {
-                let _ = self.create_fts_index(&collection, &field);
+                mgr.fts.entry(collection.clone()).or_default()
+                    .insert(field, crate::index::inverted_index::InvertedIndex::default());
             }
         }
+
+        // 3. Populate Composite (Directly in manager)
         for def in state.composite {
-            let fields: Vec<(String, SortDirection)> = def
-                .fields
-                .into_iter()
-                .map(|(field, dir)| {
-                    let direction = if dir.eq_ignore_ascii_case("desc") {
-                        SortDirection::Desc
-                    } else {
-                        SortDirection::Asc
-                    };
-                    (field, direction)
-                })
-                .collect();
+            let fields: Vec<_> = def.fields.into_iter().map(|(field, dir)| {
+                let direction = if dir.eq_ignore_ascii_case("desc") { 
+                    SortDirection::Desc 
+                } else { 
+                    SortDirection::Asc 
+                };
+                crate::index::composite::definition::CompositeField { field, direction }
+            }).collect();
+
             if !fields.is_empty() {
-                let _ = self.create_composite_index(&def.collection, fields);
+                mgr.composite.restore_index(crate::index::composite::definition::CompositeIndexDefinition {
+                    id: def.id,
+                    collection: def.collection,
+                    fields,
+                });
             }
         }
+        
+        // NO persist_index_defs() call here. We just loaded what was already on disk.
         Ok(())
     }
 
@@ -1400,16 +1383,24 @@ impl FireLite {
 
 impl Drop for FireLite {
     fn drop(&mut self) {
-        // 1. Signal workers to stop. They will wake up instantly due to recv_timeout.
-        if let Some(tx) = self.maintenance_stop.lock().unwrap().take() {
-            let _ = tx.send(());
-        }
-        if let Some(tx) = self.audit_stop.lock().unwrap().take() {
-            let _: std::result::Result<(), std::sync::mpsc::SendError<()>> = tx.send(());
+        // 1. Signal workers to stop
+        if let Some(tx) = self.maintenance_stop.lock().unwrap().take() { let _ = tx.send(()); }
+        if let Some(tx) = self.audit_stop.lock().unwrap().take() { let _ = tx.send(()); }
+
+        // 2. Save Index State
+        let snapshot_path = self.root_path.join("_indices").join("ram_indexes.bin");
+        
+        if let Ok(mgr) = self.indexes.read() {
+            // FIX: export_state now takes 0 arguments
+            if let Ok(bytes) = mgr.export_state() {
+                let _ = std::fs::write(snapshot_path, bytes);
+            }
+            // Save JSON definitions
+            let _ = self.persist_index_defs_with_guard(&mgr); 
         }
 
-        // 2. PARALLEL SHARD FLUSHING
-        // We move the shards out of the map to ensure we own them during the flush
+        // 3. PARALLEL SHARD FLUSHING
+        // Move shards out to ensure ownership during the flush
         let shards_to_flush: Vec<Arc<RwLock<StorageEngine>>> = {
             let mut shards_map = self.shards.write().unwrap();
             shards_map.drain().map(|(_, shard)| shard).collect()
@@ -1427,19 +1418,11 @@ impl Drop for FireLite {
             })
             .collect();
 
-        // 3. Wait for shard flushes
-        for h in flush_handles {
-            let _ = h.join();
-        }
+        for h in flush_handles { let _ = h.join(); }
 
-        // 4. Join the controller threads (Now near-instant because they woke up in step 1)
-        if let Some(h) = self.maintenance_handle.lock().unwrap().take() {
-            let _ = h.join();
-        }
-        if let Some(h) = self.audit_handle.lock().unwrap().take() {
-            let _ = h.join();
-        }
-
+        // 4. JOIN CONTROLLER THREADS
+        if let Some(h) = self.maintenance_handle.lock().unwrap().take() { let _ = h.join(); }
+        if let Some(h) = self.audit_handle.lock().unwrap().take() { let _ = h.join(); }
     }
 }
 

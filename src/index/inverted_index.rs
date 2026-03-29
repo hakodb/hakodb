@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use serde::{Serialize, Deserialize}; 
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize, Deserialize)]
 pub struct InvertedIndex {
     // Word -> Set of Document IDs
     pub map: BTreeMap<String, BTreeSet<String>>,

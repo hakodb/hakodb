@@ -102,7 +102,7 @@ FL_Doc* make_complex_doc(int i, const string& payload) {
     fl_doc_insert_int(d, "age", 18 + (i % 70));
     fl_doc_insert_bool(d, "active", i % 3 != 0);
     fl_doc_insert_float(d, "score", ((i % 10000) / 7.0) + 0.5);
-    fl_doc_insert_str(d, "description", (string("firelite v0.5.10 benchmark payload ") + to_string(i)).c_str());
+    fl_doc_insert_str(d, "description", (string("firelite v0.5.28 benchmark payload ") + to_string(i)).c_str());
     
     FL_Array* tags = fl_array_new();
     fl_array_append_str(tags, (string("tag-") + to_string(i % 10)).c_str());
@@ -155,12 +155,17 @@ Report run_benchmark(BenchConfig cfg) {
     cout << "ACTIVE";
 
     stage("Indexing..");
-    // CREATE INDEXES UPFRONT ON EMPTY DB
-    fl_engine_create_simple_index(db, "bench", "id");
     fl_engine_create_simple_index(db, "bench", "active"); 
     fl_engine_create_simple_index(db, "bench", "tenant"); 
-    fl_engine_create_index(db, "bench", "[{\"field\": \"tenant\", \"desc\": false}, {\"field\": \"score\", \"desc\": true}]");
+    fl_engine_create_simple_index(db, "bench", "id"); 
 
+    // FIX: Create a Composite Index for 'id' instead of a simple one.
+    // This tells the planner that the 'id' field is range-capable.
+    fl_engine_create_index(db, "bench", "[{\"field\": \"id\", \"desc\": false}]");
+
+    // Your existing multi-field index
+    fl_engine_create_index(db, "bench", "[{\"field\": \"tenant\", \"desc\": false}, {\"field\": \"score\", \"desc\": true}]");
+    
     // NO READINESS PROBE NEEDED! The background threads will complete instantly
     // because there is 0 bytes of data to scan.
     cout << "Ready";
@@ -379,7 +384,7 @@ int main(int argc, char** argv) {
     };
 
     cout << "==========================================================================================\n";
-    cout << " FIRE LITE ARCHITECTURAL DEEP-DIVE (v0.5.10) | Total Docs: " << g_docs << "\n";
+    cout << " FIRE LITE ARCHITECTURAL DEEP-DIVE (v0.5.28) | Total Docs: " << g_docs << "\n";
     cout << "==========================================================================================\n";
 
     vector<Report> results;
@@ -393,7 +398,7 @@ int main(int argc, char** argv) {
 
     // CONCLUSION TABLE
     cout << "\n\n" << string(155, '=') << "\n";
-    cout << " FINAL PERFORMANCE MATRIX (v0.5.10)\n";
+    cout << " FINAL PERFORMANCE MATRIX (v0.5.28)\n";
     cout << string(155, '-') << "\n";
     cout << left << setw(14) << "Profile" << " | "
          << setw(11) << "S/B TPS" << " | "

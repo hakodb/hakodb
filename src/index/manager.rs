@@ -1,6 +1,7 @@
 use crate::document::firelite_doc::FireLiteDoc;
 use crate::document::value::Value;
-use std::collections::HashMap;
+// use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::sync::Arc;
 
 use super::composite::definition::CompositeIndexDefinition;
@@ -8,6 +9,8 @@ use super::composite::manager::CompositeIndexManager;
 use super::inverted_index::InvertedIndex;
 use crate::index::composite::composite_index::CompositeIndex;
 use crate::index::secondary_index::SecondaryIndex;
+
+use crate::error::FireLiteError;
 
 #[derive(Default)]
 pub struct IndexManager {
@@ -153,5 +156,24 @@ impl IndexManager {
             .get(field)?
             .range_scan(value, value) // Exact match scan
             .into()
+    }
+
+    pub fn export_state(&self) -> Result<Vec<u8>, FireLiteError> {
+        bincode::serialize(&(&self.secondary, &self.fts))
+            .map_err(|e| FireLiteError::Corrupt(format!("Index export failed: {}", e)))
+    }
+
+    pub fn import_state(&mut self, bytes: &[u8]) -> Result<(), FireLiteError> {
+        // By importing hashbrown::HashMap at the top, 'HashMap' here 
+        // now correctly refers to the hashbrown version.
+        let (sec, fts): (
+            HashMap<String, HashMap<String, crate::index::secondary_index::SecondaryIndex>>,
+            HashMap<String, HashMap<String, crate::index::inverted_index::InvertedIndex>>
+        ) = bincode::deserialize(bytes)
+            .map_err(|e| FireLiteError::Corrupt(format!("Index import failed: {}", e)))?;
+        
+        self.secondary = sec;
+        self.fts = fts;
+        Ok(())
     }
 }

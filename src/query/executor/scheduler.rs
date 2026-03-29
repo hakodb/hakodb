@@ -1,9 +1,9 @@
 use std::sync::{Arc, RwLock};
-use crate::storage::engine::StorageEngine;
+use crate::storage::engine::{StorageEngine, Pointer};
 use super::task::QueryTask;
 
 pub fn shard_tasks(
-    docs: Vec<(String, Vec<u8>)>,
+    docs: Vec<(String, Pointer)>,
     workers: usize,
     plan: super::super::plan::QueryPlan,
     storage: Option<Arc<RwLock<StorageEngine>>>, // NEW: Accept storage handle

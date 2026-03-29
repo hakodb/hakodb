@@ -8,15 +8,16 @@ use crate::error::Result;
 use crate::index::manager::IndexManager;
 use crate::query::plan::ScanType;
 use crate::query::query::AggregateOp;
-use crate::storage::engine::StorageEngine;
+use crate::storage::engine::{StorageEngine, Pointer};
 
 use super::super::plan::QueryPlan;
-use super::result_stream::QueryResults;
+// use super::result_stream::QueryResults;
 use super::scheduler::shard_tasks;
 use super::task::QueryTask;
 use super::worker::{matches_filters_view, run_task, run_task_projected};
 
 use crate::index::index_key::decode_scalar_as_f64;
+
 
 pub struct ParallelQueryExecutor {
     workers: usize,
@@ -29,13 +30,104 @@ impl ParallelQueryExecutor {
         }
     }
 
+    // pub fn execute(
+    //     &self,
+    //     storage_arc: Arc<RwLock<StorageEngine>>,
+    //     indexes: &IndexManager,
+    //     plan: QueryPlan,
+    // ) -> Result<Vec<(String, FireLiteDoc)>> {
+    //     let docs = {
+    //         let storage = storage_arc.read().unwrap();
+    //         match &plan.scan {
+    //             ScanType::UnionIndex { scans } => {
+    //                 let mut union_map = HashMap::new();
+    //                 for scan in scans {
+    //                     let branch_docs = self.execute_single_scan(
+    //                         &storage,
+    //                         indexes,
+    //                         scan,
+    //                         &plan.collection,
+    //                         plan.scan_limit,
+    //                     )?;
+    //                     for (key, raw) in branch_docs {
+    //                         union_map.insert(key, raw);
+    //                     }
+    //                 }
+    //                 union_map.into_iter().collect()
+    //             }
+    //             _ => self.execute_single_scan(
+    //                 &storage,
+    //                 indexes,
+    //                 &plan.scan,
+    //                 &plan.collection,
+    //                 plan.scan_limit,
+    //             )?,
+    //         }
+    //     };
+
+    //     let mut results: QueryResults = Vec::new();
+    //     let doc_count = docs.len();
+
+    //     if doc_count < 1000 || self.workers <= 1 {
+    //         let task = QueryTask {
+    //             docs,
+    //             plan: plan.clone(),
+    //             storage: Some(storage_arc.clone()),
+    //         };
+    //         results = run_task(task);
+    //     } else {
+    //         let optimal_workers = self.workers.min((doc_count / 500).max(1));
+    //         let tasks = shard_tasks(
+    //             docs,
+    //             optimal_workers,
+    //             plan.clone(),
+    //             Some(storage_arc.clone()),
+    //         );
+
+    //         let mut handles = Vec::new();
+    //         for task in tasks {
+    //             handles.push(thread::spawn(move || run_task(task)));
+    //         }
+
+    //         for handle in handles {
+    //             results.extend(handle.join().unwrap_or_default());
+    //         }
+    //     }
+
+    //     // ONLY SORT IF NOT SATISFIED BY INDEX
+    //     if !plan.order_by_satisfied {
+    //         if let Some(order) = &plan.order_by {
+    //             // This block is very expensive for large documents!
+    //             results.sort_by(|(_, a), (_, b)| {
+    //                 let av = a.get(&order.field);
+    //                 let bv = b.get(&order.field);
+    //                 let cmp = av.cmp(&bv);
+    //                 if order.ascending { cmp } else { cmp.reverse() }
+    //             });
+    //         }
+    //     }
+
+    //     let mut final_results = if let Some(offset) = plan.offset {
+    //         results.into_iter().skip(offset).collect()
+    //     } else {
+    //         results
+    //     };
+
+    //     if let Some(limit) = plan.limit {
+    //         final_results.truncate(limit);
+    //     }
+
+    //     Ok(final_results)
+    // }
+
     pub fn execute(
         &self,
         storage_arc: Arc<RwLock<StorageEngine>>,
         indexes: &IndexManager,
         plan: QueryPlan,
     ) -> Result<Vec<(String, FireLiteDoc)>> {
-        let docs = {
+
+        let keys_from_index = {
             let storage = storage_arc.read().unwrap();
             match &plan.scan {
                 ScanType::UnionIndex { scans } => {
@@ -48,11 +140,11 @@ impl ParallelQueryExecutor {
                             &plan.collection,
                             plan.scan_limit,
                         )?;
-                        for (key, raw) in branch_docs {
-                            union_map.insert(key, raw);
+                        for (key, ptr) in branch_docs {
+                            union_map.insert(key, ptr);
                         }
                     }
-                    union_map.into_iter().collect()
+                    union_map.into_iter().collect::<Vec<_>>()
                 }
                 _ => self.execute_single_scan(
                     &storage,
@@ -64,39 +156,77 @@ impl ParallelQueryExecutor {
             }
         };
 
-        let mut results: QueryResults = Vec::new();
-        let doc_count = docs.len();
+        if keys_from_index.is_empty() { return Ok(Vec::new()); }
+
+        // 2. Wrap keys with their original logical position
+        // Change: The third element is now Pointer, not Vec<u8>
+        let mut work_items: Vec<(usize, String, Pointer)> = keys_from_index
+            .into_iter()
+            .enumerate()
+            .map(|(i, (k, v))| (i, k, v))
+            .collect();
+
+        // 3. PHYSICAL SORT: Sort by file offset to minimize disk seeking
+        // Optimization: We use the pointer we already have in the tuple!
+        work_items.sort_by_key(|(_, _, ptr)| {
+            match ptr {
+                Pointer::Segment { offset, .. } => *offset,
+                Pointer::Blob { offset, .. } => *offset,
+                _ => 0, 
+            }
+        });
+
+        // 4. SHARD & EXECUTE (Sequential Disk Sweep)
+        let docs_to_fetch: Vec<(String, Pointer)> = work_items
+            .iter()
+            .map(|(_, k, p)| (k.clone(), p.clone()))
+            .collect();
+
+        let doc_count = docs_to_fetch.len();
+        let mut processed_docs: Vec<(String, FireLiteDoc)> = Vec::with_capacity(doc_count);
 
         if doc_count < 1000 || self.workers <= 1 {
             let task = QueryTask {
-                docs,
+                docs: docs_to_fetch,
                 plan: plan.clone(),
                 storage: Some(storage_arc.clone()),
             };
-            results = run_task(task);
+            processed_docs = run_task(task);
         } else {
             let optimal_workers = self.workers.min((doc_count / 500).max(1));
-            let tasks = shard_tasks(
-                docs,
-                optimal_workers,
-                plan.clone(),
-                Some(storage_arc.clone()),
-            );
-
+            let tasks = shard_tasks(docs_to_fetch, optimal_workers, plan.clone(), Some(storage_arc.clone()));
+            
             let mut handles = Vec::new();
             for task in tasks {
                 handles.push(thread::spawn(move || run_task(task)));
             }
-
             for handle in handles {
-                results.extend(handle.join().unwrap_or_default());
+                processed_docs.extend(handle.join().unwrap_or_default());
             }
         }
 
-        // ONLY SORT IF NOT SATISFIED BY INDEX
+        // 5. RESTORE LOGICAL ORDER
+        let mut processed_map: HashMap<String, FireLiteDoc> = processed_docs.into_iter().collect();
+        let mut ordered_results: Vec<(usize, String, FireLiteDoc)> = Vec::with_capacity(doc_count);
+        
+        // Use the original work_items (which contains the pos tag) to rebuild
+        for (original_pos, key, _) in work_items {
+            if let Some(doc) = processed_map.remove(&key) {
+                ordered_results.push((original_pos, key, doc));
+            }
+        }
+
+        // Sort by the original position tag to restore Index Order
+        ordered_results.sort_by_key(|(pos, _, _)| *pos);
+
+        // 6. Manual re-sort for cases NOT satisfied by index
+        let mut results: Vec<(String, FireLiteDoc)> = ordered_results
+            .into_iter()
+            .map(|(_, k, d)| (k, d))
+            .collect();
+
         if !plan.order_by_satisfied {
             if let Some(order) = &plan.order_by {
-                // This block is very expensive for large documents!
                 results.sort_by(|(_, a), (_, b)| {
                     let av = a.get(&order.field);
                     let bv = b.get(&order.field);
@@ -106,17 +236,15 @@ impl ParallelQueryExecutor {
             }
         }
 
-        let mut final_results = if let Some(offset) = plan.offset {
-            results.into_iter().skip(offset).collect()
-        } else {
-            results
-        };
-
+        // 7. Apply Offset/Limit
+        if let Some(offset) = plan.offset {
+            results = results.into_iter().skip(offset).collect();
+        }
         if let Some(limit) = plan.limit {
-            final_results.truncate(limit);
+            results.truncate(limit);
         }
 
-        Ok(final_results)
+        Ok(results)
     }
 
     pub fn execute_aggregation(
@@ -126,50 +254,86 @@ impl ParallelQueryExecutor {
         plan: QueryPlan,
         ops: &[AggregateOp],
     ) -> Result<HashMap<String, f64>> {
-
+        // --- 1. UNIFIED FAST PATH (Index-Only Aggregation) ---
+        // Conditions: Only 1 op, no OR groups, and simple Equality filters
         if ops.len() == 1 && plan.or_groups.is_empty() {
-            if let AggregateOp::Sum(ref sum_field) = ops[0] {
-                let mut filter_ids: Option<hashbrown::HashSet<String>> = None;
-                let mut can_use_index_filter = true;
+            let op = &ops[0];
+            
+            // Determine if the operation is eligible for RAM-only execution
+            let mut filter_ids: Option<hashbrown::HashSet<String>> = None;
+            let mut can_use_fast_path = true;
 
-                for filter in &plan.filters {
-                    if filter.op == crate::query::filter::Operator::Eq {
-                        let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
-                        if let Some(ids) = indexes.lookup_secondary(&plan.collection, &filter.field, &val_bytes) {
-                            let id_set: hashbrown::HashSet<_> = ids.into_iter().collect();
-                            if let Some(ref mut existing_set) = filter_ids {
-                                existing_set.retain(|id| id_set.contains(id));
-                            } else {
-                                filter_ids = Some(id_set);
-                            }
-                        } else { can_use_index_filter = false; break; }
-                    } else { can_use_index_filter = false; break; }
-                }
+            // Step A: Attempt to resolve matching Document IDs using RAM indexes
+            for filter in &plan.filters {
+                if filter.op == crate::query::filter::Operator::Eq {
+                    let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
+                    if let Some(ids) = indexes.lookup_secondary(&plan.collection, &filter.field, &val_bytes) {
+                        let id_set: hashbrown::HashSet<_> = ids.into_iter().collect();
+                        if let Some(ref mut existing_set) = filter_ids {
+                            existing_set.retain(|id| id_set.contains(id));
+                        } else {
+                            filter_ids = Some(id_set);
+                        }
+                    } else { can_use_fast_path = false; break; }
+                } else { can_use_fast_path = false; break; }
+            }
 
-                if can_use_index_filter {
-                    if let Some(sec_map) = indexes.secondary.get(&plan.collection) {
-                        if let Some(sum_index) = sec_map.get(sum_field) {
-                            let mut total = 0.0;
-                            for (val_bytes, doc_ids) in sum_index.get_map() {
-                                if let Some(val) = decode_scalar_as_f64(val_bytes) {
-                                    let match_count = if let Some(ref allowed_ids) = filter_ids {
-                                        doc_ids.iter().filter(|id| allowed_ids.contains(*id)).count()
-                                    } else {
-                                        doc_ids.len()
-                                    };
-                                    total += val * (match_count as f64);
+            if can_use_fast_path {
+                match op {
+                    // CASE 1: COUNT
+                    AggregateOp::Count => {
+                        let count = if plan.filters.is_empty() {
+                            // Instant O(1) count from storage metadata if no filters
+                            let storage = storage_arc.read().unwrap();
+                            storage.count_prefix(&format!("{}:", plan.collection))
+                        } else {
+                            // O(Index) count from intersection results
+                            filter_ids.map(|ids| ids.len()).unwrap_or(0)
+                        };
+                        
+                        let mut res = HashMap::new();
+                        res.insert("count".to_string(), count as f64);
+                        return Ok(res);
+                    }
+
+                    // CASE 2: SUM / AVG
+                    AggregateOp::Sum(target_field) | AggregateOp::Avg(target_field) => {
+                        if let Some(sec_map) = indexes.secondary.get(&plan.collection) {
+                            if let Some(index) = sec_map.get(target_field) {
+                                let mut total_sum = 0.0;
+                                let mut total_count = 0.0;
+                                let is_avg = matches!(op, AggregateOp::Avg(_));
+
+                                for (val_bytes, doc_ids) in index.get_map() {
+                                    if let Some(val) = decode_scalar_as_f64(val_bytes) {
+                                        let match_count = if let Some(ref allowed_ids) = filter_ids {
+                                            doc_ids.iter().filter(|id| allowed_ids.contains(*id)).count()
+                                        } else {
+                                            doc_ids.len()
+                                        };
+                                        
+                                        total_sum += val * (match_count as f64);
+                                        total_count += match_count as f64;
+                                    }
                                 }
+
+                                let mut res = HashMap::new();
+                                if is_avg {
+                                    res.insert(format!("avg_{}", target_field), if total_count > 0.0 { total_sum / total_count } else { 0.0 });
+                                } else {
+                                    res.insert(format!("sum_{}", target_field), total_sum);
+                                }
+                                return Ok(res);
                             }
-                            let mut res = HashMap::new();
-                            res.insert(format!("sum_{}", sum_field), total);
-                            return Ok(res);
                         }
                     }
                 }
             }
         }
 
-        let docs = {
+        // --- 2. SLOW PATH (Physical Disk Sweep) ---
+        // Fallback for complex queries, multiple ops, or range filters
+        let docs: Vec<(String, Pointer)> = {
             let storage = storage_arc.read().unwrap();
             self.execute_single_scan(
                 &storage,
@@ -185,38 +349,30 @@ impl ParallelQueryExecutor {
 
         let process_task = |task: QueryTask, thread_ops: Vec<AggregateOp>| -> HashMap<String, f64> {
             let mut partial_results = HashMap::new();
-            for (id, mut bytes) in task.docs {
-                if bytes.is_empty() {
-                    if let Some(storage_lock) = &task.storage {
-                        if let Ok(storage) = storage_lock.read() {
-                            if let Ok(Some(data)) = storage.read_pointer_uncached_by_key(&id) {
-                                bytes = data;
-                            }
-                        }
-                    }
-                }
-                if bytes.is_empty() { continue; }
+            let storage_engine = task.storage.as_ref().unwrap().read().unwrap();
 
-                if let Some(view) = FireLiteDocView::new(&bytes) {
+            for (_id, pointer) in task.docs {
+                if let Ok(Some(bytes)) = storage_engine.read_pointer(&pointer) {
                     if matches_filters_view(&bytes, &task.plan) {
-                        for op in &thread_ops {
-                            match op {
-                                AggregateOp::Count => {
-                                    *partial_results.entry("count".to_string()).or_insert(0.0) += 1.0;
-                                }
-                                AggregateOp::Sum(field) | AggregateOp::Avg(field) => {
-                                    // PERFORMANCE: Iterate the view to find the requested field without decoding the whole doc
-                                    if let Some((_, tag, data)) = view.iter().find(|(k, _, _)| k == field) {
-                                        let borrowed = BorrowedValue { tag, data };
-                                        if let Some(num) = borrowed.as_f64() {
-                                            let key = if matches!(op, AggregateOp::Sum(_)) {
-                                                format!("sum_{}", field)
-                                            } else {
-                                                format!("avg_tmp_{}", field)
-                                            };
-                                            *partial_results.entry(key).or_insert(0.0) += num;
-                                            if matches!(op, AggregateOp::Avg(_)) {
-                                                *partial_results.entry(format!("avg_cnt_{}", field)).or_insert(0.0) += 1.0;
+                        if let Some(view) = FireLiteDocView::new(&bytes) {
+                            for op in &thread_ops {
+                                match op {
+                                    AggregateOp::Count => {
+                                        *partial_results.entry("count".to_string()).or_insert(0.0) += 1.0;
+                                    }
+                                    AggregateOp::Sum(field) | AggregateOp::Avg(field) => {
+                                        if let Some((_, tag, data)) = view.iter().find(|(k, _, _)| k == field) {
+                                            let borrowed = BorrowedValue { tag, data };
+                                            if let Some(num) = borrowed.as_f64() {
+                                                let key = if matches!(op, AggregateOp::Sum(_)) {
+                                                    format!("sum_{}", field)
+                                                } else {
+                                                    format!("avg_tmp_{}", field)
+                                                };
+                                                *partial_results.entry(key).or_insert(0.0) += num;
+                                                if matches!(op, AggregateOp::Avg(_)) {
+                                                    *partial_results.entry(format!("avg_cnt_{}", field)).or_insert(0.0) += 1.0;
+                                                }
                                             }
                                         }
                                     }
@@ -229,50 +385,33 @@ impl ParallelQueryExecutor {
             partial_results
         };
 
+        // --- 3. PARALLEL EXECUTION ---
         if doc_count < 1000 || self.workers <= 1 {
-            let task = QueryTask {
-                docs,
-                plan: plan.clone(),
-                storage: Some(storage_arc.clone()),
-            };
+            let task = QueryTask { docs, plan: plan.clone(), storage: Some(storage_arc.clone()) };
             final_results = process_task(task, ops.to_vec());
         } else {
             let optimal_workers = self.workers.min((doc_count / 500).max(1));
-            let tasks = shard_tasks(
-                docs,
-                optimal_workers,
-                plan.clone(),
-                Some(storage_arc.clone()),
-            );
+            let tasks = shard_tasks(docs, optimal_workers, plan.clone(), Some(storage_arc.clone()));
             let (tx, rx) = std::sync::mpsc::channel();
-
             for task in tasks {
                 let thread_tx = tx.clone();
                 let thread_ops = ops.to_vec();
-                thread::spawn(move || {
-                    let partial = process_task(task, thread_ops);
-                    let _ = thread_tx.send(partial);
-                });
+                thread::spawn(move || { let _ = thread_tx.send(process_task(task, thread_ops)); });
             }
             drop(tx);
-
             while let Ok(partial) = rx.recv() {
-                for (k, v) in partial {
-                    *final_results.entry(k).or_insert(0.0) += v;
-                }
+                for (k, v) in partial { *final_results.entry(k).or_insert(0.0) += v; }
             }
         }
 
+        // [4. Final Processing for Averages]
         let keys: Vec<String> = final_results.keys().cloned().collect();
         for k in keys {
             if k.starts_with("avg_tmp_") {
                 let field = &k[8..];
                 let sum = final_results.remove(&k).unwrap_or(0.0);
                 let count = final_results.remove(&format!("avg_cnt_{}", field)).unwrap_or(1.0);
-                final_results.insert(
-                    format!("avg_{}", field),
-                    if count > 0.0 { sum / count } else { 0.0 },
-                );
+                final_results.insert(format!("avg_{}", field), if count > 0.0 { sum / count } else { 0.0 });
             }
         }
 
@@ -285,7 +424,7 @@ impl ParallelQueryExecutor {
         indexes: &IndexManager,
         plan: QueryPlan,
     ) -> Result<Vec<(String, Vec<(String, Value)>)>> {
-        let docs = {
+        let docs: Vec<(String, Pointer)> = { // Explicitly set the type
             let storage = storage_arc.read().unwrap();
             self.execute_single_scan(
                 &storage,
@@ -360,41 +499,36 @@ impl ParallelQueryExecutor {
         scan: &ScanType,
         collection: &str,
         limit: Option<usize>,
-    ) -> Result<Vec<(String, Vec<u8>)>> {
+    ) -> Result<Vec<(String, Pointer)>> { // Change from Vec<u8> to Pointer
         let max_ids = limit.unwrap_or(usize::MAX);
 
         match scan {
             ScanType::FullCollection => {
-                let keys = storage.scan_prefix_keys(&format!("{}:", collection));
-                Ok(keys
-                    .into_iter()
+                Ok(storage.index.iter()
+                    .filter(|(k, _)| k.starts_with(collection))
                     .take(max_ids)
-                    .map(|k| (k, Vec::new()))
+                    .map(|(k, p)| (k.clone(), p.clone()))
                     .collect())
             }
 
             ScanType::SecondaryIndex { field, value } => {
                 let mut out = Vec::new();
-
                 if let Some(sec_map) = indexes.secondary.get(collection) {
                     if let Some(index) = sec_map.get(field) {
-                        out.extend(
-                            index
-                                .range_scan(value, value)
-                                .iter()
-                                .take(max_ids)
-                                .map(|doc_id| (Self::make_key(collection, doc_id), Vec::new()))
-                        );
+                        for doc_id in index.range_scan(value, value).iter().take(max_ids) {
+                            let key = Self::make_key(collection, doc_id);
+                            if let Some(ptr) = storage.index.get(&key) {
+                                out.push((key, ptr.clone()));
+                            }
+                        }
                     }
                 }
-
                 Ok(out)
             }
 
             ScanType::CompositeIndex { fields, values, reverse } => {
                 let mut out = Vec::new();
                 if let Some(doc_ids) = indexes.exact_match_doc_ids(collection, fields, values) {
-                    // Apply the reverse logic if the planner requested it
                     let iter: Box<dyn Iterator<Item = _>> = if *reverse {
                         Box::new(doc_ids.iter().rev())
                     } else {
@@ -402,9 +536,10 @@ impl ParallelQueryExecutor {
                     };
 
                     for doc_id in iter.take(max_ids) {
-                        let key = format!("{}:{}", collection, doc_id);
-                        // Return empty bytes to let parallel workers handle decryption/decompression
-                        out.push((key, Vec::new()));
+                        let key = Self::make_key(collection, &doc_id);
+                        if let Some(ptr) = storage.index.get(&key) {
+                            out.push((key, ptr.clone()));
+                        }
                     }
                 }
                 Ok(out)
@@ -412,68 +547,86 @@ impl ParallelQueryExecutor {
 
             ScanType::CompositeIndexRange { index_id, ranges } => {
                 let mut out = Vec::new();
-
                 if let Some(idx) = indexes.composite.get(*index_id) {
                     for (start, end) in ranges {
                         let remaining = max_ids.saturating_sub(out.len());
+                        if remaining == 0 { break; }
 
-                        if remaining == 0 {
-                            break;
+                        for (_, doc_id) in idx.tree.range((start.clone(), end.clone())).take(remaining) {
+                            let key = Self::make_key(collection, &doc_id);
+                            if let Some(ptr) = storage.index.get(&key) {
+                                out.push((key, ptr.clone()));
+                            }
                         }
-
-                        out.extend(
-                            idx.tree
-                                .range((start.clone(), end.clone()))
-                                .take(remaining)
-                                .map(|(_, doc_id)| (Self::make_key(collection, doc_id), Vec::new()))
-                        );
                     }
                 }
-
                 Ok(out)
             }
 
-            ScanType::CursorIndex { start, end } => {
+            ScanType::SecondaryIndexRange { field, start, end, reverse } => {
                 let mut out = Vec::new();
+                if let Some(sec_map) = indexes.secondary.get(collection) {
+                    if let Some(index) = sec_map.get(field) {
+                        let remaining = max_ids.saturating_sub(out.len());
+                        
+                        // Perform range scan on the BTreeMap
+                        let range_iter = index.get_map().range((start.clone(), end.clone()));
+                        
+                        // Collect doc IDs based on direction
+                        let doc_ids: Vec<String> = if *reverse {
+                            range_iter.rev().flat_map(|(_, ids)| ids.iter().cloned()).collect()
+                        } else {
+                            range_iter.flat_map(|(_, ids)| ids.iter().cloned()).collect()
+                        };
 
-                for idx in indexes.indexes_for_collection(collection) {
-                    let remaining = max_ids.saturating_sub(out.len());
-
-                    if remaining == 0 {
-                        break;
-                    }
-
-                    out.extend(
-                        idx.tree
-                            .range((start.clone(), end.clone()))
-                            .take(remaining)
-                            .map(|(_, doc_id)| (Self::make_key(collection, doc_id), Vec::new()))
-                    );
-
-                    if !out.is_empty() {
-                        break;
+                        // Map Doc IDs to Physical Pointers
+                        for doc_id in doc_ids.into_iter().take(remaining) {
+                            let key = format!("{}:{}", collection, doc_id);
+                            if let Some(ptr) = storage.index.get(&key) {
+                                out.push((key, ptr.clone()));
+                            }
+                        }
                     }
                 }
+                Ok(out)
+            }
 
+            ScanType::CursorIndex { index_id, start, end, reverse } => {
+                let mut out = Vec::new();
+                if let Some(idx) = indexes.composite.get(*index_id) {
+                    let remaining = max_ids.saturating_sub(out.len());
+                    let iter = idx.tree.range((start.clone(), end.clone()));
+                    
+                    let doc_ids: Vec<_> = if *reverse {
+                        iter.rev().map(|(_, id)| id.clone()).collect()
+                    } else {
+                        iter.map(|(_, id)| id.clone()).collect()
+                    };
+
+                    for doc_id in doc_ids.into_iter().take(remaining) {
+                        let key = Self::make_key(collection, &doc_id);
+                        if let Some(ptr) = storage.index.get(&key) {
+                            out.push((key, ptr.clone()));
+                        }
+                    }
+                }
                 Ok(out)
             }
 
             ScanType::InvertedIndex { field, query } => {
                 let mut out = Vec::new();
-
                 if let Some(fts_map) = indexes.fts.get(collection) {
                     if let Some(index) = fts_map.get(field) {
                         if let Some(doc_ids) = index.search(query) {
-                            out.extend(
-                                doc_ids
-                                    .iter()
-                                    .take(max_ids)
-                                    .map(|doc_id| (Self::make_key(collection, doc_id), Vec::new()))
-                            );
+                            for doc_id in doc_ids.iter().take(max_ids) {
+                                let key = Self::make_key(collection, doc_id);
+                                if let Some(ptr) = storage.index.get(&key) {
+                                    out.push((key, ptr.clone()));
+                                }
+                            }
                         }
                     }
                 }
-
                 Ok(out)
             }
 

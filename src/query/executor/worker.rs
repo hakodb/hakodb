@@ -6,29 +6,17 @@ use crate::query::filter::Operator;
 /// Standard worker: Decodes full or projected documents.
 pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
     let mut out = Vec::new();
-    let skip_filter_step = task.plan.filters_satisfied_by_index;
+    // Pre-acquire the read lock for the entire task
+    let storage_engine = task.storage.as_ref().unwrap().read().unwrap();
 
-    for (id, mut bytes) in task.docs {
-        if !skip_filter_step {
-            // Only load and check filters if the index didn't already do it
-            if bytes.is_empty() {
-                if let Ok(storage) = task.storage.as_ref().unwrap().read() {
-                    if let Ok(Some(data)) = storage.get(&id) { bytes = data; }
+    for (id, pointer) in task.docs {
+        // Resolve Pointer -> Bytes
+        if let Ok(Some(bytes)) = storage_engine.read_pointer(&pointer) {
+            // Now bytes is Vec<u8>, we can use it
+            if task.plan.filters_satisfied_by_index || matches_filters_view(&bytes, &task.plan) {
+                if let Some(doc) = FireLiteDoc::decode(&bytes) {
+                    out.push((id, doc));
                 }
-            }
-            if bytes.is_empty() || !matches_filters_view(&bytes, &task.plan) { continue; }
-        }
-
-        // Load the final document only for those that pass (or were pre-passed)
-        if bytes.is_empty() {
-            if let Ok(storage) = task.storage.as_ref().unwrap().read() {
-                if let Ok(Some(data)) = storage.get(&id) { bytes = data; }
-            }
-        }
-
-        if !bytes.is_empty() {
-            if let Some(doc) = FireLiteDoc::decode(&bytes) {
-                out.push((id, doc));
             }
         }
     }
@@ -38,44 +26,23 @@ pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
 /// Optimized projected worker: Extracts only requested fields without full doc decoding.
 pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)> {
     let mut out = Vec::new();
+    let storage_engine = task.storage.as_ref().unwrap().read().unwrap();
     let projection = &task.plan.projection;
 
-    for (id, mut bytes) in task.docs {
-        if bytes.is_empty() {
-            if let Some(storage_lock) = &task.storage {
-                if let Ok(storage) = storage_lock.read() {
-                    if let Ok(Some(data)) = storage.get(&id) {
-                        bytes = data;
-                    }
-                }
-            }
-        }
-        if bytes.is_empty() { continue; }
-
-        if let Some(view) = FireLiteDocView::new(&bytes) {
-            // PERFORMANCE: Filter first
+    for (id, pointer) in task.docs {
+        if let Ok(Some(bytes)) = storage_engine.read_pointer(&pointer) {
             if matches_filters_view(&bytes, &task.plan) {
                 let mut fields_out = Vec::new();
-
-                if projection.is_empty() {
-                    // Fallback to full decode if no projection provided but using projected worker
-                    if let Some(doc) = FireLiteDoc::decode(&bytes) {
-                        for (k, v) in doc.fields {
-                            fields_out.push((k.to_string(), v));
-                        }
-                    }
-                } else {
-                    // Seek only relevant fields in the binary stream
+                if let Some(view) = FireLiteDocView::new(&bytes) {
                     for field_name in projection {
                         if let Some((_, tag, data)) = view.iter().find(|(k, _, _)| k == field_name) {
-                            // Only decode the specific value found
                             if let Some(val) = crate::document::firelite_doc::decode_value(tag, data) {
                                 fields_out.push((field_name.clone(), val));
                             }
                         }
                     }
+                    out.push((id, fields_out));
                 }
-                out.push((id, fields_out));
             }
         }
     }
