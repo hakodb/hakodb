@@ -26,10 +26,23 @@ impl FireLiteDoc {
 
     pub fn encode(&self) -> Vec<u8> {
         static BUFFER_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+        
+        // 1. Get a buffer from the pool or create a new one
         let mut out = BUFFER_POOL.lock().unwrap().pop().unwrap_or_else(|| Vec::with_capacity(4096));
-        // let mut out = Vec::with_capacity(128); // Pre-allocate sensible default
+        
+        // 2. IMPORTANT: Clear the old data but keep the capacity
+        out.clear(); 
+        
         self.encode_into(&mut out);
-        out
+        
+        // 3. Clone for the return value, and put the reusable buffer back
+        // Optimization: In a real app, you might return a custom wrapper 
+        // that handles the "put back" logic on Drop.
+        let result = out.clone(); 
+        
+        BUFFER_POOL.lock().unwrap().push(out);
+        
+        result
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
