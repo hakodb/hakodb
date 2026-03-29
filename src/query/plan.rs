@@ -17,7 +17,12 @@ pub enum ScanType {
         index_id: u32,
         ranges: Vec<(Bound<SmallVec<[u8; 32]>>, Bound<SmallVec<[u8; 32]>>)>,
     },
-    // CursorIndex { start_key: SmallVec<[u8; 32]> },
+    SecondaryIndexRange {
+        field: String,
+        start: Bound<Vec<u8>>,
+        end: Bound<Vec<u8>>,
+        reverse: bool,
+    },
     SecondaryIndex {
         field: String,
         value: Vec<u8>,
@@ -33,6 +38,8 @@ pub enum ScanType {
     CursorIndex {
         start: Bound<SmallVec<[u8; 32]>>,
         end: Bound<SmallVec<[u8; 32]>>,
+        index_id: u32,
+        reverse: bool,
     },
 }
 

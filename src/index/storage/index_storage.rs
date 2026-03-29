@@ -10,6 +10,7 @@ pub struct IndexStorage {
     pub manager: CompositeIndexManager,
     log: IndexLog,
     snapshot_dir: String,
+    log_path: String,
 }
 
 impl IndexStorage {
@@ -21,6 +22,7 @@ impl IndexStorage {
             manager,
             log: IndexLog::open(log_path)?,
             snapshot_dir: snapshot_dir.to_string(),
+            log_path:log_path.to_string(),
         })
     }
 
@@ -51,6 +53,10 @@ impl IndexStorage {
     /// Clears the index log. Usually called after a successful snapshot.
     pub fn reset_log(&mut self) -> std::io::Result<()> {
         self.log.reset()
+    }
+
+    pub fn log_path(&self) -> &str {
+        &self.log_path
     }
 
 }

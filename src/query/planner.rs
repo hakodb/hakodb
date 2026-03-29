@@ -76,9 +76,44 @@ impl QueryPlanner {
                         // Cursors are inherently sorted by the index
                         return Self::make_plan(
                             query,
-                            ScanType::CursorIndex { start, end },
+                            ScanType::CursorIndex { 
+                                index_id: idx.definition.id,
+                                start, 
+                                end,
+                                reverse: !order.ascending 
+                            },
                             query.limit,
                             true,
+                            false
+                        );
+                    }
+
+                }
+
+                if let Some(sec_map) = indexes.secondary.get(&query.collection) {
+                    if sec_map.contains_key(&order.field) {
+                        // Encode the anchor values into simple scalar bytes
+                        let start = match (&query.start_at, &query.start_after) {
+                            (Some(v), _) if !v.is_empty() => Bound::Included(crate::index::index_key::encode_scalar(&v[0])),
+                            (_, Some(v)) if !v.is_empty() => Bound::Excluded(crate::index::index_key::encode_scalar(&v[0])),
+                            _ => Bound::Unbounded,
+                        };
+                        let end = match (&query.end_at, &query.end_before) {
+                            (Some(v), _) if !v.is_empty() => Bound::Included(crate::index::index_key::encode_scalar(&v[0])),
+                            (_, Some(v)) if !v.is_empty() => Bound::Excluded(crate::index::index_key::encode_scalar(&v[0])),
+                            _ => Bound::Unbounded,
+                        };
+
+                        return Self::make_plan(
+                            query,
+                            ScanType::SecondaryIndexRange {
+                                field: order.field.clone(),
+                                start,
+                                end,
+                                reverse: !order.ascending,
+                            },
+                            query.limit,
+                            true, // Order is satisfied by BTreeMap
                             false
                         );
                     }

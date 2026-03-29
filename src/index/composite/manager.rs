@@ -60,6 +60,18 @@ impl CompositeIndexManager {
         }
     }
 
+    pub fn restore_index(&mut self, definition: CompositeIndexDefinition) {
+        if definition.id > self.next_id {
+            self.next_id = definition.id;
+        }
+        let id = definition.id;
+        self.by_collection
+            .entry(definition.collection.clone())
+            .or_default()
+            .push(id);
+        self.by_id.insert(id, CompositeIndex::new(definition));
+    }
+
     pub fn index_batch<'a, I>(&mut self, collection: &str, docs: I)
     where
         I: IntoIterator<Item = (&'a str, &'a FireLiteDoc)> + Clone,
