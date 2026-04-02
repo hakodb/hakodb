@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Write, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, SyncSender};
@@ -391,7 +391,7 @@ impl FireLite {
             }
         });
 
-        // 7. Blob Workers (4 Threads)
+        // BLOB WORKER
         let shards_ptr = Arc::clone(&db.shards);
         let encryption_key = config.encryption_key.clone();
 
@@ -410,35 +410,53 @@ impl FireLite {
                         match lock.recv() { Ok(w) => w, Err(_) => break }
                     };
 
-                    let BlobWork::Put { collection, key, data } = work;
-                    let payload = if let Some(ref enc) = enc_ctx {
-                        enc.encrypt(&data).unwrap_or_else(|_| data.to_vec())
-                    } else {
-                        data.to_vec()
+                    // Extract collection name from the work variant
+                    let collection = match &work {
+                        BlobWork::Put { collection, .. } => collection.clone(),
+                        BlobWork::PutRaw { collection, .. } => collection.clone(),
                     };
 
-                    // FIX: Correctly extract the Arc<Mutex<File>> from the Shard
+                    // Get the file handle for this collection
                     let file_mutex_opt = {
                         let shards = s_ptr.read().unwrap();
                         shards.get(&collection).and_then(|shard_arc| {
                             let shard_guard = shard_arc.read().ok()?;
-                            shard_guard.blob_file.clone() // This is Option<Arc<Mutex<File>>>
+                            shard_guard.blob_file.clone()
                         })
                     };
 
                     if let Some(file_mutex) = file_mutex_opt {
-                        let (offset, len) = {
-                            let mut file = file_mutex.lock().unwrap();
-                            let pos = file.seek(SeekFrom::End(0)).unwrap();
-                            file.write_all(&payload).unwrap();
-                            (pos, payload.len() as u32)
-                        };
+                        match work {
+                            BlobWork::PutRaw { offset, data, .. } => {
+                                let payload = if let Some(ref enc) = enc_ctx {
+                                    enc.encrypt(&data).unwrap_or_else(|_| data.to_vec())
+                                } else {
+                                    data.to_vec()
+                                };
+                                let mut file = file_mutex.lock().unwrap();
+                                file.seek(SeekFrom::Start(offset)).unwrap();
+                                file.write_all(&payload).unwrap();
+                            }
+                            BlobWork::Put { key, data, .. } => {
+                                let payload = if let Some(ref enc) = enc_ctx {
+                                    enc.encrypt(&data).unwrap_or_else(|_| data.to_vec())
+                                } else {
+                                    data.to_vec()
+                                };
+                                let (offset, len) = {
+                                    let mut file = file_mutex.lock().unwrap();
+                                    let pos = file.seek(SeekFrom::End(0)).unwrap();
+                                    file.write_all(&payload).unwrap();
+                                    (pos, payload.len() as u32)
+                                };
 
-                        // Update index
-                        let shards = s_ptr.read().unwrap();
-                        if let Some(shard_arc) = shards.get(&collection) {
-                            if let Ok(mut shard) = shard_arc.write() {
-                                shard.index.insert(key, Pointer::Blob { offset, len });
+                                // Update index pointer for document-level blobs
+                                let shards = s_ptr.read().unwrap();
+                                if let Some(shard_arc) = shards.get(&collection) {
+                                    if let Ok(mut shard) = shard_arc.write() {
+                                        shard.index.insert(key, Pointer::Blob { offset, len });
+                                    }
+                                }
                             }
                         }
                     }
@@ -536,6 +554,180 @@ impl FireLite {
     }
 
     /// INTERNAL LOGIC: Handles Sharding, Durability, and Async Indexing.
+    // fn write_batch_internal(&self, mutations: Vec<BatchMutation>) -> Result<()> {
+    //     let now = SystemTime::now()
+    //         .duration_since(UNIX_EPOCH)
+    //         .unwrap()
+    //         .as_micros() as i64;
+
+    //     let mut shard_groups: HashMap<String, Vec<StorageMutation>> = HashMap::new();
+    //     let mut index_puts: HashMap<String, Vec<(String, FireLiteDoc)>> = HashMap::new();
+    //     let mut index_dels: HashMap<String, Vec<(String, FireLiteDoc)>> = HashMap::new();
+    //     let mut unique_events: HashMap<String, (String, ChangeEvent)> = HashMap::new();
+    //     let mut affected_keys = Vec::with_capacity(mutations.len());
+
+    //     // Value-level blob collection
+    //     let mut blob_work_todo = Vec::new();
+    //     let threshold = self.config.value_blob_threshold_bytes;
+
+    //     for m in mutations {
+    //         match m {
+    //             BatchMutation::Put { collection, doc_id, mut doc } => {
+    //                 let key = fast_doc_key(&collection, &doc_id);
+    //                 affected_keys.push(key.clone());
+
+    //                 // 1. Handle Server Timestamps and Value-Level Blobs (The Splitter)
+    //                 for (_, value) in &mut doc.fields {
+    //                     if matches!(value, Value::ServerTimestamp) {
+    //                         *value = Value::Timestamp(now);
+    //                     }
+
+    //                     // SPLITTER: Check if field is too large
+    //                     let data_to_blob = match value {
+    //                         Value::String(s) if s.len() > threshold => Some(s.as_bytes().to_vec()),
+    //                         Value::Binary(b) if b.len() > threshold => Some(b.clone()),
+    //                         _ => None,
+    //                     };
+
+    //                     if let Some(data) = data_to_blob {
+    //                         let shard_arc = self.get_shard(&collection);
+    //                         let shard = shard_arc.read().unwrap();
+    //                         if let Some(blob_file_mutex) = &shard.blob_file {
+    //                             let mut file = blob_file_mutex.lock().unwrap();
+    //                             let offset = file.seek(std::io::SeekFrom::End(0)).unwrap();
+    //                             let len = data.len() as u32;
+
+    //                             *value = Value::BlobLink { offset, len };
+    //                             blob_work_todo.push(BlobWork::PutRaw {
+    //                                 collection: collection.clone(),
+    //                                 offset,
+    //                                 data: Arc::new(data),
+    //                             });
+    //                         }
+    //                     }
+    //                 }
+
+    //                 let doc_bytes = doc.encode(); 
+    //                 shard_groups.entry(collection.clone()).or_default().push(
+    //                     StorageMutation::Put { key: key.clone(), value: doc_bytes }
+    //                 );
+
+    //                 index_puts.entry(collection.clone()).or_default().push((doc_id, doc));
+    //                 unique_events.insert(key.clone(), (
+    //                     collection,
+    //                     ChangeEvent { path: key, kind: ChangeKind::Put }
+    //                 ));
+    //             }
+
+    //             BatchMutation::Delete { collection, doc_id } => {
+    //                 let key = fast_doc_key(&collection, &doc_id);
+    //                 affected_keys.push(key.clone());
+
+    //                 let shard = self.get_shard(&collection);
+    //                 if let Some(bytes) = shard.read().unwrap().get(&key)? {
+    //                     if let Some(mut old_doc) = FireLiteDoc::decode(&bytes) {
+    //                         let _ = self.resolve_doc(&mut old_doc, &collection);
+    //                         index_dels.entry(collection.clone()).or_default().push((doc_id, old_doc));
+    //                     }
+    //                 }
+                    
+    //                 shard_groups.entry(collection.clone()).or_default().push(
+    //                     StorageMutation::Delete { key: key.clone() }
+    //                 );
+                    
+    //                 unique_events.insert(key.clone(), (
+    //                     collection,
+    //                     ChangeEvent { path: key, kind: ChangeKind::Delete }
+    //                 ));
+    //             }
+
+    //             BatchMutation::Patch { collection, doc_id, updates } => {
+    //                 let key = fast_doc_key(&collection, &doc_id);
+    //                 affected_keys.push(key.clone());
+
+    //                 let shard = self.get_shard(&collection);
+    //                 let storage = shard.read().unwrap();
+    //                 if let Some(old_bytes) = storage.get(&key)? {
+    //                     if let Some(mut doc) = FireLiteDoc::decode(&old_bytes) {
+    //                         let mut old_doc_for_index = doc.clone(); 
+    //                         let _ = self.resolve_doc(&mut old_doc_for_index, &collection);
+                            
+    //                         // Apply updates and run Splitter on patched fields
+    //                         for (k, mut v) in updates {
+    //                             let data_to_blob = match &v {
+    //                                 Value::String(s) if s.len() > threshold => Some(s.as_bytes().to_vec()),
+    //                                 Value::Binary(b) if b.len() > threshold => Some(b.clone()),
+    //                                 _ => None,
+    //                             };
+
+    //                             if let Some(data) = data_to_blob {
+    //                                 if let Some(blob_file_mutex) = &storage.blob_file {
+    //                                     let mut file = blob_file_mutex.lock().unwrap();
+    //                                     let offset = file.seek(std::io::SeekFrom::End(0)).unwrap();
+    //                                     v = Value::BlobLink { offset, len: data.len() as u32 };
+    //                                     blob_work_todo.push(BlobWork::PutRaw {
+    //                                         collection: collection.clone(),
+    //                                         offset,
+    //                                         data: Arc::new(data),
+    //                                     });
+    //                                 }
+    //                             }
+    //                             doc.insert(k, v);
+    //                         }
+
+    //                         let new_bytes = doc.encode();
+    //                         index_dels.entry(collection.clone()).or_default().push((doc_id.clone(), old_doc_for_index));
+    //                         index_puts.entry(collection.clone()).or_default().push((doc_id, doc));
+
+    //                         shard_groups.entry(collection.clone()).or_default().push(
+    //                             StorageMutation::Put { key: key.clone(), value: new_bytes }
+    //                         );
+
+    //                         unique_events.insert(key.clone(), (
+    //                             collection,
+    //                             ChangeEvent { path: key, kind: ChangeKind::Put }
+    //                         ));
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
+
+    //     // 2. Deterministic Locking & Apply to Storage
+    //     let mut sorted_shards: Vec<_> = shard_groups.keys().cloned().collect();
+    //     sorted_shards.sort();
+
+    //     for col_name in sorted_shards {
+    //         if let Some(ops) = shard_groups.get(&col_name) {
+    //             let shard = self.get_shard(&col_name);
+    //             let mut storage = shard.write().unwrap();
+    //             let doc_blobs = storage.apply_batch(ops)?;
+    //             // Send document-level blobs
+    //             for b in doc_blobs { let _ = self.blob_tx.try_send(b); }
+    //         }
+    //     }
+
+    //     // Send value-level blobs (the pieces extracted by the splitter)
+    //     for work in blob_work_todo {
+    //         let _ = self.blob_tx.try_send(work);
+    //     }
+
+    //     // 3. Metadata, Indexing and Notification
+    //     self.bump_versions_by_keys(affected_keys);
+
+    //     for (col, puts) in index_puts {
+    //         let deletes = index_dels.remove(&col).unwrap_or_default();
+    //         let _ = self.index_tx.send(IndexOp::Update { collection: col, puts, deletes });
+    //     }
+    //     for (col, deletes) in index_dels {
+    //         let _ = self.index_tx.send(IndexOp::Update { collection: col, puts: vec![], deletes });
+    //     }
+    //     for (_, (col, event)) in unique_events {
+    //         self.notify_watchers(&col, event);
+    //     }
+
+    //     Ok(())
+    // }
     fn write_batch_internal(&self, mutations: Vec<BatchMutation>) -> Result<()> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -546,34 +738,72 @@ impl FireLite {
         let mut index_puts: HashMap<String, Vec<(String, FireLiteDoc)>> = HashMap::new();
         let mut index_dels: HashMap<String, Vec<(String, FireLiteDoc)>> = HashMap::new();
         let mut unique_events: HashMap<String, (String, ChangeEvent)> = HashMap::new();
-        
-        // Track keys to update versions without re-iterating over mutations
         let mut affected_keys = Vec::with_capacity(mutations.len());
 
-        for m in mutations { // Consumes mutations
+        let mut blob_work_todo = Vec::new();
+        let threshold = self.config.value_blob_threshold_bytes;
+
+        // Pre-check if any collection has an FTS index (for deletion optimization)
+        let fts_collections = {
+            let mgr = self.indexes.read().unwrap();
+            mgr.fts.keys().cloned().collect::<hashbrown::HashSet<String>>()
+        };
+
+        for m in mutations {
             match m {
                 BatchMutation::Put { collection, doc_id, mut doc } => {
-                    for (_, v) in &mut doc.fields {
-                        if matches!(v, Value::ServerTimestamp) {
-                            *v = Value::Timestamp(now);
+                    let key = fast_doc_key(&collection, &doc_id);
+                    affected_keys.push(key.clone());
+
+                    // OPTIMIZATION: Only enter field loop if document is actually large
+                    // A quick check of a few fields prevents overhead on small docs
+                    let mut needs_splitting = false;
+                    for (_, v) in &doc.fields {
+                        match v {
+                            Value::String(s) if s.len() > threshold => { needs_splitting = true; break; },
+                            Value::Binary(b) if b.len() > threshold => { needs_splitting = true; break; },
+                            _ => {}
                         }
                     }
 
-                    let key = fast_doc_key(&collection, &doc_id);
-                    affected_keys.push(key.clone()); // Store for versioning
+                    if needs_splitting {
+                        let shard_arc = self.get_shard(&collection);
+                        let shard = shard_arc.read().unwrap();
+                        if let Some(blob_file_mutex) = &shard.blob_file {
+                            let mut file = blob_file_mutex.lock().unwrap();
+                            
+                            for (_, value) in &mut doc.fields {
+                                let data_to_blob = match value {
+                                    Value::String(s) if s.len() > threshold => Some(s.as_bytes().to_vec()),
+                                    Value::Binary(b) if b.len() > threshold => Some(b.clone()),
+                                    _ => None,
+                                };
+
+                                if let Some(data) = data_to_blob {
+                                    let offset = file.seek(std::io::SeekFrom::End(0)).unwrap();
+                                    let len = data.len() as u32;
+                                    *value = Value::BlobLink { offset, len };
+                                    blob_work_todo.push(BlobWork::PutRaw {
+                                        collection: collection.clone(),
+                                        offset,
+                                        data: Arc::new(data),
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    // Process Server Timestamps
+                    for (_, v) in &mut doc.fields {
+                        if matches!(v, Value::ServerTimestamp) { *v = Value::Timestamp(now); }
+                    }
 
                     let doc_bytes = doc.encode(); 
                     shard_groups.entry(collection.clone()).or_default().push(
                         StorageMutation::Put { key: key.clone(), value: doc_bytes }
                     );
-
-                    // MOVE doc_id and doc (Zero-Clone)
                     index_puts.entry(collection.clone()).or_default().push((doc_id, doc));
-
-                    unique_events.insert(key.clone(), (
-                        collection,
-                        ChangeEvent { path: key, kind: ChangeKind::Put }
-                    ));
+                    unique_events.insert(key.clone(), (collection, ChangeEvent { path: key, kind: ChangeKind::Put }));
                 }
 
                 BatchMutation::Delete { collection, doc_id } => {
@@ -582,98 +812,92 @@ impl FireLite {
 
                     let shard = self.get_shard(&collection);
                     if let Some(bytes) = shard.read().unwrap().get(&key)? {
-                        if let Some(old_doc) = FireLiteDoc::decode(&bytes) {
+                        if let Some(mut old_doc) = FireLiteDoc::decode(&bytes) {
+                            // OPTIMIZATION: Only resolve blobs if FTS index exists for this collection
+                            if fts_collections.contains(&collection) {
+                                let _ = self.resolve_doc(&mut old_doc, &collection);
+                            }
                             index_dels.entry(collection.clone()).or_default().push((doc_id, old_doc));
                         }
                     }
                     
-                    shard_groups.entry(collection.clone()).or_default().push(
-                        StorageMutation::Delete { key: key.clone() }
-                    );
-                    
-                    unique_events.insert(key.clone(), (
-                        collection,
-                        ChangeEvent { path: key, kind: ChangeKind::Delete }
-                    ));
+                    shard_groups.entry(collection.clone()).or_default().push(StorageMutation::Delete { key: key.clone() });
+                    unique_events.insert(key.clone(), (collection, ChangeEvent { path: key, kind: ChangeKind::Delete }));
                 }
 
                 BatchMutation::Patch { collection, doc_id, updates } => {
                     let key = fast_doc_key(&collection, &doc_id);
                     affected_keys.push(key.clone());
 
-                    let shard = self.get_shard(&collection);
-                    let storage = shard.read().unwrap();
-                    if let Some(old_bytes) = storage.get(&key)? {
+                    let shard_arc = self.get_shard(&collection);
+                    let shard = shard_arc.read().unwrap();
+                    if let Some(old_bytes) = shard.get(&key)? {
                         if let Some(mut doc) = FireLiteDoc::decode(&old_bytes) {
-                            let old_doc_for_index = doc.clone(); 
-                            for (k, v) in updates {
+                            let mut old_doc_for_index = doc.clone(); 
+                            if fts_collections.contains(&collection) {
+                                let _ = self.resolve_doc(&mut old_doc_for_index, &collection);
+                            }
+
+                            // Patch fields and apply splitter
+                            for (k, mut v) in updates {
+                                let data_to_blob = match &v {
+                                    Value::String(s) if s.len() > threshold => Some(s.as_bytes().to_vec()),
+                                    Value::Binary(b) if b.len() > threshold => Some(b.clone()),
+                                    _ => None,
+                                };
+
+                                if let Some(data) = data_to_blob {
+                                    if let Some(blob_file_mutex) = &shard.blob_file {
+                                        let mut file = blob_file_mutex.lock().unwrap();
+                                        let offset = file.seek(std::io::SeekFrom::End(0)).unwrap();
+                                        v = Value::BlobLink { offset, len: data.len() as u32 };
+                                        blob_work_todo.push(BlobWork::PutRaw {
+                                            collection: collection.clone(),
+                                            offset,
+                                            data: Arc::new(data),
+                                        });
+                                    }
+                                }
                                 doc.insert(k, v);
                             }
-                            let new_bytes = doc.encode();
 
+                            let new_bytes = doc.encode();
                             index_dels.entry(collection.clone()).or_default().push((doc_id.clone(), old_doc_for_index));
                             index_puts.entry(collection.clone()).or_default().push((doc_id, doc));
-
-                            shard_groups.entry(collection.clone()).or_default().push(
-                                StorageMutation::Put { key: key.clone(), value: new_bytes }
-                            );
-
-                            unique_events.insert(key.clone(), (
-                                collection,
-                                ChangeEvent { path: key, kind: ChangeKind::Put }
-                            ));
+                            shard_groups.entry(collection.clone()).or_default().push(StorageMutation::Put { key: key.clone(), value: new_bytes });
+                            unique_events.insert(key.clone(), (collection, ChangeEvent { path: key, kind: ChangeKind::Put }));
                         }
                     }
                 }
             }
         }
 
-        // 2. DETERMINISTIC LOCKING (Alphabetical)
+        // 2. Deterministic Locking (acquired once per shard)
         let mut sorted_shards: Vec<_> = shard_groups.keys().cloned().collect();
         sorted_shards.sort();
-
-        let mut all_blob_work = Vec::new();
         for col_name in sorted_shards {
             if let Some(ops) = shard_groups.get(&col_name) {
                 let shard = self.get_shard(&col_name);
                 let mut storage = shard.write().unwrap();
-                let pending_blobs = storage.apply_batch(ops)?;
-                all_blob_work.extend(pending_blobs);
+                let doc_blobs = storage.apply_batch(ops)?;
+                for b in doc_blobs { let _ = self.blob_tx.try_send(b); }
             }
         }
 
-        // Hand off blobs
-        for work in all_blob_work {
-            let _ = self.blob_tx.try_send(work);
-        }
+        for work in blob_work_todo { let _ = self.blob_tx.try_send(work); }
 
-        // 3. Update metadata using our collected keys (NEW)
+        // 3. Metadata and Indexing
         self.bump_versions_by_keys(affected_keys);
-
         for (col, puts) in index_puts {
             let deletes = index_dels.remove(&col).unwrap_or_default();
-            let _ = self.index_tx.send(IndexOp::Update {
-                collection: col,
-                puts,
-                deletes,
-            });
+            let _ = self.index_tx.send(IndexOp::Update { collection: col, puts, deletes });
         }
         for (col, deletes) in index_dels {
-            let _ = self.index_tx.send(IndexOp::Update {
-                collection: col,
-                puts: vec![],
-                deletes,
-            });
+            let _ = self.index_tx.send(IndexOp::Update { collection: col, puts: vec![], deletes });
         }
-        
-        // for (col, event) in change_events {
-        //     self.notify_watchers(&col, event);
-        // }
-
         for (_, (col, event)) in unique_events {
             self.notify_watchers(&col, event);
         }
-
         Ok(())
     }
 
@@ -709,7 +933,13 @@ impl FireLite {
             doc_id: Some(doc_id.into()),
             ok: true,
         });
-        Ok(res)
+        
+        if let Some(mut doc) = res {
+            self.resolve_doc(&mut doc, collection)?;
+            return Ok(Some(doc));
+        }
+
+        Ok(None)
     }
 
     pub fn delete(&self, col: &str, id: &str) -> Result<()> {
@@ -744,16 +974,23 @@ impl FireLite {
         let plan = QueryPlanner::plan(&query, &indexes, rows, self.config.query_workers);
 
         // let res = self.executor.execute(&storage, &indexes, plan);
-        let res = self.executor.execute(shard_arc, &indexes, plan);
+        let mut results = self.executor.execute(shard_arc, &indexes, plan)?;
 
         // AUDIT RESULT
         self.record_audit(AuditEntry {
             op: AccessOp::Query,
             collection: query.collection.clone(),
             doc_id: None,
-            ok: res.is_ok(),
+            ok: true, // prev ->results.is_ok()
         });
-        res
+
+        // --- NEW: AUTO-RESOLVE BLOB LINKS FOR ALL RESULTS ---
+        for (_, doc) in &mut results {
+            self.resolve_doc(doc, &query.collection)?;
+        }
+
+        // res
+        Ok(results)
     }
 
     pub fn query_projected_zero_copy(
@@ -773,7 +1010,7 @@ impl FireLite {
         }
 
         // 2. Prepare Query with Projection
-        let mut q = query;
+        let mut q = query.clone();
         q.projection = fields.to_vec();
 
         // 3. Acquire Locks
@@ -791,17 +1028,27 @@ impl FireLite {
         let plan = QueryPlanner::plan(&q, &indexes, rows, self.config.query_workers);
 
         // let res = self.executor.execute_projected(&storage, &indexes, plan);
-        let res = self.executor.execute_projected(shard_arc, &indexes, plan);
+        let mut results = self.executor.execute_projected(shard_arc, &indexes, plan)?;
 
         // 5. Audit & Return
         self.record_audit(AuditEntry {
             op: AccessOp::Query,
             collection: q.collection.clone(),
             doc_id: None,
-            ok: res.is_ok(),
+            ok: true,
         });
 
-        res
+        // --- NEW: RESOLVE PROJECTED BLOB FIELDS ---
+        for (_, fields_list) in &mut results {
+            for (_, value) in fields_list {
+                if let Value::BlobLink { offset, len } = *value {
+                    // Logic similar to resolve_doc but for a single Value
+                    // We call a small helper here
+                    *value = self.resolve_single_value_blob(&query.collection, offset, len)?;
+                }
+            }
+        }
+        Ok(results)
     }
 
     pub fn patch(&self, col: &str, id: &str, updates: Vec<(String, Value)>) -> Result<()> {
@@ -1243,6 +1490,9 @@ impl FireLite {
         let f_name = field.to_string();
         let col_name = collection.to_string();
 
+        // Capture encryption key for the thread
+        let enc_key = self.config.encryption_key.clone();
+
         thread::spawn(move || {
             // Step A: Lock, take a snapshot of the pointers, then release IMMEDIATELY
             let pointers = {
@@ -1269,7 +1519,8 @@ impl FireLite {
                 let mut mgr = idx_mgr.write().unwrap();
                 let mut decoded_docs = Vec::new();
                 for (full_key, bytes) in resolved_docs {
-                    if let Some(doc) = FireLiteDoc::decode(&bytes) {
+                    if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
+                        let _ = resolve_doc_static(&mut doc, &shard_arc, enc_key.as_deref());
                         if let Some((_, doc_id)) = full_key.split_once(':') {
                             decoded_docs.push((doc_id.to_string(), doc));
                         }
@@ -1314,6 +1565,8 @@ impl FireLite {
         let shard_arc = self.get_shard(col);
         let idx_mgr = Arc::clone(&self.indexes);
         let persist_ptr = Arc::clone(&self.index_storage); // <--- Required for persistence
+        
+        let enc_key = self.config.encryption_key.clone();
 
         thread::spawn(move || {
             let pointers = {
@@ -1337,7 +1590,8 @@ impl FireLite {
 
                 if let Some(composite_idx) = mgr.composite.get_mut(index_id) {
                     for (full_key, bytes) in resolved_data {
-                        if let Some(doc) = FireLiteDoc::decode(&bytes) {
+                        if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
+                            let _ = resolve_doc_static(&mut doc, &shard_arc, enc_key.as_deref());
                             if let Some((_, doc_id)) = full_key.split_once(':') {
                                 // 1. Insert into RAM
                                 composite_idx.index_document(doc_id, &doc);
@@ -1379,6 +1633,195 @@ impl FireLite {
         persist.snapshot(1).map_err(|e| FireLiteError::Io(e))?;
         Ok(())
     }
+
+    /// Scans a document for BlobLinks and fetches the data from disk.
+    /// This makes the "Skeleton" transparent to the user.
+    pub fn resolve_document_blobs(&self, doc: &mut FireLiteDoc, collection: &str) -> Result<()> {
+        let shard_arc = self.get_shard(collection);
+        let shard = shard_arc.read().unwrap();
+        
+        let file_mutex = shard.blob_file.as_ref()
+            .ok_or_else(|| FireLiteError::StorageError("Blob file missing".into()))?;
+        
+        let mut file = file_mutex.lock().unwrap();
+        let encryption = self.config.encryption_key.as_ref()
+            .map(|k| crate::storage::crypto::EncryptionContext::from_secret(k));
+
+        for (_, value) in &mut doc.fields {
+            if let Value::BlobLink { offset, len } = *value {
+                use std::io::{Read, Seek, SeekFrom};
+                
+                let mut buf = vec![0u8; len as usize];
+                file.seek(SeekFrom::Start(offset))?;
+                file.read_exact(&mut buf)?;
+
+                // Decrypt if necessary
+                let decrypted_data = if let Some(ref enc) = encryption {
+                    enc.decrypt(&buf)?
+                } else {
+                    buf
+                };
+
+                // Convert back to original type (String or Binary)
+                // We try to decode as UTF-8; if it fails, it's Binary.
+                if let Ok(s) = String::from_utf8(decrypted_data.clone()) {
+                    *value = Value::String(s);
+                } else {
+                    *value = Value::Binary(decrypted_data);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // Helper for projected resolution
+    fn resolve_single_value_blob(&self, collection: &str, offset: u64, len: u32) -> Result<Value> {
+        let shard_arc = self.get_shard(collection);
+        let shard = shard_arc.read().unwrap();
+        let file_mutex = shard.blob_file.as_ref().unwrap();
+        let mut file = file_mutex.lock().unwrap();
+        
+        use std::io::{Read, Seek, SeekFrom};
+        let mut buf = vec![0u8; len as usize];
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut buf)?;
+        
+        let data = if let Some(k) = &self.config.encryption_key {
+            let enc = crate::storage::crypto::EncryptionContext::from_secret(k);
+            enc.decrypt(&buf)?
+        } else { buf };
+
+        if let Ok(s) = String::from_utf8(data.clone()) {
+            Ok(Value::String(s))
+        } else {
+            Ok(Value::Binary(data))
+        }
+    }
+
+    /// Internal helper: Resolves all Value::BlobLink fields in a document
+    /// by reading from the collection's blob file.
+    fn resolve_doc(&self, doc: &mut FireLiteDoc, collection: &str) -> Result<()> {
+        let mut has_links = false;
+        for (_, value) in &doc.fields {
+            if matches!(value, Value::BlobLink { .. }) {
+                has_links = true;
+                break;
+            }
+        }
+
+        if !has_links { return Ok(()); }
+
+        let shard_arc = self.get_shard(collection);
+        let shard = shard_arc.read().unwrap();
+        
+        let file_mutex = shard.blob_file.as_ref()
+            .ok_or_else(|| FireLiteError::StorageError("Blob file missing".into()))?;
+        
+        let mut file = file_mutex.lock().unwrap();
+        
+        // We use the same encryption context configured for the engine
+        let encryption = self.config.encryption_key.as_ref()
+            .map(|k| crate::storage::crypto::EncryptionContext::from_secret(k));
+
+        for (_, value) in &mut doc.fields {
+            if let Value::BlobLink { offset, len } = *value {
+                use std::io::{Read, Seek, SeekFrom};
+                
+                let mut buf = vec![0u8; len as usize];
+                file.seek(SeekFrom::Start(offset))?;
+                file.read_exact(&mut buf)?;
+
+                let decrypted_data = if let Some(ref enc) = encryption {
+                    enc.decrypt(&buf)?
+                } else {
+                    buf
+                };
+
+                // Restore to original state
+                // If it's valid UTF-8, we treat it as a String, otherwise Binary.
+                if let Ok(s) = String::from_utf8(decrypted_data.clone()) {
+                    *value = Value::String(s);
+                } else {
+                    *value = Value::Binary(decrypted_data);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn vacuum(&self, collection: &str) -> Result<()> {
+        let shard_arc = self.get_shard(collection);
+        let mut shard = shard_arc.write().unwrap();
+        
+        let blob_path = shard.base_dir().join("blobs.dat");
+        let temp_path = shard.base_dir().join("blobs.tmp");
+        
+        if !blob_path.exists() { return Ok(()); }
+
+        let mut new_blob_file = std::fs::OpenOptions::new()
+            .create(true).write(true).truncate(true).open(&temp_path)?;
+        
+        let mut new_offset = 0u64;
+        let mut updates = Vec::new();
+
+        // 1. Scan the index for all documents in this shard
+        for (key, pointer) in &shard.index {
+            // We need to read the document to find BlobLinks inside it
+            if let Some(bytes) = shard.read_pointer(pointer)? {
+                if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
+                    let mut doc_changed = false;
+                    
+                    for (_, value) in &mut doc.fields {
+                        if let Value::BlobLink { offset, len } = *value {
+                            // Fetch old data
+                            let data = self.resolve_single_value_blob(collection, offset, len)?;
+                            let raw_data = match data {
+                                Value::String(s) => s.into_bytes(),
+                                Value::Binary(b) => b,
+                                _ => continue,
+                            };
+
+                            // Encrypt for the new file
+                            let payload = if let Some(key) = &self.config.encryption_key {
+                                let enc = crate::storage::crypto::EncryptionContext::from_secret(key);
+                                enc.encrypt(&raw_data)?
+                            } else { raw_data };
+
+                            // Write to new file
+                            new_blob_file.write_all(&payload)?;
+                            
+                            // Update the link in the document skeleton
+                            *value = Value::BlobLink { offset: new_offset, len: payload.len() as u32 };
+                            new_offset += payload.len() as u64;
+                            doc_changed = true;
+                        }
+                    }
+
+                    if doc_changed {
+                        updates.push((key.clone(), doc.encode()));
+                    }
+                }
+            }
+        }
+
+        // 2. Commit the new blob file
+        drop(new_blob_file);
+        std::fs::rename(&temp_path, &blob_path)?;
+        
+        // Re-open the blob file handle in the shard
+        let new_file = std::fs::OpenOptions::new().read(true).append(true).open(&blob_path)?;
+        shard.blob_file = Some(Arc::new(Mutex::new(new_file)));
+
+        // 3. Update the Skeletons in the Segment
+        // (This triggers a standard storage Put for the updated skeletons)
+        for (key, new_bytes) in updates {
+            shard.put(key, &new_bytes)?;
+        }
+
+        Ok(())
+    }
+
+
 }
 
 impl Drop for FireLite {
@@ -1427,6 +1870,33 @@ impl Drop for FireLite {
 }
 
 // --- Internal Helper Functions ---
+
+/// Helper used by background threads to resolve blobs when they don't have access to the full Engine.
+fn resolve_doc_static(doc: &mut FireLiteDoc, shard_arc: &Arc<RwLock<StorageEngine>>, enc_secret: Option<&str>) -> Result<()> {
+    let mut has_links = false;
+    for (_, value) in &doc.fields {
+        if matches!(value, Value::BlobLink { .. }) { has_links = true; break; }
+    }
+    if !has_links { return Ok(()); }
+
+    let shard = shard_arc.read().unwrap();
+    let file_mutex = shard.blob_file.as_ref().ok_or_else(|| FireLiteError::StorageError("Blob missing".into()))?;
+    let mut file = file_mutex.lock().unwrap();
+    let encryption = enc_secret.map(|k| crate::storage::crypto::EncryptionContext::from_secret(k));
+
+    for (_, value) in &mut doc.fields {
+        if let Value::BlobLink { offset, len } = *value {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut buf = vec![0u8; len as usize];
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(&mut buf)?;
+            let data = if let Some(ref enc) = encryption { enc.decrypt(&buf)? } else { buf };
+            if let Ok(s) = String::from_utf8(data.clone()) { *value = Value::String(s); }
+            else { *value = Value::Binary(data); }
+        }
+    }
+    Ok(())
+}
 
 fn doc_key(collection: &str, doc_id: &str) -> String {
     format!("{}:{}", collection, doc_id)

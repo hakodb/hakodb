@@ -36,7 +36,8 @@ impl ParallelQueryExecutor {
     //     indexes: &IndexManager,
     //     plan: QueryPlan,
     // ) -> Result<Vec<(String, FireLiteDoc)>> {
-    //     let docs = {
+
+    //     let keys_from_index = {
     //         let storage = storage_arc.read().unwrap();
     //         match &plan.scan {
     //             ScanType::UnionIndex { scans } => {
@@ -49,11 +50,11 @@ impl ParallelQueryExecutor {
     //                         &plan.collection,
     //                         plan.scan_limit,
     //                     )?;
-    //                     for (key, raw) in branch_docs {
-    //                         union_map.insert(key, raw);
+    //                     for (key, ptr) in branch_docs {
+    //                         union_map.insert(key, ptr);
     //                     }
     //                 }
-    //                 union_map.into_iter().collect()
+    //                 union_map.into_iter().collect::<Vec<_>>()
     //             }
     //             _ => self.execute_single_scan(
     //                 &storage,
@@ -65,39 +66,77 @@ impl ParallelQueryExecutor {
     //         }
     //     };
 
-    //     let mut results: QueryResults = Vec::new();
-    //     let doc_count = docs.len();
+    //     if keys_from_index.is_empty() { return Ok(Vec::new()); }
+
+    //     // 2. Wrap keys with their original logical position
+    //     // Change: The third element is now Pointer, not Vec<u8>
+    //     let mut work_items: Vec<(usize, String, Pointer)> = keys_from_index
+    //         .into_iter()
+    //         .enumerate()
+    //         .map(|(i, (k, v))| (i, k, v))
+    //         .collect();
+
+    //     // 3. PHYSICAL SORT: Sort by file offset to minimize disk seeking
+    //     // Optimization: We use the pointer we already have in the tuple!
+    //     work_items.sort_by_key(|(_, _, ptr)| {
+    //         match ptr {
+    //             Pointer::Segment { offset, .. } => *offset,
+    //             Pointer::Blob { offset, .. } => *offset,
+    //             _ => 0, 
+    //         }
+    //     });
+
+    //     // 4. SHARD & EXECUTE (Sequential Disk Sweep)
+    //     let docs_to_fetch: Vec<(String, Pointer)> = work_items
+    //         .iter()
+    //         .map(|(_, k, p)| (k.clone(), p.clone()))
+    //         .collect();
+
+    //     let doc_count = docs_to_fetch.len();
+    //     let mut processed_docs: Vec<(String, FireLiteDoc)> = Vec::with_capacity(doc_count);
 
     //     if doc_count < 1000 || self.workers <= 1 {
     //         let task = QueryTask {
-    //             docs,
+    //             docs: docs_to_fetch,
     //             plan: plan.clone(),
     //             storage: Some(storage_arc.clone()),
     //         };
-    //         results = run_task(task);
+    //         processed_docs = run_task(task);
     //     } else {
     //         let optimal_workers = self.workers.min((doc_count / 500).max(1));
-    //         let tasks = shard_tasks(
-    //             docs,
-    //             optimal_workers,
-    //             plan.clone(),
-    //             Some(storage_arc.clone()),
-    //         );
-
+    //         let tasks = shard_tasks(docs_to_fetch, optimal_workers, plan.clone(), Some(storage_arc.clone()));
+            
     //         let mut handles = Vec::new();
     //         for task in tasks {
     //             handles.push(thread::spawn(move || run_task(task)));
     //         }
-
     //         for handle in handles {
-    //             results.extend(handle.join().unwrap_or_default());
+    //             processed_docs.extend(handle.join().unwrap_or_default());
     //         }
     //     }
 
-    //     // ONLY SORT IF NOT SATISFIED BY INDEX
+    //     // 5. RESTORE LOGICAL ORDER
+    //     let mut processed_map: HashMap<String, FireLiteDoc> = processed_docs.into_iter().collect();
+    //     let mut ordered_results: Vec<(usize, String, FireLiteDoc)> = Vec::with_capacity(doc_count);
+        
+    //     // Use the original work_items (which contains the pos tag) to rebuild
+    //     for (original_pos, key, _) in work_items {
+    //         if let Some(doc) = processed_map.remove(&key) {
+    //             ordered_results.push((original_pos, key, doc));
+    //         }
+    //     }
+
+    //     // Sort by the original position tag to restore Index Order
+    //     ordered_results.sort_by_key(|(pos, _, _)| *pos);
+
+    //     // 6. Manual re-sort for cases NOT satisfied by index
+    //     let mut results: Vec<(String, FireLiteDoc)> = ordered_results
+    //         .into_iter()
+    //         .map(|(_, k, d)| (k, d))
+    //         .collect();
+
     //     if !plan.order_by_satisfied {
     //         if let Some(order) = &plan.order_by {
-    //             // This block is very expensive for large documents!
     //             results.sort_by(|(_, a), (_, b)| {
     //                 let av = a.get(&order.field);
     //                 let bv = b.get(&order.field);
@@ -107,18 +146,17 @@ impl ParallelQueryExecutor {
     //         }
     //     }
 
-    //     let mut final_results = if let Some(offset) = plan.offset {
-    //         results.into_iter().skip(offset).collect()
-    //     } else {
-    //         results
-    //     };
-
+    //     // 7. Apply Offset/Limit
+    //     if let Some(offset) = plan.offset {
+    //         results = results.into_iter().skip(offset).collect();
+    //     }
     //     if let Some(limit) = plan.limit {
-    //         final_results.truncate(limit);
+    //         results.truncate(limit);
     //     }
 
-    //     Ok(final_results)
+    //     Ok(results)
     // }
+
 
     pub fn execute(
         &self,
@@ -127,7 +165,9 @@ impl ParallelQueryExecutor {
         plan: QueryPlan,
     ) -> Result<Vec<(String, FireLiteDoc)>> {
 
-        let keys_from_index = {
+        // 1. Get keys from index
+        // Note: Use 'mut' so we can drain/truncate
+        let mut keys_from_index = {
             let storage = storage_arc.read().unwrap();
             match &plan.scan {
                 ScanType::UnionIndex { scans } => {
@@ -158,16 +198,33 @@ impl ParallelQueryExecutor {
 
         if keys_from_index.is_empty() { return Ok(Vec::new()); }
 
-        // 2. Wrap keys with their original logical position
-        // Change: The third element is now Pointer, not Vec<u8>
+        // --- REFINED OFFSET & LIMIT OPTIMIZATION ---
+        let mut offset_to_apply_later = plan.offset.unwrap_or(0);
+        
+        // If the index satisfies the SORT ORDER, we can skip pointers in RAM
+        if plan.order_by_satisfied && offset_to_apply_later > 0 {
+            let skip_count = offset_to_apply_later.min(keys_from_index.len());
+            keys_from_index.drain(0..skip_count);
+            offset_to_apply_later = 0; // Offset consumed
+        }
+
+        // NEW OPTIMIZATION: If the index also satisfies the FILTERS, 
+        // we can truncate pointers in RAM to the LIMIT.
+        // This prevents reading thousands of docs from disk just to discard them later.
+        if plan.order_by_satisfied && plan.filters_satisfied_by_index {
+            if let Some(limit) = plan.limit {
+                keys_from_index.truncate(limit);
+            }
+        }
+
+        // 2. Wrap keys with logical position
         let mut work_items: Vec<(usize, String, Pointer)> = keys_from_index
             .into_iter()
             .enumerate()
             .map(|(i, (k, v))| (i, k, v))
             .collect();
 
-        // 3. PHYSICAL SORT: Sort by file offset to minimize disk seeking
-        // Optimization: We use the pointer we already have in the tuple!
+        // 3. PHYSICAL SORT (The Sweep)
         work_items.sort_by_key(|(_, _, ptr)| {
             match ptr {
                 Pointer::Segment { offset, .. } => *offset,
@@ -176,47 +233,37 @@ impl ParallelQueryExecutor {
             }
         });
 
-        // 4. SHARD & EXECUTE (Sequential Disk Sweep)
+        // 4. SHARD & EXECUTE
         let docs_to_fetch: Vec<(String, Pointer)> = work_items
             .iter()
             .map(|(_, k, p)| (k.clone(), p.clone()))
             .collect();
 
         let doc_count = docs_to_fetch.len();
-        let mut processed_docs: Vec<(String, FireLiteDoc)> = Vec::with_capacity(doc_count);
-
-        if doc_count < 1000 || self.workers <= 1 {
-            let task = QueryTask {
+        let processed_docs = if doc_count < 1000 || self.workers <= 1 {
+            run_task(QueryTask {
                 docs: docs_to_fetch,
                 plan: plan.clone(),
                 storage: Some(storage_arc.clone()),
-            };
-            processed_docs = run_task(task);
+            })
         } else {
             let optimal_workers = self.workers.min((doc_count / 500).max(1));
             let tasks = shard_tasks(docs_to_fetch, optimal_workers, plan.clone(), Some(storage_arc.clone()));
-            
+            let mut results = Vec::new();
             let mut handles = Vec::new();
-            for task in tasks {
-                handles.push(thread::spawn(move || run_task(task)));
-            }
-            for handle in handles {
-                processed_docs.extend(handle.join().unwrap_or_default());
-            }
-        }
+            for task in tasks { handles.push(thread::spawn(move || run_task(task))); }
+            for handle in handles { results.extend(handle.join().unwrap_or_default()); }
+            results
+        };
 
         // 5. RESTORE LOGICAL ORDER
         let mut processed_map: HashMap<String, FireLiteDoc> = processed_docs.into_iter().collect();
-        let mut ordered_results: Vec<(usize, String, FireLiteDoc)> = Vec::with_capacity(doc_count);
-        
-        // Use the original work_items (which contains the pos tag) to rebuild
+        let mut ordered_results = Vec::with_capacity(doc_count);
         for (original_pos, key, _) in work_items {
             if let Some(doc) = processed_map.remove(&key) {
                 ordered_results.push((original_pos, key, doc));
             }
         }
-
-        // Sort by the original position tag to restore Index Order
         ordered_results.sort_by_key(|(pos, _, _)| *pos);
 
         // 6. Manual re-sort for cases NOT satisfied by index
@@ -236,9 +283,9 @@ impl ParallelQueryExecutor {
             }
         }
 
-        // 7. Apply Offset/Limit
-        if let Some(offset) = plan.offset {
-            results = results.into_iter().skip(offset).collect();
+        // 7. Final Offset/Limit (Catch-all for non-index queries)
+        if offset_to_apply_later > 0 {
+            results = results.into_iter().skip(offset_to_apply_later).collect();
         }
         if let Some(limit) = plan.limit {
             results.truncate(limit);

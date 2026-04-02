@@ -41,6 +41,13 @@ pub fn encode_scalar(value: &Value) -> Vec<u8> {
             b.extend_from_slice(doc_id.as_bytes());
             b
         },
+        // ADD THIS ARM:
+        Value::BlobLink { offset, len } => {
+            let mut b = vec![11]; // Tag 11
+            b.extend_from_slice(&offset.to_be_bytes());
+            b.extend_from_slice(&len.to_be_bytes());
+            b
+        }
     }
 }
 

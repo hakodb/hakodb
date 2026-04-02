@@ -3,96 +3,6 @@ use smallvec::SmallVec;
 
 use super::definition::{CompositeIndexDefinition, SortDirection};
 
-// pub fn encode_composite_key(
-//     def: &CompositeIndexDefinition,
-//     values: &[Value],
-//     doc_id: &str,
-// ) -> Vec<u8> {
-//     let mut out = Vec::new();
-//     out.extend(def.id.to_be_bytes());
-//     for (value, field) in values.iter().zip(def.fields.iter()) {
-//         encode_value(value, &field.direction, &mut out);
-//     }
-//     out.extend((doc_id.len() as u16).to_be_bytes());
-//     out.extend(doc_id.as_bytes());
-//     out
-// }
-
-// pub fn encode_composite_key(
-//     def: &CompositeIndexDefinition,
-//     values: &[Value],
-//     doc_id: &str,
-// ) -> SmallVec<[u8; 32]> {
-
-//     let mut key: SmallVec<[u8; 32]> = SmallVec::new();
-
-//     for v in values {
-//         match v {
-//             Value::Int(i) => key.extend_from_slice(&i.to_le_bytes()),
-//             Value::Float(f) => key.extend_from_slice(&f.to_le_bytes()),
-//             Value::Bool(b) => key.push(*b as u8),
-//             Value::String(s) => {
-//                 key.extend_from_slice(&(s.len() as u16).to_le_bytes());
-//                 key.extend_from_slice(s.as_bytes());
-//             }
-//             Value::Binary(b) => {
-//                 key.extend_from_slice(&(b.len() as u16).to_le_bytes());
-//                 key.extend_from_slice(b);
-//             }
-//             Value::Null => key.push(0),
-//         }
-//     }
-
-//     key.extend_from_slice(doc_id.as_bytes());
-
-//     key
-// }
-
-// fn encode_value(value: &Value, direction: &SortDirection, out: &mut Vec<u8>) {
-//     match value {
-//         Value::Null => out.push(0),
-//         Value::Bool(v) => {
-//             out.push(1);
-//             out.push(*v as u8);
-//         }
-//         Value::Int(v) => {
-//             out.push(2);
-//             let mut bytes = v.to_be_bytes();
-//             maybe_flip(direction, &mut bytes);
-//             out.extend(bytes);
-//         }
-//         Value::Float(v) => {
-//             out.push(3);
-//             let mut bytes = v.to_bits().to_be_bytes();
-//             maybe_flip(direction, &mut bytes);
-//             out.extend(bytes);
-//         }
-//         Value::String(v) => {
-//             out.push(4);
-//             let mut bytes = v.as_bytes().to_vec();
-//             maybe_flip(direction, &mut bytes);
-//             out.extend((bytes.len() as u32).to_be_bytes());
-//             out.extend(bytes);
-//         }
-//         Value::Binary(v) => {
-//             out.push(5);
-//             let mut bytes = v.clone();
-//             maybe_flip(direction, &mut bytes);
-//             out.extend((bytes.len() as u32).to_be_bytes());
-//             out.extend(bytes);
-//         }
-//     }
-// }
-
-// fn maybe_flip(direction: &SortDirection, bytes: &mut [u8]) {
-//     if matches!(direction, SortDirection::Desc) {
-//         for b in bytes {
-//             *b = !*b;
-//         }
-//     }
-// }
-
-
 pub fn encode_composite_key(
     def: &CompositeIndexDefinition,
     values: &[Value],
@@ -180,6 +90,13 @@ pub(crate) fn encode_value(
         Value::Reference { .. } => {
             out.push(10); // Tag 10
             // We don't support range sorting by the reference contents yet
+        }
+
+        // ADD THIS ARM:
+        Value::BlobLink { .. } => {
+            out.push(11); // Tag for Link
+            // We don't encode the offset into the index key because 
+            // the index should ideally be based on content, not file address.
         }
 
         Value::ServerTimestamp => {

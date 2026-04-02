@@ -149,6 +149,15 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             );
             serde_json::Value::Object(map)
         }
+        // ADD THIS ARM:
+        Value::BlobLink { offset, len } => {
+            let mut map = serde_json::Map::new();
+            let mut meta = serde_json::Map::new();
+            meta.insert("offset".to_string(), (*offset).into());
+            meta.insert("len".to_string(), (*len).into());
+            map.insert("__blob__".to_string(), serde_json::Value::Object(meta));
+            serde_json::Value::Object(map)
+        }
         Value::ServerTimestamp => serde_json::Value::Null,
     }
 }

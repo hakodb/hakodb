@@ -238,13 +238,18 @@ Report run_benchmark(BenchConfig cfg) {
     // 3. BULK UPDATE & SERIALIZABLE TX
     stage("Bulk Update (Patch)");
     t_start = now_ms();
+    FL_Batch* batch_upd = fl_batch_new();
     FL_Doc* upd = fl_doc_new();
+    
     fl_doc_insert_str(upd, "status", "updated");
     for(int i=0; i<100; i++) {
-        fl_engine_patch(db, "bench", (string("b_") + to_string(i)).c_str(), upd);
+        // fl_engine_patch(db, "bench", (string("b_") + to_string(i)).c_str(), upd);
+        fl_batch_set(batch_upd, "bench", (string("b_") + to_string(i)).c_str(), upd);
     }
+    fl_batch_commit(db, batch_upd);
     res.bulk_upd_ms = now_ms() - t_start;
-    fl_doc_free(upd);
+    fl_batch_free(batch_upd);
+    // fl_doc_free(upd);
     cout << res.bulk_upd_ms << "ms";
 
     stage("Serializable Transactions");
@@ -338,7 +343,13 @@ Report run_benchmark(BenchConfig cfg) {
     // 7. BULK DELETE
     stage("Bulk Delete");
     t_start = now_ms();
-    for(int i=0; i<100; i++) fl_engine_delete(db, "bench", (string("b_") + to_string(i+500)).c_str());
+    FL_Batch* batch_del = fl_batch_new();
+    // for(int i=0; i<100; i++) fl_engine_delete(db, "bench", (string("b_") + to_string(i+500)).c_str());
+    for(int i=0; i<100; i++) {
+        fl_batch_delete(batch_del, "bench", (string("b_") + to_string(i+500)).c_str());
+    };
+    fl_batch_commit(db, batch_del);
+    fl_batch_free(batch_del);
     res.bulk_del_ms = now_ms() - t_start;
     cout << res.bulk_del_ms << "ms";
 
@@ -418,7 +429,7 @@ int main(int argc, char** argv) {
         ss_read << fixed << setprecision(4) << r.s_read_ms << "/" << r.p_read_ms;
         ss_stress << fixed << setprecision(4) << r.stress_get_ms << "/" << r.stress_query_ms << "/" << r.comp_query_ms;
         ss_query << fixed << setprecision(1) << r.offset_ms << "/" << r.cursor_ms;
-        ss_bulk << (int)r.bulk_upd_ms << "/" << (int)r.bulk_del_ms;
+        ss_bulk << setprecision(4) << (int)r.bulk_upd_ms << "/" << setprecision(4) << (int)r.bulk_del_ms;
         ss_maint << (int)r.startup_ms << "/" << (int)r.shutdown_ms;
 
         cout << left << setw(14) << r.cfg.name << " | "

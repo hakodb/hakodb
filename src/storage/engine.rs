@@ -35,6 +35,11 @@ pub enum StorageMutation {
 }
 
 pub enum BlobWork {
+    PutRaw {
+        collection: String,
+        offset: u64,
+        data: Arc<Vec<u8>>,
+    },
     Put {
         collection: String,
         key: String,
