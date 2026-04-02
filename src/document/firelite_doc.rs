@@ -189,6 +189,12 @@ impl FireLiteDoc {
                 out.push(doc_id.len() as u8);
                 out.extend_from_slice(doc_id.as_bytes());
             }
+            Value::BlobLink { offset, len } => {
+                out.push(11); // Tag 11
+                out.extend_from_slice(&12u32.to_le_bytes()); // Length: 8 (u64) + 4 (u32) = 12
+                out.extend_from_slice(&offset.to_le_bytes());
+                out.extend_from_slice(&len.to_le_bytes());
+            }
         }
     }
 
@@ -275,50 +281,6 @@ impl<'a> Iterator for FireLiteDocIter<'a> {
     }
 }
 
-// fn encode_value(v: &Value) -> (u8, Vec<u8>) {
-//     match v {
-//         Value::Null | Value::ServerTimestamp => (1, vec![]),
-//         Value::Bool(v) => (2, vec![*v as u8]),
-//         Value::Int(v) => (3, v.to_le_bytes().to_vec()),
-//         Value::Float(v) => (4, v.to_le_bytes().to_vec()),
-//         Value::String(v) => (5, v.as_bytes().to_vec()),
-//         Value::Binary(v) => (6, v.clone()),
-//         Value::Timestamp(v) => (7, v.to_le_bytes().to_vec()),
-//         Value::Map(fields) => {
-//             let mut out = vec![];
-//             out.extend((fields.len() as u16).to_le_bytes());
-//             for (k, v) in fields {
-//                 out.push(k.len() as u8);
-//                 out.extend_from_slice(k.as_bytes());
-//                 let (tag, bytes) = encode_value(v);
-//                 out.push(tag);
-//                 out.extend((bytes.len() as u32).to_le_bytes());
-//                 out.extend_from_slice(&bytes);
-//             }
-//             (8, out)
-//         }
-//         Value::Array(items) => {
-//             let mut out = vec![];
-//             out.extend((items.len() as u32).to_le_bytes());
-//             for item in items {
-//                 let (tag, bytes) = encode_value(item);
-//                 out.push(tag);
-//                 out.extend((bytes.len() as u32).to_le_bytes());
-//                 out.extend_from_slice(&bytes);
-//             }
-//             (9, out)
-//         }
-//         Value::Reference { collection, doc_id } => {
-//             let mut out = vec![];
-//             out.push(collection.len() as u8);
-//             out.extend_from_slice(collection.as_bytes());
-//             out.push(doc_id.len() as u8);
-//             out.extend_from_slice(doc_id.as_bytes());
-//             (10, out)
-//         }
-//     }
-// }
-
 pub(crate) fn decode_value(tag: u8, bytes: &[u8]) -> Option<Value> {
     match tag {
         1 => Some(Value::Null),
@@ -372,6 +334,11 @@ pub(crate) fn decode_value(tag: u8, bytes: &[u8]) -> Option<Value> {
              pos += 1;
              let doc_id = std::str::from_utf8(bytes.get(pos..pos+d_len)?).ok()?.to_string();
              Some(Value::Reference { collection, doc_id })
+        }
+        11 => {
+            let offset = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?);
+            let len = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?);
+            Some(Value::BlobLink { offset, len })
         }
         _ => Some(Value::Null),
     }

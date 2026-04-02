@@ -21,6 +21,7 @@ pub struct FireLiteConfig {
     pub max_inlined_memory_bytes: usize,
     pub use_compression: bool,
     pub compression_level: i32,
+    pub value_blob_threshold_bytes: usize,
 }
 
 impl Default for FireLiteConfig {
@@ -39,6 +40,7 @@ impl Default for FireLiteConfig {
             max_inlined_memory_bytes: 64 * 1024 * 1024, // 64MB Default
             use_compression: false, // Disabled by default
             compression_level: 3,
+            value_blob_threshold_bytes: 16 * 1024,
         }
     }
 }

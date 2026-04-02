@@ -294,7 +294,8 @@ impl FireLiteGateway {
                                             } else {
                                                 FireLiteDoc::decode(&bytes)
                                             };
-                                            if let Some(d) = doc {
+                                            if let Some(mut d) = doc {
+                                                let _ = db.resolve_document_blobs(&mut d, &query_template.collection);
                                                 changes.push(DocumentChange { 
                                                     kind: DeltaKind::Update, 
                                                     doc_id, 
@@ -659,6 +660,15 @@ fn value_to_json(v: &Value) -> Result<serde_json::Value, String> {
             for (k, v) in fields {
                 map.insert(k.to_string(), value_to_json(v)?);
             }
+            Ok(serde_json::Value::Object(map))
+        }
+        // ADD THIS ARM:
+        Value::BlobLink { offset, len } => {
+            let mut map = serde_json::Map::new();
+            let mut meta = serde_json::Map::new();
+            meta.insert("offset".to_string(), serde_json::json!(offset));
+            meta.insert("len".to_string(), serde_json::json!(len));
+            map.insert("__blob__".to_string(), serde_json::Value::Object(meta));
             Ok(serde_json::Value::Object(map))
         }
         Value::Array(values) => Ok(serde_json::Value::Array(values.iter().map(value_to_json).collect::<Result<Vec<_>, _>>()?)),
