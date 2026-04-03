@@ -35,6 +35,89 @@ impl Value {
             Value::ServerTimestamp => 9,
         }
     }
+
+    /// Converts a FireLite Value into a serde_json::Value.
+    /// This is used by the FFI, Tauri Gateway, and CLI.
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            Value::Null | Value::ServerTimestamp => serde_json::Value::Null,
+            Value::Bool(b) => serde_json::Value::Bool(*b),
+            Value::Int(i) => serde_json::Value::Number((*i).into()),
+            Value::Float(f) => serde_json::Number::from_f64(*f)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            Value::String(s) => serde_json::Value::String(s.clone()),
+            Value::Binary(bytes) => serde_json::Value::Array(
+                bytes.iter().map(|b| serde_json::Value::Number((*b as u64).into())).collect()
+            ),
+            Value::Timestamp(micros) => serde_json::Value::Number((*micros).into()),
+            Value::Reference { collection, doc_id } => {
+                let mut map = serde_json::Map::new();
+                map.insert("__ref__".to_string(), serde_json::Value::String(format!("{collection}/{doc_id}")));
+                serde_json::Value::Object(map)
+            }
+            Value::BlobLink { offset, len } => {
+                let mut map = serde_json::Map::new();
+                let mut meta = serde_json::Map::new();
+                meta.insert("offset".to_string(), (*offset).into());
+                meta.insert("len".to_string(), (*len).into());
+                map.insert("__blob__".to_string(), serde_json::Value::Object(meta));
+                serde_json::Value::Object(map)
+            }
+            Value::Map(fields) => {
+                let mut map = serde_json::Map::new();
+                for (k, v) in fields {
+                    map.insert(k.to_string(), v.to_json());
+                }
+                serde_json::Value::Object(map)
+            }
+            Value::Array(values) => {
+                serde_json::Value::Array(values.iter().map(|v| v.to_json()).collect())
+            }
+        }
+    }
+
+    /// Converts a serde_json::Value into a FireLite Value.
+    /// Automatically detects special keys like __ref__ and __blob__.
+    pub fn from_json(json: serde_json::Value) -> std::result::Result<Self, String> {
+        match json {
+            serde_json::Value::Null => Ok(Value::Null),
+            serde_json::Value::Bool(b) => Ok(Value::Bool(b)),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() { Ok(Value::Int(i)) }
+                else { Ok(Value::Float(n.as_f64().unwrap_or(0.0))) }
+            }
+            serde_json::Value::String(s) => Ok(Value::String(s)),
+            serde_json::Value::Array(arr) => {
+                let mut values = Vec::with_capacity(arr.len());
+                for val in arr { values.push(Value::from_json(val)?); }
+                Ok(Value::Array(values))
+            }
+            serde_json::Value::Object(obj) => {
+                // Handle References
+                if let Some(serde_json::Value::String(path)) = obj.get("__ref__") {
+                    if let Some((col, id)) = path.split_once('/') {
+                        return Ok(Value::Reference {
+                            collection: col.to_string(),
+                            doc_id: id.to_string(),
+                        });
+                    }
+                }
+                // Handle Blobs
+                if let Some(serde_json::Value::Object(meta)) = obj.get("__blob__") {
+                    let offset = meta.get("offset").and_then(|o| o.as_u64()).unwrap_or(0);
+                    let len = meta.get("len").and_then(|l| l.as_u64()).unwrap_or(0) as u32;
+                    return Ok(Value::BlobLink { offset, len });
+                }
+                // Handle Maps
+                let mut map = Vec::with_capacity(obj.len());
+                for (k, v) in obj {
+                    map.push((Arc::from(k.as_str()), Value::from_json(v)?));
+                }
+                Ok(Value::Map(map))
+            }
+        }
+    }
 }
 
 // Ensure PartialEq matches the logic in Ord

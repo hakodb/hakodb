@@ -605,32 +605,40 @@ fn json_to_vec(v: &serde_json::Value) -> Result<Vec<(String, Value)>, String> {
     Ok(out)
 }
 
+// fn json_value_to_value(v: &serde_json::Value) -> Result<Value, String> {
+//     match v {
+//         serde_json::Value::Null => Ok(Value::Null),
+//         serde_json::Value::Bool(b) => Ok(Value::Bool(*b)),
+//         serde_json::Value::Number(n) => {
+//             if let Some(i) = n.as_i64() { Ok(Value::Int(i)) }
+//             else { Ok(Value::Float(n.as_f64().unwrap_or(0.0))) }
+//         }
+//         serde_json::Value::String(s) => Ok(Value::String(s.clone())),
+//         serde_json::Value::Array(arr) => arr.iter().map(json_value_to_value).collect::<Result<Vec<_>, _>>().map(Value::Array),
+//         serde_json::Value::Object(obj) => {
+//             let mut map = Vec::new();
+//             for (k, v) in obj {
+//                 map.push((Arc::from(k.as_str()), json_value_to_value(v)?));
+//             }
+//             Ok(Value::Map(map))
+//         }
+//     }
+// }
+
+// fn doc_to_json_value(doc: &FireLiteDoc) -> Result<serde_json::Value, String> {
+//     let mut map = serde_json::Map::new();
+//     for (k, v) in &doc.fields {
+//         map.insert(k.to_string(), value_to_json(v)?);
+//     }
+//     Ok(serde_json::Value::Object(map))
+// }
+
 fn json_value_to_value(v: &serde_json::Value) -> Result<Value, String> {
-    match v {
-        serde_json::Value::Null => Ok(Value::Null),
-        serde_json::Value::Bool(b) => Ok(Value::Bool(*b)),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() { Ok(Value::Int(i)) }
-            else { Ok(Value::Float(n.as_f64().unwrap_or(0.0))) }
-        }
-        serde_json::Value::String(s) => Ok(Value::String(s.clone())),
-        serde_json::Value::Array(arr) => arr.iter().map(json_value_to_value).collect::<Result<Vec<_>, _>>().map(Value::Array),
-        serde_json::Value::Object(obj) => {
-            let mut map = Vec::new();
-            for (k, v) in obj {
-                map.push((Arc::from(k.as_str()), json_value_to_value(v)?));
-            }
-            Ok(Value::Map(map))
-        }
-    }
+    Value::from_json(v.clone())
 }
 
 fn doc_to_json_value(doc: &FireLiteDoc) -> Result<serde_json::Value, String> {
-    let mut map = serde_json::Map::new();
-    for (k, v) in &doc.fields {
-        map.insert(k.to_string(), value_to_json(v)?);
-    }
-    Ok(serde_json::Value::Object(map))
+    Ok(doc.to_json())
 }
 
 fn projection_fields_to_json(fields: Vec<(String, Value)>) -> Result<serde_json::Value, String> {

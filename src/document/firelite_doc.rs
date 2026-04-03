@@ -206,6 +206,24 @@ impl FireLiteDoc {
         // This now uses the unified encode() logic
         Some(doc.encode())
     }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        for (k, v) in &self.fields {
+            map.insert(k.to_string(), v.to_json());
+        }
+        serde_json::Value::Object(map)
+    }
+    
+    /// Converts a document to JSON and includes a virtual `_id` field.
+    pub fn to_json_with_id(&self, id: &str) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        map.insert("_id".to_string(), serde_json::Value::String(id.to_string()));
+        for (k, v) in &self.fields {
+            map.insert(k.to_string(), v.to_json());
+        }
+        serde_json::Value::Object(map)
+    }
 }
 
 pub struct FireLiteDocView<'a> {
