@@ -846,24 +846,33 @@ fn json_to_fire(v: JsonValue) -> Result<Value> {
 }
 
 fn fire_to_json(v: &Value) -> JsonValue {
-    match v {
-        Value::Null => JsonValue::Null,
-        Value::Bool(b) => json!(b),
-        Value::Int(i) => json!(i),
-        Value::Float(f) => json!(f),
-        Value::String(s) => json!(s),
-        Value::Binary(b) => json!(b),
-        Value::Timestamp(t) => json!(t),
-        Value::ServerTimestamp => JsonValue::Null,
-        Value::Reference { collection, doc_id } => json!({ "__ref__": format!("{collection}/{doc_id}") }),
-        Value::Map(fields) => JsonValue::Object(
-            fields
-                .iter()
-                .map(|(k, v)| (k.to_string(), fire_to_json(v)))
-                .collect::<Map<_, _>>(),
-        ),
-        Value::Array(items) => JsonValue::Array(items.iter().map(fire_to_json).collect()),
-    }
+    v.to_json()
+    // match v {
+    //     Value::Null => JsonValue::Null,
+    //     Value::Bool(b) => json!(b),
+    //     Value::Int(i) => json!(i),
+    //     Value::Float(f) => json!(f),
+    //     Value::String(s) => json!(s),
+    //     Value::Binary(b) => json!(b),
+    //     Value::Timestamp(t) => json!(t),
+    //     Value::ServerTimestamp => JsonValue::Null,
+    //     Value::Reference { collection, doc_id } => json!({ "__ref__": format!("{collection}/{doc_id}") }),
+    //     Value::Map(fields) => JsonValue::Object(
+    //         fields
+    //             .iter()
+    //             .map(|(k, v)| (k.to_string(), fire_to_json(v)))
+    //             .collect::<Map<_, _>>(),
+    //     ),
+    //     Value::BlobLink { offset, len } => {
+    //         let mut map = serde_json::Map::new();
+    //         let mut meta = serde_json::Map::new();
+    //         meta.insert("offset".to_string(), (*offset).into());
+    //         meta.insert("len".to_string(), (*len).into());
+    //         map.insert("__blob__".to_string(), serde_json::Value::Object(meta));
+    //         serde_json::Value::Object(map)
+    //     }
+    //     Value::Array(items) => JsonValue::Array(items.iter().map(fire_to_json).collect()),
+    // }
 }
 
 fn doc_to_json(id: &str, doc: &FireLiteDoc) -> JsonValue {

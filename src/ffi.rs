@@ -115,51 +115,52 @@ fn cstr_to_string(ptr: *const c_char) -> Result<String, String> {
 }
 
 fn value_to_json(v: &Value) -> serde_json::Value {
-    match v {
-        Value::Null => serde_json::Value::Null,
-        Value::Bool(v) => serde_json::Value::Bool(*v),
-        Value::Int(v) => serde_json::Value::Number((*v).into()),
-        Value::Float(v) => serde_json::Number::from_f64(*v)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        Value::String(v) => serde_json::Value::String(v.clone()),
-        Value::Binary(v) => serde_json::Value::Array(
-            v.iter()
-                .map(|b| serde_json::Value::Number((*b as u64).into()))
-                .collect(),
-        ),
-        Value::Timestamp(v) => serde_json::Value::Number((*v).into()),
-        Value::Array(items) => {
-            // <--- ADD THIS
-            serde_json::Value::Array(items.iter().map(value_to_json).collect())
-        }
-        Value::Map(fields) => {
-            let mut map = serde_json::Map::new();
-            for (k, sv) in fields {
-                // FIX: Use .to_string() to convert Arc<str> to String
-                map.insert(k.to_string(), value_to_json(sv));
-            }
-            serde_json::Value::Object(map)
-        }
-        Value::Reference { collection, doc_id } => {
-            let mut map = serde_json::Map::new();
-            map.insert(
-                "__ref__".to_string(),
-                serde_json::Value::String(format!("{}/{}", collection, doc_id)),
-            );
-            serde_json::Value::Object(map)
-        }
-        // ADD THIS ARM:
-        Value::BlobLink { offset, len } => {
-            let mut map = serde_json::Map::new();
-            let mut meta = serde_json::Map::new();
-            meta.insert("offset".to_string(), (*offset).into());
-            meta.insert("len".to_string(), (*len).into());
-            map.insert("__blob__".to_string(), serde_json::Value::Object(meta));
-            serde_json::Value::Object(map)
-        }
-        Value::ServerTimestamp => serde_json::Value::Null,
-    }
+    v.to_json()
+    // match v {
+    //     Value::Null => serde_json::Value::Null,
+    //     Value::Bool(v) => serde_json::Value::Bool(*v),
+    //     Value::Int(v) => serde_json::Value::Number((*v).into()),
+    //     Value::Float(v) => serde_json::Number::from_f64(*v)
+    //         .map(serde_json::Value::Number)
+    //         .unwrap_or(serde_json::Value::Null),
+    //     Value::String(v) => serde_json::Value::String(v.clone()),
+    //     Value::Binary(v) => serde_json::Value::Array(
+    //         v.iter()
+    //             .map(|b| serde_json::Value::Number((*b as u64).into()))
+    //             .collect(),
+    //     ),
+    //     Value::Timestamp(v) => serde_json::Value::Number((*v).into()),
+    //     Value::Array(items) => {
+    //         // <--- ADD THIS
+    //         serde_json::Value::Array(items.iter().map(value_to_json).collect())
+    //     }
+    //     Value::Map(fields) => {
+    //         let mut map = serde_json::Map::new();
+    //         for (k, sv) in fields {
+    //             // FIX: Use .to_string() to convert Arc<str> to String
+    //             map.insert(k.to_string(), value_to_json(sv));
+    //         }
+    //         serde_json::Value::Object(map)
+    //     }
+    //     Value::Reference { collection, doc_id } => {
+    //         let mut map = serde_json::Map::new();
+    //         map.insert(
+    //             "__ref__".to_string(),
+    //             serde_json::Value::String(format!("{}/{}", collection, doc_id)),
+    //         );
+    //         serde_json::Value::Object(map)
+    //     }
+    //     // ADD THIS ARM:
+    //     Value::BlobLink { offset, len } => {
+    //         let mut map = serde_json::Map::new();
+    //         let mut meta = serde_json::Map::new();
+    //         meta.insert("offset".to_string(), (*offset).into());
+    //         meta.insert("len".to_string(), (*len).into());
+    //         map.insert("__blob__".to_string(), serde_json::Value::Object(meta));
+    //         serde_json::Value::Object(map)
+    //     }
+    //     Value::ServerTimestamp => serde_json::Value::Null,
+    // }
 }
 
 fn doc_to_json(doc: &FireLiteDoc) -> Result<String, String> {
