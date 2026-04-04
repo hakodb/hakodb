@@ -102,7 +102,7 @@ FL_Doc* make_complex_doc(int i, const string& payload) {
     fl_doc_insert_int(d, "age", 18 + (i % 70));
     fl_doc_insert_bool(d, "active", i % 3 != 0);
     fl_doc_insert_float(d, "score", ((i % 10000) / 7.0) + 0.5);
-    fl_doc_insert_str(d, "description", (string("firelite v0.6.3 benchmark payload ") + to_string(i)).c_str());
+    fl_doc_insert_str(d, "description", (string("firelite v0.6.4 benchmark payload ") + to_string(i)).c_str());
     
     FL_Array* tags = fl_array_new();
     fl_array_append_str(tags, (string("tag-") + to_string(i % 10)).c_str());
@@ -380,22 +380,29 @@ Report run_benchmark(BenchConfig cfg) {
 // ============================================================
 
 int main(int argc, char** argv) {
-    int g_docs = 10000;
+    int g_docs = 1000;
     if (argc > 1 && string(argv[1]).find("--docs=") == 0) g_docs = stoi(string(argv[1]).substr(7));
 
     vector<BenchConfig> suite = {
-        {"Strict_Sync",  g_docs, 50, 0, 4, false, false, 0,  false},
-        {"Turbo_RAM",    g_docs, 100, 2, 8, false, false, 60, false},
-        {"Cloud_Bal",    g_docs, 100, 1, 8, true,  false, 2,  false},
-        {"Secure_Small", g_docs, 50, 3, 4, false, true,  10, false},
-        {"Large_Zip",    g_docs, 150,  3, 8, true,  false, 2,  true},
-        {"Large_Secure", g_docs, 150,  3, 8, true,  true,  10, true},
+        {"Default",  g_docs, 10, 1, 4, false, false, 4,  false},
+        {"Light_App",  g_docs, 10, 2, 4, false, false, 4, false},
+        {"Strict_Data",  g_docs, 10, 3, 8, true,  false, 8,  false},
+        {"Secure_Data", g_docs, 10, 0, 8, false, true,  8, false},
+        {"Gaming", g_docs, 50, 2, 8, false, false,  16, false},
+        {"Light_Sync", g_docs, 50,  1, 8, false,  false, 2,  true},
+        {"Busy_Sync", g_docs, 150,  3, 8, false,  false,  16, true},
+        // {"Strict_Sync",  g_docs, 50, 0, 4, false, false, 0,  false},
+        // {"Turbo_RAM",    g_docs, 100, 2, 8, false, false, 60, false},
+        // {"Cloud_Bal",    g_docs, 100, 1, 8, true,  false, 2,  false},
+        // {"Secure_Small", g_docs, 50, 3, 4, false, true,  10, false},
+        // {"Large_Zip",    g_docs, 150,  3, 8, true,  false, 2,  true},
+        // {"Large_Secure", g_docs, 150,  3, 8, true,  true,  10, true},
         // {"Parallel_Max", g_docs, 100, 2, 32,false, false, 60, false},
         // {"Safety_Max",   g_docs, 100, 0, 8, true,  true,  0,  true}
     };
 
     cout << "==========================================================================================\n";
-    cout << " FIRE LITE ARCHITECTURAL DEEP-DIVE (v0.6.3) | Total Docs: " << g_docs << "\n";
+    cout << " FIRE LITE ARCHITECTURAL DEEP-DIVE (v0.6.4) | Total Docs: " << g_docs << "\n";
     cout << "==========================================================================================\n";
 
     vector<Report> results;
@@ -409,7 +416,7 @@ int main(int argc, char** argv) {
 
     // CONCLUSION TABLE
     cout << "\n\n" << string(155, '=') << "\n";
-    cout << " FINAL PERFORMANCE MATRIX (v0.6.3)\n";
+    cout << " FINAL PERFORMANCE MATRIX (v0.6.4)\n";
     cout << string(155, '-') << "\n";
     cout << left << setw(14) << "Profile" << " | "
          << setw(11) << "S/B TPS" << " | "

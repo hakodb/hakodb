@@ -5,6 +5,8 @@ use crate::engine::FireLite;
 #[cfg(feature = "net-sync")]
 use crate::document::value::Value;
 #[cfg(feature = "net-sync")]
+use crate::document::firelite_doc::FireLiteDoc;
+#[cfg(feature = "net-sync")]
 use std::sync::Arc;
 #[cfg(feature = "net-sync")]
 use std::collections::{HashMap, HashSet};
@@ -19,7 +21,7 @@ use tokio::sync::{Mutex, watch};
 #[cfg(feature = "net-sync")]
 use mdns_sd::{ServiceDaemon, ServiceInfo, ServiceEvent};
 
-// --- 1. Networking Data Structures ---
+// --- Data Structures ---
 
 #[cfg(feature = "net-sync")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -32,31 +34,12 @@ pub enum SyncStatus {
 }
 
 #[cfg(feature = "net-sync")]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PeerInfo {
-    pub id: String,
-    pub is_authority: bool,
-}
-
-#[cfg(feature = "net-sync")]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct NetworkStatus {
     pub status: SyncStatus,
     pub self_id: String,
     pub peer_count: usize,
     pub known_peers: Vec<String>,
-}
-
-#[cfg(feature = "net-sync")]
-impl Default for NetworkStatus {
-    fn default() -> Self {
-        Self {
-            status: SyncStatus::Idle,
-            self_id: String::new(),
-            peer_count: 0,
-            known_peers: Vec::new(),
-        }
-    }
 }
 
 #[cfg(feature = "net-sync")]
@@ -72,7 +55,7 @@ pub enum NetPacket {
     Pong,
 }
 
-// --- 2. The NetSyncer Engine ---
+// --- NetSyncer Engine ---
 
 #[cfg(feature = "net-sync")]
 pub struct NetSyncer {
@@ -199,19 +182,14 @@ async fn handle_incoming_peer(
     is_authority: bool,
 ) {
     let (mut reader, mut writer) = stream.into_split();
-
-    // 1. Initial Identity Exchange (Send our ID)
     let hello = bincode::serialize(&NetPacket::Identify { id: self_id, is_authority }).unwrap();
     if send_raw(&mut writer, &hello).await.is_err() { return; }
 
     tokio::spawn(async move {
-        // --- PHASE 1: IDENTIFICATION ---
-        // We wait for the peer to identify themselves BEFORE entering the loop
         let peer_id = match recv_raw(&mut reader).await {
             Ok(payload) => {
                 if let Ok(NetPacket::Identify { id, .. }) = bincode::deserialize::<NetPacket>(&payload) {
                     let id_clone = id.clone();
-                    // Move writer into map (Consumers the writer)
                     peers_map.lock().await.insert(id_clone.clone(), writer);
                     status_tx.send_modify(|s| {
                         s.status = SyncStatus::Connected;
@@ -224,8 +202,6 @@ async fn handle_incoming_peer(
             Err(_) => return,
         };
 
-        // --- PHASE 2: REPLICATION LOOP ---
-        // writer is now gone (moved into map), we only work with reader here
         loop {
             match recv_raw(&mut reader).await {
                 Ok(payload) => {
@@ -255,33 +231,30 @@ async fn handle_incoming_peer(
                                     let mut shard = shard_arc.write().unwrap();
                                     let mut local_blob_offsets = Vec::new();
                                     
+                                    // 1. PHYSICAL BLOBS (Lock-Free Write Path)
                                     if let Some(ref file) = shard.blob_file {
-                                        // 1. Get current file length as the starting append point
                                         let mut current_offset = file.metadata().unwrap().len();
-
                                         for data in &raw_blobs {
                                             let data_len = data.len() as u32;
-
-                                            // 2. Perform Positional Write (Atomic on Unix, Batch-safe on Windows)
                                             #[cfg(unix)] {
                                                 use std::os::unix::fs::FileExt;
-                                                file.write_all_at(data, current_offset).unwrap();
+                                                let _ = file.write_all_at(data, current_offset);
                                             }
                                             #[cfg(windows)] {
                                                 use std::os::windows::fs::FileExt;
-                                                file.seek_write(data, current_offset).unwrap();
+                                                let _ = file.seek_write(data, current_offset);
                                             }
-
                                             local_blob_offsets.push((current_offset, data_len));
-                                            
-                                            // 3. Increment offset for the next blob in the batch
                                             current_offset += data_len as u64;
                                         }
+                                        // Update atomic size tracker
+                                        shard.blob_size.store(current_offset, std::sync::atomic::Ordering::Release);
                                     }
 
-                                    let mut docs = (*docs_arc).clone();
+                                    // 2. POINTER MAPPING
+                                    let mut incoming_batch = (*docs_arc).clone();
                                     let mut blob_ptr_idx = 0;
-                                    for (_, doc) in &mut docs {
+                                    for (_, doc) in &mut incoming_batch {
                                         for (_, value) in &mut doc.fields {
                                             if let Value::BlobLink { .. } = value {
                                                 if let Some((new_off, new_len)) = local_blob_offsets.get(blob_ptr_idx) {
@@ -292,8 +265,38 @@ async fn handle_incoming_peer(
                                         }
                                     }
 
-                                    let _ = shard.apply_replicated_ops(&ops);
-                                    db.inject_replication_to_indexer(col, Arc::new(docs));
+                                    // 3. CONFLICT RESOLUTION (Last Write Wins)
+                                    let mut final_docs_to_index = Vec::with_capacity(incoming_batch.len());
+                                    let mut ops_to_apply = Vec::with_capacity(ops.len());
+
+                                    for (doc_id, incoming_doc) in incoming_batch {
+                                        let key = format!("{}:{}", col, doc_id);
+                                        let mut should_apply = true;
+
+                                        if let Ok(Some(local_bytes)) = shard.get(&key) {
+                                            if let Some(local_doc) = FireLiteDoc::decode(&local_bytes) {
+                                                let incoming_ts = get_logical_timestamp(&incoming_doc);
+                                                let local_ts = get_logical_timestamp(&local_doc);
+
+                                                if incoming_ts <= local_ts {
+                                                    should_apply = false;
+                                                }
+                                            }
+                                        }
+
+                                        if should_apply {
+                                            if let Some(op) = ops.iter().find(|o| o.get_key() == key) {
+                                                ops_to_apply.push(op.clone());
+                                            }
+                                            final_docs_to_index.push((doc_id, incoming_doc));
+                                        }
+                                    }
+
+                                    // 4. COMMIT TO STORAGE
+                                    if !ops_to_apply.is_empty() {
+                                        let _ = shard.apply_replicated_ops(&ops_to_apply);
+                                        db.inject_replication_to_indexer(col, Arc::new(final_docs_to_index));
+                                    }
                                 }
 
                                 status_tx.send_modify(|s| s.status = SyncStatus::Connected);
@@ -302,11 +305,10 @@ async fn handle_incoming_peer(
                         }
                     }
                 }
-                Err(_) => break, // Disconnect
+                Err(_) => break, 
             }
         }
 
-        // Cleanup
         peers_map.lock().await.remove(&peer_id);
         status_tx.send_modify(|s| {
             s.known_peers.retain(|p| p != &peer_id);
@@ -316,7 +318,17 @@ async fn handle_incoming_peer(
     });
 }
 
-// --- IO Helpers ---
+// --- Helpers ---
+
+#[cfg(feature = "net-sync")]
+fn get_logical_timestamp(doc: &FireLiteDoc) -> i64 {
+    doc.fields.iter()
+        .filter_map(|(_, v)| {
+            if let Value::Timestamp(t) = v { Some(*t) } else { None }
+        })
+        .max()
+        .unwrap_or(0)
+}
 
 async fn send_raw<W: AsyncWriteExt + Unpin>(writer: &mut W, data: &[u8]) -> tokio::io::Result<()> {
     writer.write_all(&(data.len() as u32).to_le_bytes()).await?;
