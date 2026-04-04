@@ -8,7 +8,7 @@ use crate::error::{FireLiteError, Result};
 
 use super::crypto::EncryptionContext;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum WalOp {
     BeginTx {
         tx_id: u64,

@@ -5,7 +5,7 @@ use std::sync::Mutex;
 const MAGIC: u8 = 0xF1;
 const VERSION: u8 = 2; // Format version 2: No Catalog / Raw Strings
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct FireLiteDoc {
     pub fields: Vec<(Arc<str>, Value)>,
 }
