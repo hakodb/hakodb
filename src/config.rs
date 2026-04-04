@@ -22,6 +22,7 @@ pub struct FireLiteConfig {
     pub use_compression: bool,
     pub compression_level: i32,
     pub value_blob_threshold_bytes: usize,
+    pub replication_collections: Option<Vec<String>>,
 }
 
 impl Default for FireLiteConfig {
@@ -41,6 +42,7 @@ impl Default for FireLiteConfig {
             use_compression: false, // Disabled by default
             compression_level: 3,
             value_blob_threshold_bytes: 16 * 1024,
+            replication_collections: None,
         }
     }
 }

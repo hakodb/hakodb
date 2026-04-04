@@ -298,9 +298,9 @@ impl StorageEngine {
         Ok(cols)
     }
 
-    pub fn apply_batch(&mut self, mutations: &[StorageMutation]) -> Result<Vec<BlobWork>> {
+    pub fn apply_batch(&mut self, mutations: &[StorageMutation]) -> Result<(Vec<BlobWork>, Vec<crate::storage::wal::WalOp>)> {
         if mutations.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(),Vec::new()));
         }
 
         let tx_id = self.next_tx_id;
@@ -402,7 +402,7 @@ impl StorageEngine {
         }
 
         // RETURN the work
-        Ok(blob_work_todo)
+        Ok((blob_work_todo, wal_ops))
     }
 
     pub fn flush_all(&mut self) -> Result<()> {
@@ -625,7 +625,8 @@ impl StorageEngine {
         };
 
         // self.apply_batch(&[mutation])
-        let work = self.apply_batch(&[mutation])?;
+        // let work = self.apply_batch(&[mutation])?;
+        let (work, _committed_ops) = self.apply_batch(&[mutation])?;
 
         // 2. Since this is a synchronous put, we send the work here
         for w in work {
@@ -667,7 +668,8 @@ impl StorageEngine {
         };
 
         // 1. Capture the work
-        let work = self.apply_batch(&[mutation])?;
+        // let work = self.apply_batch(&[mutation])?;
+        let (work, _committed_ops) = self.apply_batch(&[mutation])?;
 
         // 2. Send to background worker
         for w in work {
@@ -849,6 +851,30 @@ impl StorageEngine {
         self.index.iter()
             .map(|(k, p)| (k.clone(), p.clone()))
             .collect()
+    }
+
+    pub fn apply_replicated_ops(&mut self, ops: &[crate::storage::wal::WalOp]) -> Result<()> {
+        self.wal.append_batch(ops)?;
+        for op in ops {
+            match op {
+                crate::storage::wal::WalOp::Put { key, segment_id, segment_offset, len } => {
+                    self.index.insert(key.clone(), Pointer::Segment { 
+                        segment_id: *segment_id, offset: *segment_offset, len: *len 
+                    });
+                }
+                crate::storage::wal::WalOp::PutInlined { key, value } => {
+                    self.index.insert(key.clone(), Pointer::Inlined(value.clone()));
+                }
+                crate::storage::wal::WalOp::Delete { key } => {
+                    self.index.remove(key);
+                }
+                crate::storage::wal::WalOp::PutBlob { key, offset, len } => {
+                    self.index.insert(key.clone(), Pointer::Blob { offset: *offset, len: *len });
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
 }

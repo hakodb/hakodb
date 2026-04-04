@@ -118,6 +118,14 @@ impl Value {
             }
         }
     }
+
+    pub fn len_bytes(&self) -> usize {
+        match self {
+            Value::String(s) => s.len(),
+            Value::Binary(b) => b.len(),
+            _ => 0,
+        }
+    }
 }
 
 // Ensure PartialEq matches the logic in Ord
