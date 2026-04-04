@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::config::{FireLiteConfig, DurabilityMode};
 use crate::error::{FireLiteError, Result};
 use std::sync::{Arc, Mutex}; 
+use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::SyncSender;
 use crate::memory::page_cache::PageCache; 
 
@@ -69,8 +70,10 @@ pub struct StorageEngine {
     pub cache: Arc<Mutex<PageCache>>,
     pub mmap_size: usize, 
     pub index: HashMap<String, Pointer>,
-    pub(crate) blob_file: Option<Arc<std::sync::Mutex<std::fs::File>>>,
+    // pub(crate) blob_file: Option<Arc<std::sync::Mutex<std::fs::File>>>,
+    pub(crate) blob_file: Option<Arc<std::fs::File>>,
     pub(crate) blob_tx: Option<SyncSender<BlobWork>>,
+    pub(crate) blob_size: AtomicU64,
     pub logical_name: String,
 }
 
@@ -112,7 +115,12 @@ impl StorageEngine {
             .append(true)
             .open(base_path.join("blobs.dat"))?;
 
-        let blob_file = Arc::new(Mutex::new(blob_file_raw));
+        // let blob_file = Arc::new(Mutex::new(blob_file_raw));
+        // 1. Get metadata while we still have ownership of blob_file_raw
+        let initial_size = blob_file_raw.metadata()?.len();
+
+        // 2. Now move it into the Arc
+        let blob_file = Arc::new(blob_file_raw);
             
 
         for entry in std::fs::read_dir(base_dir.as_ref())? {
@@ -167,6 +175,7 @@ impl StorageEngine {
             mmap_size: cfg.mmap_size,
             blob_file: Some(blob_file),
             blob_tx: None,
+            blob_size: AtomicU64::new(initial_size),
             logical_name,
         };
 
@@ -571,18 +580,27 @@ impl StorageEngine {
             Pointer::Blob { offset, len } => {
                 let mut buf = vec![0u8; *len as usize];
                 
-                // FIX: Properly access the Mutex inside the Option/Arc
-                let file_mutex = self.blob_file.as_ref()
+                // PERFORMANCE FIX: We get the file handle but we DO NOT lock the Mutex.
+                // Positional I/O (read_at) is thread-safe by nature.
+                // let file_mutex = self.blob_file.as_ref()
+                //     .ok_or_else(|| FireLiteError::StorageError("Blob file missing".into()))?;
+                
+                // We lock briefly only to clone the Arc or handle, or if your File is inside Mutex,
+                // we use the 'lock' only to get a reference, then read. 
+                // Better yet: we use the underlying file directly if possible.
+                // let file = file_mutex.lock().map_err(|_| FireLiteError::LockPoisoned("..".into()))?;
+
+                let file = self.blob_file.as_ref()
                     .ok_or_else(|| FireLiteError::StorageError("Blob file missing".into()))?;
-                
-                let mut file = file_mutex.lock()
-                    .map_err(|_| FireLiteError::LockPoisoned("Blob file lock poisoned".into()))?;
-                
-                // Note: Since we have a Mutex lock on the file, we can use standard Seek/Read
-                // instead of platform-specific FileExt for simpler code.
-                use std::io::{Read, Seek, SeekFrom};
-                file.seek(SeekFrom::Start(*offset))?;
-                file.read_exact(&mut buf)?;
+
+                #[cfg(unix)] {
+                    use std::os::unix::fs::FileExt;
+                    file.read_exact_at(&mut buf, *offset)?;
+                }
+                #[cfg(windows)] {
+                    use std::os::windows::fs::FileExt;
+                    file.seek_read(&mut buf, *offset)?;
+                }
 
                 if let Some(enc) = &self.encryption {
                     Ok(Some(enc.decrypt(&buf)?))

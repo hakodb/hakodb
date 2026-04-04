@@ -809,70 +809,11 @@ fn strip_wrapping_quotes(input: &str) -> &str {
 }
 
 fn json_to_fire(v: JsonValue) -> Result<Value> {
-    match v {
-        JsonValue::Null => Ok(Value::Null),
-        JsonValue::Bool(b) => Ok(Value::Bool(b)),
-        JsonValue::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(Value::Int(i))
-            } else {
-                Ok(Value::Float(n.as_f64().unwrap_or_default()))
-            }
-        }
-        JsonValue::String(s) => Ok(Value::String(s)),
-        JsonValue::Array(items) => Ok(Value::Array(
-            items
-                .into_iter()
-                .map(json_to_fire)
-                .collect::<Result<Vec<_>>>()?,
-        )),
-        JsonValue::Object(map) => {
-            if let Some(JsonValue::String(path)) = map.get("__ref__") {
-                let parts: Vec<&str> = path.split('/').collect();
-                if parts.len() == 2 {
-                    return Ok(Value::Reference {
-                        collection: parts[0].to_string(),
-                        doc_id: parts[1].to_string(),
-                    });
-                }
-            }
-            Ok(Value::Map(
-                map.into_iter()
-                    .map(|(k, v)| Ok((k.into(), json_to_fire(v)?)))
-                    .collect::<Result<Vec<_>>>()?,
-            ))
-        }
-    }
+    Value::from_json(v).map_err(|e| anyhow!(e))
 }
 
 fn fire_to_json(v: &Value) -> JsonValue {
     v.to_json()
-    // match v {
-    //     Value::Null => JsonValue::Null,
-    //     Value::Bool(b) => json!(b),
-    //     Value::Int(i) => json!(i),
-    //     Value::Float(f) => json!(f),
-    //     Value::String(s) => json!(s),
-    //     Value::Binary(b) => json!(b),
-    //     Value::Timestamp(t) => json!(t),
-    //     Value::ServerTimestamp => JsonValue::Null,
-    //     Value::Reference { collection, doc_id } => json!({ "__ref__": format!("{collection}/{doc_id}") }),
-    //     Value::Map(fields) => JsonValue::Object(
-    //         fields
-    //             .iter()
-    //             .map(|(k, v)| (k.to_string(), fire_to_json(v)))
-    //             .collect::<Map<_, _>>(),
-    //     ),
-    //     Value::BlobLink { offset, len } => {
-    //         let mut map = serde_json::Map::new();
-    //         let mut meta = serde_json::Map::new();
-    //         meta.insert("offset".to_string(), (*offset).into());
-    //         meta.insert("len".to_string(), (*len).into());
-    //         map.insert("__blob__".to_string(), serde_json::Value::Object(meta));
-    //         serde_json::Value::Object(map)
-    //     }
-    //     Value::Array(items) => JsonValue::Array(items.iter().map(fire_to_json).collect()),
-    // }
 }
 
 fn doc_to_json(id: &str, doc: &FireLiteDoc) -> JsonValue {

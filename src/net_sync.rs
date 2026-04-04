@@ -255,13 +255,27 @@ async fn handle_incoming_peer(
                                     let mut shard = shard_arc.write().unwrap();
                                     let mut local_blob_offsets = Vec::new();
                                     
-                                    if let Some(ref blob_file_mutex) = shard.blob_file {
-                                        let mut file = blob_file_mutex.lock().unwrap();
+                                    if let Some(ref file) = shard.blob_file {
+                                        // 1. Get current file length as the starting append point
+                                        let mut current_offset = file.metadata().unwrap().len();
+
                                         for data in &raw_blobs {
-                                            use std::io::{Write, Seek, SeekFrom};
-                                            let offset = file.seek(SeekFrom::End(0)).unwrap();
-                                            file.write_all(data).unwrap();
-                                            local_blob_offsets.push((offset, data.len() as u32));
+                                            let data_len = data.len() as u32;
+
+                                            // 2. Perform Positional Write (Atomic on Unix, Batch-safe on Windows)
+                                            #[cfg(unix)] {
+                                                use std::os::unix::fs::FileExt;
+                                                file.write_all_at(data, current_offset).unwrap();
+                                            }
+                                            #[cfg(windows)] {
+                                                use std::os::windows::fs::FileExt;
+                                                file.seek_write(data, current_offset).unwrap();
+                                            }
+
+                                            local_blob_offsets.push((current_offset, data_len));
+                                            
+                                            // 3. Increment offset for the next blob in the batch
+                                            current_offset += data_len as u64;
                                         }
                                     }
 
