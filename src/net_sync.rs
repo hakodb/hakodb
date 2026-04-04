@@ -61,6 +61,8 @@ pub enum NetPacket {
 pub struct NetSyncer {
     db: Arc<FireLite>,
     self_id: String,
+    leader_id: String,                  // Dynamic Leader Name
+    excluded_collections: HashSet<String>, // Consumer-defined exclusions
     is_authority: bool,
     service_type: &'static str,
     status_tx: watch::Sender<NetworkStatus>,
@@ -71,7 +73,13 @@ pub struct NetSyncer {
 
 #[cfg(feature = "net-sync")]
 impl NetSyncer {
-    pub fn new(db: Arc<FireLite>, name: &str, is_authority: bool) -> Self {
+    pub fn new(
+        db: Arc<FireLite>, 
+        name: &str, 
+        leader_id: &str, 
+        excluded: Vec<String>,
+        is_authority: bool
+    ) -> Self {
         let (tx, rx) = watch::channel(NetworkStatus {
             status: SyncStatus::Idle,
             self_id: name.to_string(),
@@ -82,6 +90,8 @@ impl NetSyncer {
         Self {
             db,
             self_id: name.to_string(),
+            leader_id: leader_id.to_string(),
+            excluded_collections: excluded.into_iter().collect(),
             is_authority,
             service_type: "_firelite_pos_mesh._tcp.local.",
             status_tx: tx,
@@ -94,6 +104,8 @@ impl NetSyncer {
     pub async fn start(&self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
         let mdns = ServiceDaemon::new()?;
         let self_id = self.self_id.clone();
+        let leader_id = self.leader_id.clone();
+        let excluded = self.excluded_collections.clone();
         
         let hostname = format!("{}.local.", gethostname::gethostname().to_string_lossy());
         let service_info = ServiceInfo::new(
@@ -106,21 +118,34 @@ impl NetSyncer {
         let peers_srv = Arc::clone(&self.peers);
         let seen_srv = Arc::clone(&self.seen_messages);
         let status_srv = self.status_tx.clone();
-        let self_id_srv = self_id.clone();
         let is_auth = self.is_authority;
 
+        // --- INCOMING PEER HANDLER ---
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                handle_incoming_peer(stream, db_srv.clone(), peers_srv.clone(), seen_srv.clone(), status_srv.clone(), self_id_srv.clone(), is_auth).await;
+                handle_incoming_peer(
+                    stream, 
+                    db_srv.clone(), 
+                    peers_srv.clone(), 
+                    seen_srv.clone(), 
+                    status_srv.clone(), 
+                    self_id.clone(), 
+                    leader_id.clone(),
+                    excluded.clone(),
+                    is_auth
+                ).await;
             }
         });
 
+        // --- OUTGOING PEER BROWSER ---
         let browser = mdns.browse(self.service_type)?;
         let db_brw = Arc::clone(&self.db);
         let peers_brw = Arc::clone(&self.peers);
         let seen_brw = Arc::clone(&self.seen_messages);
         let status_brw = self.status_tx.clone();
-        let self_id_brw = self_id.clone();
+        let self_id_brw = self.self_id.clone();
+        let leader_id_brw = self.leader_id.clone();
+        let excluded_brw = self.excluded_collections.clone();
 
         tokio::spawn(async move {
             status_brw.send_modify(|s| s.status = SyncStatus::Searching);
@@ -135,16 +160,21 @@ impl NetSyncer {
                     let already_connected = { peers_brw.lock().await.contains_key(info.get_fullname()) };
                     if !already_connected {
                         if let Ok(Ok(stream)) = tokio::time::timeout(std::time::Duration::from_secs(3), TcpStream::connect(&connect_addr)).await {
-                            handle_incoming_peer(stream, db_brw.clone(), peers_brw.clone(), seen_brw.clone(), status_brw.clone(), self_id_brw.clone(), is_auth).await;
+                            handle_incoming_peer(
+                                stream, db_brw.clone(), peers_brw.clone(), seen_brw.clone(), 
+                                status_brw.clone(), self_id_brw.clone(), leader_id_brw.clone(),
+                                excluded_brw.clone(), is_auth
+                            ).await;
                         }
                     }
                 }
             }
         });
 
+        // --- REPLICATION BROADCASTER ---
         let local_rx = self.db.subscribe_replication();
         let peers_obs = Arc::clone(&self.peers);
-        let self_id_obs = self_id.clone();
+        let self_id_obs = self.self_id.clone();
 
         tokio::spawn(async move {
             while let Ok(event) = local_rx.recv() {
@@ -179,10 +209,12 @@ async fn handle_incoming_peer(
     seen_cache: Arc<Mutex<HashSet<u128>>>,
     status_tx: watch::Sender<NetworkStatus>,
     self_id: String,
+    leader_id: String,
+    excluded: HashSet<String>,
     is_authority: bool,
 ) {
     let (mut reader, mut writer) = stream.into_split();
-    let hello = bincode::serialize(&NetPacket::Identify { id: self_id, is_authority }).unwrap();
+    let hello = bincode::serialize(&NetPacket::Identify { id: self_id.clone(), is_authority }).unwrap();
     if send_raw(&mut writer, &hello).await.is_err() { return; }
 
     tokio::spawn(async move {
@@ -208,6 +240,7 @@ async fn handle_incoming_peer(
                     if let Ok(packet) = bincode::deserialize::<NetPacket>(&payload) {
                         match packet {
                             NetPacket::Replication { msg_id, origin_id, event } => {
+                                // 1. MESH LOOP PROTECTION
                                 {
                                     let mut seen = seen_cache.lock().await;
                                     if seen.contains(&msg_id) { continue; }
@@ -215,13 +248,22 @@ async fn handle_incoming_peer(
                                     if seen.len() > 2000 { seen.clear(); }
                                 }
 
-                                if (event.0 == "roles" || event.0 == "licenses") && origin_id != "MainPC" {
-                                    continue;
+                                let col = event.0.clone();
+
+                                // 2. CONSUMER EXCLUSION CHECK
+                                if excluded.contains(&col) { continue; }
+
+                                // 3. INTERNAL SECURITY GATE (__firelite_security)
+                                if col == "__firelite_security" {
+                                    // Security collection only accepted from the designated Leader
+                                    if origin_id != leader_id { continue; }
+                                } else {
+                                    // Standard collection: Verify sender is authorized in our local security DB
+                                    if !is_authorized(&db, &origin_id).await { continue; }
                                 }
 
                                 status_tx.send_modify(|s| s.status = SyncStatus::Syncing);
                                 
-                                let col = event.0.clone();
                                 let ops = event.1.clone();
                                 let docs_arc = event.2.clone();
                                 let raw_blobs = event.3.clone();
@@ -231,7 +273,7 @@ async fn handle_incoming_peer(
                                     let mut shard = shard_arc.write().unwrap();
                                     let mut local_blob_offsets = Vec::new();
                                     
-                                    // 1. PHYSICAL BLOBS (Lock-Free Write Path)
+                                    // 4. POSITIONAL BLOB WRITING (Lock-Free Read-Write Mix)
                                     if let Some(ref file) = shard.blob_file {
                                         let mut current_offset = file.metadata().unwrap().len();
                                         for data in &raw_blobs {
@@ -247,11 +289,10 @@ async fn handle_incoming_peer(
                                             local_blob_offsets.push((current_offset, data_len));
                                             current_offset += data_len as u64;
                                         }
-                                        // Update atomic size tracker
                                         shard.blob_size.store(current_offset, std::sync::atomic::Ordering::Release);
                                     }
 
-                                    // 2. POINTER MAPPING
+                                    // 5. POINTER MAPPING (Skeleton Update)
                                     let mut incoming_batch = (*docs_arc).clone();
                                     let mut blob_ptr_idx = 0;
                                     for (_, doc) in &mut incoming_batch {
@@ -265,7 +306,7 @@ async fn handle_incoming_peer(
                                         }
                                     }
 
-                                    // 3. CONFLICT RESOLUTION (Last Write Wins)
+                                    // 6. CONFLICT RESOLUTION (Last Write Wins)
                                     let mut final_docs_to_index = Vec::with_capacity(incoming_batch.len());
                                     let mut ops_to_apply = Vec::with_capacity(ops.len());
 
@@ -273,6 +314,7 @@ async fn handle_incoming_peer(
                                         let key = format!("{}:{}", col, doc_id);
                                         let mut should_apply = true;
 
+                                        // Logical LWW Check
                                         if let Ok(Some(local_bytes)) = shard.get(&key) {
                                             if let Some(local_doc) = FireLiteDoc::decode(&local_bytes) {
                                                 let incoming_ts = get_logical_timestamp(&incoming_doc);
@@ -292,7 +334,7 @@ async fn handle_incoming_peer(
                                         }
                                     }
 
-                                    // 4. COMMIT TO STORAGE
+                                    // 7. PHYSICAL COMMIT
                                     if !ops_to_apply.is_empty() {
                                         let _ = shard.apply_replicated_ops(&ops_to_apply);
                                         db.inject_replication_to_indexer(col, Arc::new(final_docs_to_index));
@@ -319,6 +361,20 @@ async fn handle_incoming_peer(
 }
 
 // --- Helpers ---
+
+#[cfg(feature = "net-sync")]
+async fn is_authorized(db: &Arc<FireLite>, peer_id: &str) -> bool {
+    // Check internal security collection for "allowed" status
+    let auth_key = format!("peers:{}", peer_id);
+    let shard = db.get_shard("__firelite_security");
+    
+    if let Ok(Some(bytes)) = shard.read().unwrap().get(&auth_key) {
+        if let Some(doc) = FireLiteDoc::decode(&bytes) {
+            return doc.get("status") == Some(&Value::String("allowed".to_string()));
+        }
+    }
+    false
+}
 
 #[cfg(feature = "net-sync")]
 fn get_logical_timestamp(doc: &FireLiteDoc) -> i64 {
