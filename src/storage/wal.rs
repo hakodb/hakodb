@@ -297,6 +297,20 @@ impl Wal {
     
 }
 
+impl WalOp {
+    /// Returns the document key associated with this operation.
+    /// Returns an empty string for transaction markers (Begin/Commit).
+    pub fn get_key(&self) -> &str {
+        match self {
+            WalOp::Put { key, .. } => key,
+            WalOp::Delete { key } => key,
+            WalOp::PutInlined { key, .. } => key,
+            WalOp::PutBlob { key, .. } => key,
+            WalOp::BeginTx { .. } | WalOp::CommitTx { .. } => "",
+        }
+    }
+}
+
 impl Drop for Wal {
     fn drop(&mut self) {
         // Final attempt to save data when the database handle is closed
