@@ -101,33 +101,29 @@ impl NetSyncer {
         // 1. CLEAR OLD TASKS (if any)
         self.stop(); 
 
-        let mut task_guard = self.tasks.lock().unwrap();
-        
-        // 3. START SECURITY MONITOR (Tracked Task)
-        let monitor_handle = Self::start_security_monitor(
-            self.db.clone(), 
-            self.auth_cache.clone(), 
-            self.leader_id.clone()
-        ).await; 
-        
-        task_guard.push(monitor_handle);
+        // FIX: Do NOT define 'let mut task_guard = self.tasks.lock().unwrap();' here.
+        // If you define it here, it stays alive until the end of the function,
+        // crashing every .await point below.
 
-        // 2. DETECT REAL LAN IP (Fixes the 0.0.0.0 Discovery Bug)
+        // 2. DETECT REAL LAN IP
         let my_ip = local_ip_address::local_ip()
             .map(|ip| ip.to_string())
             .unwrap_or_else(|_| "127.0.0.1".to_string());
 
+        // 3. START SECURITY MONITOR
+        let monitor_handle = Self::start_security_monitor(
+            self.db.clone(), 
+            self.auth_cache.clone(), 
+            self.leader_id.clone()
+        ).await;
+        
+        // Lock, push, and release immediately
+        self.tasks.lock().unwrap().push(monitor_handle);
+
         // 4. mDNS REGISTRATION
         let mdns = ServiceDaemon::new()?;
         let hostname = format!("{}.local.", gethostname::gethostname().to_string_lossy());
-        let service_info = ServiceInfo::new(
-            &self.service_type, 
-            &self.self_id, 
-            &hostname, 
-            &my_ip, 
-            port, 
-            None
-        )?;
+        let service_info = ServiceInfo::new(&self.service_type, &self.self_id, &hostname, &my_ip, port, None)?;
         mdns.register(service_info)?;
 
         // 5. TASK 1: INCOMING PEER LISTENER
@@ -151,7 +147,8 @@ impl NetSyncer {
                 ).await;
             }
         });
-        task_guard.push(handle_listener);
+        // Lock, push, and release immediately
+        self.tasks.lock().unwrap().push(handle_listener);
 
         // 6. TASK 2: OUTGOING PEER BROWSER (Discovery)
         let browser = mdns.browse(&self.service_type)?;
@@ -186,9 +183,10 @@ impl NetSyncer {
                 }
             }
         });
-        task_guard.push(handle_browser);
+        // Lock, push, and release immediately
+        self.tasks.lock().unwrap().push(handle_browser);
 
-        // 7. TASK 3: REPLICATION BROADCASTER (Performance Optimized)
+        // 7. TASK 3: REPLICATION BROADCASTER
         let local_rx = self.db.subscribe_replication();
         let peers_obs = self.peers.clone();
         let auth_obs = self.auth_cache.clone();
@@ -207,7 +205,6 @@ impl NetSyncer {
                     let mut dead = Vec::new();
 
                     for (id, writer) in p_guard.iter_mut() {
-                        // Logic check: Allow if Security Collection OR Peer is Authorized OR Peer is the Leader
                         let is_allowed = {
                             let cache = auth_obs.read().unwrap();
                             let current_leader = leader_id_obs.read().unwrap();
@@ -224,7 +221,8 @@ impl NetSyncer {
                 }
             }
         });
-        task_guard.push(handle_broadcaster);
+        // Lock, push, and release immediately
+        self.tasks.lock().unwrap().push(handle_broadcaster);
 
         Ok(())
     }
