@@ -772,7 +772,7 @@ fn execute_command(
     command: Commands, 
     _db_path: &str, 
     _durability: DurabilityArg,
-    live_peers: Option<Vec<String>>
+    net: Option<&NetSyncer>
 ) -> Result<()> {
     match command {
         Commands::Collections => list_collections(db)?,
@@ -816,7 +816,6 @@ fn execute_command(
         Commands::Rest { method, path, data, filters } => run_rest(db, &method, &path, data.as_deref(), &filters)?,
         // For Serve, we handle it separately to avoid infinite recursion
         Commands::Peers => {
-            // 1. Get Authorized Peers from DB
             let query = Query::new("__firelite_security")
                 .where_filter("_id", Operator::StartsWith, Value::String("peers:".to_string()));
             let rows = db.query(query)?;
@@ -826,26 +825,29 @@ fn execute_command(
                 db_map.insert(id.replace("peers:", ""), doc);
             }
 
+            // --- FIX: Fetch FRESH live peers right now ---
+            let live_ids = if let Some(n) = net {
+                n.status().known_peers
+            } else {
+                Vec::new()
+            };
+
             println!("\n{:<15} | {:<12} | {:<10}", "DEVICE ID", "SYNC STATUS", "NETWORK");
             println!("{}", "-".repeat(45));
 
-            // FIX: Explicitly type the HashSet to resolve inference error
             let mut displayed_ids: HashSet<String> = HashSet::new();
 
-            // 2. Display Live Peers (Physically connected via TCP)
-            if let Some(live) = live_peers {
-                for id in live {
-                    displayed_ids.insert(id.clone());
-                    let db_doc = db_map.get(&id);
-                    let status = match db_doc.and_then(|d| d.get("status")) {
-                        Some(Value::String(s)) => s.as_str(),
-                        _ => "unauthorized", 
-                    };
-                    println!("{:<15} | {:<12} | ONLINE", id, status);
-                }
+            // Use the fresh live_ids we just fetched
+            for id in live_ids {
+                displayed_ids.insert(id.clone());
+                let db_doc = db_map.get(&id);
+                let status = match db_doc.and_then(|d| d.get("status")) {
+                    Some(Value::String(s)) => s.as_str(),
+                    _ => "unauthorized", 
+                };
+                println!("{:<15} | {:<12} | ONLINE", id, status);
             }
 
-            // 3. Display Offline Peers (In DB but not currently connected)
             for (id, doc) in db_map {
                 if !displayed_ids.contains(&id) {
                     let status = match doc.get("status") {
@@ -907,7 +909,7 @@ fn run_server(
         let mut rl = DefaultEditor::new().map_err(|e| anyhow!("Readline error: {}", e))?;
         
         loop {
-            let status = net.status();
+            let status = net.status(); // This is only for the prompt string
             let prompt = format!("firelite({}:{}) > ", node_id, status.peer_count);
             
             match rl.readline(&prompt) {
@@ -928,7 +930,7 @@ fn run_server(
                                 repl_cli.command, 
                                 &db_path, 
                                 durability, 
-                                Some(status.known_peers.clone()) // FIX: Pass live peers
+                                Some(&net) // Pass reference to the engine
                             ) {
                                 println!("❌ Error: {}", e);
                             }

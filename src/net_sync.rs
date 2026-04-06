@@ -97,12 +97,27 @@ impl NetSyncer {
 
     pub async fn start(&self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
         Self::start_security_monitor(self.db.clone(), self.auth_cache.clone(), self.leader_id.clone()).await;
-        
+    
         let mdns = ServiceDaemon::new()?;
         let hostname = format!("{}.local.", gethostname::gethostname().to_string_lossy());
-        let service_info = ServiceInfo::new(&self.service_type, &self.self_id, &hostname, "0.0.0.0", port, None)?;
+
+        // --- FIX: Detect REAL LAN IP (instead of 0.0.0.0) ---
+        let my_ip = local_ip_address::local_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|_| "127.0.0.1".to_string());
+
+        // Register with actual IP
+        let service_info = ServiceInfo::new(
+            &self.service_type, 
+            &self.self_id, 
+            &hostname, 
+            &my_ip, // <--- Use detected IP here
+            port, 
+            None
+        )?;
         mdns.register(service_info)?;
 
+        // We still bind the listener to 0.0.0.0 to accept connections from any interface
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
         
         let db_shr = self.db.clone();
