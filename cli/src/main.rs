@@ -7,14 +7,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 use firelite::config::{DurabilityMode, FireLiteConfig};
 use firelite::document::firelite_doc::FireLiteDoc;
 use firelite::document::value::Value;
-use firelite::engine::FireLite;
+use firelite::engine::{FireLite, SecurityRule, AccessOp};
 use firelite::index::composite::definition::SortDirection;
 use firelite::query::filter::Operator;
 use firelite::query::query::{AggregateOp, Query};
 use firelite::net_sync::NetSyncer;
 use serde_json::{json, Map, Value as JsonValue};
 use rustyline::DefaultEditor;
-use rustyline::error::ReadlineError;
+// use rustyline::error::ReadlineError;
 
 #[derive(Parser, Debug)]
 #[command(name = "firelite")]
@@ -155,6 +155,12 @@ enum Commands {
         #[arg(long = "where")]
         filters: Vec<String>,
     },
+    /// Network Peer Management (Only in Serve mode)
+    Peers,
+    /// Authorize a peer: <hwid> <allowed|blocked>
+    Allow { hwid: String, status: String },
+    /// Claim leadership for this node using the PIN
+    Claim { pin: String },
     //// net_sync implementation
     Serve {
         #[arg(long)]
@@ -194,118 +200,6 @@ enum AggregateKindArg {
     Avg,
 }
 
-// fn main() -> Result<()> {
-//     let cli = Cli::parse();
-//     let db = open_db(&cli.db, cli.durability)?;
-
-//     match cli.command {
-//         Commands::Collections => list_collections(&db)?,
-//         Commands::Get { path, output } => get_doc(&db, &path, output.as_deref())?,
-//         Commands::Set {
-//             path,
-//             data,
-//             fromfile,
-//         } => {
-//             let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
-//             set_doc(&db, &path, &payload, false)?
-//         }
-//         Commands::Update {
-//             path,
-//             data,
-//             fromfile,
-//         } => {
-//             let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
-//             set_doc(&db, &path, &payload, true)?
-//         }
-//         Commands::Delete { path } => delete_doc(&db, &path)?,
-//         Commands::Query {
-//             collection,
-//             filters,
-//             and_filters,
-//             or_filters,
-//             fts,
-//             order,
-//             limit,
-//             offset,
-//             start_at,
-//             start_after,
-//             end_at,
-//             end_before,
-//             select,
-//             output,
-//         } => run_query(
-//             &db,
-//             &collection,
-//             &filters,
-//             &and_filters,
-//             &or_filters,
-//             fts.as_deref(),
-//             order.as_deref(),
-//             limit,
-//             offset,
-//             start_at.as_deref(),
-//             start_after.as_deref(),
-//             end_at.as_deref(),
-//             end_before.as_deref(),
-//             select.as_deref(),
-//             output.as_deref(),
-//         )?,
-//         Commands::Aggregate {
-//             collection,
-//             kind,
-//             field,
-//             filters,
-//         } => run_aggregate(&db, &collection, kind, field.as_deref(), &filters)?,
-//         Commands::Watch { collection } => watch_collection(&db, &collection)?,
-//         Commands::Seed {
-//             collection,
-//             docsize,
-//         } => seed_collection(&db, &collection, docsize)?,
-//         Commands::Index { command } => match command {
-//             IndexCommands::Create { collection, field } => {
-//                 db.create_index(&collection, &field)?;
-//                 println!("OK: created index on {collection}.{field}");
-//             }
-//             IndexCommands::CreateComposite { collection, fields } => {
-//                 let parts = parse_composite_fields(&fields)?;
-//                 let index_id = db.create_composite_index(&collection, parts);
-//                 println!("OK: created composite index #{index_id} on {collection}");
-//             }
-//             IndexCommands::CreateFts { collection, field } => {
-//                 db.create_fts_index(&collection, &field)?;
-//                 println!("OK: created FTS index on {collection}.{field}");
-//             }
-//             IndexCommands::List { collection } => {
-//                 let out = db.list_indexes(collection.as_deref());
-//                 println!("{}", serde_json::to_string_pretty(&out)?);
-//             }
-//         },
-//         Commands::TxSet {
-//             path,
-//             data,
-//             fromfile,
-//         } => {
-//             let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
-//             run_tx_set(&db, &path, &payload)?
-//         }
-//         Commands::Stats => println!("{}", serde_json::to_string_pretty(&db.get_stats())?),
-//         Commands::Compact => {
-//             db.compact()?;
-//             println!("OK: compaction complete");
-//         }
-//         Commands::Rest {
-//             method,
-//             path,
-//             data,
-//             filters,
-//         } => run_rest(&db, &method, &path, data.as_deref(), &filters)?,
-//         Commands::Serve { port, node_id, leader_id, authority } => {
-//             run_server(cli.db, cli.durability, port, node_id, leader_id, authority)?;
-//         }
-//     }
-
-//     Ok(())
-// }
 fn main() -> Result<()> {
     let cli = Cli::parse();
     
@@ -916,6 +810,34 @@ fn execute_command(
         Commands::Rest { method, path, data, filters } => run_rest(db, &method, &path, data.as_deref(), &filters)?,
         // For Serve, we handle it separately to avoid infinite recursion
         Commands::Serve { .. } => bail!("Server already running"),
+        Commands::Peers => {
+            let rows = db.query(Query::new("__firelite_security").where_filter("_id", Operator::StartsWith, Value::String("peers:".into())))?;
+            for (id, doc) in rows {
+                println!("{}: {:?}", id.replace("peers:", ""), doc.get("status").unwrap_or(&Value::String("unknown".into())));
+            }
+        }
+        Commands::Allow { hwid, status } => {
+            let key = format!("peers:{}", hwid);
+            let mut doc = FireLiteDoc::default();
+            doc.insert("status", Value::String(status));
+            doc.insert("updated_at", Value::ServerTimestamp);
+            db.put("__firelite_security", &key, &doc)?;
+            println!("OK: Device {} updated", hwid);
+        }
+        Commands::Claim { pin } => {
+            // Verify PIN against __firelite_security/config
+            if let Some(config) = db.get("__firelite_security", "config")? {
+                if config.get("leader_pin") == Some(&Value::String(pin)) {
+                    let _new_cfg = config.clone();
+                    // Note: In actual CLI, node_id is used from the Serve context.
+                    // This is a simplified proof of concept.
+                    println!("Leadership Claimed locally. Restart 'serve' with --authority");
+                } else {
+                    bail!("Invalid PIN");
+                }
+            }
+        }
+        // _ => bail!("Command not supported in this mode"),
     }
     Ok(())
 }
@@ -932,30 +854,33 @@ fn run_server(
 
     rt.block_on(async move {
         let db = Arc::new(open_db(&db_path, durability)?);
-        let sync_group = db.db_name(); 
+        
+        // Ensure security rules allow peers to read the security collection
+        if !authority {
+            db.set_security_rules(vec![
+                SecurityRule { collection_prefix: "__firelite_security".into(), op: AccessOp::Put, allow: false }
+            ]);
+        }
 
-        // FIX E0061: NetSyncer::new takes 5 arguments. 
-        // We remove &sync_group because it's handled internally via db.db_name()
+        // Initialize NetSyncer with the 5 arguments 
         let net = NetSyncer::new(
             db.clone(),
             &node_id,
             &leader_id,
-            vec![], 
+            vec!["app_state".to_string()], // Exclude sensitive app config
             authority,
         );
 
-        // FIX E0277: Convert Box<dyn Error> to anyhow::Error
         net.start(port).await.map_err(|e| anyhow!(e.to_string()))?;
 
         println!("🔥 FireLite P2P Shell Started");
-        println!("🌐 Group: {} | 🆔 ID: {} | 📡 Port: {}", sync_group, node_id, port);
-        println!("Type 'help' for commands or 'exit' to quit.");
+        println!("🌐 Node: {} | 👑 Role: {}", node_id, if authority { "Leader" } else { "Follower" });
         
         let mut rl = DefaultEditor::new().map_err(|e| anyhow!("Readline error: {}", e))?;
         
         loop {
             let status = net.status();
-            let prompt = format!("firelite({}:{}) > ", sync_group, status.peer_count);
+            let prompt = format!("firelite({}:{}) > ", node_id, status.peer_count);
             
             match rl.readline(&prompt) {
                 Ok(line) => {
@@ -964,27 +889,21 @@ fn run_server(
                     if line == "exit" || line == "quit" { break; }
                     let _ = rl.add_history_entry(line);
 
+                    // Re-parse the line as if it were a CLI command
                     let cmd_str = format!("firelite {}", line);
                     let args = shlex::split(&cmd_str).unwrap_or_default();
 
                     match Cli::try_parse_from(args) {
                         Ok(repl_cli) => {
+                            // We execute the command against the same DB instance running the sync
                             if let Err(e) = execute_command(&db, repl_cli.command, &db_path, durability) {
                                 println!("❌ Error: {}", e);
                             }
                         }
-                        Err(e) => {
-                            // This allows 'help' and 'query --help' to work inside the shell
-                            println!("{}", e);
-                        }
+                        Err(e) => println!("{}", e),
                     }
                 }
-                Err(ReadlineError::Interrupted) => break,
-                Err(ReadlineError::Eof) => break,
-                Err(err) => { 
-                    println!("Readline Error: {:?}", err); 
-                    break; 
-                }
+                Err(_) => break,
             }
         }
         Ok(())

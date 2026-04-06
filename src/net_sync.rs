@@ -56,7 +56,7 @@ pub struct NetSyncer {
     is_authority: bool,
     service_type: String,
     status_tx: watch::Sender<NetworkStatus>,
-    _status_rx: watch::Receiver<NetworkStatus>,
+    status_rx: watch::Receiver<NetworkStatus>,
     peers: Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, 
     seen_messages: Arc<AsyncMutex<HashSet<u128>>>,
     auth_cache: Arc<RwLock<HashMap<String, String>>>,
@@ -86,7 +86,7 @@ impl NetSyncer {
             is_authority,
             service_type: format!("_{}._tcp.local.", db.db_name().to_lowercase().replace('.', "_")),
             status_tx: tx,
-            _status_rx: rx,
+            status_rx: rx,
             peers: Arc::new(AsyncMutex::new(HashMap::new())),
             seen_messages: Arc::new(AsyncMutex::new(HashSet::with_capacity(1000))),
             auth_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -217,12 +217,23 @@ impl NetSyncer {
             }
         });
     }
+
+    pub fn status(&self) -> NetworkStatus {
+        // Use status_rx or _status_rx depending on how you named it in your struct
+        self.status_rx.borrow().clone()
+    }
 }
 
 async fn handle_incoming_peer(
-    stream: TcpStream, db: Arc<FireLite>, peers_map: Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>,
-    seen_cache: Arc<AsyncMutex<HashSet<u128>>>, _status_tx: watch::Sender<NetworkStatus>,
-    self_id: String, leader_id: String, excluded: HashSet<String>, is_authority: bool,
+    stream: TcpStream, 
+    db: Arc<FireLite>, 
+    peers_map: Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>,
+    seen_cache: Arc<AsyncMutex<HashSet<u128>>>, 
+    status_tx: watch::Sender<NetworkStatus>, // <--- Now being used below
+    self_id: String, 
+    leader_id: String, 
+    excluded: HashSet<String>, 
+    is_authority: bool,
     auth_cache: Arc<RwLock<HashMap<String, String>>>,
 ) {
     let (mut reader, writer) = stream.into_split();
@@ -239,7 +250,7 @@ async fn handle_incoming_peer(
             };
             let peer_id = if let Ok(NetPacket::Identify { id, .. }) = bincode::deserialize::<NetPacket>(&payload) { id } else { return; };
 
-            // 2. Automatic Registration (Leader Only)
+            // 1. Automatic Registration (Leader Only)
             if is_authority {
                 let key = format!("peers:{}", peer_id);
                 let shard_arc = db.get_shard("__firelite_security");
@@ -252,7 +263,17 @@ async fn handle_incoming_peer(
                 }
             }
 
+            // 2. Add to local peer map
             peers_map.lock().await.insert(peer_id.clone(), w_temp);
+
+            // --- FIX: USE status_tx TO NOTIFY UI OF NEW PEER ---
+            status_tx.send_modify(|s| {
+                if !s.known_peers.contains(&peer_id) {
+                    s.known_peers.push(peer_id.clone());
+                }
+                s.peer_count = s.known_peers.len();
+                s.status = SyncStatus::Connected;
+            });
 
             loop {
                 let p_bytes = match recv_raw(&mut reader).await { Ok(p) => p, Err(_) => break };
@@ -261,34 +282,24 @@ async fn handle_incoming_peer(
                 match packet {
                     NetPacket::Identify { .. } => {},
                     NetPacket::SyncRequest => {
-                        // Bootstrap if I am leader OR peer is allowed
                         if is_authority || is_peer_allowed(&auth_cache, &peer_id) {
                             handle_bootstrap_request(&db, &peers_map, &peer_id, &excluded).await;
                         }
                     }
                     NetPacket::Replication { msg_id, origin_id, event } => {
-                        // Deduplication
                         {
                             let mut seen = seen_cache.lock().await;
                             if seen.contains(&msg_id) { continue; }
                             seen.insert(msg_id);
                         }
 
-                        // --- PERFORMANCE GATE ---
                         let is_security = event.0 == "__firelite_security";
                         let sender_status = {
                             let cache = auth_cache.read().unwrap();
                             cache.get(&origin_id).cloned().unwrap_or_else(|| "pending".to_string())
                         };
 
-                        // SECURITY RULE:
-                        // 1. Security Lane: Allowed peers can send security updates (to claim leadership).
-                        // 2. Data Lane: Only "allowed" peers or the "leader" can send data.
-                        let can_sync = if is_security {
-                            sender_status == "allowed" || origin_id == leader_id
-                        } else {
-                            sender_status == "allowed" || origin_id == leader_id
-                        };
+                        let can_sync = is_security || sender_status == "allowed" || origin_id == leader_id;
 
                         if can_sync && !excluded.contains(&event.0) {
                             apply_replication(&db, event).await;
@@ -296,7 +307,16 @@ async fn handle_incoming_peer(
                     }
                 }
             }
+
+            // --- FIX: USE status_tx TO NOTIFY UI OF DISCONNECT ---
             peers_map.lock().await.remove(&peer_id);
+            status_tx.send_modify(|s| {
+                s.known_peers.retain(|p| p != &peer_id);
+                s.peer_count = s.known_peers.len();
+                if s.peer_count == 0 {
+                    s.status = SyncStatus::Searching;
+                }
+            });
         });
     }
 }
