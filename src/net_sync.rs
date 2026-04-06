@@ -9,6 +9,8 @@ use crate::document::firelite_doc::FireLiteDoc;
 #[cfg(feature = "net-sync")]
 use std::sync::Arc;
 #[cfg(feature = "net-sync")]
+use std::sync::atomic::Ordering;
+#[cfg(feature = "net-sync")]
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "net-sync")]
 use tokio::net::TcpStream;
@@ -20,6 +22,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, watch};
 #[cfg(feature = "net-sync")]
 use mdns_sd::{ServiceDaemon, ServiceInfo, ServiceEvent};
+#[cfg(feature = "net-sync")]
+use local_ip_address::list_afinet_netifas;
 
 // --- Data Structures ---
 
@@ -45,7 +49,7 @@ pub struct NetworkStatus {
 #[cfg(feature = "net-sync")]
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum NetPacket {
-    Identify { id: String, is_authority: bool },
+    Identify { id: String, is_authority: bool, db_name: String },
     Replication { 
         msg_id: u128, 
         origin_id: String, 
@@ -61,10 +65,10 @@ pub enum NetPacket {
 pub struct NetSyncer {
     db: Arc<FireLite>,
     self_id: String,
-    leader_id: String,                  // Dynamic Leader Name
-    excluded_collections: HashSet<String>, // Consumer-defined exclusions
+    leader_id: String,
+    excluded_collections: HashSet<String>,
     is_authority: bool,
-    service_type: &'static str,
+    service_type: String, // Dynamic service type
     status_tx: watch::Sender<NetworkStatus>,
     status_rx: watch::Receiver<NetworkStatus>,
     peers: Arc<Mutex<HashMap<String, OwnedWriteHalf>>>, 
@@ -87,13 +91,17 @@ impl NetSyncer {
             known_peers: Vec::new(),
         });
 
+        // Use DB name to make service type unique (Namespace Isolation)
+        let db_slug = db.db_name().to_lowercase().replace('.', "_");
+        let service_type = format!("_{}._tcp.local.", db_slug);
+
         Self {
             db,
             self_id: name.to_string(),
             leader_id: leader_id.to_string(),
             excluded_collections: excluded.into_iter().collect(),
             is_authority,
-            service_type: "_firelite_pos_mesh._tcp.local.",
+            service_type,
             status_tx: tx,
             status_rx: rx,
             peers: Arc::new(Mutex::new(HashMap::new())),
@@ -103,61 +111,87 @@ impl NetSyncer {
 
     pub async fn start(&self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
         let mdns = ServiceDaemon::new()?;
+        
+        // 1. GATHER REAL IPs (Fixes unreachable 0.0.0.0 bug)
+        let mut my_ips = HashSet::new();
+        if let Ok(network_interfaces) = list_afinet_netifas() {
+            for (_name, ip) in network_interfaces {
+                if ip.is_ipv4() && !ip.is_loopback() {
+                    my_ips.insert(ip.to_string());
+                }
+            }
+        }
+        if my_ips.is_empty() {
+            if let Ok(ip) = local_ip_address::local_ip() { my_ips.insert(ip.to_string()); }
+        }
+        let ip_list = my_ips.iter().cloned().collect::<Vec<_>>().join(",");
+
+        // 2. PREPARE SHARED DATA
         let self_id = self.self_id.clone();
         let leader_id = self.leader_id.clone();
         let excluded = self.excluded_collections.clone();
-        
         let hostname = format!("{}.local.", gethostname::gethostname().to_string_lossy());
+        let service_type = self.service_type.clone();
+        
         let service_info = ServiceInfo::new(
-            self.service_type, &self_id, &hostname, "0.0.0.0", port, None,
+            &service_type, 
+            &self_id, 
+            &hostname, 
+            &ip_list,
+            port, 
+            None,
         )?;
         mdns.register(service_info)?;
 
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-        let db_srv = Arc::clone(&self.db);
-        let peers_srv = Arc::clone(&self.peers);
-        let seen_srv = Arc::clone(&self.seen_messages);
-        let status_srv = self.status_tx.clone();
+        
+        // --- TASK 1: INCOMING PEER HANDLER ---
+        let db_inc = Arc::clone(&self.db);
+        let peers_inc = Arc::clone(&self.peers);
+        let seen_inc = Arc::clone(&self.seen_messages);
+        let status_inc = self.status_tx.clone();
+        let self_id_inc = self_id.clone();
+        let leader_id_inc = leader_id.clone();
+        let excluded_inc = excluded.clone();
         let is_auth = self.is_authority;
 
-        // --- INCOMING PEER HANDLER ---
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 handle_incoming_peer(
-                    stream, 
-                    db_srv.clone(), 
-                    peers_srv.clone(), 
-                    seen_srv.clone(), 
-                    status_srv.clone(), 
-                    self_id.clone(), 
-                    leader_id.clone(),
-                    excluded.clone(),
-                    is_auth
+                    stream, db_inc.clone(), peers_inc.clone(), seen_inc.clone(), 
+                    status_inc.clone(), self_id_inc.clone(), leader_id_inc.clone(),
+                    excluded_inc.clone(), is_auth
                 ).await;
             }
         });
 
-        // --- OUTGOING PEER BROWSER ---
-        let browser = mdns.browse(self.service_type)?;
+        // --- TASK 2: OUTGOING PEER BROWSER ---
+        let browser = mdns.browse(&service_type)?;
         let db_brw = Arc::clone(&self.db);
         let peers_brw = Arc::clone(&self.peers);
         let seen_brw = Arc::clone(&self.seen_messages);
         let status_brw = self.status_tx.clone();
-        let self_id_brw = self.self_id.clone();
-        let leader_id_brw = self.leader_id.clone();
-        let excluded_brw = self.excluded_collections.clone();
+        let self_id_brw = self_id.clone();
+        let leader_id_brw = leader_id.clone();
+        let excluded_brw = excluded.clone();
 
         tokio::spawn(async move {
             status_brw.send_modify(|s| s.status = SyncStatus::Searching);
             while let Ok(event) = browser.recv() {
                 if let ServiceEvent::ServiceResolved(info) = event {
-                    let peer_fullname = info.get_fullname();
-                    if peer_fullname.contains(&self_id_brw) { continue; }
+                    // Extract instance name from fullname safely
+                    let peer_name = info.get_fullname().split('.').next().unwrap_or("");
+                    
+                    if peer_name == self_id_brw { continue; }
 
                     let addr = info.get_addresses().iter().next().unwrap();
                     let connect_addr = format!("{}:{}", addr, info.get_port());
 
-                    let already_connected = { peers_brw.lock().await.contains_key(info.get_fullname()) };
+                    let already_connected = { 
+                        let guard = peers_brw.lock().await;
+                        guard.contains_key(peer_name) 
+                    };
+
                     if !already_connected {
                         if let Ok(Ok(stream)) = tokio::time::timeout(std::time::Duration::from_secs(3), TcpStream::connect(&connect_addr)).await {
                             handle_incoming_peer(
@@ -171,10 +205,10 @@ impl NetSyncer {
             }
         });
 
-        // --- REPLICATION BROADCASTER ---
+        // --- TASK 3: REPLICATION BROADCASTER ---
         let local_rx = self.db.subscribe_replication();
         let peers_obs = Arc::clone(&self.peers);
-        let self_id_obs = self.self_id.clone();
+        let self_id_obs = self_id.clone();
 
         tokio::spawn(async move {
             while let Ok(event) = local_rx.recv() {
@@ -214,33 +248,51 @@ async fn handle_incoming_peer(
     is_authority: bool,
 ) {
     let (mut reader, mut writer) = stream.into_split();
-    let hello = bincode::serialize(&NetPacket::Identify { id: self_id.clone(), is_authority }).unwrap();
+    
+    // 1. Handshake Identity
+    let hello = bincode::serialize(&NetPacket::Identify { 
+        id: self_id.clone(), 
+        is_authority, 
+        db_name: db.db_name() 
+    }).unwrap();
+    
     if send_raw(&mut writer, &hello).await.is_err() { return; }
 
     tokio::spawn(async move {
-        let peer_id = match recv_raw(&mut reader).await {
-            Ok(payload) => {
-                if let Ok(NetPacket::Identify { id, .. }) = bincode::deserialize::<NetPacket>(&payload) {
-                    let id_clone = id.clone();
-                    peers_map.lock().await.insert(id_clone.clone(), writer);
-                    status_tx.send_modify(|s| {
-                        s.status = SyncStatus::Connected;
-                        if !s.known_peers.contains(&id_clone) { s.known_peers.push(id_clone.clone()); }
-                        s.peer_count = s.known_peers.len();
-                    });
-                    id_clone
+        // 2. Performance Safe Identify check with 2s timeout
+        let (peer_id, _peer_db_name) = match tokio::time::timeout(
+            std::time::Duration::from_secs(2), 
+            recv_raw(&mut reader)
+        ).await {
+            Ok(Ok(payload)) => {
+                if let Ok(NetPacket::Identify { id, db_name, .. }) = bincode::deserialize::<NetPacket>(&payload) {
+                    if db_name != db.db_name() { return; }
+                    (id, db_name)
                 } else { return; }
             }
-            Err(_) => return,
+            _ => return,
         };
 
+        // 3. Prevent Duplicates
+        {
+            let mut guard = peers_map.lock().await;
+            if guard.contains_key(&peer_id) { return; }
+            guard.insert(peer_id.clone(), writer);
+        }
+
+        status_tx.send_modify(|s| {
+            s.status = SyncStatus::Connected;
+            if !s.known_peers.contains(&peer_id) { s.known_peers.push(peer_id.clone()); }
+            s.peer_count = s.known_peers.len();
+        });
+
+        // 4. Replication Loop
         loop {
             match recv_raw(&mut reader).await {
                 Ok(payload) => {
                     if let Ok(packet) = bincode::deserialize::<NetPacket>(&payload) {
                         match packet {
                             NetPacket::Replication { msg_id, origin_id, event } => {
-                                // 1. MESH LOOP PROTECTION
                                 {
                                     let mut seen = seen_cache.lock().await;
                                     if seen.contains(&msg_id) { continue; }
@@ -249,16 +301,11 @@ async fn handle_incoming_peer(
                                 }
 
                                 let col = event.0.clone();
-
-                                // 2. CONSUMER EXCLUSION CHECK
                                 if excluded.contains(&col) { continue; }
 
-                                // 3. INTERNAL SECURITY GATE (__firelite_security)
                                 if col == "__firelite_security" {
-                                    // Security collection only accepted from the designated Leader
                                     if origin_id != leader_id { continue; }
                                 } else {
-                                    // Standard collection: Verify sender is authorized in our local security DB
                                     if !is_authorized(&db, &origin_id).await { continue; }
                                 }
 
@@ -273,9 +320,8 @@ async fn handle_incoming_peer(
                                     let mut shard = shard_arc.write().unwrap();
                                     let mut local_blob_offsets = Vec::new();
                                     
-                                    // 4. POSITIONAL BLOB WRITING (Lock-Free Read-Write Mix)
                                     if let Some(ref file) = shard.blob_file {
-                                        let mut current_offset = file.metadata().unwrap().len();
+                                        let mut current_offset = shard.blob_size.load(Ordering::Acquire);
                                         for data in &raw_blobs {
                                             let data_len = data.len() as u32;
                                             #[cfg(unix)] {
@@ -289,10 +335,9 @@ async fn handle_incoming_peer(
                                             local_blob_offsets.push((current_offset, data_len));
                                             current_offset += data_len as u64;
                                         }
-                                        shard.blob_size.store(current_offset, std::sync::atomic::Ordering::Release);
+                                        shard.blob_size.store(current_offset, Ordering::Release);
                                     }
 
-                                    // 5. POINTER MAPPING (Skeleton Update)
                                     let mut incoming_batch = (*docs_arc).clone();
                                     let mut blob_ptr_idx = 0;
                                     for (_, doc) in &mut incoming_batch {
@@ -306,7 +351,6 @@ async fn handle_incoming_peer(
                                         }
                                     }
 
-                                    // 6. CONFLICT RESOLUTION (Last Write Wins)
                                     let mut final_docs_to_index = Vec::with_capacity(incoming_batch.len());
                                     let mut ops_to_apply = Vec::with_capacity(ops.len());
 
@@ -314,15 +358,11 @@ async fn handle_incoming_peer(
                                         let key = format!("{}:{}", col, doc_id);
                                         let mut should_apply = true;
 
-                                        // Logical LWW Check
                                         if let Ok(Some(local_bytes)) = shard.get(&key) {
                                             if let Some(local_doc) = FireLiteDoc::decode(&local_bytes) {
                                                 let incoming_ts = get_logical_timestamp(&incoming_doc);
                                                 let local_ts = get_logical_timestamp(&local_doc);
-
-                                                if incoming_ts <= local_ts {
-                                                    should_apply = false;
-                                                }
+                                                if incoming_ts <= local_ts { should_apply = false; }
                                             }
                                         }
 
@@ -334,13 +374,11 @@ async fn handle_incoming_peer(
                                         }
                                     }
 
-                                    // 7. PHYSICAL COMMIT
                                     if !ops_to_apply.is_empty() {
                                         let _ = shard.apply_replicated_ops(&ops_to_apply);
                                         db.inject_replication_to_indexer(col, Arc::new(final_docs_to_index));
                                     }
                                 }
-
                                 status_tx.send_modify(|s| s.status = SyncStatus::Connected);
                             }
                             _ => {}
@@ -364,10 +402,8 @@ async fn handle_incoming_peer(
 
 #[cfg(feature = "net-sync")]
 async fn is_authorized(db: &Arc<FireLite>, peer_id: &str) -> bool {
-    // Check internal security collection for "allowed" status
     let auth_key = format!("peers:{}", peer_id);
     let shard = db.get_shard("__firelite_security");
-    
     if let Ok(Some(bytes)) = shard.read().unwrap().get(&auth_key) {
         if let Some(doc) = FireLiteDoc::decode(&bytes) {
             return doc.get("status") == Some(&Value::String("allowed".to_string()));

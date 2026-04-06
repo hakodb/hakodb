@@ -1845,6 +1845,13 @@ impl FireLite {
         rx
     }
 
+    pub fn db_name(&self) -> String {
+        self.root_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "firelite_default".to_string())
+    }
+
 
 }
 

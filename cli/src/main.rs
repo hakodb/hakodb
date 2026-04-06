@@ -1,4 +1,6 @@
 use std::str::FromStr;
+use std::io::Read;
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -9,8 +11,10 @@ use firelite::engine::FireLite;
 use firelite::index::composite::definition::SortDirection;
 use firelite::query::filter::Operator;
 use firelite::query::query::{AggregateOp, Query};
+use firelite::net_sync::NetSyncer;
 use serde_json::{json, Map, Value as JsonValue};
-use std::io::Read;
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 
 #[derive(Parser, Debug)]
 #[command(name = "firelite")]
@@ -151,6 +155,20 @@ enum Commands {
         #[arg(long = "where")]
         filters: Vec<String>,
     },
+    //// net_sync implementation
+    Serve {
+        #[arg(long)]
+        port: u16,
+
+        #[arg(long)]
+        node_id: String,
+
+        #[arg(long, default_value = "leader")]
+        leader_id: String,
+
+        #[arg(long, default_value_t = false)]
+        authority: bool,
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -176,114 +194,129 @@ enum AggregateKindArg {
     Avg,
 }
 
+// fn main() -> Result<()> {
+//     let cli = Cli::parse();
+//     let db = open_db(&cli.db, cli.durability)?;
+
+//     match cli.command {
+//         Commands::Collections => list_collections(&db)?,
+//         Commands::Get { path, output } => get_doc(&db, &path, output.as_deref())?,
+//         Commands::Set {
+//             path,
+//             data,
+//             fromfile,
+//         } => {
+//             let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
+//             set_doc(&db, &path, &payload, false)?
+//         }
+//         Commands::Update {
+//             path,
+//             data,
+//             fromfile,
+//         } => {
+//             let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
+//             set_doc(&db, &path, &payload, true)?
+//         }
+//         Commands::Delete { path } => delete_doc(&db, &path)?,
+//         Commands::Query {
+//             collection,
+//             filters,
+//             and_filters,
+//             or_filters,
+//             fts,
+//             order,
+//             limit,
+//             offset,
+//             start_at,
+//             start_after,
+//             end_at,
+//             end_before,
+//             select,
+//             output,
+//         } => run_query(
+//             &db,
+//             &collection,
+//             &filters,
+//             &and_filters,
+//             &or_filters,
+//             fts.as_deref(),
+//             order.as_deref(),
+//             limit,
+//             offset,
+//             start_at.as_deref(),
+//             start_after.as_deref(),
+//             end_at.as_deref(),
+//             end_before.as_deref(),
+//             select.as_deref(),
+//             output.as_deref(),
+//         )?,
+//         Commands::Aggregate {
+//             collection,
+//             kind,
+//             field,
+//             filters,
+//         } => run_aggregate(&db, &collection, kind, field.as_deref(), &filters)?,
+//         Commands::Watch { collection } => watch_collection(&db, &collection)?,
+//         Commands::Seed {
+//             collection,
+//             docsize,
+//         } => seed_collection(&db, &collection, docsize)?,
+//         Commands::Index { command } => match command {
+//             IndexCommands::Create { collection, field } => {
+//                 db.create_index(&collection, &field)?;
+//                 println!("OK: created index on {collection}.{field}");
+//             }
+//             IndexCommands::CreateComposite { collection, fields } => {
+//                 let parts = parse_composite_fields(&fields)?;
+//                 let index_id = db.create_composite_index(&collection, parts);
+//                 println!("OK: created composite index #{index_id} on {collection}");
+//             }
+//             IndexCommands::CreateFts { collection, field } => {
+//                 db.create_fts_index(&collection, &field)?;
+//                 println!("OK: created FTS index on {collection}.{field}");
+//             }
+//             IndexCommands::List { collection } => {
+//                 let out = db.list_indexes(collection.as_deref());
+//                 println!("{}", serde_json::to_string_pretty(&out)?);
+//             }
+//         },
+//         Commands::TxSet {
+//             path,
+//             data,
+//             fromfile,
+//         } => {
+//             let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
+//             run_tx_set(&db, &path, &payload)?
+//         }
+//         Commands::Stats => println!("{}", serde_json::to_string_pretty(&db.get_stats())?),
+//         Commands::Compact => {
+//             db.compact()?;
+//             println!("OK: compaction complete");
+//         }
+//         Commands::Rest {
+//             method,
+//             path,
+//             data,
+//             filters,
+//         } => run_rest(&db, &method, &path, data.as_deref(), &filters)?,
+//         Commands::Serve { port, node_id, leader_id, authority } => {
+//             run_server(cli.db, cli.durability, port, node_id, leader_id, authority)?;
+//         }
+//     }
+
+//     Ok(())
+// }
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let db = open_db(&cli.db, cli.durability)?;
-
-    match cli.command {
-        Commands::Collections => list_collections(&db)?,
-        Commands::Get { path, output } => get_doc(&db, &path, output.as_deref())?,
-        Commands::Set {
-            path,
-            data,
-            fromfile,
-        } => {
-            let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
-            set_doc(&db, &path, &payload, false)?
-        }
-        Commands::Update {
-            path,
-            data,
-            fromfile,
-        } => {
-            let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
-            set_doc(&db, &path, &payload, true)?
-        }
-        Commands::Delete { path } => delete_doc(&db, &path)?,
-        Commands::Query {
-            collection,
-            filters,
-            and_filters,
-            or_filters,
-            fts,
-            order,
-            limit,
-            offset,
-            start_at,
-            start_after,
-            end_at,
-            end_before,
-            select,
-            output,
-        } => run_query(
-            &db,
-            &collection,
-            &filters,
-            &and_filters,
-            &or_filters,
-            fts.as_deref(),
-            order.as_deref(),
-            limit,
-            offset,
-            start_at.as_deref(),
-            start_after.as_deref(),
-            end_at.as_deref(),
-            end_before.as_deref(),
-            select.as_deref(),
-            output.as_deref(),
-        )?,
-        Commands::Aggregate {
-            collection,
-            kind,
-            field,
-            filters,
-        } => run_aggregate(&db, &collection, kind, field.as_deref(), &filters)?,
-        Commands::Watch { collection } => watch_collection(&db, &collection)?,
-        Commands::Seed {
-            collection,
-            docsize,
-        } => seed_collection(&db, &collection, docsize)?,
-        Commands::Index { command } => match command {
-            IndexCommands::Create { collection, field } => {
-                db.create_index(&collection, &field)?;
-                println!("OK: created index on {collection}.{field}");
-            }
-            IndexCommands::CreateComposite { collection, fields } => {
-                let parts = parse_composite_fields(&fields)?;
-                let index_id = db.create_composite_index(&collection, parts);
-                println!("OK: created composite index #{index_id} on {collection}");
-            }
-            IndexCommands::CreateFts { collection, field } => {
-                db.create_fts_index(&collection, &field)?;
-                println!("OK: created FTS index on {collection}.{field}");
-            }
-            IndexCommands::List { collection } => {
-                let out = db.list_indexes(collection.as_deref());
-                println!("{}", serde_json::to_string_pretty(&out)?);
-            }
-        },
-        Commands::TxSet {
-            path,
-            data,
-            fromfile,
-        } => {
-            let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
-            run_tx_set(&db, &path, &payload)?
-        }
-        Commands::Stats => println!("{}", serde_json::to_string_pretty(&db.get_stats())?),
-        Commands::Compact => {
-            db.compact()?;
-            println!("OK: compaction complete");
-        }
-        Commands::Rest {
-            method,
-            path,
-            data,
-            filters,
-        } => run_rest(&db, &method, &path, data.as_deref(), &filters)?,
+    
+    // If the command is Serve, we enter the special loop
+    if let Commands::Serve { port, node_id, leader_id, authority } = cli.command {
+        return run_server(cli.db, cli.durability, port, node_id, leader_id, authority);
     }
 
-    Ok(())
+    // Otherwise, run a one-off command
+    let db = open_db(&cli.db, cli.durability)?;
+    execute_command(&db, cli.command, &cli.db, cli.durability)
 }
 
 fn open_db(path: &str, durability: DurabilityArg) -> Result<FireLite> {
@@ -832,4 +865,128 @@ fn projected_to_json(id: &str, fields: Vec<(String, Value)>) -> JsonValue {
         map.insert(k, fire_to_json(&v));
     }
     JsonValue::Object(map)
+}
+
+// 1. Move the match logic into a reusable function
+fn execute_command(
+    db: &FireLite, 
+    command: Commands, 
+    _db_path: &str, 
+    _durability: DurabilityArg
+) -> Result<()> {
+    match command {
+        Commands::Collections => list_collections(db)?,
+        Commands::Get { path, output } => get_doc(db, &path, output.as_deref())?,
+        Commands::Set { path, data, fromfile } => {
+            let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
+            set_doc(db, &path, &payload, false)?
+        }
+        Commands::Update { path, data, fromfile } => {
+            let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
+            set_doc(db, &path, &payload, true)?
+        }
+        Commands::Delete { path } => delete_doc(db, &path)?,
+        Commands::Query { collection, filters, and_filters, or_filters, fts, order, limit, offset, start_at, start_after, end_at, end_before, select, output } => {
+            run_query(db, &collection, &filters, &and_filters, &or_filters, fts.as_deref(), order.as_deref(), limit, offset, start_at.as_deref(), start_after.as_deref(), end_at.as_deref(), end_before.as_deref(), select.as_deref(), output.as_deref())?
+        }
+        Commands::Aggregate { collection, kind, field, filters } => run_aggregate(db, &collection, kind, field.as_deref(), &filters)?,
+        Commands::Watch { collection } => watch_collection(db, &collection)?,
+        Commands::Seed { collection, docsize } => seed_collection(db, &collection, docsize)?,
+        Commands::Index { command } => match command {
+            IndexCommands::Create { collection, field } => {
+                db.create_index(&collection, &field)?;
+                println!("OK: created index");
+            }
+            IndexCommands::CreateComposite { collection, fields } => {
+                let parts = parse_composite_fields(&fields)?;
+                db.create_composite_index(&collection, parts);
+            }
+            IndexCommands::CreateFts { collection, field } => db.create_fts_index(&collection, &field)?,
+            IndexCommands::List { collection } => {
+                let out = db.list_indexes(collection.as_deref());
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            }
+        },
+        Commands::TxSet { path, data, fromfile } => {
+            let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
+            run_tx_set(db, &path, &payload)?
+        }
+        Commands::Stats => println!("{}", serde_json::to_string_pretty(&db.get_stats())?),
+        Commands::Compact => db.compact()?,
+        Commands::Rest { method, path, data, filters } => run_rest(db, &method, &path, data.as_deref(), &filters)?,
+        // For Serve, we handle it separately to avoid infinite recursion
+        Commands::Serve { .. } => bail!("Server already running"),
+    }
+    Ok(())
+}
+
+fn run_server(
+    db_path: String,
+    durability: DurabilityArg,
+    port: u16,
+    node_id: String,
+    leader_id: String,
+    authority: bool,
+) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+
+    rt.block_on(async move {
+        let db = Arc::new(open_db(&db_path, durability)?);
+        let sync_group = db.db_name(); 
+
+        // FIX E0061: NetSyncer::new takes 5 arguments. 
+        // We remove &sync_group because it's handled internally via db.db_name()
+        let net = NetSyncer::new(
+            db.clone(),
+            &node_id,
+            &leader_id,
+            vec![], 
+            authority,
+        );
+
+        // FIX E0277: Convert Box<dyn Error> to anyhow::Error
+        net.start(port).await.map_err(|e| anyhow!(e.to_string()))?;
+
+        println!("🔥 FireLite P2P Shell Started");
+        println!("🌐 Group: {} | 🆔 ID: {} | 📡 Port: {}", sync_group, node_id, port);
+        println!("Type 'help' for commands or 'exit' to quit.");
+        
+        let mut rl = DefaultEditor::new().map_err(|e| anyhow!("Readline error: {}", e))?;
+        
+        loop {
+            let status = net.status();
+            let prompt = format!("firelite({}:{}) > ", sync_group, status.peer_count);
+            
+            match rl.readline(&prompt) {
+                Ok(line) => {
+                    let line = line.trim();
+                    if line.is_empty() { continue; }
+                    if line == "exit" || line == "quit" { break; }
+                    let _ = rl.add_history_entry(line);
+
+                    let cmd_str = format!("firelite {}", line);
+                    let args = shlex::split(&cmd_str).unwrap_or_default();
+
+                    match Cli::try_parse_from(args) {
+                        Ok(repl_cli) => {
+                            if let Err(e) = execute_command(&db, repl_cli.command, &db_path, durability) {
+                                println!("❌ Error: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            // This allows 'help' and 'query --help' to work inside the shell
+                            println!("{}", e);
+                        }
+                    }
+                }
+                Err(ReadlineError::Interrupted) => break,
+                Err(ReadlineError::Eof) => break,
+                Err(err) => { 
+                    println!("Readline Error: {:?}", err); 
+                    break; 
+                }
+            }
+        }
+        Ok(())
+    })
 }
