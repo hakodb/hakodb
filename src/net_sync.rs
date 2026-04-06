@@ -6,12 +6,16 @@ use crate::engine::FireLite;
 use crate::document::value::Value;
 #[cfg(feature = "net-sync")]
 use crate::document::firelite_doc::FireLiteDoc;
+// #[cfg(feature = "net-sync")]
+// use crate::storage::engine::StorageMutation;
 #[cfg(feature = "net-sync")]
 use std::sync::Arc;
 #[cfg(feature = "net-sync")]
 use std::sync::atomic::Ordering;
 #[cfg(feature = "net-sync")]
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "net-sync")]
+use std::time::UNIX_EPOCH;
 #[cfg(feature = "net-sync")]
 use tokio::net::TcpStream;
 #[cfg(feature = "net-sync")]
@@ -50,6 +54,7 @@ pub struct NetworkStatus {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum NetPacket {
     Identify { id: String, is_authority: bool, db_name: String },
+    SyncRequest,
     Replication { 
         msg_id: u128, 
         origin_id: String, 
@@ -249,35 +254,53 @@ async fn handle_incoming_peer(
 ) {
     let (mut reader, mut writer) = stream.into_split();
     
-    // 1. Handshake Identity
+    // 1. Send our Identity
     let hello = bincode::serialize(&NetPacket::Identify { 
         id: self_id.clone(), 
         is_authority, 
         db_name: db.db_name() 
     }).unwrap();
-    
     if send_raw(&mut writer, &hello).await.is_err() { return; }
 
     tokio::spawn(async move {
-        // 2. Performance Safe Identify check with 2s timeout
-        let (peer_id, _peer_db_name) = match tokio::time::timeout(
+        // 2. RECEIVE PEER IDENTITY
+        let peer_id = match tokio::time::timeout(
             std::time::Duration::from_secs(2), 
             recv_raw(&mut reader)
         ).await {
             Ok(Ok(payload)) => {
-                if let Ok(NetPacket::Identify { id, db_name, .. }) = bincode::deserialize::<NetPacket>(&payload) {
-                    if db_name != db.db_name() { return; }
-                    (id, db_name)
+                if let Ok(NetPacket::Identify { id, db_name, is_authority: p_auth, .. }) = bincode::deserialize::<NetPacket>(&payload) {
+                    if db_name != db.db_name() { return; } 
+                    
+                    // --- SAFETY CHECK: Authority Collision ---
+                    // Prevent two nodes from both acting as Leader for the same DB.
+                    if is_authority && p_auth {
+                        #[cfg(debug_assertions)]
+                        println!("[net_sync] Rejected peer {} - Authority collision detected", id);
+                        return; 
+                    }
+
+                    id
                 } else { return; }
             }
             _ => return,
         };
 
-        // 3. Prevent Duplicates
+        // 3. Register Peer
         {
             let mut guard = peers_map.lock().await;
             if guard.contains_key(&peer_id) { return; }
             guard.insert(peer_id.clone(), writer);
+        }
+
+        // --- AUTOMATIC BOOTSTRAP TRIGGER ---
+        // If we are NOT the leader, we request a full sync immediately after connecting.
+        if !is_authority {
+            let sync_req = bincode::serialize(&NetPacket::SyncRequest).unwrap();
+            let mut guard = peers_map.lock().await;
+            if let Some(w) = guard.get_mut(&peer_id) {
+                let _ = send_raw(w, &sync_req).await;
+            }
         }
 
         status_tx.send_modify(|s| {
@@ -286,12 +309,73 @@ async fn handle_incoming_peer(
             s.peer_count = s.known_peers.len();
         });
 
-        // 4. Replication Loop
+        // 4. Main Loop
         loop {
             match recv_raw(&mut reader).await {
                 Ok(payload) => {
                     if let Ok(packet) = bincode::deserialize::<NetPacket>(&payload) {
                         match packet {
+                            // --- RESPOND TO BOOTSTRAP REQUEST ---
+                            NetPacket::SyncRequest => {
+                                let db_clone = Arc::clone(&db);
+                                let peers_clone = Arc::clone(&peers_map);
+                                let target_peer = peer_id.clone();
+                                let sender_id = self_id.clone();
+                                let excluded_list = excluded.clone();
+
+                                tokio::spawn(async move {
+                                    let collections = db_clone.list_collections().unwrap_or_default();
+                                    for col in collections {
+                                        if col.starts_with("__") || excluded_list.contains(&col) { continue; }
+
+                                        let shard = db_clone.get_shard(&col);
+                                        let all_data = shard.read().unwrap().scan_prefix("");
+                                        
+                                        if let Ok(docs) = all_data {
+                                            for chunk in docs.chunks(50) {
+                                                let mut wal_ops = Vec::new();
+                                                let mut fire_docs = Vec::new();
+                                                let mut raw_blobs = Vec::new();
+
+                                                for (key, bytes) in chunk {
+                                                    if let Some(mut doc) = FireLiteDoc::decode(bytes) {
+                                                        let doc_id = key.split_once(':').map(|x| x.1).unwrap_or(key);
+                                                        let _ = db_clone.resolve_document_blobs(&mut doc, &col);
+                                                        
+                                                        for (_, val) in &doc.fields {
+                                                            if let Value::Binary(b) = val { raw_blobs.push(b.clone()); }
+                                                            if let Value::String(s) = val {
+                                                                if s.len() > 1024 { raw_blobs.push(s.as_bytes().to_vec()); }
+                                                            }
+                                                        }
+
+                                                        fire_docs.push((doc_id.to_string(), doc));
+                                                        wal_ops.push(crate::storage::wal::WalOp::PutInlined { 
+                                                            key: key.clone(), 
+                                                            value: bytes.clone() 
+                                                        });
+                                                    }
+                                                }
+
+                                                let event = (col.clone(), wal_ops, Arc::new(fire_docs), raw_blobs);
+                                                let out_packet = NetPacket::Replication {
+                                                    msg_id: std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+                                                    origin_id: sender_id.clone(),
+                                                    event
+                                                };
+
+                                                let data = bincode::serialize(&out_packet).unwrap();
+                                                let mut guard = peers_clone.lock().await;
+                                                if let Some(w) = guard.get_mut(&target_peer) {
+                                                    if send_raw(w, &data).await.is_err() { break; }
+                                                }
+                                                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+
                             NetPacket::Replication { msg_id, origin_id, event } => {
                                 {
                                     let mut seen = seen_cache.lock().await;
@@ -351,9 +435,6 @@ async fn handle_incoming_peer(
                                         }
                                     }
 
-                                    let mut final_docs_to_index = Vec::with_capacity(incoming_batch.len());
-                                    let mut ops_to_apply = Vec::with_capacity(ops.len());
-
                                     for (doc_id, incoming_doc) in incoming_batch {
                                         let key = format!("{}:{}", col, doc_id);
                                         let mut should_apply = true;
@@ -368,15 +449,10 @@ async fn handle_incoming_peer(
 
                                         if should_apply {
                                             if let Some(op) = ops.iter().find(|o| o.get_key() == key) {
-                                                ops_to_apply.push(op.clone());
+                                                let _ = shard.apply_replicated_ops(&[op.clone()]);
+                                                db.inject_replication_to_indexer(col.clone(), Arc::new(vec![(doc_id, incoming_doc)]));
                                             }
-                                            final_docs_to_index.push((doc_id, incoming_doc));
                                         }
-                                    }
-
-                                    if !ops_to_apply.is_empty() {
-                                        let _ = shard.apply_replicated_ops(&ops_to_apply);
-                                        db.inject_replication_to_indexer(col, Arc::new(final_docs_to_index));
                                     }
                                 }
                                 status_tx.send_modify(|s| s.status = SyncStatus::Connected);
@@ -388,7 +464,6 @@ async fn handle_incoming_peer(
                 Err(_) => break, 
             }
         }
-
         peers_map.lock().await.remove(&peer_id);
         status_tx.send_modify(|s| {
             s.known_peers.retain(|p| p != &peer_id);
