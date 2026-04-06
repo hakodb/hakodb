@@ -51,7 +51,7 @@ pub enum NetPacket {
 pub struct NetSyncer {
     db: Arc<FireLite>,
     self_id: String,
-    leader_id: Arc<RwLock<String>>, // Dynamic leadership
+    leader_id: Arc<RwLock<String>>, 
     excluded_collections: HashSet<String>,
     is_authority: bool,
     service_type: String,
@@ -64,7 +64,7 @@ pub struct NetSyncer {
 
 #[cfg(feature = "net-sync")]
 impl NetSyncer {
-    pub fn new(db: Arc<FireLite>, name: &str, leader_id: &str, excluded: Vec<String>, is_authority: bool) -> Self {
+    pub fn new(db: Arc<FireLite>, name: &str, excluded: Vec<String>, is_authority: bool) -> Self {
         let (tx, rx) = watch::channel(NetworkStatus {
             status: SyncStatus::Idle,
             self_id: name.to_string(),
@@ -72,10 +72,18 @@ impl NetSyncer {
             known_peers: Vec::new(),
         });
 
+        // Try to load current leader from DB config if it exists
+        let initial_leader = match db.get("__firelite_security", "config") {
+            Ok(Some(doc)) => doc.get("current_leader")
+                .and_then(|v| if let Value::String(s) = v { Some(s.clone()) } else { None })
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+
         Self {
             db: db.clone(),
             self_id: name.to_string(),
-            leader_id: Arc::new(RwLock::new(leader_id.to_string())),
+            leader_id: Arc::new(RwLock::new(initial_leader)),
             excluded_collections: excluded.into_iter().collect(),
             is_authority,
             service_type: format!("_{}._tcp.local.", db.db_name().to_lowercase().replace('.', "_")),
@@ -166,6 +174,9 @@ impl NetSyncer {
                         let cache = auth_obs.read().unwrap();
                         let current_leader = lid_obs.read().unwrap();
                         let status = cache.get(id).map(|s| s.as_str()).unwrap_or("pending");
+                        // Broadcaster Gate: 
+                        // Security collection is broadcast to EVERYONE.
+                        // Other collections only go to allowed peers or the current leader.
                         is_security || status == "allowed" || id == &*current_leader
                     };
 
@@ -215,7 +226,23 @@ impl NetSyncer {
     }
 
     pub fn status(&self) -> NetworkStatus {
-        self.status_rx.borrow().clone()
+        let stats = self.status_rx.borrow().clone();
+        
+        // We need to get the actual keys from the live peers map
+        // Since status() is usually called by the UI, we can use try_lock 
+        // or a quick lock to avoid blocking replication.
+        let live_peers = if let Ok(guard) = self.peers.try_lock() {
+            guard.keys().cloned().collect()
+        } else {
+            stats.known_peers // Fallback to last known if locked
+        };
+
+        NetworkStatus {
+            status: stats.status,
+            self_id: self.self_id.clone(),
+            peer_count: live_peers.len(),
+            known_peers: live_peers, // These are the people physically "here"
+        }
     }
 }
 
@@ -226,7 +253,7 @@ async fn handle_incoming_peer(
     seen_cache: Arc<AsyncMutex<HashSet<u128>>>, 
     status_tx: watch::Sender<NetworkStatus>,
     self_id: String, 
-    leader_id: Arc<RwLock<String>>, // Corrected to Arc<RwLock>
+    leader_id: Arc<RwLock<String>>, 
     excluded: HashSet<String>, 
     is_authority: bool,
     auth_cache: Arc<RwLock<HashMap<String, String>>>,
@@ -273,7 +300,8 @@ async fn handle_incoming_peer(
                     NetPacket::SyncRequest => {
                         let allowed = is_peer_allowed(&auth_cache, &peer_id);
                         let is_lid = { leader_id.read().unwrap().eq(&peer_id) };
-                        if allowed || is_lid {
+                        // Accept bootstrap request if peer is authorized or is the authority
+                        if allowed || is_lid || is_authority {
                             handle_bootstrap_request(&db, &peers_map, &peer_id, &excluded).await;
                         }
                     }
@@ -284,10 +312,14 @@ async fn handle_incoming_peer(
                             seen.insert(msg_id);
                         }
 
+                        let is_security = event.0 == "__firelite_security";
                         let can_sync = {
                             let cache = auth_cache.read().unwrap();
                             let current_leader = leader_id.read().unwrap();
-                            event.0 == "__firelite_security" || 
+                            // RECEIVE GATE:
+                            // 1. Security lane is ALWAYS accepted.
+                            // 2. Data lane only from Allowed Peers or the Leader.
+                            is_security || 
                             cache.get(&origin_id).map(|s| s == "allowed").unwrap_or(false) ||
                             origin_id == *current_leader
                         };
@@ -353,7 +385,9 @@ async fn handle_bootstrap_request(db: &Arc<FireLite>, peers: &Arc<AsyncMutex<Has
             
             if let Ok(payload) = bincode::serialize(&packet) {
                 let mut guard = peers.lock().await;
-                if let Some(w) = guard.get_mut(peer_id) { let _ = send_raw(w, &payload).await; }
+                if let Some(w) = guard.get_mut(peer_id) { 
+                    let _ = send_raw(w, &payload).await; 
+                }
             }
         }
     }
