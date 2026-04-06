@@ -51,7 +51,7 @@ pub enum NetPacket {
 pub struct NetSyncer {
     db: Arc<FireLite>,
     self_id: String,
-    leader_id: String,
+    leader_id: Arc<RwLock<String>>,
     excluded_collections: HashSet<String>,
     is_authority: bool,
     service_type: String,
@@ -210,6 +210,19 @@ impl NetSyncer {
                         if let Some(doc) = FireLiteDoc::decode(&bytes) {
                             if let Some(Value::String(s)) = doc.get("status") {
                                 cache.write().unwrap().insert(peer_id, s.clone());
+                            }
+                        }
+                    }
+                }
+                if event.path == "config" {
+                    let shard_arc = db.get_shard("__firelite_security");
+                    let shard = shard_arc.read().unwrap();
+                    if let Ok(Some(bytes)) = shard.get("config") {
+                        if let Some(doc) = FireLiteDoc::decode(&bytes) {
+                            if let Some(Value::String(new_leader)) = doc.get("current_leader") {
+                                // Update the internal reference used by the replication gate
+                                let mut leader_guard = leader_ref.write().unwrap();
+                                *leader_guard = new_leader.clone();
                             }
                         }
                     }
