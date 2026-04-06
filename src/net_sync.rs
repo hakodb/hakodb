@@ -51,7 +51,7 @@ pub enum NetPacket {
 pub struct NetSyncer {
     db: Arc<FireLite>,
     self_id: String,
-    leader_id: Arc<RwLock<String>>,
+    leader_id: Arc<RwLock<String>>, // Dynamic leadership
     excluded_collections: HashSet<String>,
     is_authority: bool,
     service_type: String,
@@ -64,13 +64,7 @@ pub struct NetSyncer {
 
 #[cfg(feature = "net-sync")]
 impl NetSyncer {
-    pub fn new(
-        db: Arc<FireLite>, 
-        name: &str, 
-        leader_id: &str, // This is the initial leader
-        excluded: Vec<String>,
-        is_authority: bool
-    ) -> Self {
+    pub fn new(db: Arc<FireLite>, name: &str, leader_id: &str, excluded: Vec<String>, is_authority: bool) -> Self {
         let (tx, rx) = watch::channel(NetworkStatus {
             status: SyncStatus::Idle,
             self_id: name.to_string(),
@@ -81,7 +75,7 @@ impl NetSyncer {
         Self {
             db: db.clone(),
             self_id: name.to_string(),
-            leader_id: leader_id.to_string(), // Initial state
+            leader_id: Arc::new(RwLock::new(leader_id.to_string())),
             excluded_collections: excluded.into_iter().collect(),
             is_authority,
             service_type: format!("_{}._tcp.local.", db.db_name().to_lowercase().replace('.', "_")),
@@ -94,7 +88,7 @@ impl NetSyncer {
     }
 
     pub async fn start(&self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
-        Self::start_security_monitor(self.db.clone(), self.auth_cache.clone()).await;
+        Self::start_security_monitor(self.db.clone(), self.auth_cache.clone(), self.leader_id.clone()).await;
         
         let mdns = ServiceDaemon::new()?;
         let hostname = format!("{}.local.", gethostname::gethostname().to_string_lossy());
@@ -108,19 +102,15 @@ impl NetSyncer {
         let seen_shr = self.seen_messages.clone();
         let status_tx_shr = self.status_tx.clone();
         let auth_cache_shr = self.auth_cache.clone();
+        let leader_id_shr = self.leader_id.clone();
         let self_id = self.self_id.clone();
-        let leader_id = self.leader_id.clone();
         let excluded = self.excluded_collections.clone();
         let is_authority = self.is_authority;
 
         // TASK 1: Handle Incoming Connections
-        let db_inc = db_shr.clone();
-        let peers_inc = peers_shr.clone();
-        let seen_inc = seen_shr.clone();
-        let status_inc = status_tx_shr.clone();
-        let auth_inc = auth_cache_shr.clone();
+        let (db_inc, peers_inc, seen_inc, status_inc, auth_inc, lid_inc) = 
+            (db_shr.clone(), peers_shr.clone(), seen_shr.clone(), status_tx_shr.clone(), auth_cache_shr.clone(), leader_id_shr.clone());
         let sid_inc = self_id.clone();
-        let lid_inc = leader_id.clone();
         let excl_inc = excluded.clone();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
@@ -131,13 +121,9 @@ impl NetSyncer {
 
         // TASK 2: Service Browser (Auto-discovery)
         let browser = mdns.browse(&self.service_type)?;
-        let db_brw = db_shr.clone();
-        let peers_brw = peers_shr.clone();
-        let seen_brw = seen_shr.clone();
-        let status_brw = status_tx_shr.clone();
-        let auth_brw = auth_cache_shr.clone();
+        let (db_brw, peers_brw, seen_brw, status_brw, auth_brw, lid_brw) = 
+            (db_shr.clone(), peers_shr.clone(), seen_shr.clone(), status_tx_shr.clone(), auth_cache_shr.clone(), leader_id_shr.clone());
         let sid_brw = self_id.clone();
-        let lid_brw = leader_id.clone();
         let excl_brw = excluded.clone();
         tokio::spawn(async move {
             while let Ok(event) = browser.recv() {
@@ -145,8 +131,7 @@ impl NetSyncer {
                     let peer_name = info.get_fullname().split('.').next().unwrap_or("");
                     if peer_name == sid_brw { continue; }
                     
-                    let already_connected = { peers_brw.lock().await.contains_key(peer_name) };
-                    if !already_connected {
+                    if !peers_brw.lock().await.contains_key(peer_name) {
                         if let Some(addr) = info.get_addresses().iter().next() {
                             if let Ok(Ok(stream)) = tokio::time::timeout(std::time::Duration::from_secs(3), TcpStream::connect(format!("{}:{}", addr, info.get_port()))).await {
                                 handle_incoming_peer(stream, db_brw.clone(), peers_brw.clone(), seen_brw.clone(), 
@@ -160,10 +145,8 @@ impl NetSyncer {
 
         // TASK 3: Replication Broadcaster
         let local_rx = self.db.subscribe_replication();
-        let peers_obs = peers_shr.clone();
-        let auth_obs = auth_cache_shr.clone();
+        let (peers_obs, auth_obs, lid_obs) = (peers_shr.clone(), auth_cache_shr.clone(), leader_id_shr.clone());
         let sid_obs = self_id.clone();
-        let lid_obs = leader_id.clone();
         tokio::spawn(async move {
             while let Ok(event) = local_rx.recv() {
                 let is_security = event.0 == "__firelite_security";
@@ -181,8 +164,9 @@ impl NetSyncer {
                 for (id, writer) in p_guard.iter_mut() {
                     let is_allowed = {
                         let cache = auth_obs.read().unwrap();
+                        let current_leader = lid_obs.read().unwrap();
                         let status = cache.get(id).map(|s| s.as_str()).unwrap_or("pending");
-                        is_security || status == "allowed" || id == &lid_obs
+                        is_security || status == "allowed" || id == &*current_leader
                     };
 
                     if is_allowed {
@@ -198,7 +182,7 @@ impl NetSyncer {
         Ok(())
     }
 
-    async fn start_security_monitor(db: Arc<FireLite>, cache: Arc<RwLock<HashMap<String, String>>>) {
+    async fn start_security_monitor(db: Arc<FireLite>, cache: Arc<RwLock<HashMap<String, String>>>, leader_id_ref: Arc<RwLock<String>>) {
         let rx = db.watch_collection("__firelite_security");
         tokio::spawn(async move {
             while let Ok(event) = rx.recv() {
@@ -216,13 +200,12 @@ impl NetSyncer {
                 }
                 if event.path == "config" {
                     let shard_arc = db.get_shard("__firelite_security");
-                    let shard = shard_arc.read().unwrap();
-                    if let Ok(Some(bytes)) = shard.get("config") {
+                    let shard_guard = shard_arc.read().unwrap();
+                    if let Ok(Some(bytes)) = shard_guard.get("config") {
                         if let Some(doc) = FireLiteDoc::decode(&bytes) {
                             if let Some(Value::String(new_leader)) = doc.get("current_leader") {
-                                // Update the internal reference used by the replication gate
-                                let mut leader_guard = leader_ref.write().unwrap();
-                                *leader_guard = new_leader.clone();
+                                let mut lid = leader_id_ref.write().unwrap();
+                                *lid = new_leader.clone();
                             }
                         }
                     }
@@ -232,7 +215,6 @@ impl NetSyncer {
     }
 
     pub fn status(&self) -> NetworkStatus {
-        // Use status_rx or _status_rx depending on how you named it in your struct
         self.status_rx.borrow().clone()
     }
 }
@@ -242,9 +224,9 @@ async fn handle_incoming_peer(
     db: Arc<FireLite>, 
     peers_map: Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>,
     seen_cache: Arc<AsyncMutex<HashSet<u128>>>, 
-    status_tx: watch::Sender<NetworkStatus>, // <--- Now being used below
+    status_tx: watch::Sender<NetworkStatus>,
     self_id: String, 
-    leader_id: String, 
+    leader_id: Arc<RwLock<String>>, // Corrected to Arc<RwLock>
     excluded: HashSet<String>, 
     is_authority: bool,
     auth_cache: Arc<RwLock<HashMap<String, String>>>,
@@ -263,7 +245,6 @@ async fn handle_incoming_peer(
             };
             let peer_id = if let Ok(NetPacket::Identify { id, .. }) = bincode::deserialize::<NetPacket>(&payload) { id } else { return; };
 
-            // 1. Automatic Registration (Leader Only)
             if is_authority {
                 let key = format!("peers:{}", peer_id);
                 let shard_arc = db.get_shard("__firelite_security");
@@ -276,14 +257,9 @@ async fn handle_incoming_peer(
                 }
             }
 
-            // 2. Add to local peer map
             peers_map.lock().await.insert(peer_id.clone(), w_temp);
-
-            // --- FIX: USE status_tx TO NOTIFY UI OF NEW PEER ---
             status_tx.send_modify(|s| {
-                if !s.known_peers.contains(&peer_id) {
-                    s.known_peers.push(peer_id.clone());
-                }
+                if !s.known_peers.contains(&peer_id) { s.known_peers.push(peer_id.clone()); }
                 s.peer_count = s.known_peers.len();
                 s.status = SyncStatus::Connected;
             });
@@ -295,7 +271,9 @@ async fn handle_incoming_peer(
                 match packet {
                     NetPacket::Identify { .. } => {},
                     NetPacket::SyncRequest => {
-                        if is_authority || is_peer_allowed(&auth_cache, &peer_id) {
+                        let allowed = is_peer_allowed(&auth_cache, &peer_id);
+                        let is_lid = { leader_id.read().unwrap().eq(&peer_id) };
+                        if allowed || is_lid {
                             handle_bootstrap_request(&db, &peers_map, &peer_id, &excluded).await;
                         }
                     }
@@ -306,13 +284,13 @@ async fn handle_incoming_peer(
                             seen.insert(msg_id);
                         }
 
-                        let is_security = event.0 == "__firelite_security";
-                        let sender_status = {
+                        let can_sync = {
                             let cache = auth_cache.read().unwrap();
-                            cache.get(&origin_id).cloned().unwrap_or_else(|| "pending".to_string())
+                            let current_leader = leader_id.read().unwrap();
+                            event.0 == "__firelite_security" || 
+                            cache.get(&origin_id).map(|s| s == "allowed").unwrap_or(false) ||
+                            origin_id == *current_leader
                         };
-
-                        let can_sync = is_security || sender_status == "allowed" || origin_id == leader_id;
 
                         if can_sync && !excluded.contains(&event.0) {
                             apply_replication(&db, event).await;
@@ -320,15 +298,11 @@ async fn handle_incoming_peer(
                     }
                 }
             }
-
-            // --- FIX: USE status_tx TO NOTIFY UI OF DISCONNECT ---
             peers_map.lock().await.remove(&peer_id);
             status_tx.send_modify(|s| {
                 s.known_peers.retain(|p| p != &peer_id);
                 s.peer_count = s.known_peers.len();
-                if s.peer_count == 0 {
-                    s.status = SyncStatus::Searching;
-                }
+                if s.peer_count == 0 { s.status = SyncStatus::Searching; }
             });
         });
     }
@@ -363,8 +337,6 @@ async fn handle_bootstrap_request(db: &Arc<FireLite>, peers: &Arc<AsyncMutex<Has
     let collections = db.list_collections().unwrap_or_default();
     for col in collections {
         if excluded.contains(&col) { continue; }
-        
-        // FIX: Extract data first to drop the shard lock before network .await points
         let all_data = {
             let shard_arc = db.get_shard(&col);
             let shard_guard = shard_arc.read().unwrap();
@@ -381,9 +353,7 @@ async fn handle_bootstrap_request(db: &Arc<FireLite>, peers: &Arc<AsyncMutex<Has
             
             if let Ok(payload) = bincode::serialize(&packet) {
                 let mut guard = peers.lock().await;
-                if let Some(w) = guard.get_mut(peer_id) { 
-                    let _ = send_raw(w, &payload).await; 
-                }
+                if let Some(w) = guard.get_mut(peer_id) { let _ = send_raw(w, &payload).await; }
             }
         }
     }
@@ -405,7 +375,8 @@ async fn send_raw<W: AsyncWriteExt + Unpin>(w: &mut W, data: &[u8]) -> tokio::io
 async fn recv_raw<R: AsyncReadExt + Unpin>(r: &mut R) -> tokio::io::Result<Vec<u8>> {
     let mut len_b = [0u8; 4];
     r.read_exact(&mut len_b).await?;
-    let mut data = vec![0u8; u32::from_le_bytes(len_b) as usize];
+    let len = u32::from_le_bytes(len_b) as usize;
+    let mut data = vec![0u8; len];
     r.read_exact(&mut data).await?;
     Ok(data)
 }
