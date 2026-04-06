@@ -7,7 +7,7 @@ use crate::document::value::Value;
 #[cfg(feature = "net-sync")]
 use crate::document::firelite_doc::FireLiteDoc;
 #[cfg(feature = "net-sync")]
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Mutex};
 #[cfg(feature = "net-sync")]
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "net-sync")]
@@ -60,6 +60,7 @@ pub struct NetSyncer {
     peers: Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, 
     seen_messages: Arc<AsyncMutex<HashSet<u128>>>,
     auth_cache: Arc<RwLock<HashMap<String, String>>>,
+    tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 #[cfg(feature = "net-sync")]
@@ -92,125 +93,180 @@ impl NetSyncer {
             peers: Arc::new(AsyncMutex::new(HashMap::new())),
             seen_messages: Arc::new(AsyncMutex::new(HashSet::with_capacity(1000))),
             auth_cache: Arc::new(RwLock::new(HashMap::new())),
+            tasks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     pub async fn start(&self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
-        Self::start_security_monitor(self.db.clone(), self.auth_cache.clone(), self.leader_id.clone()).await;
-    
-        let mdns = ServiceDaemon::new()?;
-        let hostname = format!("{}.local.", gethostname::gethostname().to_string_lossy());
+        // 1. CLEAR OLD TASKS (if any)
+        self.stop(); 
 
-        // --- FIX: Detect REAL LAN IP (instead of 0.0.0.0) ---
+        let mut task_guard = self.tasks.lock().unwrap();
+        
+        // 3. START SECURITY MONITOR (Tracked Task)
+        let monitor_handle = Self::start_security_monitor(
+            self.db.clone(), 
+            self.auth_cache.clone(), 
+            self.leader_id.clone()
+        ).await; 
+        
+        task_guard.push(monitor_handle);
+
+        // 2. DETECT REAL LAN IP (Fixes the 0.0.0.0 Discovery Bug)
         let my_ip = local_ip_address::local_ip()
             .map(|ip| ip.to_string())
             .unwrap_or_else(|_| "127.0.0.1".to_string());
 
-        // Register with actual IP
+        // 4. mDNS REGISTRATION
+        let mdns = ServiceDaemon::new()?;
+        let hostname = format!("{}.local.", gethostname::gethostname().to_string_lossy());
         let service_info = ServiceInfo::new(
             &self.service_type, 
             &self.self_id, 
             &hostname, 
-            &my_ip, // <--- Use detected IP here
+            &my_ip, 
             port, 
             None
         )?;
         mdns.register(service_info)?;
 
-        // We still bind the listener to 0.0.0.0 to accept connections from any interface
+        // 5. TASK 1: INCOMING PEER LISTENER
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-        
-        let db_shr = self.db.clone();
-        let peers_shr = self.peers.clone();
-        let seen_shr = self.seen_messages.clone();
-        let status_tx_shr = self.status_tx.clone();
-        let auth_cache_shr = self.auth_cache.clone();
-        let leader_id_shr = self.leader_id.clone();
-        let self_id = self.self_id.clone();
-        let excluded = self.excluded_collections.clone();
-        let is_authority = self.is_authority;
+        let db_inc = self.db.clone();
+        let peers_inc = self.peers.clone();
+        let seen_inc = self.seen_messages.clone();
+        let status_tx_inc = self.status_tx.clone();
+        let auth_cache_inc = self.auth_cache.clone();
+        let leader_id_inc = self.leader_id.clone();
+        let self_id_inc = self.self_id.clone();
+        let excluded_inc = self.excluded_collections.clone();
+        let is_auth = self.is_authority;
 
-        // TASK 1: Handle Incoming Connections
-        let (db_inc, peers_inc, seen_inc, status_inc, auth_inc, lid_inc) = 
-            (db_shr.clone(), peers_shr.clone(), seen_shr.clone(), status_tx_shr.clone(), auth_cache_shr.clone(), leader_id_shr.clone());
-        let sid_inc = self_id.clone();
-        let excl_inc = excluded.clone();
-        tokio::spawn(async move {
+        let handle_listener = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                handle_incoming_peer(stream, db_inc.clone(), peers_inc.clone(), seen_inc.clone(), 
-                    status_inc.clone(), sid_inc.clone(), lid_inc.clone(), excl_inc.clone(), is_authority, auth_inc.clone()).await;
+                handle_incoming_peer(
+                    stream, db_inc.clone(), peers_inc.clone(), seen_inc.clone(),
+                    status_tx_inc.clone(), self_id_inc.clone(), leader_id_inc.clone(),
+                    excluded_inc.clone(), is_auth, auth_cache_inc.clone()
+                ).await;
             }
         });
+        task_guard.push(handle_listener);
 
-        // TASK 2: Service Browser (Auto-discovery)
+        // 6. TASK 2: OUTGOING PEER BROWSER (Discovery)
         let browser = mdns.browse(&self.service_type)?;
-        let (db_brw, peers_brw, seen_brw, status_brw, auth_brw, lid_brw) = 
-            (db_shr.clone(), peers_shr.clone(), seen_shr.clone(), status_tx_shr.clone(), auth_cache_shr.clone(), leader_id_shr.clone());
-        let sid_brw = self_id.clone();
-        let excl_brw = excluded.clone();
-        tokio::spawn(async move {
+        let db_brw = self.db.clone();
+        let peers_brw = self.peers.clone();
+        let seen_brw = self.seen_messages.clone();
+        let status_tx_brw = self.status_tx.clone();
+        let auth_cache_brw = self.auth_cache.clone();
+        let leader_id_brw = self.leader_id.clone();
+        let self_id_brw = self.self_id.clone();
+        let excluded_brw = self.excluded_collections.clone();
+
+        let handle_browser = tokio::spawn(async move {
             while let Ok(event) = browser.recv() {
                 if let ServiceEvent::ServiceResolved(info) = event {
                     let peer_name = info.get_fullname().split('.').next().unwrap_or("");
-                    if peer_name == sid_brw { continue; }
+                    if peer_name == self_id_brw { continue; }
                     
-                    if !peers_brw.lock().await.contains_key(peer_name) {
+                    let already_connected = { peers_brw.lock().await.contains_key(peer_name) };
+                    if !already_connected {
                         if let Some(addr) = info.get_addresses().iter().next() {
-                            if let Ok(Ok(stream)) = tokio::time::timeout(std::time::Duration::from_secs(3), TcpStream::connect(format!("{}:{}", addr, info.get_port()))).await {
-                                handle_incoming_peer(stream, db_brw.clone(), peers_brw.clone(), seen_brw.clone(), 
-                                    status_brw.clone(), sid_brw.clone(), lid_brw.clone(), excl_brw.clone(), is_authority, auth_brw.clone()).await;
+                            let addr_str = format!("{}:{}", addr, info.get_port());
+                            if let Ok(Ok(stream)) = tokio::time::timeout(std::time::Duration::from_secs(3), TcpStream::connect(&addr_str)).await {
+                                handle_incoming_peer(
+                                    stream, db_brw.clone(), peers_brw.clone(), seen_brw.clone(),
+                                    status_tx_brw.clone(), self_id_brw.clone(), leader_id_brw.clone(),
+                                    excluded_brw.clone(), is_auth, auth_cache_brw.clone()
+                                ).await;
                             }
                         }
                     }
                 }
             }
         });
+        task_guard.push(handle_browser);
 
-        // TASK 3: Replication Broadcaster
+        // 7. TASK 3: REPLICATION BROADCASTER (Performance Optimized)
         let local_rx = self.db.subscribe_replication();
-        let (peers_obs, auth_obs, lid_obs) = (peers_shr.clone(), auth_cache_shr.clone(), leader_id_shr.clone());
-        let sid_obs = self_id.clone();
-        tokio::spawn(async move {
+        let peers_obs = self.peers.clone();
+        let auth_obs = self.auth_cache.clone();
+        let leader_id_obs = self.leader_id.clone();
+        let self_id_obs = self.self_id.clone();
+
+        let handle_broadcaster = tokio::spawn(async move {
             while let Ok(event) = local_rx.recv() {
                 let is_security = event.0 == "__firelite_security";
-                let packet = NetPacket::Replication { 
-                    msg_id: std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros(), 
-                    origin_id: sid_obs.clone(), 
-                    event 
-                };
-                let payload = bincode::serialize(&packet).unwrap();
-                let header = (payload.len() as u32).to_le_bytes();
+                let msg_id = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros();
+                let packet = NetPacket::Replication { msg_id, origin_id: self_id_obs.clone(), event };
+                
+                if let Ok(payload) = bincode::serialize(&packet) {
+                    let header = (payload.len() as u32).to_le_bytes();
+                    let mut p_guard = peers_obs.lock().await;
+                    let mut dead = Vec::new();
 
-                let mut p_guard = peers_obs.lock().await;
-                let mut dead = Vec::new();
+                    for (id, writer) in p_guard.iter_mut() {
+                        // Logic check: Allow if Security Collection OR Peer is Authorized OR Peer is the Leader
+                        let is_allowed = {
+                            let cache = auth_obs.read().unwrap();
+                            let current_leader = leader_id_obs.read().unwrap();
+                            is_security || cache.get(id).map(|s| s == "allowed").unwrap_or(false) || id == &*current_leader
+                        };
 
-                for (id, writer) in p_guard.iter_mut() {
-                    let is_allowed = {
-                        let cache = auth_obs.read().unwrap();
-                        let current_leader = lid_obs.read().unwrap();
-                        let status = cache.get(id).map(|s| s.as_str()).unwrap_or("pending");
-                        // Broadcaster Gate: 
-                        // Security collection is broadcast to EVERYONE.
-                        // Other collections only go to allowed peers or the current leader.
-                        is_security || status == "allowed" || id == &*current_leader
-                    };
-
-                    if is_allowed {
-                        if writer.write_all(&header).await.is_err() || writer.write_all(&payload).await.is_err() {
-                            dead.push(id.clone());
+                        if is_allowed {
+                            if writer.write_all(&header).await.is_err() || writer.write_all(&payload).await.is_err() {
+                                dead.push(id.clone());
+                            }
                         }
                     }
+                    for id in dead { p_guard.remove(&id); }
                 }
-                for id in dead { p_guard.remove(&id); }
             }
         });
+        task_guard.push(handle_broadcaster);
 
         Ok(())
     }
 
-    async fn start_security_monitor(db: Arc<FireLite>, cache: Arc<RwLock<HashMap<String, String>>>, leader_id_ref: Arc<RwLock<String>>) {
-        let rx = db.watch_collection("__firelite_security");
+    // 8. THE STOP FUNCTION (Instant Cleanup)
+    pub fn stop(&self) {
+        let mut task_guard = self.tasks.lock().unwrap();
+        for handle in task_guard.drain(..) {
+            handle.abort(); // Immediately kills the task and releases resources/ports
+        }
+        // Set status to Idle for UI
+        self.status_tx.send_modify(|s| {
+            s.status = SyncStatus::Idle;
+            s.peer_count = 0;
+            s.known_peers.clear();
+        });
+    }
+
+    async fn start_security_monitor(
+        db: Arc<FireLite>, 
+        cache: Arc<RwLock<HashMap<String, String>>>, 
+        leader_id_ref: Arc<RwLock<String>>
+    ) -> tokio::task::JoinHandle<()> {
+        {
+            let shard_arc = db.get_shard("__firelite_security");
+            let shard = shard_arc.read().unwrap();
+            if let Ok(docs) = shard.scan_prefix("peers:") {
+                let mut guard = cache.write().unwrap();
+                for (key, bytes) in docs {
+                    if let Some(doc) = FireLiteDoc::decode(&bytes) {
+                        if let Some(Value::String(status)) = doc.get("status") {
+                            let peer_id = key.replace("peers:", "");
+                            guard.insert(peer_id, status.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Return the JoinHandle from tokio::spawn
         tokio::spawn(async move {
+            let rx = db.watch_collection("__firelite_security");
             while let Ok(event) = rx.recv() {
                 if event.path.starts_with("peers:") {
                     let peer_id = event.path.replace("peers:", "");
@@ -218,8 +274,8 @@ impl NetSyncer {
                     let shard_guard = shard_arc.read().unwrap();
                     if let Ok(Some(bytes)) = shard_guard.get(&event.path) {
                         if let Some(doc) = FireLiteDoc::decode(&bytes) {
-                            if let Some(Value::String(s)) = doc.get("status") {
-                                cache.write().unwrap().insert(peer_id, s.clone());
+                            if let Some(Value::String(status)) = doc.get("status") {
+                                cache.write().unwrap().insert(peer_id, status.clone());
                             }
                         }
                     }
@@ -237,26 +293,24 @@ impl NetSyncer {
                     }
                 }
             }
-        });
+        })
     }
 
     pub fn status(&self) -> NetworkStatus {
+        // Calling .borrow() on the watch::Receiver counts as a "read"
         let stats = self.status_rx.borrow().clone();
         
-        // We need to get the actual keys from the live peers map
-        // Since status() is usually called by the UI, we can use try_lock 
-        // or a quick lock to avoid blocking replication.
         let live_peers = if let Ok(guard) = self.peers.try_lock() {
             guard.keys().cloned().collect()
         } else {
-            stats.known_peers // Fallback to last known if locked
+            stats.known_peers
         };
 
         NetworkStatus {
             status: stats.status,
             self_id: self.self_id.clone(),
             peer_count: live_peers.len(),
-            known_peers: live_peers, // These are the people physically "here"
+            known_peers: live_peers,
         }
     }
 }
