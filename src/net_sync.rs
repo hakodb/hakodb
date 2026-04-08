@@ -24,8 +24,8 @@ use mdns_sd::{ServiceDaemon, ServiceInfo, ServiceEvent};
 use sha2::{Sha256, Digest};
 #[cfg(feature = "net-sync")]
 use tokio::net::{TcpStream, tcp::OwnedWriteHalf};
-// #[cfg(feature = "net-sync")]
-// use std::net::SocketAddr;
+#[cfg(feature = "net-sync")]
+use crate::engine::engine::resolve_doc_static;
 
 // --- Data Structures ---
 
@@ -278,22 +278,39 @@ impl NetSyncer {
                             let mut logical_ops = Vec::with_capacity(ops.len());
                             for op in ops {
                                 match op {
+                                    // CASE 1: Standard Segment Put
                                     WalOp::Put { key, segment_id, segment_offset, len } => {
                                         let ptr = Pointer::Segment { segment_id, offset: segment_offset, len };
-                                        if let Ok(Some(data)) = shard.read_pointer_uncached(&ptr) {
-                                            logical_ops.push(WalOp::PutInlined { key, value: data });
+                                        if let Ok(Some(bytes)) = shard.read_pointer_uncached(&ptr) {
+                                            if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
+                                                let _ = resolve_doc_static(&mut doc, &shard_arc, db_tail.config.encryption_key.as_deref());
+                                                logical_ops.push(WalOp::PutInlined { key, value: doc.encode() });
+                                            }
                                         }
                                     }
+                                    // CASE 2: Standalone Blob Put
                                     WalOp::PutBlob { key, offset, len } => {
                                         let ptr = Pointer::Blob { offset, len };
-                                        if let Ok(Some(data)) = shard.read_pointer_uncached(&ptr) {
-                                            logical_ops.push(WalOp::PutInlined { key, value: data });
+                                        if let Ok(Some(bytes)) = shard.read_pointer_uncached(&ptr) {
+                                            if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
+                                                let _ = resolve_doc_static(&mut doc, &shard_arc, db_tail.config.encryption_key.as_deref());
+                                                logical_ops.push(WalOp::PutInlined { key, value: doc.encode() });
+                                            }
                                         }
                                     }
-                                    _ => logical_ops.push(op),
+                                    // CASE 3: Already inlined or a Delete (Pass through as-is)
+                                    WalOp::Delete { .. } | WalOp::PutInlined { .. } => {
+                                        logical_ops.push(op);
+                                    }
+                                    // Ignore internal transaction markers
+                                    _ => {}
                                 }
                             }
-                            broadcast_batch_replication(&peers_tail, &self_id_tail, col.clone(), logical_ops);
+                            
+                            if !logical_ops.is_empty() {
+                                broadcast_batch_replication(&peers_tail, &self_id_tail, col.clone(), logical_ops);
+                            }
+                            
                             offsets.insert(col, new_pos);
                             changed = true;
                         }
@@ -435,9 +452,15 @@ async fn handle_bootstrap_request(db: &Arc<FireLite>, peers: &Arc<AsyncMutex<Has
             let ops = match pointer {
                 Pointer::Deleted { timestamp } => vec![WalOp::Delete { key: key.clone(), timestamp }],
                 _ => {
-                    if let Ok(Some(value)) = shard_arc.read().unwrap().read_pointer_internal(&pointer, false) {
-                        vec![WalOp::PutInlined { key: key.clone(), value }]
+                    // FIX START: Resolve blobs before sending bootstrap data
+                    if let Ok(Some(bytes)) = shard_arc.read().unwrap().read_pointer_internal(&pointer, false) {
+                        if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
+                            // If this doc has blob links, pull the data from disk into the doc object
+                            let _ = resolve_doc_static(&mut doc, &shard_arc, db.config.encryption_key.as_deref());
+                            vec![WalOp::PutInlined { key: key.clone(), value: doc.encode() }]
+                        } else { continue; }
                     } else { continue; }
+                    // FIX END
                 }
             };
 
@@ -450,26 +473,35 @@ async fn handle_bootstrap_request(db: &Arc<FireLite>, peers: &Arc<AsyncMutex<Has
     }
 }
 
+#[cfg(feature = "net-sync")]
 async fn apply_replication_batch(db: &Arc<FireLite>, collection: String, ops: Vec<WalOp>) {
     let shard_arc = db.get_shard(&collection);
+    
+    let mut filtered_ops = Vec::new();
+    let mut index_puts = Vec::new();
+    let threshold = db.config.value_blob_threshold_bytes;
+
+    // AQUIRE WRITE LOCK ONCE for the whole batch to ensure atomic offset management
     let mut shard = shard_arc.write().unwrap();
 
-    let mut filtered_ops = Vec::new();
-
     for op in ops {
-        // 1. Extract Metadata (Key and Timestamp) for LWW check
-        let (key, remote_ts) = match &op {
+        let (key, mut doc, is_delete, delete_ts) = match op {
             WalOp::PutInlined { key, value } => {
-                if let Some(doc) = FireLiteDoc::decode(value) {
-                    (key, doc.get_logical_time())
+                if let Some(d) = FireLiteDoc::decode(&value) {
+                    (key, d, false, 0)
                 } else { continue; }
             }
-            WalOp::Delete { key, timestamp } => (key, *timestamp),
+            WalOp::Delete { key, timestamp } => {
+                // Dummy doc for type consistency in the loop
+                (key, FireLiteDoc::default(), true, timestamp)
+            }
             _ => continue,
         };
 
-        // 2. Conflict Resolution (Document OR Tombstone)
-        if let Some(local_ptr) = shard.index.get(key) {
+        // 1. Conflict Resolution (LWW) - Applies to BOTH Puts and Deletes
+        let remote_ts = if is_delete { delete_ts } else { doc.get_logical_time() };
+        
+        if let Some(local_ptr) = shard.index.get(&key) {
             let local_ts = match local_ptr {
                 Pointer::Deleted { timestamp } => *timestamp,
                 _ => {
@@ -481,27 +513,33 @@ async fn apply_replication_batch(db: &Arc<FireLite>, collection: String, ops: Ve
                 }
             };
 
-            // Skip if local is strictly newer or equal
             if remote_ts <= local_ts {
-                continue;
+                continue; // Ignore old updates
             }
         }
 
-        // 3. If we passed the check, keep the operation
-        filtered_ops.push(op);
+        // 2. Handle Logic
+        if is_delete {
+            filtered_ops.push(WalOp::Delete { key, timestamp: delete_ts });
+        } else {
+            // 3. Local Re-blobbing (Safely inside Write Lock)
+            if let Some(file) = &shard.blob_file {
+                let mut current_offset = shard.blob_size.load(std::sync::atomic::Ordering::Acquire);
+                db.process_doc_blobs(&mut doc, file, &mut current_offset, threshold, remote_ts);
+                shard.blob_size.store(current_offset, std::sync::atomic::Ordering::Release);
+            }
+
+            let skeleton_bytes = doc.encode();
+            filtered_ops.push(WalOp::PutInlined { key: key.clone(), value: skeleton_bytes });
+
+            if let Some((_, doc_id)) = key.split_once(':') {
+                index_puts.push((doc_id.to_string(), doc));
+            }
+        }
     }
 
-    // 4. Commit accepted operations to local storage
     if !filtered_ops.is_empty() {
         if shard.apply_replicated_ops(&filtered_ops).is_ok() {
-            let index_puts: Vec<_> = filtered_ops.into_iter().filter_map(|o| {
-                if let WalOp::PutInlined { key, value } = o {
-                    let id = key.split(':').last()?.to_string();
-                    let doc = FireLiteDoc::decode(&value)?;
-                    Some((id, doc))
-                } else { None }
-            }).collect();
-
             if !index_puts.is_empty() {
                 db.inject_replication_to_indexer(collection, Arc::new(index_puts));
             }

@@ -199,7 +199,7 @@ enum IndexOp {
 
 pub struct FireLite {
     root_path: PathBuf,
-    config: FireLiteConfig,
+    pub(crate) config: FireLiteConfig,
     pub(crate) shards: Arc<RwLock<HashMap<String, Arc<RwLock<StorageEngine>>>>>, // The only storage
 
     index_storage: Arc<Mutex<IndexStorage>>,
@@ -791,7 +791,7 @@ impl FireLite {
         Ok(())
     }
 
-    fn process_doc_blobs(
+    pub fn process_doc_blobs(
         &self, 
         doc: &mut FireLiteDoc, 
         file: &std::fs::File,
@@ -1863,7 +1863,7 @@ impl Drop for FireLite {
 // --- Internal Helper Functions ---
 
 /// Helper used by background threads to resolve blobs when they don't have access to the full Engine.
-fn resolve_doc_static(doc: &mut FireLiteDoc, shard_arc: &Arc<RwLock<StorageEngine>>, enc_secret: Option<&str>) -> Result<()> {
+pub(crate) fn resolve_doc_static(doc: &mut FireLiteDoc, shard_arc: &Arc<RwLock<StorageEngine>>, enc_secret: Option<&str>) -> Result<()> {
     // ... check has_links ...
     let shard = shard_arc.read().unwrap();
     

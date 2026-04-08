@@ -68,6 +68,7 @@ pub struct StorageEngine {
     pub(crate) encryption: Option<EncryptionContext>,
     inlined_bytes: usize,
     max_inlined_bytes: usize,
+    blob_threshold: usize,
     use_compression: bool, 
     pub(crate) collection_counts: HashMap<String, usize>,
     pub cache: Arc<Mutex<PageCache>>,
@@ -115,7 +116,8 @@ impl StorageEngine {
         let blob_file_raw = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
-            .append(true)
+            // .append(true)
+            .write(true)
             .open(base_path.join("blobs.dat"))?;
 
         // let blob_file = Arc::new(Mutex::new(blob_file_raw));
@@ -172,6 +174,7 @@ impl StorageEngine {
             encryption,
             use_compression: cfg.use_compression,
             inlined_bytes: 0, 
+            blob_threshold: cfg.value_blob_threshold_bytes,
             max_inlined_bytes: cfg.max_inlined_memory_bytes,
             collection_counts: HashMap::new(),
             cache, 
@@ -347,6 +350,7 @@ impl StorageEngine {
         let mut puts_to_segment = Vec::new();
         let mut segment_mutation_indices = Vec::new();
         let mut blob_work_todo = Vec::new();
+        // let threshold = 
 
         // --- THE HOT LOOP: No Networking, No Cloning ---
         for (i, mutation) in mutations.iter().enumerate() {
@@ -354,10 +358,11 @@ impl StorageEngine {
                 StorageMutation::Put { key, value } => {
                     let len = value.len();
                     
+                    
                     if len < 4096 { // Path 1: Tiny (Inline)
                         wal_ops.push(WalOp::PutInlined { key: key.clone(), value: value.clone() });
                         index_updates.push((key.clone(), Some(Pointer::Inlined(value.clone()))));
-                    } else if len > 32768 { // Path 2: Large (Side-load to Blob File)
+                    } else if len > self.blob_threshold { // Path 2: Large (Side-load to Blob File)
                         let arc_data = Arc::new(value.clone());
                         index_updates.push((key.clone(), Some(Pointer::BlobPending(arc_data.clone()))));
                         
