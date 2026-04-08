@@ -15,11 +15,10 @@ use firelite::net_sync::NetSyncer;
 use serde_json::{json, Map, Value as JsonValue};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
-use std::collections::{HashMap, HashSet};
 
 #[derive(Parser, Debug)]
 #[command(name = "firelite")]
-#[command(version, about = "FireLite v0.5.9 command-line database manager")]
+#[command(version, about = "FireLite v0.6.17 command-line database manager")]
 struct Cli {
     /// Database path (default: ./firelite.db)
     #[arg(long, global = true, default_value = "./firelite.db")]
@@ -158,11 +157,6 @@ enum Commands {
     },
     /// Network Peer Management (Only in Serve mode)
     Peers,
-    /// Authorize a peer: <hwid> <allowed|blocked>
-    Allow { hwid: String, status: String },
-    /// Claim leadership for this node using the PIN
-    Claim { pin: String },
-    //// net_sync implementation
     /// Exit the shell
     Exit,
     /// Exit the shell
@@ -175,11 +169,8 @@ enum Commands {
         #[arg(long)]
         node_id: String,
 
-        #[arg(long)]
-        leader_id: Option<String>,
-
-        #[arg(long, default_value_t = false)]
-        authority: bool,
+        #[arg(long, default_value = "default_key")]
+        key: String,
     }
 }
 
@@ -209,12 +200,11 @@ enum AggregateKindArg {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     
-    if let Commands::Serve { port, node_id, leader_id, authority } = cli.command {
-        return run_server(cli.db, cli.durability, port, node_id, leader_id, authority);
+    if let Commands::Serve { port, node_id, key } = cli.command {
+        return run_server(cli.db, cli.durability, port, node_id, key);
     }
 
     let db = open_db(&cli.db, cli.durability)?;
-    // Pass None for live_peers as there is no active sync engine in one-off mode
     execute_command(&db, cli.command, &cli.db, cli.durability, None)
 }
 
@@ -749,12 +739,17 @@ fn fire_to_json(v: &Value) -> JsonValue {
 }
 
 fn doc_to_json(id: &str, doc: &FireLiteDoc) -> JsonValue {
-    let mut map = Map::new();
-    map.insert("_id".to_string(), json!(id));
-    for (k, v) in &doc.fields {
-        map.insert(k.to_string(), fire_to_json(v));
+    // let mut map = Map::new();
+    // map.insert("_id".to_string(), json!(id));
+    // for (k, v) in &doc.fields {
+    //     map.insert(k.to_string(), fire_to_json(v));
+    // }
+    // JsonValue::Object(map)
+    let mut json = doc.to_json();
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert("_id".to_string(), serde_json::json!(id));
     }
-    JsonValue::Object(map)
+    json
 }
 
 fn projected_to_json(id: &str, fields: Vec<(String, Value)>) -> JsonValue {
@@ -816,61 +811,14 @@ fn execute_command(
         Commands::Rest { method, path, data, filters } => run_rest(db, &method, &path, data.as_deref(), &filters)?,
         // For Serve, we handle it separately to avoid infinite recursion
         Commands::Peers => {
-            let query = Query::new("__firelite_security")
-                .where_filter("_id", Operator::StartsWith, Value::String("peers:".to_string()));
-            let rows = db.query(query)?;
-            
-            let mut db_map = HashMap::new();
-            for (id, doc) in rows {
-                db_map.insert(id.replace("peers:", ""), doc);
+            let status = net.ok_or_else(|| anyhow!("Networking not active. Use 'serve'."))?.status();
+            println!("\n{:<20} | {:<10}", "PEER ID", "NETWORK");
+            println!("{}", "-".repeat(35));
+            for id in status.known_peers {
+                println!("{:<20} | ONLINE", id);
             }
-
-            // --- FIX: Fetch FRESH live peers right now ---
-            let live_ids = if let Some(n) = net {
-                n.status().known_peers
-            } else {
-                Vec::new()
-            };
-
-            println!("\n{:<15} | {:<12} | {:<10}", "DEVICE ID", "SYNC STATUS", "NETWORK");
-            println!("{}", "-".repeat(45));
-
-            let mut displayed_ids: HashSet<String> = HashSet::new();
-
-            // Use the fresh live_ids we just fetched
-            for id in live_ids {
-                displayed_ids.insert(id.clone());
-                let db_doc = db_map.get(&id);
-                let status = match db_doc.and_then(|d| d.get("status")) {
-                    Some(Value::String(s)) => s.as_str(),
-                    _ => "unauthorized", 
-                };
-                println!("{:<15} | {:<12} | ONLINE", id, status);
-            }
-
-            for (id, doc) in db_map {
-                if !displayed_ids.contains(&id) {
-                    let status = match doc.get("status") {
-                        Some(Value::String(s)) => s.as_str(),
-                        _ => "pending",
-                    };
-                    println!("{:<15} | {:<12} | offline", id, status);
-                }
-            }
+            if status.peer_count == 0 { println!("(No peers discovered yet)"); }
             println!();
-        }
-        
-        Commands::Allow { hwid, status } => {
-            let key = format!("peers:{}", hwid);
-            let mut doc = FireLiteDoc::default();
-            doc.insert("status", Value::String(status.clone()));
-            doc.insert("updated_at", Value::ServerTimestamp);
-            db.put("__firelite_security", &key, &doc)?;
-            println!("OK: Status for {} set to {}", hwid, status);
-        }
-        Commands::Claim { pin: _ } => {
-            // This implementation should ideally match the Tauri claim_leadership logic
-            println!("Claim logic triggered with PIN. Metadata replicated to network.");
         }
         Commands::Exit | Commands::Quit => {
             // Handled by the loop break
@@ -886,37 +834,37 @@ fn run_server(
     durability: DurabilityArg,
     port: u16,
     node_id: String,
-    _leader_id: Option<String>,
-    authority: bool,
+    key: String,
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
     rt.block_on(async move {
         let db = Arc::new(open_db(&db_path, durability)?);
         
+        // NEW: Init Mesh Syncer
         let net = NetSyncer::new(
             db.clone(),
             &node_id,
-            vec!["app_state".to_string()], 
-            authority,
+            &key,
+            vec!["app_state".to_string()],
         );
 
         net.start(port).await.map_err(|e| anyhow!(e.to_string()))?;
 
-        println!("🔥 FireLite P2P Shell Started");
-        println!("🌐 Node: {} | Role: {}", node_id, if authority { "Authority" } else { "Follower" });
+        println!("🔥 FireLite v0.7.0 Mesh Shell Active");
+        println!("🌐 Node: {} | Room: {}", node_id, key);
+        println!("🚀 Auto-Discovery Enabled (mDNS)");
         
         let mut rl = DefaultEditor::new().map_err(|e| anyhow!("Readline error: {}", e))?;
         
         loop {
-            let status = net.status(); // This is only for the prompt string
+            let status = net.status(); 
             let prompt = format!("firelite({}:{}) > ", node_id, status.peer_count);
             
             match rl.readline(&prompt) {
                 Ok(line) => {
                     let line = line.trim();
                     if line.is_empty() { continue; }
-                    // Handle exit/quit via manual string check
                     if line == "exit" || line == "quit" { break; } 
                     
                     let _ = rl.add_history_entry(line);
@@ -925,34 +873,19 @@ fn run_server(
 
                     match Cli::try_parse_from(args) {
                         Ok(repl_cli) => {
-                            if let Err(e) = execute_command(
-                                &db, 
-                                repl_cli.command, 
-                                &db_path, 
-                                durability, 
-                                Some(&net) // Pass reference to the engine
-                            ) {
+                            if let Err(e) = execute_command(&db, repl_cli.command, &db_path, durability, Some(&net)) {
                                 println!("❌ Error: {}", e);
                             }
                         }
                         Err(e) => println!("{}", e),
                     }
                 }
-                // Handle Ctrl+C (Interrupted) and Ctrl+D (Eof)
-                Err(ReadlineError::Interrupted) => {
-                    println!("Interrupted");
-                    break;
-                }
-                Err(ReadlineError::Eof) => {
-                    println!("Exit");
-                    break;
-                }
-                Err(err) => { 
-                    println!("Readline Error: {:?}", err); 
-                    break; 
-                }
+                Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
+                Err(err) => { println!("Readline Error: {:?}", err); break; }
             }
         }
+        net.stop();
+        println!("Sync engine stopped.");
         Ok(())
     })
 }

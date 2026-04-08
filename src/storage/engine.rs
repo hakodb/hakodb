@@ -7,12 +7,14 @@ use crate::error::{FireLiteError, Result};
 use std::sync::{Arc, Mutex}; 
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::SyncSender;
+use std::time::{SystemTime, UNIX_EPOCH};
 use crate::memory::page_cache::PageCache; 
 
 use super::compaction::compact_segment;
 use super::crypto::EncryptionContext;
 use super::segment::Segment;
 use super::wal::{Wal, WalOp};
+
 
 #[derive(Debug, Clone)] 
 pub enum Pointer {
@@ -27,6 +29,7 @@ pub enum Pointer {
         len: u32,
     },
     BlobPending(Arc<Vec<u8>>),
+    Deleted { timestamp: i64 },
 }
 
 #[derive(Debug, Clone)]
@@ -59,7 +62,7 @@ pub struct StorageEngine {
     segments: HashMap<u64, SegmentMeta>,
     active_segment_id: u64,
     next_segment_id: u64,
-    wal: Wal,
+    pub(crate) wal: Wal,
     next_tx_id: u64,
     compaction_threshold_bytes: usize,
     pub(crate) encryption: Option<EncryptionContext>,
@@ -195,8 +198,8 @@ impl StorageEngine {
                     };
                     self.update_index_entry(key, Some(pointer));
                 }
-                WalOp::Delete { key } => {
-                    self.update_index_entry(key, None);
+                WalOp::Delete { key, timestamp  } => {
+                    self.update_index_entry(key, Some(Pointer::Deleted { timestamp }));
                 }
                 WalOp::BeginTx { .. } | WalOp::CommitTx { .. } => {}
                 WalOp::PutInlined { key, value } => {
@@ -212,31 +215,47 @@ impl StorageEngine {
     }
 
     fn update_index_entry(&mut self, key: String, new_pointer: Option<Pointer>) {
+        let collection = &self.logical_name;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
 
-        // let collection_name = key.split_once(':').map(|(c, _)| c.to_string());
-        let collection:&str = &self.logical_name.clone();
-
-        // 1. If there was an old entry, subtract its size if it was inlined
+        // --- STEP 1: CLEANUP OLD ENTRY ---
         if let Some(old_p) = self.index.remove(&key) {
-            if let Pointer::Inlined(data) = old_p {
-                self.inlined_bytes = self.inlined_bytes.saturating_sub(data.len());
+            match &old_p {
+                Pointer::Inlined(data) => { self.inlined_bytes = self.inlined_bytes.saturating_sub(data.len()); }
+                _ => {}
             }
 
-            // DECREMENT count for this collection
-            if let Some(count) = self.collection_counts.get_mut(collection) {
-                *count = count.saturating_sub(1);
+            let is_tomb = matches!(old_p, Pointer::Deleted { .. });
+            
+            // If it was a real document, we MUST decrement now, 
+            // because it's either being replaced or deleted.
+            if !is_tomb {
+                if let Some(count) = self.collection_counts.get_mut(collection) {
+                    *count = count.saturating_sub(1);
+                }
             }
-        }
+            is_tomb
+        } else {
+            false // Brand new key
+        };
 
-        // 2. If we are adding a new entry, add its size if it is inlined
-        if let Some(p) = new_pointer {
-            if let Pointer::Inlined(ref data) = p {
-                self.inlined_bytes += data.len();
+        // --- STEP 2: APPLY NEW ENTRY ---
+        match new_pointer {
+            Some(p) => {
+                if let Pointer::Inlined(ref data) = p { self.inlined_bytes += data.len(); }
+
+                // Only increment if we are putting a REAL document 
+                // AND we aren't just replacing one tombstone with another.
+                if !matches!(p, Pointer::Deleted { .. }) {
+                    *self.collection_counts.entry(collection.to_string()).or_insert(0) += 1;
+                }
+                self.index.insert(key, p);
             }
-
-            // INCREMENT count for this collection
-            *self.collection_counts.entry(collection.to_string()).or_insert(0) += 1;
-            self.index.insert(key, p);
+            None => {
+                // LOCAL DELETE PATH
+                // We already decremented the count in Step 1 if it was a real doc.
+                self.index.insert(key, Pointer::Deleted { timestamp: now });
+            }
         }
     }
 
@@ -307,83 +326,68 @@ impl StorageEngine {
         Ok(cols)
     }
 
-    pub fn apply_batch(&mut self, mutations: &[StorageMutation]) -> Result<(Vec<BlobWork>, Vec<crate::storage::wal::WalOp>)> {
-        if mutations.is_empty() {
-            return Ok((Vec::new(),Vec::new()));
-        }
+    pub fn apply_batch(
+        &mut self, 
+        mutations: &[StorageMutation], 
+        is_remote: bool // Added to distinguish Local vs Sync
+    ) -> Result<(Vec<BlobWork>, Vec<crate::storage::wal::WalOp>)> {
+        let now = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
+        if mutations.is_empty() { return Ok((Vec::new(), Vec::new())); }
 
         let tx_id = self.next_tx_id;
         self.next_tx_id += 1;
 
-        // rotate BEFORE writing
+        // Ensure we have space in the active segment
         self.maybe_rotate_active_segment()?;
 
-        // --- REMOVED THE REDUNDANT puts_to_write and append_batch BLOCK HERE ---
-
-        let mut wal_ops = Vec::with_capacity(mutations.len() * 2 + 2);
+        let mut wal_ops = Vec::with_capacity(mutations.len() + 2);
         wal_ops.push(WalOp::BeginTx { tx_id });
 
-        let mut index_updates = Vec::with_capacity(mutations.len());
+        let mut index_updates = Vec::new();
         let mut puts_to_segment = Vec::new();
         let mut segment_mutation_indices = Vec::new();
-
         let mut blob_work_todo = Vec::new();
 
-        // --- STEP 1: Decide Strategy (Inline or Segment) ---
+        // --- THE HOT LOOP: No Networking, No Cloning ---
         for (i, mutation) in mutations.iter().enumerate() {
             match mutation {
                 StorageMutation::Put { key, value } => {
-                    if value.len() < 4096 { // 4KB Threshold
-                        // Strategy: Inline (Only goes to WAL and RAM Index)
-                        wal_ops.push(WalOp::PutInlined {
-                            key: key.clone(),
-                            value: value.clone(),
-                        });
+                    let len = value.len();
+                    
+                    if len < 4096 { // Path 1: Tiny (Inline)
+                        wal_ops.push(WalOp::PutInlined { key: key.clone(), value: value.clone() });
                         index_updates.push((key.clone(), Some(Pointer::Inlined(value.clone()))));
-                    } else if value.len() > 32768 {
-                        // Path 2: Large (v0.8.0 Async Side-load)
+                    } else if len > 32768 { // Path 2: Large (Side-load to Blob File)
                         let arc_data = Arc::new(value.clone());
-                        
-                        // Mark in index as Pending (UI gets RAM speed)
                         index_updates.push((key.clone(), Some(Pointer::BlobPending(arc_data.clone()))));
-
-                        // Hand off to the background thread
+                        
+                        // Keep the local Blob Worker active!
                         blob_work_todo.push(BlobWork::Put {
-                            collection: self.logical_name.clone(), // get collection name
+                            collection: self.logical_name.clone(),
                             key: key.clone(),
                             data: arc_data,
                         });
-                    } else {
-                        // Strategy: Segment (Collect for bulk write later)
+                    } else { // Path 3: Medium (Standard Segment)
                         puts_to_segment.push(value.as_slice());
                         segment_mutation_indices.push(i);
                     }
                 }
                 StorageMutation::Delete { key } => {
-                    wal_ops.push(WalOp::Delete { key: key.clone() });
-                    index_updates.push((key.clone(), None));
+                    wal_ops.push(WalOp::Delete { key: key.clone(), timestamp: now });
+                    index_updates.push((key.clone(), Some(Pointer::Deleted { timestamp: now })));
                 }
             }
         }
 
-        // --- STEP 2: Write Large Puts to Segment ---
+        // Write medium values to the active segment
         if !puts_to_segment.is_empty() {
             let active_id = self.active_segment_id;
-            // We get mutable access to the segment only when we actually have data to write
-            let active = self.segments.get_mut(&active_id)
-                .ok_or_else(|| FireLiteError::Corrupt("active segment missing".into()))?;
-            
+            let active = self.segments.get_mut(&active_id).unwrap();
             let offsets = active.segment.append_batch(&puts_to_segment)?;
 
-            for (offset_data, mutation_idx) in offsets.into_iter().zip(segment_mutation_indices) {
-                if let StorageMutation::Put { key, .. } = &mutations[mutation_idx] {
-                    let (offset, len) = offset_data;
-                    wal_ops.push(WalOp::Put {
-                        key: key.clone(),
-                        segment_id: active_id,
-                        segment_offset: offset,
-                        len,
-                    });
+            for ((offset, len), mut_idx) in offsets.into_iter().zip(segment_mutation_indices) {
+                if let StorageMutation::Put { key, .. } = &mutations[mut_idx] {
+                    wal_ops.push(WalOp::Put { key: key.clone(), segment_id: active_id, segment_offset: offset, len });
                     index_updates.push((key.clone(), Some(Pointer::Segment { segment_id: active_id, offset, len })));
                 }
             }
@@ -391,26 +395,17 @@ impl StorageEngine {
 
         wal_ops.push(WalOp::CommitTx { tx_id });
 
-        // --- STEP 3: Coordinated Sync ---
-        // Only flush the segment if we actually wrote something to it in Step 2
-        if !puts_to_segment.is_empty() && 
-        (self.wal.durability_mode() == DurabilityMode::Always || 
-            self.wal.durability_mode() == DurabilityMode::OnCommit) {
-            
-            if let Some(active) = self.segments.get_mut(&self.active_segment_id) {
-                active.segment.flush()?; 
-            }
-        }
+        // --- THE DURABILITY STEP ---
+        // Write to WAL with the 'is_remote' priority flag.
+        self.wal.append_batch(&wal_ops, is_remote)?;
 
-        // Write everything to WAL (Standard puts and Inlined puts)
-        self.wal.append_batch(&wal_ops)?;
-
-        // Update the index using our new tracking helper
+        // Update RAM Index
         for (key, pointer) in index_updates {
             self.update_index_entry(key, pointer);
         }
 
-        // RETURN the work
+        // RETURN: The blob work goes to the background thread. 
+        // The replication work is handled by the Standalone Agent tailing the WAL.
         Ok((blob_work_todo, wal_ops))
     }
 
@@ -566,9 +561,12 @@ impl StorageEngine {
                     // If we crash while pending, treat it as inlined in WAL for safety
                     ops.push(WalOp::PutInlined { key: key.clone(), value: (**data).clone() });
                 }
+                Pointer::Deleted { timestamp } => {
+                    ops.push(WalOp::Delete { key: key.clone(), timestamp: *timestamp });
+                }
             }
         }
-        self.wal.append_batch(&ops)?;
+        self.wal.append_batch(&ops, false)?;
         Ok(())
     }
 
@@ -580,16 +578,6 @@ impl StorageEngine {
             Pointer::Blob { offset, len } => {
                 let mut buf = vec![0u8; *len as usize];
                 
-                // PERFORMANCE FIX: We get the file handle but we DO NOT lock the Mutex.
-                // Positional I/O (read_at) is thread-safe by nature.
-                // let file_mutex = self.blob_file.as_ref()
-                //     .ok_or_else(|| FireLiteError::StorageError("Blob file missing".into()))?;
-                
-                // We lock briefly only to clone the Arc or handle, or if your File is inside Mutex,
-                // we use the 'lock' only to get a reference, then read. 
-                // Better yet: we use the underlying file directly if possible.
-                // let file = file_mutex.lock().map_err(|_| FireLiteError::LockPoisoned("..".into()))?;
-
                 let file = self.blob_file.as_ref()
                     .ok_or_else(|| FireLiteError::StorageError("Blob file missing".into()))?;
 
@@ -611,7 +599,8 @@ impl StorageEngine {
             Pointer::Segment { segment_id, offset, len } => {
                 let Some(meta) = self.segments.get(segment_id) else { return Ok(None); };
                 Ok(Some(meta.segment.read_at(*offset, *len, use_cache)?))
-            }
+            },
+            Pointer::Deleted { .. } => Ok(None),
         }
     }
 
@@ -644,7 +633,7 @@ impl StorageEngine {
 
         // self.apply_batch(&[mutation])
         // let work = self.apply_batch(&[mutation])?;
-        let (work, _committed_ops) = self.apply_batch(&[mutation])?;
+        let (work, _committed_ops) = self.apply_batch(&[mutation], false)?;
 
         // 2. Since this is a synchronous put, we send the work here
         for w in work {
@@ -667,14 +656,19 @@ impl StorageEngine {
     //     }
     // }
     pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        // 1. Look up the pointer in the index
-        let Some(pointer) = self.index.get(key) else { 
-            return Ok(None); 
-        };
+        // // 1. Look up the pointer in the index
+        // let Some(pointer) = self.index.get(key) else { 
+        //     return Ok(None); 
+        // };
         
-        // 2. Use the centralized internal reader which handles 
-        // Inlined, BlobPending, Blob, and Segment exhaustive matching.
-        self.read_pointer_internal(pointer, true)
+        // // 2. Use the centralized internal reader which handles 
+        // // Inlined, BlobPending, Blob, and Segment exhaustive matching.
+        // self.read_pointer_internal(pointer, true)
+        match self.index.get(key) {
+            Some(Pointer::Deleted { .. }) => Ok(None), // Treat as non-existent
+            Some(pointer) => self.read_pointer_internal(pointer, true),
+            None => Ok(None),
+        }
     }
 
     pub fn delete(&mut self, key: &str) -> Result<()> {
@@ -687,7 +681,7 @@ impl StorageEngine {
 
         // 1. Capture the work
         // let work = self.apply_batch(&[mutation])?;
-        let (work, _committed_ops) = self.apply_batch(&[mutation])?;
+        let (work, _committed_ops) = self.apply_batch(&[mutation], false)?;
 
         // 2. Send to background worker
         for w in work {
@@ -872,7 +866,7 @@ impl StorageEngine {
     }
 
     pub fn apply_replicated_ops(&mut self, ops: &[crate::storage::wal::WalOp]) -> Result<()> {
-        self.wal.append_batch(ops)?;
+        self.wal.append_batch(ops, true)?;
         for op in ops {
             match op {
                 crate::storage::wal::WalOp::Put { key, segment_id, segment_offset, len } => {
@@ -881,10 +875,13 @@ impl StorageEngine {
                     });
                 }
                 crate::storage::wal::WalOp::PutInlined { key, value } => {
-                    self.index.insert(key.clone(), Pointer::Inlined(value.clone()));
+                    self.update_index_entry(key.clone(), Some(Pointer::Inlined(value.clone())));
+                    // self.index.insert(key.clone(), Pointer::Inlined(value.clone()));
                 }
-                crate::storage::wal::WalOp::Delete { key } => {
-                    self.index.remove(key);
+                crate::storage::wal::WalOp::Delete { key, timestamp } => {
+                    // self.index.remove(key);
+                    // self.update_index_entry(key.clone(), None);
+                    self.update_index_entry(key.clone(), Some(Pointer::Deleted { timestamp: *timestamp }));
                 }
                 crate::storage::wal::WalOp::PutBlob { key, offset, len } => {
                     self.index.insert(key.clone(), Pointer::Blob { offset: *offset, len: *len });
@@ -893,6 +890,28 @@ impl StorageEngine {
             }
         }
         Ok(())
+    }
+
+    pub fn get_wal_checkpoint(&self) -> u64 {
+        self.wal.file.metadata()
+            .map(|m: std::fs::Metadata| m.len())
+            .unwrap_or(0)
+    }
+
+    pub fn purge_old_tombstones(&mut self, max_age: std::time::Duration) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap().as_micros() as i64;
+        let max_age_micros = max_age.as_micros() as i64;
+
+        self.index.retain(|_, pointer| {
+            if let Pointer::Deleted { timestamp } = pointer {
+                // Keep if it's younger than the max age
+                (now - *timestamp) < max_age_micros
+            } else {
+                true // Keep all real documents
+            }
+        });
     }
 
 }

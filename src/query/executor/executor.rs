@@ -552,7 +552,8 @@ impl ParallelQueryExecutor {
         match scan {
             ScanType::FullCollection => {
                 Ok(storage.index.iter()
-                    .filter(|(k, _)| k.starts_with(collection))
+                    // FIX: Added check to skip Pointer::Deleted
+                    .filter(|(k, p)| k.starts_with(collection) && !matches!(p, Pointer::Deleted { .. }))
                     .take(max_ids)
                     .map(|(k, p)| (k.clone(), p.clone()))
                     .collect())
@@ -562,10 +563,14 @@ impl ParallelQueryExecutor {
                 let mut out = Vec::new();
                 if let Some(sec_map) = indexes.secondary.get(collection) {
                     if let Some(index) = sec_map.get(field) {
-                        for doc_id in index.range_scan(value, value).iter().take(max_ids) {
+                        for doc_id in index.range_scan(value, value).iter() {
                             let key = Self::make_key(collection, doc_id);
                             if let Some(ptr) = storage.index.get(&key) {
-                                out.push((key, ptr.clone()));
+                                // FIX: Ensure we don't return a deleted pointer found in secondary index
+                                if !matches!(ptr, Pointer::Deleted { .. }) {
+                                    out.push((key, ptr.clone()));
+                                    if out.len() >= max_ids { break; }
+                                }
                             }
                         }
                     }
@@ -585,7 +590,11 @@ impl ParallelQueryExecutor {
                     for doc_id in iter.take(max_ids) {
                         let key = Self::make_key(collection, &doc_id);
                         if let Some(ptr) = storage.index.get(&key) {
-                            out.push((key, ptr.clone()));
+                            // out.push((key, ptr.clone()));
+                            if !matches!(ptr, Pointer::Deleted { .. }) {
+                                out.push((key, ptr.clone()));
+                                if out.len() >= max_ids { break; }
+                            }
                         }
                     }
                 }
@@ -602,7 +611,11 @@ impl ParallelQueryExecutor {
                         for (_, doc_id) in idx.tree.range((start.clone(), end.clone())).take(remaining) {
                             let key = Self::make_key(collection, &doc_id);
                             if let Some(ptr) = storage.index.get(&key) {
-                                out.push((key, ptr.clone()));
+                                // out.push((key, ptr.clone()));
+                                if !matches!(ptr, Pointer::Deleted { .. }) {
+                                    out.push((key, ptr.clone()));
+                                    if out.len() >= max_ids { break; }
+                                }
                             }
                         }
                     }
@@ -630,7 +643,11 @@ impl ParallelQueryExecutor {
                         for doc_id in doc_ids.into_iter().take(remaining) {
                             let key = format!("{}:{}", collection, doc_id);
                             if let Some(ptr) = storage.index.get(&key) {
-                                out.push((key, ptr.clone()));
+                                // out.push((key, ptr.clone()));
+                                if !matches!(ptr, Pointer::Deleted { .. }) {
+                                    out.push((key, ptr.clone()));
+                                    if out.len() >= max_ids { break; }
+                                }
                             }
                         }
                     }
@@ -653,7 +670,11 @@ impl ParallelQueryExecutor {
                     for doc_id in doc_ids.into_iter().take(remaining) {
                         let key = Self::make_key(collection, &doc_id);
                         if let Some(ptr) = storage.index.get(&key) {
-                            out.push((key, ptr.clone()));
+                            // out.push((key, ptr.clone()));
+                            if !matches!(ptr, Pointer::Deleted { .. }) {
+                                out.push((key, ptr.clone()));
+                                if out.len() >= max_ids { break; }
+                            }
                         }
                     }
                 }
@@ -668,7 +689,11 @@ impl ParallelQueryExecutor {
                             for doc_id in doc_ids.iter().take(max_ids) {
                                 let key = Self::make_key(collection, doc_id);
                                 if let Some(ptr) = storage.index.get(&key) {
-                                    out.push((key, ptr.clone()));
+                                    // out.push((key, ptr.clone()));
+                                    if !matches!(ptr, Pointer::Deleted { .. }) {
+                                        out.push((key, ptr.clone()));
+                                        if out.len() >= max_ids { break; }
+                                    }
                                 }
                             }
                         }
