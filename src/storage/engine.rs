@@ -69,16 +69,16 @@ pub struct StorageEngine {
     inlined_bytes: usize,
     max_inlined_bytes: usize,
     blob_threshold: usize,
-    use_compression: bool, 
+    pub(crate) use_compression: bool, 
     pub(crate) collection_counts: HashMap<String, usize>,
     pub cache: Arc<Mutex<PageCache>>,
     pub mmap_size: usize, 
     pub index: HashMap<String, Pointer>,
-    // pub(crate) blob_file: Option<Arc<std::sync::Mutex<std::fs::File>>>,
     pub(crate) blob_file: Option<Arc<std::fs::File>>,
     pub(crate) blob_tx: Option<SyncSender<BlobWork>>,
     pub(crate) blob_size: AtomicU64,
     pub logical_name: String,
+    pub(crate) in_flight_blob_bytes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl StorageEngine {
@@ -183,6 +183,7 @@ impl StorageEngine {
             blob_tx: None,
             blob_size: AtomicU64::new(initial_size),
             logical_name,
+            in_flight_blob_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
 
         engine.recover()?;
@@ -578,14 +579,18 @@ impl StorageEngine {
 
     pub(crate) fn read_pointer_internal(&self, pointer: &Pointer, use_cache: bool) -> Result<Option<Vec<u8>>> {
         match pointer {
+            // THE PERFORMANCE WIN: If the blob worker hasn't finished, 
+            // read directly from the Arc in memory.
             Pointer::BlobPending(data) => Ok(Some((**data).clone())),
+
             Pointer::Inlined(data) => Ok(Some(data.clone())),
+
             Pointer::Blob { offset, len } => {
-                let mut buf = vec![0u8; *len as usize];
-                
                 let file = self.blob_file.as_ref()
                     .ok_or_else(|| FireLiteError::StorageError("Blob file missing".into()))?;
-
+                
+                let mut buf = vec![0u8; *len as usize];
+                
                 #[cfg(unix)] {
                     use std::os::unix::fs::FileExt;
                     file.read_exact_at(&mut buf, *offset)?;
@@ -595,16 +600,23 @@ impl StorageEngine {
                     file.seek_read(&mut buf, *offset)?;
                 }
 
-                if let Some(enc) = &self.encryption {
-                    Ok(Some(enc.decrypt(&buf)?))
+                // Blobs handle their own encryption/decryption because they 
+                // aren't part of the LSM compaction cycles.
+                let data = if let Some(enc) = &self.encryption {
+                    enc.decrypt(&buf)?
                 } else {
-                    Ok(Some(buf))
-                }
+                    buf
+                };
+
+                // Note: If you add blob compression, decode it here as well.
+                Ok(Some(data))
             },
+
             Pointer::Segment { segment_id, offset, len } => {
                 let Some(meta) = self.segments.get(segment_id) else { return Ok(None); };
                 Ok(Some(meta.segment.read_at(*offset, *len, use_cache)?))
             },
+
             Pointer::Deleted { .. } => Ok(None),
         }
     }

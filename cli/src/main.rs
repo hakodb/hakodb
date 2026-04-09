@@ -11,7 +11,7 @@ use firelite::engine::FireLite;
 use firelite::index::composite::definition::SortDirection;
 use firelite::query::filter::Operator;
 use firelite::query::query::{AggregateOp, Query};
-use firelite::net_sync::NetSyncer;
+use firelite::net_sync::{NetSyncer, SyncStatus};
 use serde_json::{json, Map, Value as JsonValue};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -811,13 +811,15 @@ fn execute_command(
         Commands::Rest { method, path, data, filters } => run_rest(db, &method, &path, data.as_deref(), &filters)?,
         // For Serve, we handle it separately to avoid infinite recursion
         Commands::Peers => {
-            let status = net.ok_or_else(|| anyhow!("Networking not active. Use 'serve'."))?.status();
+            let status = net.ok_or_else(|| anyhow!("Networking not active."))?.status();
+            println!("\n--- Mesh Network ---");
+            println!("Status: {}", format_sync_status(status.status)); // <--- Used here too
+            println!("Peers:  {}", status.peer_count);
             println!("\n{:<20} | {:<10}", "PEER ID", "NETWORK");
             println!("{}", "-".repeat(35));
             for id in status.known_peers {
                 println!("{:<20} | ONLINE", id);
             }
-            if status.peer_count == 0 { println!("(No peers discovered yet)"); }
             println!();
         }
         Commands::Exit | Commands::Quit => {
@@ -827,6 +829,14 @@ fn execute_command(
         // _ => bail!("Command not supported in this mode"),
     }
     Ok(())
+}
+
+fn format_sync_status(status: SyncStatus) -> &'static str {
+    match status {
+        SyncStatus::Idle => "Idle",
+        SyncStatus::Connected => "Online",
+        SyncStatus::Syncing => "Syncing",
+    }
 }
 
 fn run_server(
@@ -851,15 +861,20 @@ fn run_server(
 
         net.start(port).await.map_err(|e| anyhow!(e.to_string()))?;
 
-        println!("🔥 FireLite v0.7.0 Mesh Shell Active");
-        println!("🌐 Node: {} | Room: {}", node_id, key);
-        println!("🚀 Auto-Discovery Enabled (mDNS)");
+        println!("🔥 FireLite v0.6.19 Mesh Shell Active");
+        println!("🌐 Node: {} | Room Hash Verified", node_id);
         
         let mut rl = DefaultEditor::new().map_err(|e| anyhow!("Readline error: {}", e))?;
         
         loop {
             let status = net.status(); 
-            let prompt = format!("firelite({}:{}) > ", node_id, status.peer_count);
+            // let prompt = format!("firelite({}:{}) > ", node_id, status.peer_count);
+            let prompt = format!(
+                "firelite({}:{} | {}) > ", 
+                node_id, 
+                status.peer_count, 
+                format_sync_status(status.status) // <--- Now SyncStatus is used!
+            );
             
             match rl.readline(&prompt) {
                 Ok(line) => {
@@ -885,7 +900,6 @@ fn run_server(
             }
         }
         net.stop();
-        println!("Sync engine stopped.");
         Ok(())
     })
 }

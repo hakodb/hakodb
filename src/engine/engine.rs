@@ -20,6 +20,7 @@ use crate::query::executor::executor::ParallelQueryExecutor;
 use crate::query::planner::QueryPlanner;
 use crate::query::query::Query;
 use crate::storage::engine::{BlobWork, StorageEngine, StorageMutation};
+// use crate::config::DurabilityMode;
 
 use crate::util::lock::SafeLock;
 
@@ -403,8 +404,11 @@ impl FireLite {
         });
 
         // BLOB WORKER
+        // 1. Capture config values once before spawning threads
         let shards_ptr = Arc::clone(&db.shards);
         let encryption_key = config.encryption_key.clone();
+        let use_compression = config.use_compression;
+        let compression_level = config.compression_level;
 
         for _ in 0..4 {
             let rx = Arc::clone(&shared_blob_rx);
@@ -412,72 +416,120 @@ impl FireLite {
             let enc_key = encryption_key.clone();
 
             thread::spawn(move || {
-                let enc_ctx = enc_key.map(|k| crate::storage::crypto::EncryptionContext::from_secret(&k));
-                
                 loop {
+                    // A. Receive work from the channel
                     let work = {
                         let lock = match rx.lock() { Ok(g) => g, Err(_) => break };
                         match lock.recv() { Ok(w) => w, Err(_) => break }
                     };
 
+                    // B. Resolve collection name and the Shard handle
                     let collection = match &work {
                         BlobWork::Put { collection, .. } => collection.clone(),
                         BlobWork::PutRaw { collection, .. } => collection.clone(),
                     };
 
-                    let file_opt = {
+                    let shard_arc = {
                         let shards = s_ptr.read().unwrap();
-                        shards.get(&collection).and_then(|shard_arc| {
-                            let shard_guard = shard_arc.read().ok()?;
-                            shard_guard.blob_file.clone() // This is now Option<Arc<File>>
-                        })
+                        match shards.get(&collection) {
+                            Some(s) => Arc::clone(s),
+                            None => continue, // Collection was likely dropped
+                        }
                     };
 
-                    if let Some(file) = file_opt { // file is now Arc<File>
-                        match work {
-                            BlobWork::PutRaw { offset, data, .. } => {
-                                let payload = if let Some(ref enc) = enc_ctx {
-                                    enc.encrypt(&data).unwrap_or_else(|_| data.to_vec())
-                                } else {
-                                    data.to_vec()
-                                };
-                                
-                                // POSITIONAL WRITE (Lock-Free)
-                                #[cfg(unix)] {
-                                    use std::os::unix::fs::FileExt;
-                                    let _ = file.write_all_at(&payload, offset);
-                                }
-                                #[cfg(windows)] {
-                                    use std::os::windows::fs::FileExt;
-                                    let _ = file.seek_write(&payload, offset);
-                                }
-                            }
-                            BlobWork::Put { key, data, collection } => {
-                                let payload = if let Some(ref enc) = enc_ctx {
-                                    enc.encrypt(&data).unwrap_or_else(|_| data.to_vec())
-                                } else {
-                                    data.to_vec()
-                                };
+                    // C. Access Shard metadata (read-lock briefly)
+                    let (file_opt, durability) = {
+                        let shard = shard_arc.read().unwrap();
+                        (shard.blob_file.clone(), shard.wal.durability_mode())
+                    };
 
-                                let (offset, len) = {
+                    if let Some(file) = file_opt {
+                        match work {
+                            BlobWork::Put { key, data, .. } => {
+                                let mut payload = (*data).clone();
+
+                                // 1. COMPRESSION (Respect global config)
+                                if use_compression && payload.len() > 2048 {
+                                    if let Ok(compressed) = zstd::encode_all(&payload[..], compression_level) {
+                                        if compressed.len() < payload.len() {
+                                            payload = compressed;
+                                        }
+                                    }
+                                }
+
+                                // 2. ENCRYPTION (Respect global config)
+                                if let Some(ref secret) = enc_key {
+                                    let enc = crate::storage::crypto::EncryptionContext::from_secret(secret);
+                                    if let Ok(encrypted) = enc.encrypt(&payload) {
+                                        payload = encrypted;
+                                    }
+                                }
+
+                                let payload_len = payload.len() as u32;
+
+                                // 3. PHYSICAL WRITE
+                                let offset = {
+                                    // We use the file metadata to find the append point
                                     let off = file.metadata().unwrap().len();
+                                    
                                     #[cfg(unix)] {
                                         use std::os::unix::fs::FileExt;
-                                        let _ = file.write_all_at(&payload, off);
+                                        file.write_all_at(&payload, off).expect("Blob write failed");
                                     }
                                     #[cfg(windows)] {
                                         use std::os::windows::fs::FileExt;
-                                        let _ = file.seek_write(&payload, off);
+                                        file.seek_write(&payload, off).expect("Blob write failed");
                                     }
-                                    (off, payload.len() as u32)
+
+                                    // DURABILITY: If 'Always', flip the bits on the physical platter
+                                    if durability == crate::config::DurabilityMode::Always {
+                                        let _ = file.sync_data();
+                                    }
+                                    off
                                 };
 
-                                // Update index pointer
-                                let shards = s_ptr.read().unwrap();
-                                if let Some(shard_arc) = shards.get(&collection) {
-                                    if let Ok(mut shard) = shard_arc.write() {
-                                        shard.index.insert(key, crate::storage::engine::Pointer::Blob { offset, len });
+                                // 4. ATOMIC HANDOVER
+                                // Update the index to point to Disk instead of RAM
+                                if let Ok(mut shard) = shard_arc.write() {
+                                    shard.index.insert(key, crate::storage::engine::Pointer::Blob { 
+                                        offset, 
+                                        len: payload_len 
+                                    });
+                                    // Release the memory pressure counter
+                                    shard.in_flight_blob_bytes.fetch_sub(data.len(), Ordering::Relaxed);
+                                    // Update the atomic size tracker
+                                    shard.blob_size.store(offset + payload_len as u64, Ordering::Release);
+                                }
+                            }
+
+                            BlobWork::PutRaw { offset, data, .. } => {
+                                // PutRaw is usually used for fixed-position updates (e.g., Vacuum)
+                                let mut payload = (*data).clone();
+
+                                // Apply same transformation chain for consistency
+                                if use_compression && payload.len() > 2048 {
+                                    if let Ok(compressed) = zstd::encode_all(&payload[..], compression_level) {
+                                        payload = compressed;
                                     }
+                                }
+                                if let Some(ref secret) = enc_key {
+                                    let enc = crate::storage::crypto::EncryptionContext::from_secret(secret);
+                                    if let Ok(encrypted) = enc.encrypt(&payload) {
+                                        payload = encrypted;
+                                    }
+                                }
+
+                                #[cfg(unix)] {
+                                    use std::os::unix::fs::FileExt;
+                                    file.write_all_at(&payload, offset).expect("Blob PutRaw failed");
+                                }
+                                #[cfg(windows)] {
+                                    use std::os::windows::fs::FileExt;
+                                    file.seek_write(&payload, offset).expect("Blob PutRaw failed");
+                                }
+
+                                if durability == crate::config::DurabilityMode::Always {
+                                    let _ = file.sync_data();
                                 }
                             }
                         }
@@ -1081,22 +1133,6 @@ impl FireLite {
             versions.insert(key, self.global_version.fetch_add(1, Ordering::SeqCst));
         }
     }
-
-    // fn bump_versions_for_mutations(&self, mutations: &[BatchMutation]) {
-    //     let mut versions = self.doc_versions.write().unwrap();
-    //     for m in mutations {
-    //         let key = match m {
-    //             BatchMutation::Put {
-    //                 collection, doc_id, ..
-    //             } => doc_key(collection, doc_id),
-    //             BatchMutation::Delete { collection, doc_id } => doc_key(collection, doc_id),
-    //             BatchMutation::Patch { collection, doc_id, .. } => {
-    //                 doc_key(collection, doc_id)
-    //             }
-    //         };
-    //         versions.insert(key, self.global_version.fetch_add(1, Ordering::SeqCst));
-    //     }
-    // }
 
     pub fn begin_serializable_transaction(&self) -> SerializableTransaction {
         SerializableTransaction {
