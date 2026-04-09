@@ -2,19 +2,25 @@ use crate::document::firelite_doc::{FireLiteDoc, FireLiteDocView};
 use crate::document::value::Value;
 use super::task::QueryTask;
 use crate::query::filter::Operator;
+// use crate::engine::engine::resolve_doc_static;
 
-/// Standard worker: Decodes full or projected documents.
 pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
     let mut out = Vec::new();
-    // Pre-acquire the read lock for the entire task
+    let (blob_file, encryption) = {
+        let guard = task.storage.as_ref().unwrap().read().unwrap();
+        (guard.blob_file.clone(), guard.encryption.clone())
+    };
     let storage_engine = task.storage.as_ref().unwrap().read().unwrap();
 
     for (id, pointer) in task.docs {
-        // Resolve Pointer -> Bytes
         if let Ok(Some(bytes)) = storage_engine.read_pointer(&pointer) {
-            // Now bytes is Vec<u8>, we can use it
             if task.plan.filters_satisfied_by_index || matches_filters_view(&bytes, &task.plan) {
-                if let Some(doc) = FireLiteDoc::decode(&bytes) {
+                if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
+                    
+                    if let Some(ref file) = blob_file {
+                        let _ = inflate_blobs(&mut doc, file, encryption.as_ref());
+                    }
+                    
                     out.push((id, doc));
                 }
             }
@@ -23,20 +29,67 @@ pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
     out
 }
 
-/// Optimized projected worker: Extracts only requested fields without full doc decoding.
+fn inflate_blobs(doc: &mut FireLiteDoc, file: &std::fs::File, encryption: Option<&crate::storage::crypto::EncryptionContext>) -> Result<(), crate::error::FireLiteError> {
+    for (_, value) in &mut doc.fields {
+        if let Value::BlobLink { offset, len } = *value {
+            let mut buf = vec![0u8; len as usize];
+            
+            #[cfg(unix)] {
+                use std::os::unix::fs::FileExt;
+                file.read_exact_at(&mut buf, offset)?;
+            }
+            #[cfg(windows)] {
+                use std::os::windows::fs::FileExt;
+                file.seek_read(&mut buf, offset)?;
+            }
+
+            let data = if let Some(enc) = encryption {
+                enc.decrypt(&buf)?
+            } else {
+                buf
+            };
+
+            // Convert back to original type (Simple heuristic for the benchmark)
+            if let Ok(s) = String::from_utf8(data.clone()) {
+                *value = Value::String(s);
+            } else {
+                *value = Value::Binary(data);
+            }
+        }
+    }
+    Ok(())
+}
+
+
 pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)> {
     let mut out = Vec::new();
+    
+    // 1. Pull the handles from the Shard (StorageEngine)
+    // We do this once per task (worker thread)
+    let (blob_file, encryption) = {
+        let guard = task.storage.as_ref().unwrap().read().unwrap();
+        (guard.blob_file.clone(), guard.encryption.clone())
+    };
+
     let storage_engine = task.storage.as_ref().unwrap().read().unwrap();
     let projection = &task.plan.projection;
 
     for (id, pointer) in task.docs {
         if let Ok(Some(bytes)) = storage_engine.read_pointer(&pointer) {
-            if matches_filters_view(&bytes, &task.plan) {
+            if task.plan.filters_satisfied_by_index || matches_filters_view(&bytes, &task.plan) {
                 let mut fields_out = Vec::new();
                 if let Some(view) = FireLiteDocView::new(&bytes) {
                     for field_name in projection {
                         if let Some((_, tag, data)) = view.iter().find(|(k, _, _)| k == field_name) {
-                            if let Some(val) = crate::document::firelite_doc::decode_value(tag, data) {
+                            if let Some(mut val) = crate::document::firelite_doc::decode_value(tag, data) {
+                                
+                                // PARALLEL BLOB RESOLUTION for Projected Fields
+                                if let Value::BlobLink { offset, len } = val {
+                                    if let Some(ref file) = blob_file {
+                                        val = resolve_single_blob_in_worker(file, offset, len, encryption.as_ref());
+                                    }
+                                }
+                                
                                 fields_out.push((field_name.clone(), val));
                             }
                         }
@@ -47,6 +100,30 @@ pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)
         }
     }
     out
+}
+
+// Helper for projected resolution
+fn resolve_single_blob_in_worker(
+    file: &std::fs::File, 
+    offset: u64, 
+    len: u32, 
+    encryption: Option<&crate::storage::crypto::EncryptionContext>
+) -> Value {
+    let mut buf = vec![0u8; len as usize];
+    #[cfg(unix)] { use std::os::unix::fs::FileExt; let _ = file.read_exact_at(&mut buf, offset); }
+    #[cfg(windows)] { use std::os::windows::fs::FileExt; let _ = file.seek_read(&mut buf, offset); }
+
+    let data = if let Some(enc) = encryption {
+        enc.decrypt(&buf).unwrap_or(buf)
+    } else {
+        buf
+    };
+
+    if let Ok(s) = String::from_utf8(data.clone()) {
+        Value::String(s)
+    } else {
+        Value::Binary(data)
+    }
 }
 
 /// The high-performance core: Scans document bytes ONCE and performs 

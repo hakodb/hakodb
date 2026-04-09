@@ -9,7 +9,7 @@ use crate::storage::wal::WalOp;
 #[cfg(feature = "net-sync")]
 use crate::storage::engine::Pointer;
 #[cfg(feature = "net-sync")]
-use std::sync::{Arc, Mutex, RwLock, atomic::Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 #[cfg(feature = "net-sync")]
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "net-sync")]
@@ -386,6 +386,7 @@ async fn apply_replication_batch(db: &Arc<FireLite>, collection: String, ops: Ve
     let shard_arc = db.get_shard(&collection);
     let mut filtered_ops = Vec::new();
     let mut index_puts = Vec::new();
+    let mut replication_blob_work = Vec::new();
     let threshold = db.config.value_blob_threshold_bytes;
 
     let mut shard = shard_arc.write().unwrap();
@@ -408,21 +409,30 @@ async fn apply_replication_batch(db: &Arc<FireLite>, collection: String, ops: Ve
             if remote_ts <= local_ts { continue; }
         }
 
-        if is_delete {
-            filtered_ops.push(WalOp::Delete { key, timestamp: delete_ts });
-        } else {
-            if let Some(file) = &shard.blob_file {
-                let mut current_offset = shard.blob_size.load(Ordering::Acquire);
-                db.process_doc_blobs(&mut doc, file, &mut current_offset, threshold, remote_ts);
-                shard.blob_size.store(current_offset, Ordering::Release);
-            }
+        if !is_delete {
+            // Updated call: now returns work instead of blocking on file write
+            let work = db.process_doc_blobs(&collection, &mut doc, &shard.blob_size, threshold, remote_ts);
+            replication_blob_work.extend(work);
+            
             filtered_ops.push(WalOp::PutInlined { key: key.clone(), value: doc.encode() });
-            if let Some((_, doc_id)) = key.split_once(':') { index_puts.push((doc_id.to_string(), doc)); }
+            if let Some((_, doc_id)) = key.split_once(':') { 
+                index_puts.push((doc_id.to_string(), doc)); 
+            }
+        } else {
+            filtered_ops.push(WalOp::Delete { key, timestamp: delete_ts });
         }
     }
 
+    // Commit to local shard
     if !filtered_ops.is_empty() && shard.apply_replicated_ops(&filtered_ops).is_ok() {
-        if !index_puts.is_empty() { db.inject_replication_to_indexer(collection, Arc::new(index_puts)); }
+        if !index_puts.is_empty() { 
+            db.inject_replication_to_indexer(collection, Arc::new(index_puts)); 
+        }
+    }
+
+    // DISPATCH: Offload remote blobs to the same background pool as local writes
+    for w in replication_blob_work {
+        let _ = db.blob_tx.try_send(w);
     }
 }
 

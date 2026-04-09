@@ -301,7 +301,7 @@ Report run_benchmark(BenchConfig cfg) {
     double t_query_stress = now_ms();
     for(int i=0; i<300; i++) {
         FL_Query* q = fl_query_new("bench");
-        fl_query_where_eq_int(q, "active", 1);
+        fl_query_where_eq_bool(q, "active", true);
         // Non-indexed filters force the single-pass worker
         // fl_query_where_eq_str(q, "tenant", "tenant-5");
         fl_query_limit(q, 50);
@@ -388,8 +388,8 @@ int main(int argc, char** argv) {
         {"Light_App",  g_docs, 10, 2, 4, false, false, 4, false},
         {"Strict_Data",  g_docs, 10, 3, 8, true,  false, 8,  false},
         {"Secure_Data", g_docs, 10, 0, 8, false, true,  8, false},
-        {"Gaming", g_docs, 50, 2, 8, false, false,  16, false},
-        {"Light_Sync", g_docs, 50,  1, 8, false,  false, 2,  true},
+        {"Gaming", g_docs, 50, 2, 8, false, false,  8, true},
+        {"Light_Sync", g_docs, 50,  1, 8, false,  false, 2,  false},
         {"Busy_Sync", g_docs, 150,  3, 8, false,  false,  16, true},
         // {"Strict_Sync",  g_docs, 50, 0, 4, false, false, 0,  false},
         // {"Turbo_RAM",    g_docs, 100, 2, 8, false, false, 60, false},

@@ -804,6 +804,33 @@ pub extern "C" fn fl_query_where_eq_str(
     0
 }
 
+#[no_mangle]
+pub extern "C" fn fl_query_where_eq_bool(
+    query: *mut FL_Query,
+    field: *const c_char,
+    value: bool, // Receive the bool directly
+) -> i32 {
+    if query.is_null() {
+        return set_last_error("null query handle");
+    }
+
+    let field = match cstr_to_string(field) {
+        Ok(v) => v,
+        Err(e) => return set_last_error(e),
+    };
+
+    let query_ptr = unsafe { &mut *query };
+
+    // Update the query with Value::Bool directly
+    query_ptr.query = query_ptr
+        .query
+        .clone()
+        .where_filter(&field, Operator::Eq, Value::Bool(value));
+
+    clear_last_error();
+    0
+}
+
 fn apply_string_filter(
     query: *mut FL_Query,
     field: *const c_char,

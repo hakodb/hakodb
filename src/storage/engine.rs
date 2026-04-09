@@ -6,7 +6,6 @@ use crate::config::{FireLiteConfig, DurabilityMode};
 use crate::error::{FireLiteError, Result};
 use std::sync::{Arc, Mutex}; 
 use std::sync::atomic::AtomicU64;
-use std::sync::mpsc::SyncSender;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::memory::page_cache::PageCache; 
 
@@ -14,6 +13,7 @@ use super::compaction::compact_segment;
 use super::crypto::EncryptionContext;
 use super::segment::Segment;
 use super::wal::{Wal, WalOp};
+use crossbeam_channel::Sender as CrossbeamSender;
 
 
 #[derive(Debug, Clone)] 
@@ -65,7 +65,7 @@ pub struct StorageEngine {
     pub(crate) wal: Wal,
     next_tx_id: u64,
     compaction_threshold_bytes: usize,
-    pub(crate) encryption: Option<EncryptionContext>,
+    pub encryption: Option<EncryptionContext>,
     inlined_bytes: usize,
     max_inlined_bytes: usize,
     blob_threshold: usize,
@@ -74,8 +74,8 @@ pub struct StorageEngine {
     pub cache: Arc<Mutex<PageCache>>,
     pub mmap_size: usize, 
     pub index: HashMap<String, Pointer>,
-    pub(crate) blob_file: Option<Arc<std::fs::File>>,
-    pub(crate) blob_tx: Option<SyncSender<BlobWork>>,
+    pub blob_file: Option<Arc<std::fs::File>>,
+    pub(crate) blob_tx: Option<CrossbeamSender<BlobWork>>,
     pub(crate) blob_size: AtomicU64,
     pub logical_name: String,
     pub(crate) in_flight_blob_bytes: Arc<std::sync::atomic::AtomicUsize>,

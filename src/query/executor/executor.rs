@@ -1,6 +1,7 @@
 use hashbrown::HashMap;
 use std::sync::{Arc, RwLock};
 use std::thread;
+use rayon::prelude::*;
 
 use crate::document::firelite_doc::{FireLiteDoc, FireLiteDocView, BorrowedValue};
 use crate::document::value::Value;
@@ -29,134 +30,6 @@ impl ParallelQueryExecutor {
             workers: workers.max(1),
         }
     }
-
-    // pub fn execute(
-    //     &self,
-    //     storage_arc: Arc<RwLock<StorageEngine>>,
-    //     indexes: &IndexManager,
-    //     plan: QueryPlan,
-    // ) -> Result<Vec<(String, FireLiteDoc)>> {
-
-    //     let keys_from_index = {
-    //         let storage = storage_arc.read().unwrap();
-    //         match &plan.scan {
-    //             ScanType::UnionIndex { scans } => {
-    //                 let mut union_map = HashMap::new();
-    //                 for scan in scans {
-    //                     let branch_docs = self.execute_single_scan(
-    //                         &storage,
-    //                         indexes,
-    //                         scan,
-    //                         &plan.collection,
-    //                         plan.scan_limit,
-    //                     )?;
-    //                     for (key, ptr) in branch_docs {
-    //                         union_map.insert(key, ptr);
-    //                     }
-    //                 }
-    //                 union_map.into_iter().collect::<Vec<_>>()
-    //             }
-    //             _ => self.execute_single_scan(
-    //                 &storage,
-    //                 indexes,
-    //                 &plan.scan,
-    //                 &plan.collection,
-    //                 plan.scan_limit,
-    //             )?,
-    //         }
-    //     };
-
-    //     if keys_from_index.is_empty() { return Ok(Vec::new()); }
-
-    //     // 2. Wrap keys with their original logical position
-    //     // Change: The third element is now Pointer, not Vec<u8>
-    //     let mut work_items: Vec<(usize, String, Pointer)> = keys_from_index
-    //         .into_iter()
-    //         .enumerate()
-    //         .map(|(i, (k, v))| (i, k, v))
-    //         .collect();
-
-    //     // 3. PHYSICAL SORT: Sort by file offset to minimize disk seeking
-    //     // Optimization: We use the pointer we already have in the tuple!
-    //     work_items.sort_by_key(|(_, _, ptr)| {
-    //         match ptr {
-    //             Pointer::Segment { offset, .. } => *offset,
-    //             Pointer::Blob { offset, .. } => *offset,
-    //             _ => 0, 
-    //         }
-    //     });
-
-    //     // 4. SHARD & EXECUTE (Sequential Disk Sweep)
-    //     let docs_to_fetch: Vec<(String, Pointer)> = work_items
-    //         .iter()
-    //         .map(|(_, k, p)| (k.clone(), p.clone()))
-    //         .collect();
-
-    //     let doc_count = docs_to_fetch.len();
-    //     let mut processed_docs: Vec<(String, FireLiteDoc)> = Vec::with_capacity(doc_count);
-
-    //     if doc_count < 1000 || self.workers <= 1 {
-    //         let task = QueryTask {
-    //             docs: docs_to_fetch,
-    //             plan: plan.clone(),
-    //             storage: Some(storage_arc.clone()),
-    //         };
-    //         processed_docs = run_task(task);
-    //     } else {
-    //         let optimal_workers = self.workers.min((doc_count / 500).max(1));
-    //         let tasks = shard_tasks(docs_to_fetch, optimal_workers, plan.clone(), Some(storage_arc.clone()));
-            
-    //         let mut handles = Vec::new();
-    //         for task in tasks {
-    //             handles.push(thread::spawn(move || run_task(task)));
-    //         }
-    //         for handle in handles {
-    //             processed_docs.extend(handle.join().unwrap_or_default());
-    //         }
-    //     }
-
-    //     // 5. RESTORE LOGICAL ORDER
-    //     let mut processed_map: HashMap<String, FireLiteDoc> = processed_docs.into_iter().collect();
-    //     let mut ordered_results: Vec<(usize, String, FireLiteDoc)> = Vec::with_capacity(doc_count);
-        
-    //     // Use the original work_items (which contains the pos tag) to rebuild
-    //     for (original_pos, key, _) in work_items {
-    //         if let Some(doc) = processed_map.remove(&key) {
-    //             ordered_results.push((original_pos, key, doc));
-    //         }
-    //     }
-
-    //     // Sort by the original position tag to restore Index Order
-    //     ordered_results.sort_by_key(|(pos, _, _)| *pos);
-
-    //     // 6. Manual re-sort for cases NOT satisfied by index
-    //     let mut results: Vec<(String, FireLiteDoc)> = ordered_results
-    //         .into_iter()
-    //         .map(|(_, k, d)| (k, d))
-    //         .collect();
-
-    //     if !plan.order_by_satisfied {
-    //         if let Some(order) = &plan.order_by {
-    //             results.sort_by(|(_, a), (_, b)| {
-    //                 let av = a.get(&order.field);
-    //                 let bv = b.get(&order.field);
-    //                 let cmp = av.cmp(&bv);
-    //                 if order.ascending { cmp } else { cmp.reverse() }
-    //             });
-    //         }
-    //     }
-
-    //     // 7. Apply Offset/Limit
-    //     if let Some(offset) = plan.offset {
-    //         results = results.into_iter().skip(offset).collect();
-    //     }
-    //     if let Some(limit) = plan.limit {
-    //         results.truncate(limit);
-    //     }
-
-    //     Ok(results)
-    // }
-
 
     pub fn execute(
         &self,
@@ -239,22 +112,30 @@ impl ParallelQueryExecutor {
             .map(|(_, k, p)| (k.clone(), p.clone()))
             .collect();
 
+        // let doc_count = docs_to_fetch.len();
+        // let processed_docs = if doc_count < 1000 || self.workers <= 1 {
+        //     run_task(QueryTask {
+        //         docs: docs_to_fetch,
+        //         plan: plan.clone(),
+        //         storage: Some(storage_arc.clone()),
+        //     })
+        // } else {
+        //     let optimal_workers = self.workers.min((doc_count / 500).max(1));
+        //     let tasks = shard_tasks(docs_to_fetch, optimal_workers, plan.clone(), Some(storage_arc.clone()));
+        //     let mut results = Vec::new();
+        //     let mut handles = Vec::new();
+        //     for task in tasks { handles.push(thread::spawn(move || run_task(task))); }
+        //     for handle in handles { results.extend(handle.join().unwrap_or_default()); }
+        //     results
+        // };
         let doc_count = docs_to_fetch.len();
-        let processed_docs = if doc_count < 1000 || self.workers <= 1 {
-            run_task(QueryTask {
-                docs: docs_to_fetch,
-                plan: plan.clone(),
-                storage: Some(storage_arc.clone()),
-            })
-        } else {
-            let optimal_workers = self.workers.min((doc_count / 500).max(1));
-            let tasks = shard_tasks(docs_to_fetch, optimal_workers, plan.clone(), Some(storage_arc.clone()));
-            let mut results = Vec::new();
-            let mut handles = Vec::new();
-            for task in tasks { handles.push(thread::spawn(move || run_task(task))); }
-            for handle in handles { results.extend(handle.join().unwrap_or_default()); }
-            results
-        };
+        let optimal_workers = self.workers.min((doc_count / 500).max(1));
+        let tasks = shard_tasks(docs_to_fetch, optimal_workers, plan.clone(), Some(storage_arc.clone()));
+
+        let processed_docs: Vec<(String, FireLiteDoc)> = tasks
+            .into_par_iter() // This uses the global fixed thread pool
+            .flat_map(|task| run_task(task))
+            .collect();
 
         // 5. RESTORE LOGICAL ORDER
         let mut processed_map: HashMap<String, FireLiteDoc> = processed_docs.into_iter().collect();
