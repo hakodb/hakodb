@@ -19,7 +19,8 @@ use crate::index::storage::index_storage::IndexStorage;
 use crate::query::executor::executor::ParallelQueryExecutor;
 use crate::query::planner::QueryPlanner;
 use crate::query::query::Query;
-use crate::storage::engine::{BlobWork, StorageEngine, StorageMutation, Pointer};
+use crate::storage::blob::{BlobManager, BlobWork};
+use crate::storage::engine::{StorageEngine, StorageMutation, Pointer};
 // use crate::config::DurabilityMode;
 
 use crate::util::lock::SafeLock;
@@ -468,9 +469,6 @@ impl FireLite {
             // let use_compression = config.use_compression;
             // let compression_level = config.compression_level;
             
-            let enc_key = config.encryption_key.clone();
-            let use_compression = config.use_compression;
-            let compression_level = config.compression_level;
             thread::spawn(move || {
                 // Buffer to collect multiple works to reduce lock switching
                 let mut work_batch = Vec::with_capacity(16);
@@ -490,50 +488,75 @@ impl FireLite {
                         }
                     }
 
-                    // C. Process the batch
+                    // C. Group work by collection to reduce lock ping-pong
+                    let mut by_collection: HashMap<String, Vec<BlobWork>> = HashMap::new();
                     for work in work_batch.drain(..) {
-                        let (collection, ..) = match &work {
-                            BlobWork::Put { collection, .. } => (collection.clone(), false),
-                            BlobWork::PutRaw { collection, .. } => (collection.clone(), true),
+                        let collection = match &work {
+                            BlobWork::Put { collection, .. } => collection.clone(),
+                            BlobWork::PutRaw { collection, .. } => collection.clone(),
                         };
+                        by_collection.entry(collection).or_default().push(work);
+                    }
 
+                    for (collection, works) in by_collection {
                         let shard_arc = match s_ptr.read().unwrap().get(&collection) {
                             Some(s) => Arc::clone(s),
                             None => continue,
                         };
 
-                        // D. Grouping operations by lock access
-                        let (file, durability) = {
+                        let (blob_manager, durability) = {
                             let shard = shard_arc.read().unwrap();
-                            (shard.blob_file.clone(), shard.wal.durability_mode())
+                            (shard.blob_manager.clone(), shard.wal.durability_mode())
                         };
+                        let Some(blob_manager) = blob_manager else { continue };
 
-                        if let Some(file) = file {
+                        let mut writes: Vec<(u64, Vec<u8>)> = Vec::with_capacity(works.len());
+                        let mut index_updates: Vec<(String, Pointer)> = Vec::new();
+                        let mut release_in_flight = 0usize;
+
+                        for work in works {
                             match work {
                                 BlobWork::Put { key, data, .. } => {
-                                    let payload = prepare_blob(&data, &enc_key, use_compression, compression_level);
+                                    let payload = blob_manager.prepare_payload(&data);
                                     let payload_len = payload.len() as u32;
-                                    
-                                    // Positional Write (Atomic on the OS level)
-                                    let offset = {
-                                        let off = file.metadata().unwrap().len();
-                                        write_at(&file, &payload, off);
-                                        if durability == DurabilityMode::Always { let _ = file.sync_data(); }
-                                        off
-                                    };
-
-                                    // Atomic Index Swap
-                                    if let Ok(mut shard) = shard_arc.write() {
-                                        shard.index.insert(key, Pointer::Blob { offset, len: payload_len });
-                                        shard.in_flight_blob_bytes.fetch_sub(data.len(), Ordering::Relaxed);
-                                        shard.blob_size.store(offset + payload_len as u64, Ordering::Release);
-                                    }
+                                    let offset = blob_manager.reserve_len(payload.len());
+                                    writes.push((offset, payload));
+                                    index_updates.push((key, Pointer::Blob { offset, len: payload_len }));
+                                    release_in_flight += data.len();
                                 }
                                 BlobWork::PutRaw { offset, data, .. } => {
-                                    let payload = prepare_blob(&data, &enc_key, use_compression, compression_level);
-                                    write_at(&file, &payload, offset);
-                                    if durability == DurabilityMode::Always { let _ = file.sync_data(); }
+                                    writes.push((offset, (*data).clone()));
                                 }
+                            }
+                        }
+
+                        writes.sort_by_key(|(offset, _)| *offset);
+                        let mut coalesced: Vec<(u64, Vec<u8>)> = Vec::new();
+                        for (offset, payload) in writes {
+                            if let Some((base, merged)) = coalesced.last_mut() {
+                                let expected = *base + merged.len() as u64;
+                                if expected == offset {
+                                    merged.extend_from_slice(&payload);
+                                    continue;
+                                }
+                            }
+                            coalesced.push((offset, payload));
+                        }
+
+                        for (offset, payload) in coalesced {
+                            let _ = blob_manager.write_at(&payload, offset);
+                        }
+
+                        if durability == DurabilityMode::Always {
+                            let _ = blob_manager.file().sync_data();
+                        }
+
+                        if !index_updates.is_empty() {
+                            if let Ok(mut shard) = shard_arc.write() {
+                                for (key, pointer) in index_updates {
+                                    shard.index.insert(key, pointer);
+                                }
+                                shard.in_flight_blob_bytes.fetch_sub(release_in_flight, Ordering::Relaxed);
                             }
                         }
                     }
@@ -663,7 +686,7 @@ impl FireLite {
                         doc._time = now;
                         
                         // ASYNC BLOB COLLECTION
-                        let work = self.process_doc_blobs(&collection, &mut doc, &shard_guard.blob_size, threshold, now);
+                        let work = shard_guard.blob_manager.as_ref().map(|bm| bm.extract_blobs(&collection, &mut doc, threshold, now)).unwrap_or_default();
                         all_blob_work.extend(work);
                         
                         storage_ops.push(StorageMutation::Put { key: affected_key.clone(), value: doc.encode() });
@@ -693,7 +716,7 @@ impl FireLite {
                                     let _ = resolve_doc_static(&mut old_idx_doc, &shard_arc, self.config.encryption_key.as_deref());
                                 }
                                 
-                                let work = self.process_patch_blobs(&collection, &mut doc, updates, &shard_guard.blob_size, threshold);
+                                let work = shard_guard.blob_manager.as_ref().map(|bm| bm.extract_patch_blobs(&collection, &mut doc, updates, threshold)).unwrap_or_default();
                                 all_blob_work.extend(work);
                                 
                                 index_dels.push((doc_id.clone(), old_idx_doc));
@@ -747,7 +770,7 @@ impl FireLite {
                         affected_keys.push(key.clone());
                         
                         // ASYNC BLOB COLLECTION
-                        let work = self.process_doc_blobs(&collection, &mut doc, &shard.blob_size, threshold, now);
+                        let work = shard.blob_manager.as_ref().map(|bm| bm.extract_blobs(&collection, &mut doc, threshold, now)).unwrap_or_default();
                         all_blob_work.extend(work);
 
                         shard_groups.entry(collection.clone()).or_default().push(StorageMutation::Put { key: key.clone(), value: doc.encode() });
@@ -780,7 +803,7 @@ impl FireLite {
                                 }
                                 
                                 // ASYNC BLOB COLLECTION
-                                let work = self.process_patch_blobs(&collection, &mut doc, updates, &shard.blob_size, threshold);
+                                let work = shard.blob_manager.as_ref().map(|bm| bm.extract_patch_blobs(&collection, &mut doc, updates, threshold)).unwrap_or_default();
                                 all_blob_work.extend(work);
 
                                 index_dels_map.entry(collection.clone()).or_default().push((doc_id.clone(), old_doc_for_index));
@@ -825,70 +848,11 @@ impl FireLite {
         &self, 
         collection: &str,
         doc: &mut FireLiteDoc, 
-        blob_size_atomic: &std::sync::atomic::AtomicU64,
+        blob_manager: &BlobManager,
         threshold: usize, 
         now: i64
     ) -> Vec<BlobWork> {
-        let mut work_items = Vec::new();
-        for (_, value) in &mut doc.fields {
-            if matches!(value, Value::ServerTimestamp) { *value = Value::Timestamp(now); }
-            let len = value.len_bytes();
-            if len > threshold {
-                let raw = match value { 
-                    Value::String(s) => s.as_bytes().to_vec(), 
-                    Value::Binary(b) => b.clone(), 
-                    _ => continue 
-                };
-                let raw_len = raw.len() as u32;
-                let data_arc = Arc::new(raw);
-
-                // ATOMIC: Reserve space without a lock
-                let offset = blob_size_atomic.fetch_add(raw_len as u64, Ordering::SeqCst);
-
-                work_items.push(BlobWork::PutRaw {
-                    collection: collection.to_string(),
-                    offset,
-                    data: data_arc,
-                });
-
-                *value = Value::BlobLink { offset, len: raw_len };
-            }
-        }
-        work_items
-    }
-
-    fn process_patch_blobs(
-        &self, 
-        collection: &str,
-        doc: &mut FireLiteDoc, 
-        updates: Vec<(String, Value)>, 
-        blob_size_atomic: &std::sync::atomic::AtomicU64,
-        threshold: usize, 
-    ) -> Vec<BlobWork> {
-        let mut work_items = Vec::new();
-        for (k, mut v) in updates {
-            if v.len_bytes() > threshold {
-                let raw = match &v { 
-                    Value::String(s) => s.as_bytes().to_vec(), 
-                    Value::Binary(b) => b.clone(), 
-                    _ => { doc.insert(k, v); continue; } 
-                };
-                let raw_len = raw.len() as u32;
-                let data_arc = Arc::new(raw);
-
-                let offset = blob_size_atomic.fetch_add(raw_len as u64, Ordering::SeqCst);
-
-                work_items.push(BlobWork::PutRaw {
-                    collection: collection.to_string(),
-                    offset,
-                    data: data_arc,
-                });
-
-                v = Value::BlobLink { offset, len: raw_len };
-            }
-            doc.insert(k, v);
-        }
-        work_items
+        blob_manager.extract_blobs(collection, doc, threshold, now)
     }
 
     pub fn put(&self, col: &str, id: &str, doc: &FireLiteDoc) -> Result<()> {
@@ -1596,32 +1560,18 @@ impl FireLite {
     /// This makes the "Skeleton" transparent to the user.
     pub fn resolve_document_blobs(&self, doc: &mut FireLiteDoc, collection: &str) -> Result<()> {
         let shard_arc = self.get_shard(collection);
-        let shard = shard_arc.read().unwrap();
-        
-        let file = shard.blob_file.as_ref()
-            .ok_or_else(|| FireLiteError::StorageError("Blob file missing".into()))?;
-        
-        let encryption = self.config.encryption_key.as_ref()
-            .map(|k| crate::storage::crypto::EncryptionContext::from_secret(k));
+        let blob_manager = {
+            let shard = shard_arc.read().unwrap();
+            shard
+                .blob_manager
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| FireLiteError::StorageError("Blob manager missing".into()))?
+        };
 
         for (_, value) in &mut doc.fields {
             if let Value::BlobLink { offset, len } = *value {
-                let mut buf = vec![0u8; len as usize];
-                
-                #[cfg(unix)] {
-                    use std::os::unix::fs::FileExt;
-                    file.read_exact_at(&mut buf, offset)?;
-                }
-                #[cfg(windows)] {
-                    use std::os::windows::fs::FileExt;
-                    file.seek_read(&mut buf, offset)?;
-                }
-
-                let decrypted_data = if let Some(ref enc) = encryption {
-                    enc.decrypt(&buf)?
-                } else {
-                    buf
-                };
+                let decrypted_data = blob_manager.read_at(offset, len)?;
 
                 if let Ok(s) = String::from_utf8(decrypted_data.clone()) {
                     *value = Value::String(s);
@@ -1636,25 +1586,15 @@ impl FireLite {
     // Helper for projected resolution
     fn resolve_single_value_blob(&self, collection: &str, offset: u64, len: u32) -> Result<Value> {
         let shard_arc = self.get_shard(collection);
-        let shard = shard_arc.read().unwrap();
-        let file = shard.blob_file.as_ref()
-            .ok_or_else(|| FireLiteError::StorageError("Blob file missing".into()))?;
-        
-        let mut buf = vec![0u8; len as usize];
-        
-        #[cfg(unix)] {
-            use std::os::unix::fs::FileExt;
-            file.read_exact_at(&mut buf, offset)?;
-        }
-        #[cfg(windows)] {
-            use std::os::windows::fs::FileExt;
-            file.seek_read(&mut buf, offset)?;
-        }
-        
-        let data = if let Some(k) = &self.config.encryption_key {
-            let enc = crate::storage::crypto::EncryptionContext::from_secret(k);
-            enc.decrypt(&buf)?
-        } else { buf };
+        let blob_manager = {
+            let shard = shard_arc.read().unwrap();
+            shard
+                .blob_manager
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| FireLiteError::StorageError("Blob manager missing".into()))?
+        };
+        let data = blob_manager.read_at(offset, len)?;
 
         if let Ok(s) = String::from_utf8(data.clone()) {
             Ok(Value::String(s))
@@ -1677,35 +1617,18 @@ impl FireLite {
         if !has_links { return Ok(()); }
 
         let shard_arc = self.get_shard(collection);
-        let shard = shard_arc.read().unwrap();
-        
-        // FIX: Removed "..." and added proper error handling
-        let file = shard.blob_file.as_ref()
-            .ok_or_else(|| FireLiteError::StorageError("Blob file missing".into()))?;
-
-        // FIX: Re-added the missing encryption context definition
-        let encryption = self.config.encryption_key.as_ref()
-            .map(|k| crate::storage::crypto::EncryptionContext::from_secret(k));
+        let blob_manager = {
+            let shard = shard_arc.read().unwrap();
+            shard
+                .blob_manager
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| FireLiteError::StorageError("Blob manager missing".into()))?
+        };
 
         for (_, value) in &mut doc.fields {
             if let Value::BlobLink { offset, len } = *value {
-                let mut buf = vec![0u8; len as usize];
-                
-                // USE POSITIONAL I/O (Matches StorageEngine changes)
-                #[cfg(unix)] {
-                    use std::os::unix::fs::FileExt;
-                    file.read_exact_at(&mut buf, offset)?;
-                }
-                #[cfg(windows)] {
-                    use std::os::windows::fs::FileExt;
-                    file.seek_read(&mut buf, offset)?;
-                }
-
-                let decrypted_data = if let Some(ref enc) = encryption {
-                    enc.decrypt(&buf)?
-                } else {
-                    buf
-                };
+                let decrypted_data = blob_manager.read_at(offset, len)?;
 
                 if let Ok(s) = String::from_utf8(decrypted_data.clone()) {
                     *value = Value::String(s);
@@ -1779,8 +1702,13 @@ impl FireLite {
         // Re-open the blob file handle in the shard
         // let new_file = std::fs::OpenOptions::new().read(true).append(true).open(&blob_path)?;
         let new_file = std::fs::OpenOptions::new().read(true).append(true).open(&blob_path)?;
-        // shard.blob_file = Some(Arc::new(Mutex::new(new_file)));
-        shard.blob_file = Some(Arc::new(new_file));
+        shard.blob_manager = Some(Arc::new(BlobManager::new(
+            Arc::new(new_file),
+            shard.encryption.clone(),
+            self.config.use_compression,
+            self.config.compression_level,
+            new_offset,
+        )));
 
         // 3. Update the Skeletons in the Segment
         // (This triggers a standard storage Put for the updated skeletons)
@@ -1870,29 +1798,20 @@ impl Drop for FireLite {
 // --- Internal Helper Functions ---
 
 /// Helper used by background threads to resolve blobs when they don't have access to the full Engine.
-pub(crate) fn resolve_doc_static(doc: &mut FireLiteDoc, shard_arc: &Arc<RwLock<StorageEngine>>, enc_secret: Option<&str>) -> Result<()> {
+pub(crate) fn resolve_doc_static(doc: &mut FireLiteDoc, shard_arc: &Arc<RwLock<StorageEngine>>, _enc_secret: Option<&str>) -> Result<()> {
     // ... check has_links ...
-    let shard = shard_arc.read().unwrap();
-    
-    // FIX: blob_file is Arc<File>, not Mutex
-    let file = shard.blob_file.as_ref().ok_or_else(|| FireLiteError::StorageError("Blob missing".into()))?;
-    let encryption = enc_secret.map(|k| crate::storage::crypto::EncryptionContext::from_secret(k));
+    let blob_manager = {
+        let shard = shard_arc.read().unwrap();
+        shard
+            .blob_manager
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| FireLiteError::StorageError("Blob manager missing".into()))?
+    };
 
     for (_, value) in &mut doc.fields {
         if let Value::BlobLink { offset, len } = *value {
-            let mut buf = vec![0u8; len as usize];
-            
-            // POSITIONAL READ
-            #[cfg(unix)] {
-                use std::os::unix::fs::FileExt;
-                file.read_exact_at(&mut buf, offset)?;
-            }
-            #[cfg(windows)] {
-                use std::os::windows::fs::FileExt;
-                file.seek_read(&mut buf, offset)?;
-            }
-
-            let data = if let Some(ref enc) = encryption { enc.decrypt(&buf)? } else { buf };
+            let data = blob_manager.read_at(offset, len)?;
             if let Ok(s) = String::from_utf8(data.clone()) { *value = Value::String(s); }
             else { *value = Value::Binary(data); }
         }
@@ -1915,22 +1834,4 @@ fn fast_doc_key(col: &str, id: &str) -> String {
     s.push(':');
     s.push_str(id);
     s
-}
-
-// Helper to keep worker code clean
-fn prepare_blob(data: &[u8], key: &Option<String>, compress: bool, level: i32) -> Vec<u8> {
-    let mut p = data.to_vec();
-    if compress && p.len() > 2048 {
-        if let Ok(c) = zstd::encode_all(&p[..], level) { if c.len() < p.len() { p = c; } }
-    }
-    if let Some(s) = key {
-        let enc = crate::storage::crypto::EncryptionContext::from_secret(s);
-        if let Ok(e) = enc.encrypt(&p) { p = e; }
-    }
-    p
-}
-
-fn write_at(file: &std::fs::File, buf: &[u8], offset: u64) {
-    #[cfg(unix)] { use std::os::unix::fs::FileExt; file.write_all_at(buf, offset).expect("Blob IO fail"); }
-    #[cfg(windows)] { use std::os::windows::fs::FileExt; file.seek_write(buf, offset).expect("Blob IO fail"); }
 }

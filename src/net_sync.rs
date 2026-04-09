@@ -411,7 +411,11 @@ async fn apply_replication_batch(db: &Arc<FireLite>, collection: String, ops: Ve
 
         if !is_delete {
             // Updated call: now returns work instead of blocking on file write
-            let work = db.process_doc_blobs(&collection, &mut doc, &shard.blob_size, threshold, remote_ts);
+            let work = shard
+                .blob_manager
+                .as_ref()
+                .map(|bm| db.process_doc_blobs(&collection, &mut doc, bm, threshold, remote_ts))
+                .unwrap_or_default();
             replication_blob_work.extend(work);
             
             filtered_ops.push(WalOp::PutInlined { key: key.clone(), value: doc.encode() });

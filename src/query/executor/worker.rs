@@ -6,9 +6,9 @@ use crate::query::filter::Operator;
 
 pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
     let mut out = Vec::new();
-    let (blob_file, encryption) = {
+    let blob_manager = {
         let guard = task.storage.as_ref().unwrap().read().unwrap();
-        (guard.blob_file.clone(), guard.encryption.clone())
+        guard.blob_manager.clone()
     };
     let storage_engine = task.storage.as_ref().unwrap().read().unwrap();
 
@@ -17,8 +17,8 @@ pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
             if task.plan.filters_satisfied_by_index || matches_filters_view(&bytes, &task.plan) {
                 if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
                     
-                    if let Some(ref file) = blob_file {
-                        let _ = inflate_blobs(&mut doc, file, encryption.as_ref());
+                    if let Some(ref manager) = blob_manager {
+                        let _ = inflate_blobs(&mut doc, manager);
                     }
                     
                     out.push((id, doc));
@@ -29,25 +29,10 @@ pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
     out
 }
 
-fn inflate_blobs(doc: &mut FireLiteDoc, file: &std::fs::File, encryption: Option<&crate::storage::crypto::EncryptionContext>) -> Result<(), crate::error::FireLiteError> {
+fn inflate_blobs(doc: &mut FireLiteDoc, blob_manager: &crate::storage::blob::BlobManager) -> Result<(), crate::error::FireLiteError> {
     for (_, value) in &mut doc.fields {
         if let Value::BlobLink { offset, len } = *value {
-            let mut buf = vec![0u8; len as usize];
-            
-            #[cfg(unix)] {
-                use std::os::unix::fs::FileExt;
-                file.read_exact_at(&mut buf, offset)?;
-            }
-            #[cfg(windows)] {
-                use std::os::windows::fs::FileExt;
-                file.seek_read(&mut buf, offset)?;
-            }
-
-            let data = if let Some(enc) = encryption {
-                enc.decrypt(&buf)?
-            } else {
-                buf
-            };
+            let data = blob_manager.read_at(offset, len)?;
 
             // Convert back to original type (Simple heuristic for the benchmark)
             if let Ok(s) = String::from_utf8(data.clone()) {
@@ -66,9 +51,9 @@ pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)
     
     // 1. Pull the handles from the Shard (StorageEngine)
     // We do this once per task (worker thread)
-    let (blob_file, encryption) = {
+    let blob_manager = {
         let guard = task.storage.as_ref().unwrap().read().unwrap();
-        (guard.blob_file.clone(), guard.encryption.clone())
+        guard.blob_manager.clone()
     };
 
     let storage_engine = task.storage.as_ref().unwrap().read().unwrap();
@@ -85,8 +70,8 @@ pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)
                                 
                                 // PARALLEL BLOB RESOLUTION for Projected Fields
                                 if let Value::BlobLink { offset, len } = val {
-                                    if let Some(ref file) = blob_file {
-                                        val = resolve_single_blob_in_worker(file, offset, len, encryption.as_ref());
+                                    if let Some(ref manager) = blob_manager {
+                                        val = resolve_single_blob_in_worker(manager, offset, len);
                                     }
                                 }
                                 
@@ -104,20 +89,11 @@ pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)
 
 // Helper for projected resolution
 fn resolve_single_blob_in_worker(
-    file: &std::fs::File, 
+    blob_manager: &crate::storage::blob::BlobManager,
     offset: u64, 
-    len: u32, 
-    encryption: Option<&crate::storage::crypto::EncryptionContext>
+    len: u32,
 ) -> Value {
-    let mut buf = vec![0u8; len as usize];
-    #[cfg(unix)] { use std::os::unix::fs::FileExt; let _ = file.read_exact_at(&mut buf, offset); }
-    #[cfg(windows)] { use std::os::windows::fs::FileExt; let _ = file.seek_read(&mut buf, offset); }
-
-    let data = if let Some(enc) = encryption {
-        enc.decrypt(&buf).unwrap_or(buf)
-    } else {
-        buf
-    };
+    let data = blob_manager.read_at(offset, len).unwrap_or_default();
 
     if let Ok(s) = String::from_utf8(data.clone()) {
         Value::String(s)

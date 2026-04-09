@@ -1,3 +1,4 @@
+pub mod blob;
 pub mod compaction;
 pub mod crypto;
 pub mod engine;
