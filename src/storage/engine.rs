@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use crate::config::{FireLiteConfig, DurabilityMode};
 use crate::error::{FireLiteError, Result};
 use std::sync::{Arc, Mutex}; 
-use std::sync::atomic::AtomicU64;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::memory::page_cache::PageCache; 
 
+use super::blob::{BlobManager, BlobWork};
 use super::compaction::compact_segment;
 use super::crypto::EncryptionContext;
 use super::segment::Segment;
@@ -38,19 +38,6 @@ pub enum StorageMutation {
     Delete { key: String },
 }
 
-pub enum BlobWork {
-    PutRaw {
-        collection: String,
-        offset: u64,
-        data: Arc<Vec<u8>>,
-    },
-    Put {
-        collection: String,
-        key: String,
-        data: Arc<Vec<u8>>,
-    },
-}
-
 struct SegmentMeta {
     // id: u64,
     level: u32,
@@ -74,9 +61,8 @@ pub struct StorageEngine {
     pub cache: Arc<Mutex<PageCache>>,
     pub mmap_size: usize, 
     pub index: HashMap<String, Pointer>,
-    pub blob_file: Option<Arc<std::fs::File>>,
+    pub blob_manager: Option<Arc<BlobManager>>,
     pub(crate) blob_tx: Option<CrossbeamSender<BlobWork>>,
-    pub(crate) blob_size: AtomicU64,
     pub logical_name: String,
     pub(crate) in_flight_blob_bytes: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -171,7 +157,7 @@ impl StorageEngine {
             index: HashMap::new(),
             next_tx_id: 1,
             compaction_threshold_bytes: cfg.auto_compaction_threshold_bytes,
-            encryption,
+            encryption: encryption.clone(),
             use_compression: cfg.use_compression,
             inlined_bytes: 0, 
             blob_threshold: cfg.value_blob_threshold_bytes,
@@ -179,9 +165,14 @@ impl StorageEngine {
             collection_counts: HashMap::new(),
             cache, 
             mmap_size: cfg.mmap_size,
-            blob_file: Some(blob_file),
+            blob_manager: Some(Arc::new(BlobManager::new(
+                blob_file,
+                encryption.clone(),
+                cfg.use_compression,
+                cfg.compression_level,
+                initial_size,
+            ))),
             blob_tx: None,
-            blob_size: AtomicU64::new(initial_size),
             logical_name,
             in_flight_blob_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
@@ -586,30 +577,9 @@ impl StorageEngine {
             Pointer::Inlined(data) => Ok(Some(data.clone())),
 
             Pointer::Blob { offset, len } => {
-                let file = self.blob_file.as_ref()
-                    .ok_or_else(|| FireLiteError::StorageError("Blob file missing".into()))?;
-                
-                let mut buf = vec![0u8; *len as usize];
-                
-                #[cfg(unix)] {
-                    use std::os::unix::fs::FileExt;
-                    file.read_exact_at(&mut buf, *offset)?;
-                }
-                #[cfg(windows)] {
-                    use std::os::windows::fs::FileExt;
-                    file.seek_read(&mut buf, *offset)?;
-                }
-
-                // Blobs handle their own encryption/decryption because they 
-                // aren't part of the LSM compaction cycles.
-                let data = if let Some(enc) = &self.encryption {
-                    enc.decrypt(&buf)?
-                } else {
-                    buf
-                };
-
-                // Note: If you add blob compression, decode it here as well.
-                Ok(Some(data))
+                let manager = self.blob_manager.as_ref()
+                    .ok_or_else(|| FireLiteError::StorageError("Blob manager missing".into()))?;
+                Ok(Some(manager.read_at(*offset, *len)?))
             },
 
             Pointer::Segment { segment_id, offset, len } => {
