@@ -27,7 +27,12 @@ impl CompositeIndex {
         let mut values = Vec::with_capacity(self.definition.fields.len());
 
         for f in &self.definition.fields {
-            let v = doc.get(&f.field)?.clone();
+            // NEW: Check if the index is requesting the timestamp
+            let v = if f.field == "_time" {
+                Value::Int(doc._time)
+            } else {
+                doc.get(&f.field)?.clone()
+            };
             values.push(v);
         }
 

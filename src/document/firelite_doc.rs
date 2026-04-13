@@ -296,15 +296,17 @@ pub(crate) fn decode_value(tag: u8, bytes: &[u8]) -> Option<Value> {
             Some(Value::Array(items))
         }
         10 => {
-             let mut pos = 0;
-             let c_len = *bytes.get(pos)? as usize;
-             pos += 1;
-             let collection = std::str::from_utf8(bytes.get(pos..pos+c_len)?).ok()?.to_string();
-             pos += c_len;
-             let d_len = *bytes.get(pos)? as usize;
-             pos += 1;
-             let doc_id = std::str::from_utf8(bytes.get(pos..pos+d_len)?).ok()?.to_string();
-             Some(Value::Reference { collection, doc_id })
+            let mut pos = 0;
+            let c_len = *bytes.get(pos)? as usize;
+            pos += 1;
+            let collection = std::str::from_utf8(bytes.get(pos..pos+c_len)?).ok()?.to_string();
+            pos += c_len;
+            
+            // CRITICAL: Does your decoder expect a second length byte?
+            let d_len = *bytes.get(pos)? as usize; // Make sure this line exists!
+            pos += 1;
+            let doc_id = std::str::from_utf8(bytes.get(pos..pos+d_len)?).ok()?.to_string();
+            Some(Value::Reference { collection, doc_id })
         }
         11 => {
             let offset = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?);

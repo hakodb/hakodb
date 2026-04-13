@@ -12,7 +12,7 @@ pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
     for (id, pointer) in task.docs {
         if let Ok(Some(bytes)) = storage_guard.read_pointer(&pointer) {
             // 1. Zero-allocation filter check
-            if task.plan.filters_satisfied_by_index || matches_filters_view(&bytes, &task.plan) {
+            if task.plan.filters_satisfied_by_index || matches_filters_view(&id, &bytes, &task.plan) {
                 if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
                     
                     // 2. Call the helper function (This removes the warning)
@@ -67,7 +67,7 @@ pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)
 
     for (id, pointer) in task.docs {
         if let Ok(Some(bytes)) = storage_engine.read_pointer(&pointer) {
-            if task.plan.filters_satisfied_by_index || matches_filters_view(&bytes, &task.plan) {
+            if task.plan.filters_satisfied_by_index || matches_filters_view(&id, &bytes, &task.plan) {
                 let mut fields_out = Vec::new();
                 if let Some(view) = FireLiteDocView::new(&bytes) {
                     for field_name in projection {
@@ -113,15 +113,31 @@ fn resolve_single_blob_in_worker(
 /// The high-performance core: Scans document bytes ONCE and performs 
 /// comparisons without allocating memory for document values.
 pub(crate) fn matches_filters_view(
+    doc_id :&str,
     bytes: &[u8],
     plan: &crate::query::plan::QueryPlan,
 ) -> bool {
-    let Some(view) = FireLiteDocView::new(bytes) else { return false; };
+    let doc_time = i64::from_le_bytes(bytes[2..10].try_into().unwrap_or([0;8]));
     if plan.filters.is_empty() && plan.or_groups.is_empty() { return true; }
-
+    
     let mut and_matches = vec![false; plan.filters.len()];
     let mut or_group_results = vec![false; plan.or_groups.len()];
 
+    for (i, f) in plan.filters.iter().enumerate() {
+        if f.field == "id" {
+            // Compare string reference without allocation
+            if crate::query::filter::compare_values(&Value::String(doc_id.to_owned()), &f.op, &f.value) {
+                and_matches[i] = true;
+            }
+        } else if f.field == "_time" {
+            // Compare i64 directly
+            if crate::query::filter::compare_values(&Value::Int(doc_time), &f.op, &f.value) {
+                and_matches[i] = true;
+            }
+        }
+    }
+    
+    let Some(view) = FireLiteDocView::new(bytes) else { return false; };
     // CRITICAL PERFORMANCE FIX: Single linear pass over fields
     for (key, tag, data) in view.iter() {
         // 1. Check ANDs

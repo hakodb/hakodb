@@ -779,6 +779,7 @@ async fn apply_replication_batch(db: Arc<FireLite>, collection: String, ops: Vec
             if let Some(local_ptr) = shard_read.index.get(&key) {
                 let local_ts = match local_ptr {
                     Pointer::Deleted { timestamp } => *timestamp,
+                    Pointer::Inlined(bytes) => i64::from_le_bytes(bytes[2..10].try_into().unwrap_or([0;8])),
                     _ => {
                         // Fast path: if the pointer is in-memory (Inlined/Pending), get time directly
                         // otherwise decode the disk header.

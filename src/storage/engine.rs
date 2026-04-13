@@ -678,23 +678,27 @@ impl StorageEngine {
     }
 
     pub fn count_prefix(&self, prefix: &str) -> usize {
-        self.index.keys().filter(|k| k.starts_with(prefix)).count()
+        if prefix.is_empty() || prefix == self.logical_name {
+            return self.index.values()
+                .filter(|p| !matches!(p, Pointer::Deleted { .. }))
+                .count();
+        }
+        // Fallback for sub-collection support if needed
+        self.index.iter()
+            .filter(|(k, p)| k.starts_with(prefix) && !matches!(p, Pointer::Deleted { .. }))
+            .count()
     }
 
     pub fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut out = Vec::new();
 
-        let snapshot: Vec<(String, Pointer)> = self
-            .index
-            .iter()
-            .filter(|(k, _)| k.starts_with(prefix))
-            .map(|(k, p)| (k.clone(), p.clone()))
-            .collect();
+        for (key, pointer) in &self.index {
+            // Skip deleted and filter by prefix if one is provided
+            if matches!(pointer, Pointer::Deleted { .. }) { continue; }
+            if !prefix.is_empty() && !key.starts_with(prefix) { continue; }
 
-        let mut out = Vec::with_capacity(snapshot.len());
-
-        for (key, pointer) in snapshot {
-            if let Some(value) = self.read_pointer(&pointer)? {
-                out.push((key, value));
+            if let Some(value) = self.read_pointer(pointer)? {
+                out.push((key.clone(), value));
             }
         }
 
@@ -817,9 +821,11 @@ impl StorageEngine {
     /// Returns only the keys matching a prefix. 
     /// Extremely memory efficient because it doesn't touch the disk/mmap bodies.
     pub fn scan_prefix_keys(&self, prefix: &str) -> Vec<String> {
-        self.index.keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
+        self.index.iter()
+            .filter(|(k, p)| {
+                !matches!(p, Pointer::Deleted { .. }) && (prefix.is_empty() || k.starts_with(prefix))
+            })
+            .map(|(k, _)| k.clone())
             .collect()
     }
 

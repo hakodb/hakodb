@@ -297,9 +297,11 @@ fn split_doc_path(path: &str) -> Result<(&str, &str)> {
 
 fn split_doc_path_with_fields(path: &str) -> Result<(&str, &str, Vec<String>)> {
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.len() < 2 {
-        bail!("expected path format: <collection>/<doc_id>[/field[/field...]]");
+
+    if parts.len() == 1 {
+        return Ok((path, "", Vec::new()));
     }
+
     Ok((
         parts[0],
         parts[1],
@@ -1052,7 +1054,6 @@ fn run_server(
         
         loop {
             let status = net.status(); 
-            // let prompt = format!("firelite({}:{}) > ", node_id, status.peer_count);
             let prompt = format!(
                 "firelite({}:{} | {}) > ", 
                 node_id, 

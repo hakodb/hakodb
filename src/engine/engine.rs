@@ -172,7 +172,7 @@ impl SerializableTransaction {
         collection: &str,
         doc_id: &str,
     ) -> Result<Option<FireLiteDoc>> {
-        let key = doc_key(collection, doc_id);
+        let key = doc_id.to_string();
         let doc = db.get(collection, doc_id)?;
         let version = db.current_version(&key);
         self.reads.insert(key, version);
@@ -227,6 +227,7 @@ pub struct FireLite {
     blob_stop_tx: Mutex<Option<Sender<()>>>, 
     blob_worker_handle: Mutex<Option<thread::JoinHandle<()>>>,
     pub(crate) trigger_blob_flush: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) id_sequence: std::sync::atomic::AtomicU16,
 }
 
 impl FireLite {
@@ -435,6 +436,7 @@ impl FireLite {
             trigger_blob_flush: trigger_flush,
             blob_stop_tx: Mutex::new(Some(stop_tx)),
             blob_worker_handle: Mutex::new(Some(blob_worker_handle)),
+            id_sequence: std::sync::atomic::AtomicU16::new(0),
         };
 
         let _ = db.restore_index_defs();
@@ -490,11 +492,10 @@ impl FireLite {
                     if !snapshot_loaded {
                         if let Ok(data) = storage.scan_prefix("") {
                             let mut mgr = indexes_ptr.write().unwrap();
-                            for (full_key, bytes) in data {
-                                if let Some((_, doc_id)) = full_key.split_once(':') {
-                                    if let Some(doc) = FireLiteDoc::decode(&bytes) {
-                                        mgr.index_document(&col_name, doc_id, &doc);
-                                    }
+                            for (doc_id, bytes) in data {
+                                if let Some(doc) = FireLiteDoc::decode(&bytes) {
+                                    // doc_id is already the naked ID
+                                    mgr.index_document(&col_name, &doc_id, &doc);
                                 }
                             }
                         }
@@ -572,14 +573,18 @@ impl FireLite {
     }
 
     fn write_batch_internal(&self, mutations: Vec<BatchMutation>) -> Result<()> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
-        let threshold = self.config.value_blob_threshold_bytes;
+        // Use nanoseconds for higher precision in ID generation
+        let now_nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64;
+        // Keep your existing micros for the _time metadata if you prefer, 
+        // but nanos is better for ID uniqueness.
+        let now_micros = now_nanos / 1000; 
 
+        let threshold = self.config.value_blob_threshold_bytes;
         let mut shard_map: HashMap<String, ShardWork> = HashMap::new();
 
         for m in mutations {
             // 1. Resolve basic info immediately
-            let (col, doc_id, mut doc, is_delete) = match m {
+            let (col, mut doc_id, mut doc, is_delete) = match m {
                 BatchMutation::Put { collection, doc_id, doc } => (collection, doc_id, doc, false),
                 BatchMutation::Patch { collection, doc_id, updates } => {
                     let mut current_doc = self.get(&collection, &doc_id)?.unwrap_or_default();
@@ -591,9 +596,12 @@ impl FireLite {
                 }
             };
 
+            if doc_id.is_empty() || doc_id == "" {
+                doc_id = self.generate_sortable_id(now_nanos);
+            }
+
             // 2. COMPUTE KEY ONCE
-            // let key = fast_doc_key(&col, &doc_id);
-            let key_arc: Arc<str> = Arc::from(fast_doc_key(&col, &doc_id).as_str());
+            let key_arc: Arc<str> = Arc::from(doc_id.as_str());
 
             let work = shard_map.entry(col.clone()).or_insert_with(|| ShardWork {
                 ops: Vec::new(), keys: Vec::new(), events: Vec::new(), 
@@ -602,13 +610,13 @@ impl FireLite {
 
             if is_delete {
                 let key_clone = key_arc.clone();
-                work.ops.push(WalOp::Delete { key: key_arc.to_string(), timestamp: now });
+                work.ops.push(WalOp::Delete { key: key_arc.to_string(), timestamp: now_micros });
                 work.keys.push(key_arc);
                 work.events.push((col, ChangeEvent { path: key_clone.to_string(), kind: ChangeKind::Delete }));
                 continue;
             }
 
-            doc._time = now;
+            doc._time = now_micros;
             
             // 3. REUSE KEY for Blobs
             let blob_work = {
@@ -644,8 +652,7 @@ impl FireLite {
                 }
 
                 for (doc_id, doc) in &work.index_puts {
-                    let k = fast_doc_key(&col_name, &doc_id);
-                    shard.update_index_entry(k, Some(Pointer::BlobPending(Arc::new(doc.clone()))));
+                    shard.update_index_entry(doc_id.clone(), Some(Pointer::BlobPending(Arc::new(doc.clone()))));
                 }
                 
                 // ... (Rest of the loop: queueing blobs, same as before) ...
@@ -711,7 +718,7 @@ impl FireLite {
         let shard = self.get_shard(collection);
         let storage = shard.safe_read()?;
         let res = storage
-            .get(&doc_key(collection, doc_id))?
+            .get(doc_id)?
             .and_then(|b| FireLiteDoc::decode(&b));
 
         // AUDIT SUCCESS
@@ -758,7 +765,7 @@ impl FireLite {
 
         let shard_arc = self.get_shard(&query.collection);
         let indexes = self.indexes.read().unwrap();
-        let rows = shard_arc.read().unwrap().count_prefix(&format!("{}:", query.collection));
+        let rows = shard_arc.read().unwrap().count_prefix("");
 
         let plan = QueryPlanner::plan(&query, &indexes, rows, self.config.query_workers);
 
@@ -803,7 +810,7 @@ impl FireLite {
 
         let shard_arc = self.get_shard(&q.collection);
         let indexes = self.indexes.read().unwrap();
-        let rows = shard_arc.read().unwrap().count_prefix(&format!("{}:", q.collection));
+        let rows = shard_arc.read().unwrap().count_prefix("");
 
         let plan = QueryPlanner::plan(&q, &indexes, rows, self.config.query_workers);
 
@@ -992,7 +999,7 @@ impl FireLite {
         let rows = shard_arc
             .read()
             .unwrap()
-            .count_prefix(&format!("{}:", query.collection));
+            .count_prefix("");
 
         // FIX: Add self.config.query_workers as the 4th argument
         let plan = QueryPlanner::plan(&query, &indexes, rows, self.config.query_workers);
@@ -1220,9 +1227,7 @@ impl FireLite {
                 let mut decoded_docs = Vec::new();
                 for (full_key, bytes) in resolved_docs {
                     if let Some(doc) = FireLiteDoc::decode(&bytes) {
-                        if let Some((_, doc_id)) = full_key.split_once(':') {
-                            decoded_docs.push((doc_id.to_string(), doc));
-                        }
+                        decoded_docs.push((full_key, doc));
                     }
                 }
                 IndexingService::backfill_secondary(
@@ -1285,9 +1290,7 @@ impl FireLite {
                 for (full_key, bytes) in resolved_docs {
                     if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
                         let _ = resolve_doc_static(&mut doc, &shard_arc, enc_key.as_deref());
-                        if let Some((_, doc_id)) = full_key.split_once(':') {
-                            decoded_docs.push((doc_id.to_string(), doc));
-                        }
+                        decoded_docs.push((full_key, doc));
                     }
                 }
                 IndexingService::backfill_fts(
@@ -1353,27 +1356,24 @@ impl FireLite {
                 let mut persist = persist_ptr.lock().unwrap();
 
                 if let Some(composite_idx) = mgr.composite.get_mut(index_id) {
-                    for (full_key, bytes) in resolved_data {
+                    for (doc_id, bytes) in resolved_data {
                         if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
                             let _ = resolve_doc_static(&mut doc, &shard_arc, enc_key.as_deref());
-                            if let Some((_, doc_id)) = full_key.split_once(':') {
-                                // 1. Insert into RAM
-                                composite_idx.index_document(doc_id, &doc);
+                            composite_idx.index_document(&doc_id, &doc);
 
-                                // 2. Insert LEAN KEY into index.log
-                                if let Some(vals) = composite_idx.document_values(&doc) {
-                                    let key_bytes =
-                                        crate::index::composite::key_encoder::encode_composite_key(
-                                            &composite_idx.definition,
-                                            &vals,
-                                            doc_id,
-                                        );
-                                    let _ = persist.insert(
-                                        index_id,
-                                        key_bytes.to_vec(),
-                                        doc_id.to_string(),
+                            // 2. Insert LEAN KEY into index.log
+                            if let Some(vals) = composite_idx.document_values(&doc) {
+                                let key_bytes =
+                                    crate::index::composite::key_encoder::encode_composite_key(
+                                        &composite_idx.definition,
+                                        &vals,
+                                        &doc_id,
                                     );
-                                }
+                                let _ = persist.insert(
+                                    index_id,
+                                    key_bytes.to_vec(),
+                                    doc_id.to_string(),
+                                );
                             }
                         }
                     }
@@ -1616,16 +1616,18 @@ impl FireLite {
         map
     }
 
+    fn generate_sortable_id(&self, timestamp_nanos: i64) -> String {
+        let seq = self.id_sequence.fetch_add(1, Ordering::Relaxed);
+        // [16 chars Timestamp Hex] + [4 chars Sequence Hex]
+        format!("{:016x}{:04x}", timestamp_nanos, seq)
+    }
+
 }
 
 impl Drop for FireLite {
     fn drop(&mut self) {
         // 1. Stop Audit/Maintenance
         if let Some(tx) = self.system_stop.lock().unwrap().take() { let _ = tx.send(()); }
-
-        // 2. Shut down refinery/transformation worker
-        // if let Some(tx) = self.transformation_tx.lock().unwrap().take() { drop(tx); }
-        // if let Some(h) = self.transformation_handle.lock().unwrap().take() { let _ = h.join(); }
 
         // 3. FLUSH BLOB WORKER (The "Touch" Sequence)
         // Set the trigger to wake up the worker, then send the stop signal
@@ -1709,19 +1711,6 @@ pub(crate) fn resolve_doc_static(
     Ok(())
 }
 
-fn doc_key(collection: &str, doc_id: &str) -> String {
-    format!("{}:{}", collection, doc_id)
-}
-
-fn subcollection_prefix(collection: &str, doc_id: &str, subcollection: &str) -> String {
-    format!("{}:{}/{}", collection, doc_id, subcollection)
-}
-
-// Helper to build a key without format!()
-fn fast_doc_key(col: &str, id: &str) -> String {
-    let mut s = String::with_capacity(col.len() + id.len() + 1);
-    s.push_str(col);
-    s.push(':');
-    s.push_str(id);
-    s
+fn subcollection_prefix(_collection: &str, doc_id: &str, subcollection: &str) -> String {
+    format!("{}/{}", doc_id, subcollection)
 }

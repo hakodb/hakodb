@@ -341,9 +341,7 @@ impl FireLiteGateway {
 }
 
 fn extract_id_from_path(path: &str) -> String {
-    path.split_once(':')
-        .map(|(_, id)| id.to_string())
-        .unwrap_or_else(|| path.to_string())
+    path.to_string()
 }
 
 #[derive(Debug, Clone)]

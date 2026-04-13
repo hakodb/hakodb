@@ -142,10 +142,22 @@ impl ParallelQueryExecutor {
         // Manual sort if the Index couldn't satisfy the order_by clause
         if !plan.order_by_satisfied {
             if let Some(order) = &plan.order_by {
-                results.sort_by(|(_, a), (_, b)| {
-                    let av = a.get(&order.field);
-                    let bv = b.get(&order.field);
-                    let cmp = av.cmp(&bv);
+                results.sort_by(|(id_a, doc_a), (id_b, doc_b)| {
+                    let cmp = match order.field.as_str() {
+                        // 1. Sort by the naked ID (String comparison)
+                        "id" => id_a.cmp(id_b),
+                        
+                        // 2. Sort by the native timestamp (i64 comparison)
+                        "_time" => doc_a._time.cmp(&doc_b._time),
+                        
+                        // 3. Fallback to regular document fields
+                        _ => {
+                            let av = doc_a.get(&order.field);
+                            let bv = doc_b.get(&order.field);
+                            av.cmp(&bv)
+                        }
+                    };
+
                     if order.ascending { cmp } else { cmp.reverse() }
                 });
             }
@@ -163,12 +175,8 @@ impl ParallelQueryExecutor {
     }
 
     #[inline]
-    fn make_key(collection: &str, doc_id: &str) -> String {
-        let mut s = String::with_capacity(collection.len() + doc_id.len() + 1);
-        s.push_str(collection);
-        s.push(':');
-        s.push_str(doc_id);
-        s
+    fn make_key(_collection: &str, doc_id: &str) -> String {
+        doc_id.to_string()
     }
 
     pub fn execute_aggregation(
@@ -209,7 +217,7 @@ impl ParallelQueryExecutor {
                         let count = if plan.filters.is_empty() {
                             // Instant O(1) count from storage metadata if no filters
                             let storage = storage_arc.read().unwrap();
-                            storage.count_prefix(&format!("{}:", plan.collection))
+                            storage.count_prefix("")
                         } else {
                             // O(Index) count from intersection results
                             filter_ids.map(|ids| ids.len()).unwrap_or(0)
@@ -275,9 +283,9 @@ impl ParallelQueryExecutor {
             let mut partial_results = HashMap::new();
             let storage_engine = task.storage.as_ref().unwrap().read().unwrap();
 
-            for (_id, pointer) in task.docs {
+            for (id, pointer) in task.docs {
                 if let Ok(Some(bytes)) = storage_engine.read_pointer(&pointer) {
-                    if matches_filters_view(&bytes, &task.plan) {
+                    if matches_filters_view(&id, &bytes, &task.plan) {
                         if let Some(view) = FireLiteDocView::new(&bytes) {
                             for op in &thread_ops {
                                 match op {
@@ -389,10 +397,19 @@ impl ParallelQueryExecutor {
         }
 
         if let Some(order) = &plan.order_by {
-            results.sort_by(|(_, a), (_, b)| {
-                let av = a.iter().find(|(k, _)| k == &order.field).map(|(_, v)| v);
-                let bv = b.iter().find(|(k, _)| k == &order.field).map(|(_, v)| v);
-                let cmp = av.cmp(&bv);
+            results.sort_by(|(id_a, fields_a), (id_b, fields_b)| {
+                let cmp = match order.field.as_str() {
+                    "id" => id_a.cmp(id_b),
+                    
+                    // In projected results, _time is already injected into the fields vec 
+                    // by FireLiteDoc::decode_projected
+                    _ => {
+                        let av = fields_a.iter().find(|(k, _)| k == &order.field).map(|(_, v)| v);
+                        let bv = fields_b.iter().find(|(k, _)| k == &order.field).map(|(_, v)| v);
+                        av.cmp(&bv)
+                    }
+                };
+
                 if order.ascending { cmp } else { cmp.reverse() }
             });
         }
@@ -425,7 +442,7 @@ impl ParallelQueryExecutor {
             ScanType::FullCollection => {
                 Ok(storage.index.iter()
                     // FIX: Added check to skip Pointer::Deleted
-                    .filter(|(k, p)| k.starts_with(collection) && !matches!(p, Pointer::Deleted { .. }))
+                    .filter(|(_, p)| !matches!(p, Pointer::Deleted { .. }))
                     .take(max_ids)
                     .map(|(k, p)| (k.clone(), p.clone()))
                     .collect())
@@ -513,11 +530,9 @@ impl ParallelQueryExecutor {
 
                         // Map Doc IDs to Physical Pointers
                         for doc_id in doc_ids.into_iter().take(remaining) {
-                            let key = format!("{}:{}", collection, doc_id);
-                            if let Some(ptr) = storage.index.get(&key) {
-                                // out.push((key, ptr.clone()));
+                            if let Some(ptr) = storage.index.get(&doc_id) {
                                 if !matches!(ptr, Pointer::Deleted { .. }) {
-                                    out.push((key, ptr.clone()));
+                                    out.push((doc_id, ptr.clone()));
                                     if out.len() >= max_ids { break; }
                                 }
                             }
