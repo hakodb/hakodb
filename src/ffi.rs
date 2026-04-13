@@ -4,9 +4,9 @@ use std::os::raw::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{channel, Sender};
 use std::time::Duration;
-use std::sync::Arc;
 use std::{ptr, thread};
 
+// use std::sync::Arc;
 use hashbrown::HashMap;
 
 use crate::config::{DurabilityMode, FireLiteConfig};
@@ -90,7 +90,7 @@ pub struct FL_ResultSet {
 #[cfg(feature = "net-sync")]
 #[allow(non_camel_case_types)]
 pub struct FL_NetSyncer {
-    inner: Arc<crate::net_sync::NetSyncer>,
+    inner: std::sync::Arc<crate::net_sync::NetSyncer>,
 }
 
 thread_local! {
@@ -2129,7 +2129,7 @@ pub extern "C" fn fl_net_syncer_new(
     // We need to clone the Arc<FireLite> logically. 
     // Since FL_Engine wraps FireLite (which is not an Arc inside FL_Engine), 
     // we use a temporary wrap to pass it to the syncer.
-    let db_ptr:Arc<FireLite> = unsafe { Arc::from_raw(&engine_ref.db as *const _) };
+    let db_ptr:std::sync::Arc<FireLite> = unsafe { std::sync::Arc::from_raw(&engine_ref.db as *const _) };
     let syncer = crate::net_sync::NetSyncer::new(
         db_ptr.clone(),
         &name_str,
@@ -2140,7 +2140,7 @@ pub extern "C" fn fl_net_syncer_new(
     std::mem::forget(db_ptr);
 
     Box::into_raw(Box::new(FL_NetSyncer {
-        inner: Arc::new(syncer),
+        inner: std::sync::Arc::new(syncer),
     }))
 }
 
