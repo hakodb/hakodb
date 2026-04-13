@@ -76,17 +76,6 @@ pub enum FireLiteOp {
     GetAuditLog,
     SetDurability { mode: i32 },
     SetCompression { enabled: bool, level: i32 },
-    NetSyncStart { 
-        name: String, 
-        room_key: String, 
-        port: u16, 
-        #[serde(default)]
-        excluded: Vec<String>,
-        #[serde(default)]
-        relay: bool 
-    },
-    NetSyncStop,
-    NetSyncStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,7 +287,7 @@ impl FireLiteGateway {
 
                                     if let Ok(Some(bytes)) = bytes_res {
                                         // VARIANT 2 & 3: Filtered Query / DocChanges
-                                        if crate::query::executor::worker::matches_filters_view(&bytes, &filter_plan) {
+                                        if crate::query::executor::worker::matches_filters_view(&doc_id, &bytes, &filter_plan) {
                                             let doc = if let Some(p) = &query_template.projection {
                                                 FireLiteDoc::decode_projected(&bytes, p)
                                             } else {
