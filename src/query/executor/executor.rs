@@ -411,11 +411,6 @@ impl ParallelQueryExecutor {
     }
 
 
-    // #[inline]
-    // fn make_key(collection: &str, doc_id: &str) -> String {
-    //     format!("{}:{}", collection, doc_id)
-    // }
-
     fn execute_single_scan(
         &self,
         storage: &StorageEngine,

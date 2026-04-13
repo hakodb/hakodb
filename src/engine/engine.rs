@@ -141,13 +141,6 @@ struct ShardWork {
     blob_queue_items: Vec<BlobWork>,
 }
 
-// pub(crate) struct TransformTask {
-//     pub collection: String,
-//     pub doc_id: String,
-//     pub doc: Arc<FireLiteDoc>,
-//     // blob_work: Vec<BlobWork>,
-// }
-
 impl Transaction {
     pub fn put(&mut self, collection: &str, doc_id: &str, doc: FireLiteDoc) {
         self.mutations.push(BatchMutation::Put {
@@ -353,7 +346,6 @@ impl FireLite {
         // --- WORKER 3: BLOB WORKER (IO Queue) ---
         let shards_blob_clone = Arc::clone(&shards);
         let trigger_for_blobs_w3 = Arc::clone(&trigger_flush);
-        // let durability_mode = config.durability_mode;
         let blob_worker_handle = thread::spawn(move || {
             loop {
                 let shutting_down = stop_rx.try_recv().is_ok();
@@ -441,8 +433,6 @@ impl FireLite {
             system_stop: Mutex::new(Some(system_stop_tx)),
             system_handle: Mutex::new(Some(system_handle_thread)),
             trigger_blob_flush: trigger_flush,
-            // transformation_tx: Mutex::new(Some(transformation_tx)),
-            // transformation_handle: Mutex::new(Some(transformation_handle)),
             blob_stop_tx: Mutex::new(Some(stop_tx)),
             blob_worker_handle: Mutex::new(Some(blob_worker_handle)),
         };
@@ -828,16 +818,6 @@ impl FireLite {
             ok: true,
         });
 
-        // --- NEW: RESOLVE PROJECTED BLOB FIELDS ---
-        // for (_, fields_list) in &mut results {
-        //     for (_, value) in fields_list {
-        //         if let Value::BlobLink { offset, len } = *value {
-        //             // Logic similar to resolve_doc but for a single Value
-        //             // We call a small helper here
-        //             *value = self.resolve_single_value_blob(&query.collection, offset, len)?;
-        //         }
-        //     }
-        // }
         Ok(results)
     }
 
@@ -924,12 +904,6 @@ impl FireLite {
         shard.get(key).copied()
     }
 
-    // pub(crate) fn bump_versions_by_keys(&self, keys: Vec<String>) {
-    //     let mut versions = self.doc_versions.write().unwrap();
-    //     for key in keys {
-    //         versions.insert(key, self.global_version.fetch_add(1, Ordering::SeqCst));
-    //     }
-    // }
     pub(crate) fn bump_versions_by_keys(&self, keys: Vec<Arc<str>>) {
         for key in keys {
             // Use a simple hash to pick a bucket

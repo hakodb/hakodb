@@ -105,9 +105,6 @@ impl StorageEngine {
         let mut max_id = 0;
         let mut active_segment_id = 0;
 
-        // let blob_file = std::fs::OpenOptions::new()
-        //     .create(true).read(true).append(true)
-        //     .open(base_path.join("blobs.dat"))?;
         let blob_file_raw = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -115,7 +112,6 @@ impl StorageEngine {
             .write(true)
             .open(base_path.join("blobs.dat"))?;
 
-        // let blob_file = Arc::new(Mutex::new(blob_file_raw));
         // 1. Get metadata while we still have ownership of blob_file_raw
         let initial_size = blob_file_raw.metadata()?.len();
 
@@ -180,7 +176,6 @@ impl StorageEngine {
             ))),
             blob_tx: None,
             logical_name,
-            // in_flight_blob_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             blob_flush_queue: std::collections::VecDeque::with_capacity(1024),
             total_pending_blob_bytes: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -656,25 +651,7 @@ impl StorageEngine {
         Ok(())
     }
 
-    // pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-    //     let Some(pointer) = self.index.get(key).cloned() else { return Ok(None); };
-    //     match pointer {
-    //         Pointer::Inlined(data) => Ok(Some(data.clone())),
-    //         Pointer::Segment { segment_id, offset, len } => {
-    //             let Some(meta) = self.segments.get(&segment_id) else { return Ok(None); };
-    //             Ok(Some(meta.segment.read_at(offset, len, true)?))
-    //         }
-    //     }
-    // }
     pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        // // 1. Look up the pointer in the index
-        // let Some(pointer) = self.index.get(key) else { 
-        //     return Ok(None); 
-        // };
-        
-        // // 2. Use the centralized internal reader which handles 
-        // // Inlined, BlobPending, Blob, and Segment exhaustive matching.
-        // self.read_pointer_internal(pointer, true)
         match self.index.get(key) {
             Some(Pointer::Deleted { .. }) => Ok(None), // Treat as non-existent
             Some(pointer) => self.read_pointer_internal(pointer, true),
@@ -683,15 +660,11 @@ impl StorageEngine {
     }
 
     pub fn delete(&mut self, key: &str) -> Result<()> {
-        // self.apply_batch(&[StorageMutation::Delete {
-        //     key: key.to_string(),
-        // }])
         let mutation = StorageMutation::Delete {
             key: key.to_string(),
         };
 
         // 1. Capture the work
-        // let work = self.apply_batch(&[mutation])?;
         let (work, _committed_ops) = self.apply_batch(&[mutation], false)?;
 
         // 2. Send to background worker
@@ -802,7 +775,6 @@ impl StorageEngine {
         self.segments.insert(
             target_id, 
             SegmentMeta { 
-                // id: target_id, 
                 level: 1, 
                 segment: target 
             });
@@ -887,11 +859,8 @@ impl StorageEngine {
                 }
                 crate::storage::wal::WalOp::PutInlined { key, value } => {
                     self.update_index_entry(key.clone(), Some(Pointer::Inlined(value.clone())));
-                    // self.index.insert(key.clone(), Pointer::Inlined(value.clone()));
                 }
                 crate::storage::wal::WalOp::Delete { key, timestamp } => {
-                    // self.index.remove(key);
-                    // self.update_index_entry(key.clone(), None);
                     self.update_index_entry(key.clone(), Some(Pointer::Deleted { timestamp: *timestamp }));
                 }
                 crate::storage::wal::WalOp::PutBlob { key, offset, len } => {
@@ -979,7 +948,7 @@ mod tests {
             let _ = engine.flush_wal();
         }
 
-        let mut reopened = StorageEngine::open(&path, &cfg, "test_collection".to_string()).expect("reopen should succeed");
+        let reopened = StorageEngine::open(&path, &cfg, "test_collection".to_string()).expect("reopen should succeed");
         assert_eq!(
             reopened.get("k1").expect("read should succeed"),
             Some(b"value-1".to_vec())
@@ -1012,7 +981,6 @@ mod tests {
         engine.segments.insert(
             extra_id,
             SegmentMeta {
-                // id: extra_id,
                 level: 1,
                 segment: extra_segment,
             },

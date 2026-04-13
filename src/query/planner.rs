@@ -136,23 +136,6 @@ impl QueryPlanner {
             }
         }
 
-        // 5. PRIORITY 4: Secondary Index (Equality)
-        // if use_index_heuristic {
-        //     for filter in &query.filters {
-        //         if matches!(filter.op, Operator::Eq) {
-        //             if indexes.secondary.get(&query.collection).map_or(false, |m| m.contains_key(&filter.field)) {
-        //                 let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
-        //                 return Self::make_plan(
-        //                     query,
-        //                     ScanType::SecondaryIndex { field: filter.field.clone(), value: val_bytes },
-        //                     None,
-        //                     false,
-        //                     false
-        //                 );
-        //             }
-        //         }
-        //     }
-        // }
         if use_index_heuristic {
             // Check Secondary Index (Simple Index)
             for filter in &query.filters {

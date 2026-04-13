@@ -54,4 +54,5 @@ harness = false
 members = [
     ".",          
     "cli",  
+    "fsync",
 ]

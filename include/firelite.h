@@ -20,6 +20,8 @@ struct FL_Doc;
 
 struct FL_Engine;
 
+struct FL_NetSyncer;
+
 struct FL_Query;
 
 struct FL_ResultSet;
@@ -280,5 +282,13 @@ int32_t fl_query_where_in(FL_Query *query, const char *field, FL_Array *array);
 int32_t fl_engine_snapshot_indices(FL_Engine *engine);
 
 void fl_config_set_compression(FL_Config *config, bool enabled, int32_t level);
+
+FL_NetSyncer *fl_net_syncer_new(FL_Engine *engine, const char *name, const char *room_key);
+
+int32_t fl_net_syncer_start(FL_NetSyncer *syncer, uint16_t port);
+
+char *fl_net_syncer_status(FL_NetSyncer *syncer);
+
+void fl_net_syncer_free(FL_NetSyncer *syncer);
 
 }  // extern "C"

@@ -4,6 +4,7 @@ use std::os::raw::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{channel, Sender};
 use std::time::Duration;
+use std::sync::Arc;
 use std::{ptr, thread};
 
 use hashbrown::HashMap;
@@ -84,6 +85,12 @@ pub struct FL_Transaction {
 #[allow(non_camel_case_types)]
 pub struct FL_ResultSet {
     pub docs: Vec<*mut FL_Doc>,
+}
+
+#[cfg(feature = "net-sync")]
+#[allow(non_camel_case_types)]
+pub struct FL_NetSyncer {
+    inner: Arc<crate::net_sync::NetSyncer>,
 }
 
 thread_local! {
@@ -483,38 +490,6 @@ pub extern "C" fn fl_doc_insert_bin(
     0
 }
 
-// #[no_mangle]
-// pub extern "C" fn fl_engine_insert(
-//     engine: *mut FL_Engine,
-//     collection: *const c_char,
-//     doc_id: *const c_char,
-//     doc: *const FL_Doc,
-// ) -> i32 {
-//     if engine.is_null() || doc.is_null() {
-//         return set_last_error("null engine/doc handle");
-//     }
-//     let collection = match cstr_to_string(collection) {
-//         Ok(v) => v,
-//         Err(e) => return set_last_error(e),
-//     };
-//     let doc_id = match cstr_to_string(doc_id) {
-//         Ok(v) => v,
-//         Err(e) => return set_last_error(e),
-//     };
-
-//     let engine = unsafe { &mut *engine };
-//     let doc = unsafe { &*doc };
-//     match engine.db.put(&collection, &doc_id, &doc.doc) {
-//         Ok(_) => {
-//             clear_last_error();
-//             0
-//         }
-//         Err(e) => {
-//     set_last_error(e.to_string());
-//     -1 // or ptr::null_mut() depending on function return type
-// },
-//     }
-// }
 #[no_mangle]
 pub extern "C" fn fl_engine_insert(
     engine: *mut FL_Engine,
@@ -570,18 +545,6 @@ pub extern "C" fn fl_engine_get(
                 return ptr::null_mut();
             }
         };
-        // let engine = unsafe { &mut *engine };
-        // match engine.db.get(&collection, &doc_id) {
-        //     Ok(Some(doc)) => {
-        //         clear_last_error();
-        //         Box::into_raw(Box::new(FL_Doc { doc }))
-        //     }
-        //     Ok(None) => ptr::null_mut(),
-        //     Err(e) => {
-        //         set_last_error(e.to_string());
-        //         ptr::null_mut()
-        //     }
-        // }
         let engine = unsafe { &mut *engine };
         match engine.db.get(&collection, &doc_id) {
             Ok(Some(doc)) => Box::into_raw(Box::new(FL_Doc { doc })),
@@ -1029,17 +992,6 @@ pub extern "C" fn fl_query_order_by(
     0
 }
 
-// #[no_mangle]
-// pub extern "C" fn fl_query_limit(query: *mut FL_Query, limit: usize) -> i32 {
-//     if query.is_null() {
-//         return set_last_error("null query handle");
-//     }
-//     let query = unsafe { &mut *query };
-//     query.query = query.query.clone().limit(limit);
-//     clear_last_error();
-//     0
-// }
-
 #[no_mangle]
 pub extern "C" fn fl_query_limit(query: *mut FL_Query, limit: usize) -> i32 {
     if query.is_null() {
@@ -1136,34 +1088,6 @@ pub extern "C" fn fl_query_execute(engine: *mut FL_Engine, query: *const FL_Quer
         }
     })
 }
-
-// #[no_mangle]
-// pub extern "C" fn fl_query_execute_binary(engine: *mut FL_Engine, query: *const FL_Query) -> *mut FL_BinaryResult {
-//     let results = unsafe { (*engine).db.query((*query).query.clone()).unwrap() };
-    
-//     let mut big_buffer = Vec::new();
-//     let count = results.len();
-
-//     for (_id, doc) in results {
-//         let doc_bytes = doc.encode(); // Already binary!
-//         // 1. Write the length of this doc (4 bytes)
-//         big_buffer.extend_from_slice(&(doc_bytes.len() as u32).to_le_bytes());
-//         // 2. Write the doc itself
-//         big_buffer.extend_from_slice(&doc_bytes);
-//     }
-
-//     // Wrap in a heap-allocated struct to pass to C++
-//     let res = Box::new(FL_BinaryResult {
-//         data: big_buffer.as_ptr(),
-//         length: big_buffer.len(),
-//         count,
-//     });
-
-//     // Prevent Rust from freeing the big_buffer immediately
-//     std::mem::forget(big_buffer); 
-    
-//     Box::into_raw(res)
-// }
 
 #[no_mangle]
 pub extern "C" fn fl_query_execute_to_handles(
@@ -2188,5 +2112,78 @@ pub extern "C" fn fl_config_set_compression(config: *mut FL_Config, enabled: boo
     if let Some(cfg) = unsafe { config.as_mut() } {
         cfg.inner.use_compression = enabled;
         cfg.inner.compression_level = level;
+    }
+}
+
+#[cfg(feature = "net-sync")]
+#[no_mangle]
+pub extern "C" fn fl_net_syncer_new(
+    engine: *mut FL_Engine,
+    name: *const c_char,
+    room_key: *const c_char,
+) -> *mut FL_NetSyncer {
+    let engine_ref = unsafe { &*engine };
+    let name_str = cstr_to_string(name).unwrap_or_else(|_| "node".into());
+    let room_str = cstr_to_string(room_key).unwrap_or_else(|_| "default".into());
+
+    // We need to clone the Arc<FireLite> logically. 
+    // Since FL_Engine wraps FireLite (which is not an Arc inside FL_Engine), 
+    // we use a temporary wrap to pass it to the syncer.
+    let db_ptr:Arc<FireLite> = unsafe { Arc::from_raw(&engine_ref.db as *const _) };
+    let syncer = crate::net_sync::NetSyncer::new(
+        db_ptr.clone(),
+        &name_str,
+        &room_str,
+        vec![],
+    );
+    // Important: Forget the raw pointer so we don't drop the engine!
+    std::mem::forget(db_ptr);
+
+    Box::into_raw(Box::new(FL_NetSyncer {
+        inner: Arc::new(syncer),
+    }))
+}
+
+#[cfg(feature = "net-sync")]
+#[no_mangle]
+pub extern "C" fn fl_net_syncer_start(syncer: *mut FL_NetSyncer, port: u16) -> i32 {
+    if syncer.is_null() { return -1; }
+    let s_ref = unsafe { &*syncer };
+    let inner = s_ref.inner.clone();
+
+    // Use block_on to bridge synchronous FFI to the async start method
+    let rt = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => return set_last_error("No tokio runtime found"),
+    };
+
+    match rt.block_on(async move { inner.start(port).await }) {
+        Ok(_) => 0,
+        Err(e) => {
+            set_last_error(e.to_string());
+            -1
+        }
+    }
+}
+
+#[cfg(feature = "net-sync")]
+#[no_mangle]
+pub extern "C" fn fl_net_syncer_status(syncer: *mut FL_NetSyncer) -> *mut c_char {
+    if syncer.is_null() { return ptr::null_mut(); }
+    let s_ref = unsafe { &*syncer };
+    let status = s_ref.inner.status();
+    
+    match serde_json::to_string(&status) {
+        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Err(_) => ptr::null_mut()
+    }
+}
+
+#[cfg(feature = "net-sync")]
+#[no_mangle]
+pub extern "C" fn fl_net_syncer_free(syncer: *mut FL_NetSyncer) {
+    if !syncer.is_null() {
+        let s = unsafe { Box::from_raw(syncer) };
+        s.inner.stop();
     }
 }
