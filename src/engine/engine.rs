@@ -155,8 +155,8 @@ impl Transaction {
             doc_id: doc_id.to_string(),
         });
     }
-    pub fn commit(self, db: &FireLite) -> Result<()> {
-        db.write_batch(self.mutations)
+    pub fn commit(self, db: &FireLite) -> Result<Vec<String>> {
+        Ok(db.write_batch(self.mutations)?)
     }
 }
 
@@ -191,8 +191,8 @@ impl SerializableTransaction {
             doc_id: doc_id.to_string(),
         });
     }
-    pub fn commit(self, db: &FireLite) -> Result<()> {
-        db.commit_serializable(self.reads.clone(), self.mutations.clone())
+    pub fn commit(self, db: &FireLite) -> Result<Vec<String>> {
+        Ok(db.commit_serializable(self.reads.clone(), self.mutations.clone())?)
     }
 }
 
@@ -545,7 +545,7 @@ impl FireLite {
         &self,
         reads: HashMap<String, Option<u64>>,
         mutations: Vec<BatchMutation>,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         let _guard = self.tx_lock.lock().unwrap();
 
         for (key, expected) in reads {
@@ -555,10 +555,11 @@ impl FireLite {
         }
 
         // Delegate to the now-unlocked internal logic
-        self.write_batch_internal(mutations)
+        let res = self.write_batch_internal(mutations)?;
+        Ok(res)
     }
 
-    pub fn write_batch(&self, mutations: Vec<BatchMutation>) -> Result<()> {
+    pub fn write_batch(&self, mutations: Vec<BatchMutation>) -> Result<Vec<String>> {
         // 1. Security Check
         if !mutations.iter().all(|m| self.allowed(self.get_col(m), AccessOp::Batch)) {
             self.record_audit(AuditEntry { op: AccessOp::Batch, collection: "<sharded>".into(), doc_id: None, ok: false });
@@ -572,7 +573,7 @@ impl FireLite {
         res
     }
 
-    fn write_batch_internal(&self, mutations: Vec<BatchMutation>) -> Result<()> {
+    fn write_batch_internal(&self, mutations: Vec<BatchMutation>) -> Result<Vec<String>> {
         // Use nanoseconds for higher precision in ID generation
         let now_nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64;
         // Keep your existing micros for the _time metadata if you prefer, 
@@ -581,6 +582,7 @@ impl FireLite {
 
         let threshold = self.config.value_blob_threshold_bytes;
         let mut shard_map: HashMap<String, ShardWork> = HashMap::new();
+        let mut assigned_ids = Vec::with_capacity(mutations.len());
 
         for m in mutations {
             // 1. Resolve basic info immediately
@@ -599,6 +601,8 @@ impl FireLite {
             if doc_id.is_empty() || doc_id == "" {
                 doc_id = self.generate_sortable_id(now_nanos);
             }
+
+            assigned_ids.push(doc_id.clone());
 
             // 2. COMPUTE KEY ONCE
             let key_arc: Arc<str> = Arc::from(doc_id.as_str());
@@ -689,7 +693,7 @@ impl FireLite {
             });
         }
 
-        Ok(())
+        Ok(assigned_ids)
     }
 
     // Fix signature for public helper
@@ -737,19 +741,21 @@ impl FireLite {
         Ok(None)
     }
 
-    pub fn put(&self, col: &str, id: &str, doc: &FireLiteDoc) -> Result<()> {
-        self.write_batch(vec![BatchMutation::Put {
+    pub fn put(&self, col: &str, id: &str, doc: &FireLiteDoc) -> Result<String> {
+        let res = self.write_batch(vec![BatchMutation::Put {
             collection: col.into(),
             doc_id: id.into(),
             doc: doc.clone(),
-        }])
+        }])?;
+        Ok(res.into_iter().next().unwrap_or_default())
     }
 
-    pub fn delete(&self, col: &str, id: &str) -> Result<()> {
-        self.write_batch(vec![BatchMutation::Delete {
+    pub fn delete(&self, col: &str, id: &str) -> Result<String> {
+        let res = self.write_batch(vec![BatchMutation::Delete {
             collection: col.into(),
             doc_id: id.into(),
-        }])
+        }])?;
+        Ok(res.into_iter().next().unwrap_or_default())
     }
 
     pub fn query(&self, query: Query) -> Result<Vec<(String, FireLiteDoc)>> {
@@ -828,7 +834,7 @@ impl FireLite {
         Ok(results)
     }
 
-    pub fn patch(&self, col: &str, id: &str, updates: Vec<(String, Value)>) -> Result<()> {
+    pub fn patch(&self, col: &str, id: &str, updates: Vec<(String, Value)>) -> Result<String> {
         if !self.allowed(col, AccessOp::Put) {
             self.record_audit(AuditEntry {
                 op: AccessOp::Put,
@@ -839,20 +845,21 @@ impl FireLite {
             return Err(FireLiteError::Corrupt("Denied".into()));
         }
 
-        let res = self.write_batch(vec![BatchMutation::Patch {
+        let data = self.write_batch(vec![BatchMutation::Patch {
             collection: col.to_string(),
             doc_id: id.to_string(),
             updates,
         }]);
 
         // AUDIT RESULT
-        self.record_audit(AuditEntry {
+        let _ = self.record_audit(AuditEntry {
             op: AccessOp::Put,
             collection: col.into(),
             doc_id: Some(id.into()),
-            ok: res.is_ok(),
+            ok: data.is_ok(),
         });
-        res
+
+        Ok(data?.into_iter().next().unwrap_or_default()) 
     }
 
     pub fn get_stats(&self) -> HashMap<String, usize> {
@@ -1024,8 +1031,9 @@ impl FireLite {
         subcol: &str,
         subid: &str,
         doc: &FireLiteDoc,
-    ) -> Result<()> {
-        self.put(&subcollection_prefix(col, id, subcol), subid, doc)
+    ) -> Result<String> {
+        let res = self.put(&subcollection_prefix(col, id, subcol), subid, doc)?;
+        Ok(res)
     }
 
     pub fn audit_entries(&self) -> Vec<AuditEntry> {

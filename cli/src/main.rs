@@ -373,8 +373,7 @@ fn set_doc(db: &FireLite, path: &str, data: &str, merge: bool, is_batch: bool ) 
         }
 
         db.write_batch(mutations)?;
-        println!("OK: batch committed {} documents", results.len());
-        println!("IDs: {}", results.join(", "));
+        println!("Ok: {collection}/[{}]", results.join(", "));
     } else {
 
         let (collection, doc_id, fields) = split_doc_path_with_fields(path)?;
@@ -405,8 +404,8 @@ fn set_doc(db: &FireLite, path: &str, data: &str, merge: bool, is_batch: bool ) 
             }
         }
     
-        db.put(collection, doc_id, &doc)?;
-        println!("OK: {collection}/{doc_id}");
+        let id = db.put(collection, doc_id, &doc)?;
+        println!("OK: {collection}/{id}");
     }
     Ok(())
 }
@@ -437,8 +436,8 @@ fn delete_doc(db: &FireLite, path: &str, is_batch: bool, data: Option<&str>) -> 
         println!("OK: deleted {} documents from {}", count, collection);
     } else {
         let (collection, doc_id) = split_doc_path(path)?;
-        db.delete(collection, doc_id)?;
-        println!("OK: deleted {collection}/{doc_id}");
+        let id = db.delete(collection, doc_id)?;
+        println!("OK: deleted {collection}/{id}");
     }
     Ok(())
 }
@@ -458,8 +457,8 @@ fn run_tx_set(db: &FireLite, path: &str, data: &str) -> Result<()> {
     let mut tx = db.begin_serializable_transaction();
     tx.get(db, collection, doc_id)?;
     tx.put(collection, doc_id, doc);
-    tx.commit(db)?;
-    println!("OK: transaction committed for {collection}/{doc_id}");
+    let ids = tx.commit(db)?;
+    println!("OK: transaction committed for {collection}/{}", ids.into_iter().next().unwrap_or_default());
     Ok(())
 }
 
