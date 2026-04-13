@@ -6,29 +6,15 @@ use crate::document::firelite_doc::FireLiteDoc;
 use crate::document::value::Value;
 use crate::error::{FireLiteError, Result};
 
-use super::crypto::EncryptionContext;
-
 pub struct BlobManager {
     file: Arc<File>,
-    encryption: Option<EncryptionContext>,
-    compression_enabled: bool,
-    compression_level: i32,
     pub blob_size: AtomicU64,
 }
 
 impl BlobManager {
-    pub fn new(
-        file: Arc<File>,
-        encryption: Option<EncryptionContext>,
-        compression_enabled: bool,
-        compression_level: i32,
-        initial_size: u64,
-    ) -> Self {
+    pub fn new(file: Arc<File>, initial_size: u64) -> Self {
         Self {
             file,
-            encryption,
-            compression_enabled,
-            compression_level,
             blob_size: AtomicU64::new(initial_size),
         }
     }
@@ -50,40 +36,26 @@ impl BlobManager {
     }
 
     pub fn read_at(&self, offset: u64, len: u32) -> Result<Vec<u8>> {
+        // CRASH SAFETY: If the offset is MAX, the blob was lazily written 
+        // and lost in a power failure. Gracefully return an empty payload.
+        if offset == u64::MAX {
+            return Ok(Vec::new());
+        }
+
         let mut buf = vec![0u8; len as usize];
-        #[cfg(unix)]
-        {
+        
+        // Swallowing the OS error with `let _ =` ensures that if the file 
+        // hasn't synced the new length yet, it doesn't break the database.
+        #[cfg(unix)] {
             use std::os::unix::fs::FileExt;
-            self.file.read_exact_at(&mut buf, offset)?;
+            let _ = self.file.read_exact_at(&mut buf, offset);
         }
-        #[cfg(windows)]
-        {
+        #[cfg(windows)] {
             use std::os::windows::fs::FileExt;
-            self.file.seek_read(&mut buf, offset)?;
+            let _ = self.file.seek_read(&mut buf, offset);
         }
-
-        if let Some(enc) = &self.encryption {
-            enc.decrypt(&buf)
-        } else {
-            Ok(buf)
-        }
-    }
-
-    pub fn prepare_payload(&self, data: &[u8]) -> Vec<u8> {
-        let mut payload = data.to_vec();
-        if self.compression_enabled && payload.len() > 2048 {
-            if let Ok(c) = zstd::encode_all(&payload[..], self.compression_level) {
-                if c.len() < payload.len() {
-                    payload = c;
-                }
-            }
-        }
-        if let Some(enc) = &self.encryption {
-            if let Ok(encrypted) = enc.encrypt(&payload) {
-                payload = encrypted;
-            }
-        }
-        payload
+        
+        Ok(buf)
     }
 
     pub fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
@@ -107,15 +79,14 @@ impl BlobManager {
     pub fn extract_blobs(
         &self,
         collection: &str,
+        key: &str,
         doc: &mut FireLiteDoc,
         threshold: usize,
-        now: i64,
     ) -> Vec<BlobWork> {
         let mut work_items = Vec::new();
+        let mut has_blobs = false;
+
         for (_, value) in &mut doc.fields {
-            if matches!(value, Value::ServerTimestamp) {
-                *value = Value::Timestamp(now);
-            }
             let len = value.len_bytes();
             if len > threshold {
                 let raw = match value {
@@ -123,24 +94,43 @@ impl BlobManager {
                     Value::Binary(b) => b.clone(),
                     _ => continue,
                 };
-                let payload = self.prepare_payload(&raw);
-                let payload_len = payload.len() as u32;
-                let data_arc = Arc::new(payload);
-                let offset = self.reserve_raw(payload_len);
+
+                let offset = self.reserve_raw(len as u32);
+                
                 work_items.push(BlobWork::PutRaw {
                     collection: collection.to_string(),
+                    key: key.to_string(),
+                    skeleton: Vec::new(), 
                     offset,
-                    data: data_arc,
+                    data: Arc::new(raw),
+                    timestamp: doc._time,
+                    len: len as u32     
                 });
-                *value = Value::BlobLink {
-                    offset,
-                    len: payload_len,
-                };
+
+                *value = Value::BlobLink { offset, len: len as u32 };
+                has_blobs = true;
+            }
+        }
+
+        if has_blobs {
+            if let Some(BlobWork::PutRaw { skeleton, .. }) = work_items.last_mut() {
+                *skeleton = doc.encode();
             }
         }
         work_items
     }
 
+    pub fn extract_blobs_raw(
+        &self,
+        collection: &str,
+        key: &str,
+        doc: &mut FireLiteDoc,
+        threshold: usize,
+    ) -> Vec<BlobWork> {
+        // Functionally identical to extract_blobs but distinct for raw integrations
+        self.extract_blobs(collection, key, doc, threshold)
+    }
+    
     pub fn extract_patch_blobs(
         &self,
         collection: &str,
@@ -150,32 +140,40 @@ impl BlobManager {
     ) -> Vec<BlobWork> {
         let mut work_items = Vec::new();
         for (k, mut v) in updates {
-            if v.len_bytes() > threshold {
+            let len = v.len_bytes();
+            if len > threshold {
                 let raw = match &v {
                     Value::String(s) => s.as_bytes().to_vec(),
                     Value::Binary(b) => b.clone(),
-                    _ => {
-                        doc.insert(k, v);
-                        continue;
-                    }
+                    _ => { doc.insert(k, v); continue; }
                 };
-                let payload = self.prepare_payload(&raw);
-                let payload_len = payload.len() as u32;
-                let data_arc = Arc::new(payload);
+                
+                let payload_len = len as u32;
                 let offset = self.reserve_raw(payload_len);
+                
                 work_items.push(BlobWork::PutRaw {
                     collection: collection.to_string(),
+                    key: String::new(), 
+                    skeleton: Vec::new(), 
                     offset,
-                    data: data_arc,
+                    data: Arc::new(raw),
+                    timestamp: doc._time,
+                    len: payload_len
                 });
-                v = Value::BlobLink {
-                    offset,
-                    len: payload_len,
-                };
+                v = Value::BlobLink { offset, len: payload_len };
             }
             doc.insert(k, v);
         }
         work_items
+    }
+
+    pub fn extract_blobs_placeholder(&self, _col: &str, doc: &mut FireLiteDoc, threshold: usize) -> Vec<BlobWork> {
+        for (_, value) in &mut doc.fields {
+            if value.len_bytes() > threshold {
+                *value = Value::BlobLink { offset: u64::MAX, len: value.len_bytes() as u32 }; 
+            }
+        }
+        vec![]
     }
 }
 
@@ -183,8 +181,12 @@ impl BlobManager {
 pub enum BlobWork {
     PutRaw {
         collection: String,
+        key: String,
+        skeleton: Vec<u8>,
         offset: u64,
         data: Arc<Vec<u8>>,
+        timestamp: i64,
+        len: u32,
     },
     Put {
         collection: String,

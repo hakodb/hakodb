@@ -2,23 +2,23 @@ use crate::document::firelite_doc::{FireLiteDoc, FireLiteDocView};
 use crate::document::value::Value;
 use super::task::QueryTask;
 use crate::query::filter::Operator;
-// use crate::engine::engine::resolve_doc_static;
+
 
 pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
     let mut out = Vec::new();
-    let blob_manager = {
-        let guard = task.storage.as_ref().unwrap().read().unwrap();
-        guard.blob_manager.clone()
-    };
-    let storage_engine = task.storage.as_ref().unwrap().read().unwrap();
+    let storage_guard = task.storage.as_ref().unwrap().read().unwrap();
+    let blob_manager = storage_guard.blob_manager.as_ref();
 
     for (id, pointer) in task.docs {
-        if let Ok(Some(bytes)) = storage_engine.read_pointer(&pointer) {
+        if let Ok(Some(bytes)) = storage_guard.read_pointer(&pointer) {
+            // 1. Zero-allocation filter check
             if task.plan.filters_satisfied_by_index || matches_filters_view(&bytes, &task.plan) {
                 if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
                     
-                    if let Some(ref manager) = blob_manager {
-                        let _ = inflate_blobs(&mut doc, manager);
+                    // 2. Call the helper function (This removes the warning)
+                    if let Some(bm) = blob_manager {
+                        // We ignore errors here so a single bad blob doesn't crash the whole query
+                        let _ = inflate_blobs(&mut doc, bm);
                     }
                     
                     out.push((id, doc));
@@ -30,16 +30,22 @@ pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
 }
 
 fn inflate_blobs(doc: &mut FireLiteDoc, blob_manager: &crate::storage::blob::BlobManager) -> Result<(), crate::error::FireLiteError> {
-    for (_, value) in &mut doc.fields {
-        if let Value::BlobLink { offset, len } = *value {
-            let data = blob_manager.read_at(offset, len)?;
+    // Collect references to avoid multiple scans of doc.fields
+    let links: Vec<&mut Value> = doc.fields.iter_mut()
+        .map(|(_, v)| v)
+        .filter(|v| matches!(v, Value::BlobLink { .. }))
+        .collect();
 
-            // Convert back to original type (Simple heuristic for the benchmark)
-            if let Ok(s) = String::from_utf8(data.clone()) {
-                *value = Value::String(s);
-            } else {
-                *value = Value::Binary(data);
-            }
+    if links.is_empty() { return Ok(()); }
+
+    // Sequential because we are already inside a Rayon thread for the Query Task
+    for val in links {
+        if let Value::BlobLink { offset, len } = *val {
+            let data = blob_manager.read_at(offset, len)?;
+            *val = match String::from_utf8(data) {
+                Ok(s) => Value::String(s),
+                Err(e) => Value::Binary(e.into_bytes()),
+            };
         }
     }
     Ok(())
@@ -93,12 +99,14 @@ fn resolve_single_blob_in_worker(
     offset: u64, 
     len: u32,
 ) -> Value {
-    let data = blob_manager.read_at(offset, len).unwrap_or_default();
+    // If read fails, return Null rather than panicking the worker
+    let Ok(data) = blob_manager.read_at(offset, len) else {
+        return Value::Null;
+    };
 
-    if let Ok(s) = String::from_utf8(data.clone()) {
-        Value::String(s)
-    } else {
-        Value::Binary(data)
+    match String::from_utf8(data) {
+        Ok(s) => Value::String(s),
+        Err(e) => Value::Binary(e.into_bytes()),
     }
 }
 

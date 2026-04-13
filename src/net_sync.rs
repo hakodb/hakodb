@@ -11,6 +11,8 @@ use crate::storage::engine::Pointer;
 #[cfg(feature = "net-sync")]
 use std::sync::{Arc, Mutex, RwLock};
 #[cfg(feature = "net-sync")]
+use std::sync::atomic::Ordering;
+#[cfg(feature = "net-sync")]
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "net-sync")]
 use std::time::{Duration, Instant, UNIX_EPOCH, SystemTime};
@@ -24,6 +26,8 @@ use sha2::{Sha256, Digest};
 use tokio::net::{TcpStream, tcp::OwnedWriteHalf};
 #[cfg(feature = "net-sync")]
 use mdns_sd::{ServiceDaemon, ServiceInfo, ServiceEvent};
+#[cfg(feature = "net-sync")]
+use crate::storage::blob::BlobWork;
 
 // --- Data Structures ---
 
@@ -45,6 +49,7 @@ pub struct NetworkStatus {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum NetPacket {
     Identify { id: String, room_hash: [u8; 32] },
+    Ping { versions: HashMap<String, i64> },
     SyncRequest,
     Replication { msg_id: u128, collection: String, ops: Vec<WalOp> },
 }
@@ -59,10 +64,13 @@ pub struct NetSyncer {
     status_tx: watch::Sender<NetworkStatus>,
     status_rx: watch::Receiver<NetworkStatus>,
     peers: Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, 
-    seen_messages: Arc<AsyncMutex<HashSet<u128>>>,
+    seen_messages: Arc<AsyncMutex<Vec<u128>>>,
     tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     shard_offsets: Arc<Mutex<HashMap<String, u64>>>,
     pub enable_relay: bool, 
+    last_mesh_ping: Arc<Mutex<Instant>>,
+    echo_cache: Arc<Mutex<HashMap<String, i64>>>,
+    mdns: Arc<Mutex<Option<ServiceDaemon>>>,
 }
 
 #[cfg(feature = "net-sync")]
@@ -96,10 +104,13 @@ impl NetSyncer {
             status_tx: tx,
             status_rx: rx,
             peers: Arc::new(AsyncMutex::new(HashMap::new())),
-            seen_messages: Arc::new(AsyncMutex::new(HashSet::with_capacity(1000))),
+            seen_messages: Arc::new(AsyncMutex::new(Vec::with_capacity(1000))),
             tasks: Arc::new(Mutex::new(Vec::new())),
             shard_offsets: Arc::new(Mutex::new(shard_offsets)),
-            enable_relay: false
+            enable_relay: false,
+            last_mesh_ping: Arc::new(Mutex::new(Instant::now())),
+            echo_cache: Arc::new(Mutex::new(HashMap::new())),
+            mdns: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -111,8 +122,6 @@ impl NetSyncer {
     pub async fn start(&self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
         self.stop();
         let my_ip = local_ip_address::local_ip().map(|ip| ip.to_string()).unwrap_or_else(|_| "127.0.0.1".to_string());
-
-        // 1. TCP Listener (Same as before)
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
         let db_ptr = self.db.clone();
         let peers_ptr = self.peers.clone();
@@ -121,51 +130,149 @@ impl NetSyncer {
         let sid = self.self_id.clone();
         let hash = self.room_hash;
         let excl_srv = self.excluded_collections.clone();
+        let last_ping_ptr = self.last_mesh_ping.clone();
+        let echo_cache_clone = self.echo_cache.clone();
 
         let relay_enabled = self.enable_relay; 
 
         let handle_srv = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                handle_peer(stream, db_ptr.clone(), peers_ptr.clone(), seen_ptr.clone(), stx_ptr.clone(), sid.clone(), hash, excl_srv.clone(), relay_enabled).await;
+                let db_c = db_ptr.clone();
+                let peers_c = peers_ptr.clone();
+                let seen_c = seen_ptr.clone();
+                let stx_c = stx_ptr.clone();
+                let sid_c = sid.clone();
+                let hash_c = hash;
+                let excl_c = excl_srv.clone();
+                let lp_c = last_ping_ptr.clone();
+                let echo_c = echo_cache_clone.clone();
+                
+                // SPAWN the handler so the loop can continue accepting other peers
+                tokio::spawn(async move {
+                    handle_peer(
+                        stream, db_c, peers_c, seen_c, stx_c, 
+                        sid_c, hash_c, excl_c, relay_enabled, 
+                        lp_c, echo_c
+                    ).await;
+                });
             }
         });
         self.tasks.lock().unwrap().push(handle_srv);
 
         // 3. mDNS Discovery (The Working Part)
-        let mdns = ServiceDaemon::new()?;
+        let mdns = ServiceDaemon::new().expect("Failed to create mDNS");
+        * self.mdns.lock().unwrap() = Some(mdns.clone());
+        
         let hostname = gethostname::gethostname().to_string_lossy().into_owned() + ".local.";
         let service_info = ServiceInfo::new(&self.service_type, &self.self_id, &hostname, &my_ip, port, None)?;
         mdns.register(service_info)?;
+
+        // 1. Create the browser once
         let browser = mdns.browse(&self.service_type)?;
 
+        // 2. Prepare all clones needed for the background task
         let db_rx = self.db.clone();
         let peers_rx = self.peers.clone();
         let seen_rx = self.seen_messages.clone();
         let stx_rx = self.status_tx.clone();
         let sid_rx = self.self_id.clone();
         let excl_disc = self.excluded_collections.clone();
+        let lp_disc = self.last_mesh_ping.clone();
+        let hash_disc = self.room_hash;
+        let relay_disc = self.enable_relay;
+        let echo_cache_clone = self.echo_cache.clone();
 
+        // 3. SINGLE Unified Discovery & Reconnection Task
         let handle_discovery = tokio::spawn(async move {
-            while let Ok(event) = browser.recv_async().await {
-                if let ServiceEvent::ServiceResolved(info) = event {
-                    let p_name = info.get_fullname().split('.').next().unwrap_or("");
-                    
-                    // TIE-BREAKING: Only the larger ID connects
-                    if p_name > sid_rx.as_str() {
-                        if let Some(addr) = info.get_addresses().iter().next() {
-                            let p_addr = format!("{}:{}", addr, info.get_port());
-                            let already_connected = { peers_rx.lock().await.contains_key(p_name) };
-                            
-                            if !already_connected {
-                                if let Ok(Ok(stream)) = tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&p_addr)).await {
-                                    handle_peer(stream, db_rx.clone(), peers_rx.clone(), seen_rx.clone(), stx_rx.clone(), sid_rx.clone(), hash, excl_disc.clone(), relay_enabled).await;
+            // Map of Name -> Last Known Address
+            let mut discovery_cache: HashMap<String, String> = HashMap::new();
+            let mut retry_interval = tokio::time::interval(Duration::from_secs(15));
+            let mut connecting: HashSet<String> = HashSet::new();
+            
+            // We own 'browser' here and use it exclusively in this loop
+            loop {
+                tokio::select! {
+                    // Branch A: Listen for NEW peers via mDNS
+                    event_res = browser.recv_async() => {
+                        match event_res {
+                            Ok(ServiceEvent::ServiceResolved(info)) => {
+                                let p_name = info.get_fullname().split('.').next().unwrap_or("").to_string();
+                                if p_name == sid_rx { continue; }
+
+                                // if let Some(addr) = info.get_addresses().iter().next() {
+                                //     let p_addr = format!("{}:{}", addr, info.get_port());
+                                //     discovery_cache.insert(p_name, p_addr);
+                                // }
+                                let p_addr = info.get_addresses()
+                                    .iter()
+                                    .filter_map(|addr| match addr {
+                                        std::net::IpAddr::V4(v4) if !v4.is_loopback() => Some(*v4),
+                                        _ => None,
+                                    })
+                                    .max_by_key(|ip| {
+                                        let o = ip.octets();
+                                        // prioritize LAN ranges
+                                        if o[0] == 192 && o[1] == 168 { 3 }
+                                        else if o[0] == 10 { 2 }
+                                        else if o[0] == 172 && (16..=31).contains(&o[1]) { 1 }
+                                        else { 0 }
+                                    })
+                                    .map(|ip| format!("{}:{}", ip, info.get_port()));
+
+                                if let Some(p_addr) = p_addr {
+                                    discovery_cache.insert(p_name, p_addr);
                                 }
+                            }
+                            Ok(ServiceEvent::ServiceRemoved(_type, name)) => {
+                                let p_name = name.split('.').next().unwrap_or("");
+                                discovery_cache.remove(p_name);
+                                connecting.remove(p_name);
+                            }
+                            _ => { }
+                        }
+                    }
+
+                    // Branch B: PERIODICALLY try to connect to peers in the cache
+                    _ = retry_interval.tick() => {
+                        let active_peer_names = {
+                            let guard = peers_rx.lock().await;
+                            guard.keys().cloned().collect::<HashSet<String>>()
+                        };
+
+                        connecting.retain(|name| !active_peer_names.contains(name));
+
+                        for (p_name, p_addr) in &discovery_cache {
+                            // TIE-BREAKING: Only higher ID initiates to prevent double-connections
+                            if p_name > &sid_rx && !active_peer_names.contains(p_name) {
+                            // if !active_peer_names.contains(p_name) {
+                                let db_c = db_rx.clone();
+                                let peers_c = peers_rx.clone();
+                                let seen_c = seen_rx.clone();
+                                let stx_c = stx_rx.clone();
+                                let sid_c = sid_rx.clone();
+                                let excl_c = excl_disc.clone();
+                                let lp_c = lp_disc.clone();
+                                let addr_c = p_addr.clone();
+                                let echo_cache = echo_cache_clone.clone();
+
+                                tokio::spawn(async move {
+                                    // Short timeout so a single dead peer doesn't hang the loop
+                                    if let Ok(Ok(stream)) = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr_c)).await {
+                                        handle_peer(
+                                            stream, db_c, peers_c, seen_c, stx_c, 
+                                            sid_c, hash_disc, excl_c, relay_disc, lp_c,
+                                            echo_cache
+                                        ).await;
+                                    }
+                                });
                             }
                         }
                     }
                 }
             }
         });
+
+        // 4. Push the single handle to the tasks list
         self.tasks.lock().unwrap().push(handle_discovery);
 
         // 3. Tailer
@@ -173,6 +280,7 @@ impl NetSyncer {
         let peers_tail = self.peers.clone();
         let offsets_tail = self.shard_offsets.clone();
         let excl_tail = self.excluded_collections.clone();
+        let echo_cache_clone = self.echo_cache.clone();
         
         let handle_tailer = tokio::task::spawn_blocking(move || {
             let mut last_checkpoint_save = Instant::now(); // Use Instant for timing
@@ -199,6 +307,40 @@ impl NetSyncer {
                         if !ops.is_empty() {
                             let mut logical_ops = Vec::new();
                             for op in ops {
+
+                                let key = op.get_key();
+                                        
+                                // 1. Get the timestamp from the WAL record
+                                let wal_timestamp = match &op {
+                                    WalOp::PutInlined { value, .. } => {
+                                        // Version 3: Magic(1), Ver(1), Time(8)
+                                        i64::from_le_bytes(value[2..10].try_into().unwrap_or([0;8]))
+                                    }
+                                    WalOp::Delete { timestamp, .. } => *timestamp,
+                                    _ => 0,
+                                };
+
+                                // 2. CHECK & REMOVE (The Core Fix)
+                                let is_echo = {
+                                    let echo_cache = echo_cache_clone.clone();
+                                    let mut cache = echo_cache.lock().unwrap();
+                                    if let Some(&cached_ts) = cache.get(key) {
+                                        if cached_ts == wal_timestamp {
+                                            // Match found! Remove it so it doesn't linger
+                                            cache.remove(key);
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                };
+
+                                if is_echo {
+                                    continue; // Skip this one, it was a remote write
+                                }
+
                                 if let Some(bytes) = resolve_op_to_bytes(&shard, &db_tail, &op) {
                                     logical_ops.push(WalOp::PutInlined { key: op.get_key().to_string(), value: bytes });
                                 } else if matches!(op, WalOp::Delete { .. }) {
@@ -231,12 +373,62 @@ impl NetSyncer {
         });
         self.tasks.lock().unwrap().push(handle_tailer);
 
+        // Inside NetSyncer::start
+        let db_audit = self.db.clone();
+        let peers_audit = self.peers.clone();
+        let last_ping_ptr = self.last_mesh_ping.clone();
+
+        let handle_periodic_ping = tokio::spawn(async move {
+            let base_interval = Duration::from_secs(300); // 5 minutes audit
+            
+            loop {
+                tokio::time::sleep(base_interval).await;
+
+                // Randomized Jitter to prevent "Thundering Herd"
+                let jitter = {
+                    use rand::Rng;
+                    rand::thread_rng().gen_range(10..500)
+                };
+                tokio::time::sleep(Duration::from_millis(jitter)).await;
+
+                // Only ping if NO ONE in the mesh has pinged in the last 5 minutes
+                let should_ping = {
+                    let lp = last_ping_ptr.lock().unwrap();
+                    lp.elapsed() >= base_interval
+                };
+
+                if should_ping {
+                    let my_versions = db_audit.get_version_map();
+                    let packet = NetPacket::Ping { versions: my_versions };
+                    
+                    if let Ok(payload) = bincode::serialize(&packet) {
+                        let mut guard = peers_audit.lock().await;
+                        for writer in guard.values_mut() {
+                            let _ = send_raw(writer, &payload).await;
+                        }
+                        // Reset local timer
+                        let mut lp = last_ping_ptr.lock().unwrap();
+                        *lp = Instant::now();
+                    }
+                }
+            }
+        });
+        self.tasks.lock().unwrap().push(handle_periodic_ping);
+
         Ok(())
     }
 
     pub fn stop(&self) {
         let mut guard = self.tasks.lock().unwrap();
         for h in guard.drain(..) { h.abort(); }
+        if let Some(mdns) = self.mdns.lock().unwrap().take() {
+            let _ = mdns.shutdown();
+        }
+        // 4. clear peers (close sockets)
+        let peers = self.peers.clone();
+        tokio::spawn(async move {
+            peers.lock().await.clear();
+        });
     }
 
     pub fn status(&self) -> NetworkStatus {
@@ -246,52 +438,175 @@ impl NetSyncer {
 
 // --- Logic Helpers ---
 
+// async fn handle_peer(
+//     stream: TcpStream, db: Arc<FireLite>, peers_map: Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>,
+//     seen_cache: Arc<AsyncMutex<HashSet<u128>>>, status_tx: watch::Sender<NetworkStatus>,
+//     self_id: String, my_hash: [u8; 32], excluded: HashSet<String>,
+//     enable_relay: bool, last_ping: Arc<Mutex<Instant>>,
+//     echo_cache: Arc<Mutex<HashMap<String, i64>>>,
+// ) {
+//     let (mut reader, mut writer) = stream.into_split();
+//     let handshake = bincode::serialize(&NetPacket::Identify { id: self_id.clone(), room_hash: my_hash }).unwrap();
+//     if send_raw(&mut writer, &handshake).await.is_err() { return; }
+    
+//     let my_versions = db.get_version_map();
+//     let ping = bincode::serialize(&NetPacket::Ping { versions: my_versions }).unwrap();
+//     let _ = send_raw(&mut writer, &ping).await;
+
+//     let p_bytes = match tokio::time::timeout(Duration::from_secs(2), recv_raw(&mut reader)).await {
+//         Ok(Ok(b)) => b, _ => return,
+//     };
+    
+//     if let Ok(NetPacket::Identify { id: peer_id, room_hash: p_hash }) = bincode::deserialize::<NetPacket>(&p_bytes) {
+//         if p_hash != my_hash { return; }
+//         peers_map.lock().await.insert(peer_id.clone(), writer);
+//         update_status(&status_tx, &peers_map).await;
+//         let _ = send_raw(peers_map.lock().await.get_mut(&peer_id).unwrap(), &bincode::serialize(&NetPacket::SyncRequest).unwrap()).await;
+//         let echo_cache_clone = echo_cache.clone();
+
+//         loop {
+//             let raw = match recv_raw(&mut reader).await { Ok(b) => b, _ => break };
+//             if let Ok(packet) = bincode::deserialize::<NetPacket>(&raw) {
+//                 match packet {
+//                     NetPacket::Ping { versions: remote_versions } => {
+
+//                         println!("{} \n", serde_json::to_string_pretty(&remote_versions).unwrap());
+
+//                         if let Ok(mut lp) = last_ping.lock() {
+//                             *lp = Instant::now();
+//                         }
+
+//                         // 2. Peer sent us their versions. Compare with ours.
+//                         for (col, remote_time) in remote_versions {
+//                             let local_time = db.get_collection_version(&col);
+
+//                             if local_time > remote_time {
+//                                 // We have newer data! Send a SyncRequest to ourselves 
+//                                 // to trigger sending data to THEM.
+//                                 handle_delta_send(&db, &peers_map, &peer_id, &col, remote_time).await;
+//                             }
+//                         }
+//                     }
+//                     NetPacket::SyncRequest => handle_bootstrap(&db, &peers_map, &peer_id, &excluded).await,
+//                     NetPacket::Replication { msg_id, collection, ops } => {
+//                         if msg_id != 0 && !seen_cache.lock().await.insert(msg_id) { continue; }
+//                         // FIX: Removed & to pass the Arc correctly
+//                         apply_replication_batch(db.clone(), collection, ops, echo_cache_clone.clone()).await; 
+//                         // if enable_relay {
+//                         //     relay_mesh(&peers_map, &raw, &peer_id).await;
+//                         // }
+//                         if msg_id != 0 && enable_relay {
+//                             relay_mesh(&peers_map, &raw, &peer_id).await;
+//                         }
+//                     }
+//                     _ => {}
+//                 }
+//             }
+//         }
+//         peers_map.lock().await.remove(&peer_id);
+//         update_status(&status_tx, &peers_map).await;
+//     }
+// }
 async fn handle_peer(
-    stream: TcpStream, db: Arc<FireLite>, peers_map: Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>,
-    seen_cache: Arc<AsyncMutex<HashSet<u128>>>, status_tx: watch::Sender<NetworkStatus>,
-    self_id: String, my_hash: [u8; 32], excluded: HashSet<String>,
-    enable_relay: bool,
+    stream: TcpStream, 
+    db: Arc<FireLite>, 
+    peers_map: Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>,
+    seen_cache: Arc<AsyncMutex<Vec<u128>>>, 
+    status_tx: watch::Sender<NetworkStatus>,
+    self_id: String, 
+    my_hash: [u8; 32], 
+    excluded: HashSet<String>,
+    enable_relay: bool, 
+    last_ping: Arc<Mutex<Instant>>,
+    echo_cache: Arc<Mutex<HashMap<String, i64>>>,
 ) {
     let (mut reader, mut writer) = stream.into_split();
-    let handshake = bincode::serialize(&NetPacket::Identify { id: self_id.clone(), room_hash: my_hash }).unwrap();
-    if send_raw(&mut writer, &handshake).await.is_err() { return; }
-    
-    let p_bytes = match tokio::time::timeout(Duration::from_secs(2), recv_raw(&mut reader)).await {
-        Ok(Ok(b)) => b, _ => return,
-    };
-    
-    if let Ok(NetPacket::Identify { id: peer_id, room_hash: p_hash }) = bincode::deserialize::<NetPacket>(&p_bytes) {
-        if p_hash != my_hash { return; }
-        peers_map.lock().await.insert(peer_id.clone(), writer);
-        update_status(&status_tx, &peers_map).await;
-        let _ = send_raw(peers_map.lock().await.get_mut(&peer_id).unwrap(), &bincode::serialize(&NetPacket::SyncRequest).unwrap()).await;
 
-        loop {
-            let raw = match recv_raw(&mut reader).await { Ok(b) => b, _ => break };
-            if let Ok(packet) = bincode::deserialize::<NetPacket>(&raw) {
-                match packet {
-                    NetPacket::SyncRequest => handle_bootstrap(&db, &peers_map, &peer_id, &excluded).await,
-                    NetPacket::Replication { msg_id, collection, ops } => {
-                        if msg_id != 0 && !seen_cache.lock().await.insert(msg_id) { continue; }
-                        apply_replication_batch(&db, collection, ops).await;
-                        // relay_mesh(&peers_map, &raw, &peer_id).await;
-                        if enable_relay {
-                            relay_mesh(&peers_map, &raw, &peer_id).await;
+    // 1. Identify Handshake
+    let handshake = NetPacket::Identify { id: self_id.clone(), room_hash: my_hash };
+    if let Ok(bytes) = bincode::serialize(&handshake) {
+        if send_raw(&mut writer, &bytes).await.is_err() { return; }
+    }
+
+    let p_bytes = match tokio::time::timeout(Duration::from_secs(5), recv_raw(&mut reader)).await {
+        Ok(Ok(b)) => b,
+        _ => return,
+    };
+
+    let peer_id = match bincode::deserialize::<NetPacket>(&p_bytes) {
+        Ok(NetPacket::Identify { id, room_hash }) => {
+            if room_hash != my_hash || id == self_id { return; }
+            id
+        }
+        _ => return,
+    };
+
+    // 2. Register Peer
+    {
+        let mut guard = peers_map.lock().await;
+        guard.insert(peer_id.clone(), writer);
+    }
+    update_status(&status_tx, &peers_map).await;
+
+    // 3. Initial Sync Trigger
+    let my_versions = db.get_version_map();
+    {
+        let mut guard = peers_map.lock().await;
+        if let Some(w) = guard.get_mut(&peer_id) {
+            let _ = send_packet(w, NetPacket::Ping { versions: my_versions }).await;
+            let _ = send_packet(w, NetPacket::SyncRequest).await;
+        }
+    }
+
+    // 4. Loop
+    let echo_cache_clone = echo_cache.clone();
+    loop {
+        let raw = match recv_raw(&mut reader).await { Ok(b) => b, _ => break };
+
+        if let Ok(packet) = bincode::deserialize::<NetPacket>(&raw) {
+            match packet {
+                NetPacket::Ping { versions } => {
+                    if let Ok(mut lp) = last_ping.lock() { *lp = Instant::now(); }
+                    for (col, remote_time) in versions {
+                        if db.get_collection_version(&col) > remote_time {
+                            handle_delta_send(&db, &peers_map, &peer_id, &col, remote_time).await;
                         }
                     }
-                    _ => {}
                 }
+                NetPacket::SyncRequest => {
+                    handle_bootstrap(&db, &peers_map, &peer_id, &excluded).await;
+                }
+                NetPacket::Replication { msg_id, collection, ops } => {
+                    // Check Cache
+                    if msg_id != 0 {
+                        let mut cache = seen_cache.lock().await;
+                        if cache.contains(&msg_id) { continue; }
+                        cache.push(msg_id);
+                        if cache.len() > 1000 { cache.remove(0); }
+                    }
+
+                    // Apply (Lock is released here)
+                    apply_replication_batch(db.clone(), collection, ops, echo_cache_clone.clone()).await; 
+
+                    if msg_id != 0 && enable_relay { 
+                        relay_mesh(&peers_map, &raw, &peer_id).await; 
+                    }
+                }
+                _ => {}
             }
         }
-        peers_map.lock().await.remove(&peer_id);
-        update_status(&status_tx, &peers_map).await;
     }
+
+    // 5. Cleanup
+    peers_map.lock().await.remove(&peer_id);
+    update_status(&status_tx, &peers_map).await;
 }
 
+
 fn resolve_op_to_bytes(shard_arc: &Arc<RwLock<crate::storage::engine::StorageEngine>>, db: &Arc<FireLite>, op: &WalOp) -> Option<Vec<u8>> {
-    // 1. Resolve the raw bytes from the WAL op
+    // 1. Resolve the raw bytes (Skeleton) from the WAL op
     let bytes = match op {
-        // If it's a pointer to a segment or a finalized blob on disk
+        WalOp::PutInlined { value, .. } => value.clone(),
         WalOp::Put { segment_id, segment_offset, len, .. } => {
             let ptr = Pointer::Segment { segment_id: *segment_id, offset: *segment_offset, len: *len };
             shard_arc.read().unwrap().read_pointer_internal(&ptr, false).ok().flatten()?
@@ -300,29 +615,24 @@ fn resolve_op_to_bytes(shard_arc: &Arc<RwLock<crate::storage::engine::StorageEng
             let ptr = Pointer::Blob { offset: *offset, len: *len };
             shard_arc.read().unwrap().read_pointer_internal(&ptr, false).ok().flatten()?
         }
-        // If it's already inlined in the WAL (This is where our skeletons live!)
-        WalOp::PutInlined { value, .. } => value.clone(),
-        
-        _ => return None, // Ignore markers like BeginTx/CommitTx
+        _ => return None,
     };
 
-    // 2. Decode the document to see if it's a skeleton
-    let mut doc = FireLiteDoc::decode(&bytes)?;
-    
-    // 3. Check for any BlobLinks
-    let has_links = doc.fields.iter().any(|(_, v)| matches!(v, Value::BlobLink { .. }));
-
-    if has_links {
-        let encryption_key = db.config.encryption_key.as_deref();
+    // 2. Decode to check for BlobLinks
+    if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
+        let has_links = doc.fields.iter().any(|(_, v)| matches!(v, Value::BlobLink { .. }));
         
-        if let Err(_e) = crate::engine::engine::resolve_doc_static(&mut doc, shard_arc, encryption_key) {
+        if has_links {
+            // INFLATE: Replace file offsets with actual binary data for the wire
+            // Blobs are not encrypted/compressed, so we read them raw from disk
+            let encryption_key = db.config.encryption_key.as_deref();
+            if crate::engine::engine::resolve_doc_static(&mut doc, shard_arc, encryption_key).is_ok() {
+                return Some(doc.encode_buffered()); // Encode the now-full document
+            }
             return None;
         }
-        
-        return Some(doc.encode());
     }
 
-    // If no links were found, it's a standard document, send as-is
     Some(bytes)
 }
 
@@ -381,62 +691,274 @@ async fn handle_bootstrap(db: &Arc<FireLite>, peers: &Arc<AsyncMutex<HashMap<Str
     }
 }
 
+#[cfg(feature = "net-sync")]
+async fn handle_delta_send(
+    db: &Arc<FireLite>, 
+    peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, 
+    peer_id: &str, 
+    collection: &str, 
+    since_time: i64
+) {
+    let shard_arc = db.get_shard(collection);
+    let encryption_key = db.config.encryption_key.as_deref();
 
-async fn apply_replication_batch(db: &Arc<FireLite>, collection: String, ops: Vec<WalOp>) {
-    let shard_arc = db.get_shard(&collection);
-    let mut filtered_ops = Vec::new();
-    let mut index_puts = Vec::new();
-    let mut replication_blob_work = Vec::new();
-    let threshold = db.config.value_blob_threshold_bytes;
+    // 1. SCAN PHASE (RAM-only)
+    // Identify which keys changed without touching the disk yet.
+    let changed_items: Vec<(String, Pointer)> = {
+        let guard = shard_arc.read().unwrap();
+        guard.index.iter()
+            .filter_map(|(k, ptr)| {
+                let ts = match ptr {
+                    Pointer::Inlined(bytes) => {
+                        // Extract _time from version 3 header [2..10]
+                        i64::from_le_bytes(bytes[2..10].try_into().unwrap_or([0;8]))
+                    }
+                    Pointer::BlobPending(doc) => doc.get_logical_time(),
+                    Pointer::Deleted { timestamp } => *timestamp,
+                    Pointer::BlobPendingData { data: _, skeleton } => {
+                        i64::from_le_bytes(skeleton[2..10].try_into().unwrap_or([0;8]))
+                    }
+                    _ => 0,
+                };
+                
+                if ts > since_time {
+                    Some((k.clone(), ptr.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
 
-    let mut shard = shard_arc.write().unwrap();
-    for op in ops {
-        let (key, mut doc, is_delete, delete_ts) = match op {
-            WalOp::PutInlined { key, value } => {
-                if let Some(d) = FireLiteDoc::decode(&value) { (key, d, false, 0) } else { continue; }
+    if changed_items.is_empty() { return; }
+
+    // 2. INFLATION & TRANSMISSION PHASE
+    let mut batch_ops = Vec::with_capacity(50);
+
+    for (key, ptr) in changed_items {
+        match ptr {
+            Pointer::Deleted { timestamp } => {
+                batch_ops.push(WalOp::Delete { key, timestamp });
             }
-            WalOp::Delete { key, timestamp } => (key, FireLiteDoc::default(), true, timestamp),
-            _ => continue,
-        };
+            _ => {
+                // Read the skeleton/data from local storage
+                let raw_res = {
+                    let guard = shard_arc.read().unwrap();
+                    guard.read_pointer_internal(&ptr, false).ok().flatten()
+                };
 
-        let remote_ts = if is_delete { delete_ts } else { doc.get_logical_time() };
-        if let Some(local_ptr) = shard.index.get(&key) {
-            let local_ts = match local_ptr {
-                Pointer::Deleted { timestamp } => *timestamp,
-                _ => shard.read_pointer_internal(local_ptr, false).ok().flatten()
-                        .and_then(|b| FireLiteDoc::decode(&b)).map(|d| d.get_logical_time()).unwrap_or(0),
-            };
-            if remote_ts <= local_ts { continue; }
+                if let Some(bytes) = raw_res {
+                    if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
+                        // INFLATE: If document has blobs, resolve them.
+                        // resolve_doc_static will look in the RAM queue before hitting blobs.dat
+                        let has_blobs = doc.fields.iter().any(|(_, v)| matches!(v, Value::BlobLink { .. }));
+                        
+                        let finalized_bytes = if has_blobs {
+                            if crate::engine::engine::resolve_doc_static(&mut doc, &shard_arc, encryption_key).is_ok() {
+                                doc.encode_buffered()
+                            } else {
+                                continue; // Skip if inflation fails to prevent sending corrupted docs
+                            }
+                        } else {
+                            bytes // No blobs, send original bytes
+                        };
+
+                        batch_ops.push(WalOp::PutInlined { key, value: finalized_bytes });
+                    }
+                }
+            }
         }
 
-        if !is_delete {
-            // Updated call: now returns work instead of blocking on file write
-            let work = shard
-                .blob_manager
-                .as_ref()
-                .map(|bm| db.process_doc_blobs(&collection, &mut doc, bm, threshold, remote_ts))
-                .unwrap_or_default();
-            replication_blob_work.extend(work);
+        // 3. BATCH SENDING
+        if batch_ops.len() >= 50 {
+            send_replication_packet(peers, peer_id, collection, std::mem::take(&mut batch_ops)).await;
+        }
+    }
+
+    // Send the final remaining items
+    if !batch_ops.is_empty() {
+        send_replication_packet(peers, peer_id, collection, batch_ops).await;
+    }
+}
+
+/// Helper to serialize and send a batch of operations to a specific peer.
+/// msg_id is set to 0 for bootstrap/delta syncs to prevent mesh relay loops.
+async fn send_replication_packet(
+    peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, 
+    peer_id: &str, 
+    collection: &str, 
+    ops: Vec<WalOp>
+) {
+    let packet = NetPacket::Replication { 
+        msg_id: 0, 
+        collection: collection.to_string(), 
+        ops 
+    };
+
+    // Serialize the packet using bincode
+    match bincode::serialize(&packet) {
+        Ok(payload) => {
+            // Acquire the async lock for the peer map
+            let mut guard = peers.lock().await;
             
-            filtered_ops.push(WalOp::PutInlined { key: key.clone(), value: doc.encode() });
-            if let Some((_, doc_id)) = key.split_once(':') { 
-                index_puts.push((doc_id.to_string(), doc)); 
+            // Look up the specific peer's TCP write half
+            if let Some(writer) = guard.get_mut(peer_id) {
+                // Send using your existing send_raw utility (length-prefix + data)
+                if let Err(e) = send_raw(writer, &payload).await {
+                    eprintln!("[net_sync] Failed to send packet to {}: {}", peer_id, e);
+                }
             }
-        } else {
-            filtered_ops.push(WalOp::Delete { key, timestamp: delete_ts });
+        }
+        Err(e) => {
+            eprintln!("[net_sync] Serialization error for peer {}: {}", peer_id, e);
         }
     }
+}
 
-    // Commit to local shard
-    if !filtered_ops.is_empty() && shard.apply_replicated_ops(&filtered_ops).is_ok() {
-        if !index_puts.is_empty() { 
-            db.inject_replication_to_indexer(collection, Arc::new(index_puts)); 
+#[cfg(feature = "net-sync")]
+async fn apply_replication_batch(db: Arc<FireLite>, collection: String, ops: Vec<WalOp>, echo_cache: Arc<Mutex<HashMap<String, i64>>>,) {
+    let shard_arc = db.get_shard(&collection);
+    let threshold = db.config.value_blob_threshold_bytes;
+    
+    let mut accepted_ops = Vec::new();
+    let mut affected_keys = Vec::new();
+    let mut index_puts = Vec::new();
+    let mut blob_work_items = Vec::new();
+
+    // 1. PHASE 1: PREPARE AND CONFLICT RESOLUTION
+    {
+        // We take a read lock first to check timestamps (LWW)
+        let shard_read = shard_arc.read().unwrap();
+        let echo_cache_clone = echo_cache.clone();
+        
+        for op in ops {
+            let (key, mut doc, is_delete, remote_ts) = match op {
+                WalOp::PutInlined { ref key, ref value } => {
+                    if let Some(d) = FireLiteDoc::decode(value) { 
+                        let ts = d.get_logical_time();
+                        (key.clone(), d, false, ts) 
+                    } else { continue; }
+                }
+                WalOp::Delete { ref key, timestamp } => {
+                    (key.clone(), FireLiteDoc::default(), true, timestamp)
+                }
+                _ => continue,
+            };
+
+            // Conflict Resolution: Only apply if the remote timestamp is newer than local
+            if let Some(local_ptr) = shard_read.index.get(&key) {
+                let local_ts = match local_ptr {
+                    Pointer::Deleted { timestamp } => *timestamp,
+                    _ => {
+                        // Fast path: if the pointer is in-memory (Inlined/Pending), get time directly
+                        // otherwise decode the disk header.
+                        shard_read.read_pointer_internal(local_ptr, false)
+                            .ok().flatten()
+                            .and_then(|b| FireLiteDoc::decode(&b))
+                            .map(|d| d.get_logical_time())
+                            .unwrap_or(0)
+                    }
+                };
+                if remote_ts <= local_ts { continue; }
+            }
+
+            if is_delete {
+                {
+                    let mut cache = echo_cache_clone.lock().unwrap();
+                    cache.insert(key.clone(), remote_ts);
+                }
+                accepted_ops.push(WalOp::Delete { key: key.clone(), timestamp: remote_ts });
+                index_puts.push((key, None)); // None signals delete in our local loop
+            } else {
+                let ts = doc.get_logical_time();
+                {
+                    let mut cache = echo_cache_clone.lock().unwrap();
+                    cache.insert(key.clone(), ts);
+                }
+                // RE-EXTRACT BLOBS: If the sender sent a full doc but it's large,
+                // we extract blobs locally on the receiver to save segment space.
+                if let Some(bm) = &shard_read.blob_manager {
+                    let extracted = bm.extract_blobs_raw(&collection, &key, &mut doc, threshold);
+                    for b in extracted {
+                        blob_work_items.push(b);
+                    }
+                }
+                
+                let skeleton_bytes = doc.encode();
+                accepted_ops.push(WalOp::PutInlined { key: key.clone(), value: skeleton_bytes });
+                index_puts.push((key.clone(), Some(doc)));
+                affected_keys.push(key.into());
+            }
         }
+    } // Read lock dropped
+
+    if accepted_ops.is_empty() { return; }
+
+    // 2. PHASE 2: PHYSICAL COMMIT (Receiver Shard)
+    {
+        let mut shard = shard_arc.write().unwrap();
+        
+        // A. WAL Commit
+        let tx_id = shard.next_tx_id;
+        shard.next_tx_id += 1;
+        // Use the fast batch appender
+        let _ = shard.wal.append_batch_fast(tx_id, &accepted_ops, true); // true = remote (skip fsync)
+
+        // B. Index Update
+        for (key, doc_opt) in index_puts {
+            if let Some(doc) = doc_opt {
+                // If we extracted blobs, mark as Pending
+                let has_blob = blob_work_items.iter().any(|b| {
+                    if let BlobWork::PutRaw { key: k, .. } = b { k == &key } else { false }
+                });
+
+                if has_blob {
+                    shard.update_index_entry(key, Some(Pointer::BlobPending(Arc::new(doc))));
+                } else {
+                    shard.update_index_entry(key, Some(Pointer::Inlined(doc.encode())));
+                }
+            } else {
+                // It was a delete
+                let ts = accepted_ops.iter().find_map(|o| {
+                    if let WalOp::Delete { key: k, timestamp } = o {
+                        if k == &key { return Some(*timestamp); }
+                    }
+                    None
+                }).unwrap_or(0);
+                shard.update_index_entry(key, Some(Pointer::Deleted { timestamp: ts }));
+            }
+        }
+
+        // C. Queue Blobs for Receiver's Blob Worker
+        let mut total_bytes = 0;
+        for b in blob_work_items {
+            if let BlobWork::PutRaw { len, .. } = &b { total_bytes += *len as usize; }
+            shard.blob_flush_queue.push_back(b);
+        }
+        shard.total_pending_blob_bytes.fetch_add(total_bytes, Ordering::Relaxed);
+        
+        // Wake up receiver's blob worker
+        db.trigger_blob_flush.store(true, Ordering::Release);
     }
 
-    // DISPATCH: Offload remote blobs to the same background pool as local writes
-    for w in replication_blob_work {
-        let _ = db.blob_tx.try_send(w);
+    // 3. PHASE 3: NOTIFY LOCAL SYSTEM
+    db.bump_versions_by_keys(affected_keys);
+    
+    // We don't notify watchers for replication by default to avoid loops, 
+    // but we MUST update search indexes.
+    let index_docs: Vec<(String, FireLiteDoc)> = accepted_ops.iter().filter_map(|op| {
+        if let WalOp::PutInlined { key, value } = op {
+            let doc_id = key.split_once(':').map(|(_, id)| id.to_string()).unwrap_or_default();
+            FireLiteDoc::decode(value).map(|d| (doc_id, d))
+        } else { None }
+    }).collect();
+
+    if !index_docs.is_empty() {
+        let _ = db.index_tx.send(crate::engine::engine::IndexOp::Update { 
+            collection: collection.clone(), 
+            puts: Arc::new(index_docs), 
+            deletes: vec![] 
+        });
     }
 }
 
@@ -454,7 +976,12 @@ fn broadcast_mesh(peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, col:
         let p_ptr = peers.clone();
         tokio::spawn(async move {
             let mut guard = p_ptr.lock().await;
-            for writer in guard.values_mut() { let _ = send_raw(writer, &payload).await; }
+            for writer in guard.values_mut() { 
+                let peer = writer.peer_addr().unwrap().ip().to_string();
+                println!("Send to : {}", peer);
+                let _ = send_raw(writer, &payload).await; 
+
+            }
         });
     }
 }
@@ -480,4 +1007,12 @@ async fn recv_raw<R: AsyncReadExt + Unpin>(r: &mut R) -> tokio::io::Result<Vec<u
     let mut data = vec![0u8; u32::from_le_bytes(len_b) as usize];
     r.read_exact(&mut data).await?;
     Ok(data)
+}
+
+/// Helper to send typed packets safely
+async fn send_packet(writer: &mut OwnedWriteHalf, packet: NetPacket) -> tokio::io::Result<()> {
+    if let Ok(payload) = bincode::serialize(&packet) {
+        send_raw(writer, &payload).await?;
+    }
+    Ok(())
 }

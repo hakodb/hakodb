@@ -36,7 +36,7 @@ impl Default for FireLiteConfig {
             durability_mode: DurabilityMode::Interval,
             group_commit_max_ops: 128,
             encryption_key: None,
-            enable_audit_log: true,
+            enable_audit_log: false,
             audit_log_path: None,
             max_inlined_memory_bytes: 64 * 1024 * 1024, // 64MB Default
             use_compression: false, // Disabled by default

@@ -169,6 +169,43 @@ impl Wal {
         self.maybe_sync(has_commit, is_remote)
     }
 
+    pub fn append_batch_fast(&mut self, tx_id: u64, ops: &[WalOp], is_remote: bool) -> Result<()> {
+        // 1. Encode BeginTx
+        self.append_to_buffer(&WalOp::BeginTx { tx_id });
+
+        // 2. Encode all ops
+        for op in ops {
+            self.append_to_buffer(op);
+        }
+
+        // 3. Encode CommitTx
+        self.append_to_buffer(&WalOp::CommitTx { tx_id });
+
+        self.maybe_sync(true, is_remote)
+    }
+
+    fn append_to_buffer(&mut self, op: &WalOp) {
+        let start = self.write_buffer.len();
+        self.write_buffer.extend_from_slice(&[0u8; 8]); // Header
+
+        // Encode directly into the buffer if not encrypted
+        if let Some(enc) = &self.encryption {
+            let mut temp = Vec::new(); // Fallback for encryption
+            encode_into(&mut temp, op);
+            let ciphertext = enc.encrypt(&temp).unwrap();
+            self.write_buffer.extend_from_slice(&ciphertext);
+        } else {
+            encode_into(&mut self.write_buffer, op);
+        }
+
+        let payload_len = (self.write_buffer.len() - start - 8) as u32;
+        let crc = crc32fast::hash(&self.write_buffer[start + 8..]);
+        
+        self.write_buffer[start..start+4].copy_from_slice(&payload_len.to_le_bytes());
+        self.write_buffer[start+4..start+8].copy_from_slice(&crc.to_le_bytes());
+        self.pending_ops_since_sync += 1;
+    }
+
     pub fn flush(&mut self) -> Result<()> {
         if self.write_buffer.is_empty() {
             return Ok(());
@@ -646,7 +683,7 @@ mod tests {
         let replayed = wal.replay().expect("replay");
         assert!(replayed.is_empty());
 
-        wal.append(&WalOp::CommitTx { tx_id: 1 }).expect("commit");
+        wal.append(&WalOp::CommitTx { tx_id: 1 }, false).expect("commit");
         let replayed = wal.replay().expect("replay2");
         assert_eq!(replayed.len(), 1);
 

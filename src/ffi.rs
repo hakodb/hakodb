@@ -81,9 +81,10 @@ pub struct FL_Transaction {
     pub tx: crate::engine::SerializableTransaction,
 }
 
-// struct SendPtr(*mut std::ffi::c_void);
-// unsafe impl Send for SendPtr {}
-// unsafe impl Sync for SendPtr {}
+#[allow(non_camel_case_types)]
+pub struct FL_ResultSet {
+    pub docs: Vec<*mut FL_Doc>,
+}
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
@@ -116,51 +117,6 @@ fn cstr_to_string(ptr: *const c_char) -> Result<String, String> {
 
 fn value_to_json(v: &Value) -> serde_json::Value {
     v.to_json()
-    // match v {
-    //     Value::Null => serde_json::Value::Null,
-    //     Value::Bool(v) => serde_json::Value::Bool(*v),
-    //     Value::Int(v) => serde_json::Value::Number((*v).into()),
-    //     Value::Float(v) => serde_json::Number::from_f64(*v)
-    //         .map(serde_json::Value::Number)
-    //         .unwrap_or(serde_json::Value::Null),
-    //     Value::String(v) => serde_json::Value::String(v.clone()),
-    //     Value::Binary(v) => serde_json::Value::Array(
-    //         v.iter()
-    //             .map(|b| serde_json::Value::Number((*b as u64).into()))
-    //             .collect(),
-    //     ),
-    //     Value::Timestamp(v) => serde_json::Value::Number((*v).into()),
-    //     Value::Array(items) => {
-    //         // <--- ADD THIS
-    //         serde_json::Value::Array(items.iter().map(value_to_json).collect())
-    //     }
-    //     Value::Map(fields) => {
-    //         let mut map = serde_json::Map::new();
-    //         for (k, sv) in fields {
-    //             // FIX: Use .to_string() to convert Arc<str> to String
-    //             map.insert(k.to_string(), value_to_json(sv));
-    //         }
-    //         serde_json::Value::Object(map)
-    //     }
-    //     Value::Reference { collection, doc_id } => {
-    //         let mut map = serde_json::Map::new();
-    //         map.insert(
-    //             "__ref__".to_string(),
-    //             serde_json::Value::String(format!("{}/{}", collection, doc_id)),
-    //         );
-    //         serde_json::Value::Object(map)
-    //     }
-    //     // ADD THIS ARM:
-    //     Value::BlobLink { offset, len } => {
-    //         let mut map = serde_json::Map::new();
-    //         let mut meta = serde_json::Map::new();
-    //         meta.insert("offset".to_string(), (*offset).into());
-    //         meta.insert("len".to_string(), (*len).into());
-    //         map.insert("__blob__".to_string(), serde_json::Value::Object(meta));
-    //         serde_json::Value::Object(map)
-    //     }
-    //     Value::ServerTimestamp => serde_json::Value::Null,
-    // }
 }
 
 fn doc_to_json(doc: &FireLiteDoc) -> Result<String, String> {
@@ -584,7 +540,7 @@ pub extern "C" fn fl_engine_insert(
         let doc = unsafe { &*doc };
         match engine.db.put(&collection, &doc_id, &doc.doc) {
             Ok(_) => 0,
-            Err(e) => set_last_error(e.to_string()),
+            Err(e) => set_last_error(format!("{}", e)),
         }
     })
 }
@@ -1179,6 +1135,101 @@ pub extern "C" fn fl_query_execute(engine: *mut FL_Engine, query: *const FL_Quer
             }
         }
     })
+}
+
+// #[no_mangle]
+// pub extern "C" fn fl_query_execute_binary(engine: *mut FL_Engine, query: *const FL_Query) -> *mut FL_BinaryResult {
+//     let results = unsafe { (*engine).db.query((*query).query.clone()).unwrap() };
+    
+//     let mut big_buffer = Vec::new();
+//     let count = results.len();
+
+//     for (_id, doc) in results {
+//         let doc_bytes = doc.encode(); // Already binary!
+//         // 1. Write the length of this doc (4 bytes)
+//         big_buffer.extend_from_slice(&(doc_bytes.len() as u32).to_le_bytes());
+//         // 2. Write the doc itself
+//         big_buffer.extend_from_slice(&doc_bytes);
+//     }
+
+//     // Wrap in a heap-allocated struct to pass to C++
+//     let res = Box::new(FL_BinaryResult {
+//         data: big_buffer.as_ptr(),
+//         length: big_buffer.len(),
+//         count,
+//     });
+
+//     // Prevent Rust from freeing the big_buffer immediately
+//     std::mem::forget(big_buffer); 
+    
+//     Box::into_raw(res)
+// }
+
+#[no_mangle]
+pub extern "C" fn fl_query_execute_to_handles(
+    engine: *mut FL_Engine,
+    query: *const FL_Query,
+) -> *mut FL_ResultSet {
+    safety_shield!(std::ptr::null_mut(), {
+        let engine = unsafe { &*engine };
+        let query_obj = unsafe { &*query };
+
+        // 1. Run the actual query (Fast logic)
+        let results = engine.db.query(query_obj.query.clone()).unwrap_or_default();
+
+        // 2. Convert each result into a handle (*mut FL_Doc), just like 'get' does
+        let doc_handles: Vec<*mut FL_Doc> = results
+            .into_iter()
+            .map(|(_id, doc)| Box::into_raw(Box::new(FL_Doc { doc })))
+            .collect();
+
+        // 3. Wrap the list of handles in a ResultSet handle
+        Box::into_raw(Box::new(FL_ResultSet { docs: doc_handles }))
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn fl_result_set_count(results: *mut FL_ResultSet) -> usize {
+    if results.is_null() { return 0; }
+    unsafe {
+        // results.as_ref() returns Option<&FL_ResultSet>
+        results.as_ref().map(|rs| rs.docs.len()).unwrap_or(0)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_result_set_get_doc(results: *mut FL_ResultSet, index: usize) -> *mut FL_Doc {
+    if results.is_null() { return std::ptr::null_mut(); }
+    unsafe {
+        // 1. Convert raw pointer to a reference
+        if let Some(rs) = results.as_ref() {
+            // 2. Access the vector and the element at the index
+            rs.docs.get(index)
+                .cloned() // Copy the raw pointer (*mut FL_Doc) out of the Option
+                .unwrap_or(std::ptr::null_mut())
+        } else {
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_result_set_free(results: *mut FL_ResultSet) {
+    if !results.is_null() {
+        unsafe {
+            // Take ownership back from C++
+            let rs = Box::from_raw(results);
+            
+            // Crucial: The ResultSet owns these docs. We must free each one.
+            for doc_ptr in rs.docs {
+                if !doc_ptr.is_null() {
+                    // This triggers the Rust destructor for each FireLiteDoc
+                    let _ = Box::from_raw(doc_ptr);
+                }
+            }
+            // rs goes out of scope here and the Vec itself is freed
+        }
+    }
 }
 
 #[no_mangle]

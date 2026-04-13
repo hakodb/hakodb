@@ -22,6 +22,8 @@ struct FL_Engine;
 
 struct FL_Query;
 
+struct FL_ResultSet;
+
 struct FL_Transaction;
 
 struct FL_Watch;
@@ -152,6 +154,14 @@ int32_t fl_query_offset(FL_Query *query, uintptr_t offset);
 int32_t fl_query_select_field(FL_Query *query, const char *field);
 
 char *fl_query_execute(FL_Engine *engine, const FL_Query *query);
+
+FL_ResultSet *fl_query_execute_to_handles(FL_Engine *engine, const FL_Query *query);
+
+uintptr_t fl_result_set_count(FL_ResultSet *results);
+
+FL_Doc *fl_result_set_get_doc(FL_ResultSet *results, uintptr_t index);
+
+void fl_result_set_free(FL_ResultSet *results);
 
 char *fl_doc_to_json(const FL_Doc *doc);
 

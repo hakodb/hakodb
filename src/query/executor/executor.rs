@@ -37,122 +37,109 @@ impl ParallelQueryExecutor {
         indexes: &IndexManager,
         plan: QueryPlan,
     ) -> Result<Vec<(String, FireLiteDoc)>> {
-
-        // 1. Get keys from index
-        // Note: Use 'mut' so we can drain/truncate
+        // 1. PHASE 1: INDEX SCAN
+        // Fetch physical pointers from the RAM Index
         let mut keys_from_index = {
             let storage = storage_arc.read().unwrap();
-            match &plan.scan {
-                ScanType::UnionIndex { scans } => {
-                    let mut union_map = HashMap::new();
-                    for scan in scans {
-                        let branch_docs = self.execute_single_scan(
-                            &storage,
-                            indexes,
-                            scan,
-                            &plan.collection,
-                            plan.scan_limit,
-                        )?;
-                        for (key, ptr) in branch_docs {
-                            union_map.insert(key, ptr);
-                        }
-                    }
-                    union_map.into_iter().collect::<Vec<_>>()
-                }
-                _ => self.execute_single_scan(
-                    &storage,
-                    indexes,
-                    &plan.scan,
-                    &plan.collection,
-                    plan.scan_limit,
-                )?,
-            }
+            self.execute_single_scan(
+                &storage,
+                indexes,
+                &plan.scan,
+                &plan.collection,
+                plan.scan_limit,
+            )?
         };
 
-        if keys_from_index.is_empty() { return Ok(Vec::new()); }
+        if keys_from_index.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        // --- REFINED OFFSET & LIMIT OPTIMIZATION ---
+        // 2. PHASE 2: RAM-LEVEL OPTIMIZATION (Limit/Offset)
         let mut offset_to_apply_later = plan.offset.unwrap_or(0);
         
-        // If the index satisfies the SORT ORDER, we can skip pointers in RAM
+        // If the index already provides the correct sort order, 
+        // we can discard pointers in RAM before touching the disk.
         if plan.order_by_satisfied && offset_to_apply_later > 0 {
             let skip_count = offset_to_apply_later.min(keys_from_index.len());
             keys_from_index.drain(0..skip_count);
-            offset_to_apply_later = 0; // Offset consumed
+            offset_to_apply_later = 0; 
         }
 
-        // NEW OPTIMIZATION: If the index also satisfies the FILTERS, 
-        // we can truncate pointers in RAM to the LIMIT.
-        // This prevents reading thousands of docs from disk just to discard them later.
         if plan.order_by_satisfied && plan.filters_satisfied_by_index {
             if let Some(limit) = plan.limit {
                 keys_from_index.truncate(limit);
             }
         }
 
-        // 2. Wrap keys with logical position
+        // 3. PHASE 3: PHYSICAL SORT (The "Sweep" optimization)
+        // Record logical position to restore order later
         let mut work_items: Vec<(usize, String, Pointer)> = keys_from_index
             .into_iter()
             .enumerate()
             .map(|(i, (k, v))| (i, k, v))
             .collect();
 
-        // 3. PHYSICAL SORT (The Sweep)
+        // Sort by file offset to ensure sequential disk reads (minimizes seek time)
         work_items.sort_by_key(|(_, _, ptr)| {
             match ptr {
                 Pointer::Segment { offset, .. } => *offset,
                 Pointer::Blob { offset, .. } => *offset,
+                Pointer::Inlined(_) | Pointer::BlobPending(_) | Pointer::BlobPendingData { .. } => 0,
                 _ => 0, 
             }
         });
 
-        // 4. SHARD & EXECUTE
         let docs_to_fetch: Vec<(String, Pointer)> = work_items
             .iter()
             .map(|(_, k, p)| (k.clone(), p.clone()))
             .collect();
 
-        // let doc_count = docs_to_fetch.len();
-        // let processed_docs = if doc_count < 1000 || self.workers <= 1 {
-        //     run_task(QueryTask {
-        //         docs: docs_to_fetch,
-        //         plan: plan.clone(),
-        //         storage: Some(storage_arc.clone()),
-        //     })
-        // } else {
-        //     let optimal_workers = self.workers.min((doc_count / 500).max(1));
-        //     let tasks = shard_tasks(docs_to_fetch, optimal_workers, plan.clone(), Some(storage_arc.clone()));
-        //     let mut results = Vec::new();
-        //     let mut handles = Vec::new();
-        //     for task in tasks { handles.push(thread::spawn(move || run_task(task))); }
-        //     for handle in handles { results.extend(handle.join().unwrap_or_default()); }
-        //     results
-        // };
+        // 4. PHASE 4: ADAPTIVE WORKER DISPATCH
         let doc_count = docs_to_fetch.len();
-        let optimal_workers = self.workers.min((doc_count / 500).max(1));
-        let tasks = shard_tasks(docs_to_fetch, optimal_workers, plan.clone(), Some(storage_arc.clone()));
+        
+        // Decide how many workers to use based on result set density
+        // Threshold: 1 worker per 150 documents, capped by global config.
+        let target_workers = match doc_count {
+            0..=150 => 1,           // Small set: Stay on current thread (Fairness to Get)
+            151..=500 => 2,         // Medium: Parallelize across 2 cores
+            _ => self.workers,      // Large: Full system power
+        }.min(self.workers).max(1);
 
-        let processed_docs: Vec<(String, FireLiteDoc)> = tasks
-            .into_par_iter() // This uses the global fixed thread pool
-            .flat_map(|task| run_task(task))
-            .collect();
+        let tasks = shard_tasks(docs_to_fetch, target_workers, plan.clone(), Some(storage_arc.clone()));
 
-        // 5. RESTORE LOGICAL ORDER
+        let processed_docs: Vec<(String, FireLiteDoc)> = if target_workers == 1 {
+            // SHORT-CIRCUIT: Avoid Rayon task-scheduling overhead for small results.
+            // This ensures a query for 50 docs is as fast as 50 individual Get calls.
+            tasks.into_iter()
+                .flat_map(|task| run_task(task))
+                .collect()
+        } else {
+            // PARALLEL PATH: Use full CPU power for heavy workloads
+            tasks.into_par_iter()
+                .flat_map(|task| run_task(task))
+                .collect()
+        };
+
+        // 5. PHASE 5: LOGICAL ORDER RESTORATION
         let mut processed_map: HashMap<String, FireLiteDoc> = processed_docs.into_iter().collect();
         let mut ordered_results = Vec::with_capacity(doc_count);
+        
         for (original_pos, key, _) in work_items {
             if let Some(doc) = processed_map.remove(&key) {
                 ordered_results.push((original_pos, key, doc));
             }
         }
+        
+        // Restore the order provided by the index (or original insertion order)
         ordered_results.sort_by_key(|(pos, _, _)| *pos);
 
-        // 6. Manual re-sort for cases NOT satisfied by index
         let mut results: Vec<(String, FireLiteDoc)> = ordered_results
             .into_iter()
             .map(|(_, k, d)| (k, d))
             .collect();
 
+        // 6. PHASE 6: FINAL SORTING & SLICING
+        // Manual sort if the Index couldn't satisfy the order_by clause
         if !plan.order_by_satisfied {
             if let Some(order) = &plan.order_by {
                 results.sort_by(|(_, a), (_, b)| {
@@ -164,7 +151,7 @@ impl ParallelQueryExecutor {
             }
         }
 
-        // 7. Final Offset/Limit (Catch-all for non-index queries)
+        // Apply final Offset/Limit for non-indexed queries
         if offset_to_apply_later > 0 {
             results = results.into_iter().skip(offset_to_apply_later).collect();
         }
@@ -173,6 +160,15 @@ impl ParallelQueryExecutor {
         }
 
         Ok(results)
+    }
+
+    #[inline]
+    fn make_key(collection: &str, doc_id: &str) -> String {
+        let mut s = String::with_capacity(collection.len() + doc_id.len() + 1);
+        s.push_str(collection);
+        s.push(':');
+        s.push_str(doc_id);
+        s
     }
 
     pub fn execute_aggregation(
@@ -415,10 +411,10 @@ impl ParallelQueryExecutor {
     }
 
 
-    #[inline]
-    fn make_key(collection: &str, doc_id: &str) -> String {
-        format!("{}:{}", collection, doc_id)
-    }
+    // #[inline]
+    // fn make_key(collection: &str, doc_id: &str) -> String {
+    //     format!("{}:{}", collection, doc_id)
+    // }
 
     fn execute_single_scan(
         &self,

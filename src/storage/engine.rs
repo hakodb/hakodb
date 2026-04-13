@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use crate::config::{FireLiteConfig, DurabilityMode};
 use crate::error::{FireLiteError, Result};
 use std::sync::{Arc, Mutex}; 
-use std::time::{SystemTime, UNIX_EPOCH};
+// use std::sync::atomic::Ordering;
+use std::time::UNIX_EPOCH;
 use crate::memory::page_cache::PageCache; 
 
 use super::blob::{BlobManager, BlobWork};
@@ -14,6 +15,8 @@ use super::crypto::EncryptionContext;
 use super::segment::Segment;
 use super::wal::{Wal, WalOp};
 use crossbeam_channel::Sender as CrossbeamSender;
+use crate::document::firelite_doc::FireLiteDoc;
+// use crate::document::value::Value;
 
 
 #[derive(Debug, Clone)] 
@@ -28,7 +31,11 @@ pub enum Pointer {
         offset: u64,
         len: u32,
     },
-    BlobPending(Arc<Vec<u8>>),
+    BlobPending(Arc<FireLiteDoc>),
+    BlobPendingData { 
+        data: Arc<Vec<u8>>, 
+        skeleton: Vec<u8> 
+    },
     Deleted { timestamp: i64 },
 }
 
@@ -50,12 +57,12 @@ pub struct StorageEngine {
     active_segment_id: u64,
     next_segment_id: u64,
     pub(crate) wal: Wal,
-    next_tx_id: u64,
+    pub(crate) next_tx_id: u64,
     compaction_threshold_bytes: usize,
     pub encryption: Option<EncryptionContext>,
-    inlined_bytes: usize,
-    max_inlined_bytes: usize,
-    blob_threshold: usize,
+    pub(crate) inlined_bytes: usize,
+    pub(crate) max_inlined_bytes: usize,
+    pub(crate) blob_threshold: usize,
     pub(crate) use_compression: bool, 
     pub(crate) collection_counts: HashMap<String, usize>,
     pub cache: Arc<Mutex<PageCache>>,
@@ -64,7 +71,9 @@ pub struct StorageEngine {
     pub blob_manager: Option<Arc<BlobManager>>,
     pub(crate) blob_tx: Option<CrossbeamSender<BlobWork>>,
     pub logical_name: String,
-    pub(crate) in_flight_blob_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    // pub(crate) in_flight_blob_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) blob_flush_queue: std::collections::VecDeque<BlobWork>, 
+    pub(crate) total_pending_blob_bytes: std::sync::atomic::AtomicUsize,
 }
 
 impl StorageEngine {
@@ -167,14 +176,13 @@ impl StorageEngine {
             mmap_size: cfg.mmap_size,
             blob_manager: Some(Arc::new(BlobManager::new(
                 blob_file,
-                encryption.clone(),
-                cfg.use_compression,
-                cfg.compression_level,
                 initial_size,
             ))),
             blob_tx: None,
             logical_name,
-            in_flight_blob_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            // in_flight_blob_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            blob_flush_queue: std::collections::VecDeque::with_capacity(1024),
+            total_pending_blob_bytes: std::sync::atomic::AtomicUsize::new(0),
         };
 
         engine.recover()?;
@@ -209,48 +217,29 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn update_index_entry(&mut self, key: String, new_pointer: Option<Pointer>) {
-        let collection = &self.logical_name;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
-
-        // --- STEP 1: CLEANUP OLD ENTRY ---
+    pub(crate) fn update_index_entry(&mut self, key: String, new_pointer: Option<Pointer>) {
         if let Some(old_p) = self.index.remove(&key) {
-            match &old_p {
-                Pointer::Inlined(data) => { self.inlined_bytes = self.inlined_bytes.saturating_sub(data.len()); }
+            match old_p {
+                Pointer::Inlined(ref d) => { self.inlined_bytes = self.inlined_bytes.saturating_sub(d.len()); }
+                Pointer::BlobPendingData { ref skeleton, .. } => { self.inlined_bytes = self.inlined_bytes.saturating_sub(skeleton.len()); }
                 _ => {}
             }
 
-            let is_tomb = matches!(old_p, Pointer::Deleted { .. });
-            
-            // If it was a real document, we MUST decrement now, 
-            // because it's either being replaced or deleted.
-            if !is_tomb {
-                if let Some(count) = self.collection_counts.get_mut(collection) {
+            if !matches!(old_p, Pointer::Deleted { .. }) {
+                if let Some(count) = self.collection_counts.get_mut(&self.logical_name) {
                     *count = count.saturating_sub(1);
                 }
             }
-            is_tomb
-        } else {
-            false // Brand new key
-        };
+        }
 
         // --- STEP 2: APPLY NEW ENTRY ---
-        match new_pointer {
-            Some(p) => {
-                if let Pointer::Inlined(ref data) = p { self.inlined_bytes += data.len(); }
-
-                // Only increment if we are putting a REAL document 
-                // AND we aren't just replacing one tombstone with another.
-                if !matches!(p, Pointer::Deleted { .. }) {
-                    *self.collection_counts.entry(collection.to_string()).or_insert(0) += 1;
-                }
-                self.index.insert(key, p);
+        if let Some(p) = new_pointer {
+            match &p {
+                Pointer::Inlined(d) => { self.inlined_bytes += d.len(); }
+                Pointer::BlobPendingData { skeleton, .. } => { self.inlined_bytes += skeleton.len(); }
+                _ => {}
             }
-            None => {
-                // LOCAL DELETE PATH
-                // We already decremented the count in Step 1 if it was a real doc.
-                self.index.insert(key, Pointer::Deleted { timestamp: now });
-            }
+            self.index.insert(key, p);
         }
     }
 
@@ -356,9 +345,9 @@ impl StorageEngine {
                         index_updates.push((key.clone(), Some(Pointer::Inlined(value.clone()))));
                     } else if len > self.blob_threshold { // Path 2: Large (Side-load to Blob File)
                         let arc_data = Arc::new(value.clone());
-                        index_updates.push((key.clone(), Some(Pointer::BlobPending(arc_data.clone()))));
+                        // FIX: Use Pointer::Inlined for raw byte batches
+                        index_updates.push((key.clone(), Some(Pointer::Inlined(value.clone()))));
                         
-                        // Keep the local Blob Worker active!
                         blob_work_todo.push(BlobWork::Put {
                             collection: self.logical_name.clone(),
                             key: key.clone(),
@@ -407,12 +396,35 @@ impl StorageEngine {
     }
 
     pub fn flush_all(&mut self) -> Result<()> {
-        // First flush the data segment
+        self.drain_blob_queue()?;
         if let Some(meta) = self.segments.get_mut(&self.active_segment_id) {
             meta.segment.flush()?;
         }
-        // Then flush the WAL
         self.wal.flush()?;
+        Ok(())
+    }
+
+    pub fn drain_blob_queue(&mut self) -> Result<()> {
+        let bm_handle = self.blob_manager.clone();
+        let Some(bm) = bm_handle else { return Ok(()); };
+        
+        while let Some(work) = self.blob_flush_queue.pop_front() {
+            // Note the addition of timestamp
+            if let BlobWork::PutRaw { key, offset, data, skeleton, timestamp, .. } = work {
+                // 1. Physical Write
+                bm.write_at(data.as_slice(), offset)?;
+                
+                // 2. Atomic Swap with Timestamp Verification
+                if !skeleton.is_empty() {
+                    if let Some(Pointer::BlobPending(current_doc)) = self.index.get(&key) {
+                        if current_doc.get_logical_time() == timestamp {
+                            self.update_index_entry(key, Some(Pointer::Inlined(skeleton)));
+                        }
+                    }
+                }
+            }
+        }
+        bm.file().sync_all()?;
         Ok(())
     }
 
@@ -531,7 +543,7 @@ impl StorageEngine {
         Ok(true)
     }
 
-    fn rewrite_wal_snapshot(&mut self) -> Result<()> {
+    pub(crate) fn rewrite_wal_snapshot(&mut self) -> Result<()> {
         self.wal.reset()?;
         let mut ops = Vec::with_capacity(self.index.len());
         for (key, pointer) in &self.index {
@@ -554,9 +566,17 @@ impl StorageEngine {
                 Pointer::Blob { offset, len } => {
                     ops.push(WalOp::PutBlob { key: key.clone(), offset: *offset, len: *len });
                 }
-                Pointer::BlobPending(data) => {
-                    // If we crash while pending, treat it as inlined in WAL for safety
-                    ops.push(WalOp::PutInlined { key: key.clone(), value: (**data).clone() });
+                Pointer::BlobPending(pending_doc) => {
+                    // pending_doc is Arc<FireLiteDoc>
+                    let mut skeleton = (**pending_doc).clone();
+                    if let Some(bm) = &self.blob_manager {
+                        bm.extract_blobs_placeholder(&self.logical_name, &mut skeleton, self.blob_threshold);
+                    }
+                    ops.push(WalOp::PutInlined { key: key.clone(), value: skeleton.encode() });
+                }
+                Pointer::BlobPendingData { skeleton, .. } => {
+                    // Transform worker finished. We already have the skeleton bytes.
+                    ops.push(WalOp::PutInlined { key: key.clone(), value: skeleton.clone() });
                 }
                 Pointer::Deleted { timestamp } => {
                     ops.push(WalOp::Delete { key: key.clone(), timestamp: *timestamp });
@@ -570,18 +590,22 @@ impl StorageEngine {
 
     pub(crate) fn read_pointer_internal(&self, pointer: &Pointer, use_cache: bool) -> Result<Option<Vec<u8>>> {
         match pointer {
-            // THE PERFORMANCE WIN: If the blob worker hasn't finished, 
-            // read directly from the Arc in memory.
-            Pointer::BlobPending(data) => Ok(Some((**data).clone())),
-
+            // PENDING: Serve directly from the Arc in memory (Fastest)
+            Pointer::BlobPending(doc) => Ok(Some(doc.encode())),
+            
+            // Standard small documents stored directly in RAM
             Pointer::Inlined(data) => Ok(Some(data.clone())),
-
+            
+            // FINAL DISK STATE: Standard File/Mmap Read
             Pointer::Blob { offset, len } => {
-                let manager = self.blob_manager.as_ref()
-                    .ok_or_else(|| FireLiteError::StorageError("Blob manager missing".into()))?;
-                Ok(Some(manager.read_at(*offset, *len)?))
+                let bm = self.blob_manager.as_ref().unwrap();
+                Ok(Some(bm.read_at(*offset, *len)?))
             },
+            
+            // PENDING REFINERY: Handle the intermediate state if used
+            Pointer::BlobPendingData { data, .. } => Ok(Some((**data).clone())),
 
+            // STANDARD SEGMENT DATA: (Handles its own compression/encryption)
             Pointer::Segment { segment_id, offset, len } => {
                 let Some(meta) = self.segments.get(segment_id) else { return Ok(None); };
                 Ok(Some(meta.segment.read_at(*offset, *len, use_cache)?))
@@ -919,6 +943,7 @@ fn parse_segment_name(name: &str) -> Option<(u32, u64)> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Arc;
 
     use crate::config::FireLiteConfig;
 
@@ -983,7 +1008,7 @@ mod tests {
         let extra_id = engine.next_segment_id;
         engine.next_segment_id += 1;
         let extra_path = segment_path(&path, 1, extra_id);
-        let extra_segment = Segment::open(extra_path, None).expect("segment open should succeed");
+        let extra_segment = Segment::open(extra_path, 0, engine.encryption.clone(), Arc::clone(&engine.cache), engine.mmap_size).expect("segment open should succeed");
         engine.segments.insert(
             extra_id,
             SegmentMeta {
