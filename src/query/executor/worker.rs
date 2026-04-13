@@ -3,18 +3,24 @@ use crate::document::value::Value;
 use super::task::QueryTask;
 use crate::query::filter::Operator;
 
-/// Standard worker: Decodes full or projected documents.
+
 pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
     let mut out = Vec::new();
-    // Pre-acquire the read lock for the entire task
-    let storage_engine = task.storage.as_ref().unwrap().read().unwrap();
+    let storage_guard = task.storage.as_ref().unwrap().read().unwrap();
+    let blob_manager = storage_guard.blob_manager.as_ref();
 
     for (id, pointer) in task.docs {
-        // Resolve Pointer -> Bytes
-        if let Ok(Some(bytes)) = storage_engine.read_pointer(&pointer) {
-            // Now bytes is Vec<u8>, we can use it
-            if task.plan.filters_satisfied_by_index || matches_filters_view(&bytes, &task.plan) {
-                if let Some(doc) = FireLiteDoc::decode(&bytes) {
+        if let Ok(Some(bytes)) = storage_guard.read_pointer(&pointer) {
+            // 1. Zero-allocation filter check
+            if task.plan.filters_satisfied_by_index || matches_filters_view(&id, &bytes, &task.plan) {
+                if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
+                    
+                    // 2. Call the helper function (This removes the warning)
+                    if let Some(bm) = blob_manager {
+                        // We ignore errors here so a single bad blob doesn't crash the whole query
+                        let _ = inflate_blobs(&mut doc, bm);
+                    }
+                    
                     out.push((id, doc));
                 }
             }
@@ -23,20 +29,58 @@ pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
     out
 }
 
-/// Optimized projected worker: Extracts only requested fields without full doc decoding.
+fn inflate_blobs(doc: &mut FireLiteDoc, blob_manager: &crate::storage::blob::BlobManager) -> Result<(), crate::error::FireLiteError> {
+    // Collect references to avoid multiple scans of doc.fields
+    let links: Vec<&mut Value> = doc.fields.iter_mut()
+        .map(|(_, v)| v)
+        .filter(|v| matches!(v, Value::BlobLink { .. }))
+        .collect();
+
+    if links.is_empty() { return Ok(()); }
+
+    // Sequential because we are already inside a Rayon thread for the Query Task
+    for val in links {
+        if let Value::BlobLink { offset, len } = *val {
+            let data = blob_manager.read_at(offset, len)?;
+            *val = match String::from_utf8(data) {
+                Ok(s) => Value::String(s),
+                Err(e) => Value::Binary(e.into_bytes()),
+            };
+        }
+    }
+    Ok(())
+}
+
+
 pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)> {
     let mut out = Vec::new();
+    
+    // 1. Pull the handles from the Shard (StorageEngine)
+    // We do this once per task (worker thread)
+    let blob_manager = {
+        let guard = task.storage.as_ref().unwrap().read().unwrap();
+        guard.blob_manager.clone()
+    };
+
     let storage_engine = task.storage.as_ref().unwrap().read().unwrap();
     let projection = &task.plan.projection;
 
     for (id, pointer) in task.docs {
         if let Ok(Some(bytes)) = storage_engine.read_pointer(&pointer) {
-            if matches_filters_view(&bytes, &task.plan) {
+            if task.plan.filters_satisfied_by_index || matches_filters_view(&id, &bytes, &task.plan) {
                 let mut fields_out = Vec::new();
                 if let Some(view) = FireLiteDocView::new(&bytes) {
                     for field_name in projection {
                         if let Some((_, tag, data)) = view.iter().find(|(k, _, _)| k == field_name) {
-                            if let Some(val) = crate::document::firelite_doc::decode_value(tag, data) {
+                            if let Some(mut val) = crate::document::firelite_doc::decode_value(tag, data) {
+                                
+                                // PARALLEL BLOB RESOLUTION for Projected Fields
+                                if let Value::BlobLink { offset, len } = val {
+                                    if let Some(ref manager) = blob_manager {
+                                        val = resolve_single_blob_in_worker(manager, offset, len);
+                                    }
+                                }
+                                
                                 fields_out.push((field_name.clone(), val));
                             }
                         }
@@ -49,18 +93,51 @@ pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)
     out
 }
 
+// Helper for projected resolution
+fn resolve_single_blob_in_worker(
+    blob_manager: &crate::storage::blob::BlobManager,
+    offset: u64, 
+    len: u32,
+) -> Value {
+    // If read fails, return Null rather than panicking the worker
+    let Ok(data) = blob_manager.read_at(offset, len) else {
+        return Value::Null;
+    };
+
+    match String::from_utf8(data) {
+        Ok(s) => Value::String(s),
+        Err(e) => Value::Binary(e.into_bytes()),
+    }
+}
+
 /// The high-performance core: Scans document bytes ONCE and performs 
 /// comparisons without allocating memory for document values.
 pub(crate) fn matches_filters_view(
+    doc_id :&str,
     bytes: &[u8],
     plan: &crate::query::plan::QueryPlan,
 ) -> bool {
-    let Some(view) = FireLiteDocView::new(bytes) else { return false; };
+    let doc_time = i64::from_le_bytes(bytes[2..10].try_into().unwrap_or([0;8]));
     if plan.filters.is_empty() && plan.or_groups.is_empty() { return true; }
-
+    
     let mut and_matches = vec![false; plan.filters.len()];
     let mut or_group_results = vec![false; plan.or_groups.len()];
 
+    for (i, f) in plan.filters.iter().enumerate() {
+        if f.field == "id" {
+            // Compare string reference without allocation
+            if crate::query::filter::compare_values(&Value::String(doc_id.to_owned()), &f.op, &f.value) {
+                and_matches[i] = true;
+            }
+        } else if f.field == "_time" {
+            // Compare i64 directly
+            if crate::query::filter::compare_values(&Value::Int(doc_time), &f.op, &f.value) {
+                and_matches[i] = true;
+            }
+        }
+    }
+    
+    let Some(view) = FireLiteDocView::new(bytes) else { return false; };
     // CRITICAL PERFORMANCE FIX: Single linear pass over fields
     for (key, tag, data) in view.iter() {
         // 1. Check ANDs

@@ -20,7 +20,7 @@ impl QueryPlanner {
         worker_count: usize,
     ) -> QueryPlan {
         let work_per_thread = collection_rows / worker_count.max(1);
-        let use_index_heuristic = work_per_thread > 500;
+        let use_index_heuristic = work_per_thread > 50;
 
         // 1. PRIORITY 1: Full-Text Search
         for filter in &query.filters {
@@ -132,23 +132,25 @@ impl QueryPlanner {
         // 4. Try Union/OR/IN Logic
         if !query.or_groups.is_empty() || query.filters.iter().any(|f| matches!(f.op, Operator::In)) {
             if let Some(union_scan) = Self::try_plan_union(query, indexes) {
-                return Self::make_plan(query, union_scan, None, false,false);
+                return Self::make_plan(query, union_scan, None, false, false);
             }
         }
 
-        // 5. PRIORITY 4: Secondary Index (Equality)
         if use_index_heuristic {
+            // Check Secondary Index (Simple Index)
             for filter in &query.filters {
                 if matches!(filter.op, Operator::Eq) {
-                    if indexes.secondary.get(&query.collection).map_or(false, |m| m.contains_key(&filter.field)) {
-                        let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
-                        return Self::make_plan(
-                            query,
-                            ScanType::SecondaryIndex { field: filter.field.clone(), value: val_bytes },
-                            None,
-                            false,
-                            false
-                        );
+                    if let Some(sec_map) = indexes.secondary.get(&query.collection) {
+                        if sec_map.contains_key(&filter.field) {
+                            let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
+                            return Self::make_plan(
+                                query,
+                                ScanType::SecondaryIndex { field: filter.field.clone(), value: val_bytes },
+                                query.limit, // Respect limit at the scan level
+                                false, // Order not satisfied by simple index
+                                false
+                            );
+                        }
                     }
                 }
             }

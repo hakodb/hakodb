@@ -4,6 +4,7 @@ use std::os::raw::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{channel, Sender};
 use std::time::Duration;
+use std::sync::Arc;
 use std::{ptr, thread};
 
 use hashbrown::HashMap;
@@ -81,9 +82,16 @@ pub struct FL_Transaction {
     pub tx: crate::engine::SerializableTransaction,
 }
 
-// struct SendPtr(*mut std::ffi::c_void);
-// unsafe impl Send for SendPtr {}
-// unsafe impl Sync for SendPtr {}
+#[allow(non_camel_case_types)]
+pub struct FL_ResultSet {
+    pub docs: Vec<*mut FL_Doc>,
+}
+
+#[cfg(feature = "net-sync")]
+#[allow(non_camel_case_types)]
+pub struct FL_NetSyncer {
+    inner: Arc<crate::net_sync::NetSyncer>,
+}
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
@@ -116,51 +124,6 @@ fn cstr_to_string(ptr: *const c_char) -> Result<String, String> {
 
 fn value_to_json(v: &Value) -> serde_json::Value {
     v.to_json()
-    // match v {
-    //     Value::Null => serde_json::Value::Null,
-    //     Value::Bool(v) => serde_json::Value::Bool(*v),
-    //     Value::Int(v) => serde_json::Value::Number((*v).into()),
-    //     Value::Float(v) => serde_json::Number::from_f64(*v)
-    //         .map(serde_json::Value::Number)
-    //         .unwrap_or(serde_json::Value::Null),
-    //     Value::String(v) => serde_json::Value::String(v.clone()),
-    //     Value::Binary(v) => serde_json::Value::Array(
-    //         v.iter()
-    //             .map(|b| serde_json::Value::Number((*b as u64).into()))
-    //             .collect(),
-    //     ),
-    //     Value::Timestamp(v) => serde_json::Value::Number((*v).into()),
-    //     Value::Array(items) => {
-    //         // <--- ADD THIS
-    //         serde_json::Value::Array(items.iter().map(value_to_json).collect())
-    //     }
-    //     Value::Map(fields) => {
-    //         let mut map = serde_json::Map::new();
-    //         for (k, sv) in fields {
-    //             // FIX: Use .to_string() to convert Arc<str> to String
-    //             map.insert(k.to_string(), value_to_json(sv));
-    //         }
-    //         serde_json::Value::Object(map)
-    //     }
-    //     Value::Reference { collection, doc_id } => {
-    //         let mut map = serde_json::Map::new();
-    //         map.insert(
-    //             "__ref__".to_string(),
-    //             serde_json::Value::String(format!("{}/{}", collection, doc_id)),
-    //         );
-    //         serde_json::Value::Object(map)
-    //     }
-    //     // ADD THIS ARM:
-    //     Value::BlobLink { offset, len } => {
-    //         let mut map = serde_json::Map::new();
-    //         let mut meta = serde_json::Map::new();
-    //         meta.insert("offset".to_string(), (*offset).into());
-    //         meta.insert("len".to_string(), (*len).into());
-    //         map.insert("__blob__".to_string(), serde_json::Value::Object(meta));
-    //         serde_json::Value::Object(map)
-    //     }
-    //     Value::ServerTimestamp => serde_json::Value::Null,
-    // }
 }
 
 fn doc_to_json(doc: &FireLiteDoc) -> Result<String, String> {
@@ -527,38 +490,6 @@ pub extern "C" fn fl_doc_insert_bin(
     0
 }
 
-// #[no_mangle]
-// pub extern "C" fn fl_engine_insert(
-//     engine: *mut FL_Engine,
-//     collection: *const c_char,
-//     doc_id: *const c_char,
-//     doc: *const FL_Doc,
-// ) -> i32 {
-//     if engine.is_null() || doc.is_null() {
-//         return set_last_error("null engine/doc handle");
-//     }
-//     let collection = match cstr_to_string(collection) {
-//         Ok(v) => v,
-//         Err(e) => return set_last_error(e),
-//     };
-//     let doc_id = match cstr_to_string(doc_id) {
-//         Ok(v) => v,
-//         Err(e) => return set_last_error(e),
-//     };
-
-//     let engine = unsafe { &mut *engine };
-//     let doc = unsafe { &*doc };
-//     match engine.db.put(&collection, &doc_id, &doc.doc) {
-//         Ok(_) => {
-//             clear_last_error();
-//             0
-//         }
-//         Err(e) => {
-//     set_last_error(e.to_string());
-//     -1 // or ptr::null_mut() depending on function return type
-// },
-//     }
-// }
 #[no_mangle]
 pub extern "C" fn fl_engine_insert(
     engine: *mut FL_Engine,
@@ -584,7 +515,7 @@ pub extern "C" fn fl_engine_insert(
         let doc = unsafe { &*doc };
         match engine.db.put(&collection, &doc_id, &doc.doc) {
             Ok(_) => 0,
-            Err(e) => set_last_error(e.to_string()),
+            Err(e) => set_last_error(format!("{}", e)),
         }
     })
 }
@@ -614,18 +545,6 @@ pub extern "C" fn fl_engine_get(
                 return ptr::null_mut();
             }
         };
-        // let engine = unsafe { &mut *engine };
-        // match engine.db.get(&collection, &doc_id) {
-        //     Ok(Some(doc)) => {
-        //         clear_last_error();
-        //         Box::into_raw(Box::new(FL_Doc { doc }))
-        //     }
-        //     Ok(None) => ptr::null_mut(),
-        //     Err(e) => {
-        //         set_last_error(e.to_string());
-        //         ptr::null_mut()
-        //     }
-        // }
         let engine = unsafe { &mut *engine };
         match engine.db.get(&collection, &doc_id) {
             Ok(Some(doc)) => Box::into_raw(Box::new(FL_Doc { doc })),
@@ -800,6 +719,33 @@ pub extern "C" fn fl_query_where_eq_str(
         .query
         .clone()
         .where_filter(&field, Operator::Eq, Value::String(value));
+    clear_last_error();
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn fl_query_where_eq_bool(
+    query: *mut FL_Query,
+    field: *const c_char,
+    value: bool, // Receive the bool directly
+) -> i32 {
+    if query.is_null() {
+        return set_last_error("null query handle");
+    }
+
+    let field = match cstr_to_string(field) {
+        Ok(v) => v,
+        Err(e) => return set_last_error(e),
+    };
+
+    let query_ptr = unsafe { &mut *query };
+
+    // Update the query with Value::Bool directly
+    query_ptr.query = query_ptr
+        .query
+        .clone()
+        .where_filter(&field, Operator::Eq, Value::Bool(value));
+
     clear_last_error();
     0
 }
@@ -1046,17 +992,6 @@ pub extern "C" fn fl_query_order_by(
     0
 }
 
-// #[no_mangle]
-// pub extern "C" fn fl_query_limit(query: *mut FL_Query, limit: usize) -> i32 {
-//     if query.is_null() {
-//         return set_last_error("null query handle");
-//     }
-//     let query = unsafe { &mut *query };
-//     query.query = query.query.clone().limit(limit);
-//     clear_last_error();
-//     0
-// }
-
 #[no_mangle]
 pub extern "C" fn fl_query_limit(query: *mut FL_Query, limit: usize) -> i32 {
     if query.is_null() {
@@ -1152,6 +1087,73 @@ pub extern "C" fn fl_query_execute(engine: *mut FL_Engine, query: *const FL_Quer
             }
         }
     })
+}
+
+#[no_mangle]
+pub extern "C" fn fl_query_execute_to_handles(
+    engine: *mut FL_Engine,
+    query: *const FL_Query,
+) -> *mut FL_ResultSet {
+    safety_shield!(std::ptr::null_mut(), {
+        let engine = unsafe { &*engine };
+        let query_obj = unsafe { &*query };
+
+        // 1. Run the actual query (Fast logic)
+        let results = engine.db.query(query_obj.query.clone()).unwrap_or_default();
+
+        // 2. Convert each result into a handle (*mut FL_Doc), just like 'get' does
+        let doc_handles: Vec<*mut FL_Doc> = results
+            .into_iter()
+            .map(|(_id, doc)| Box::into_raw(Box::new(FL_Doc { doc })))
+            .collect();
+
+        // 3. Wrap the list of handles in a ResultSet handle
+        Box::into_raw(Box::new(FL_ResultSet { docs: doc_handles }))
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn fl_result_set_count(results: *mut FL_ResultSet) -> usize {
+    if results.is_null() { return 0; }
+    unsafe {
+        // results.as_ref() returns Option<&FL_ResultSet>
+        results.as_ref().map(|rs| rs.docs.len()).unwrap_or(0)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_result_set_get_doc(results: *mut FL_ResultSet, index: usize) -> *mut FL_Doc {
+    if results.is_null() { return std::ptr::null_mut(); }
+    unsafe {
+        // 1. Convert raw pointer to a reference
+        if let Some(rs) = results.as_ref() {
+            // 2. Access the vector and the element at the index
+            rs.docs.get(index)
+                .cloned() // Copy the raw pointer (*mut FL_Doc) out of the Option
+                .unwrap_or(std::ptr::null_mut())
+        } else {
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_result_set_free(results: *mut FL_ResultSet) {
+    if !results.is_null() {
+        unsafe {
+            // Take ownership back from C++
+            let rs = Box::from_raw(results);
+            
+            // Crucial: The ResultSet owns these docs. We must free each one.
+            for doc_ptr in rs.docs {
+                if !doc_ptr.is_null() {
+                    // This triggers the Rust destructor for each FireLiteDoc
+                    let _ = Box::from_raw(doc_ptr);
+                }
+            }
+            // rs goes out of scope here and the Vec itself is freed
+        }
+    }
 }
 
 #[no_mangle]
@@ -2110,5 +2112,78 @@ pub extern "C" fn fl_config_set_compression(config: *mut FL_Config, enabled: boo
     if let Some(cfg) = unsafe { config.as_mut() } {
         cfg.inner.use_compression = enabled;
         cfg.inner.compression_level = level;
+    }
+}
+
+#[cfg(feature = "net-sync")]
+#[no_mangle]
+pub extern "C" fn fl_net_syncer_new(
+    engine: *mut FL_Engine,
+    name: *const c_char,
+    room_key: *const c_char,
+) -> *mut FL_NetSyncer {
+    let engine_ref = unsafe { &*engine };
+    let name_str = cstr_to_string(name).unwrap_or_else(|_| "node".into());
+    let room_str = cstr_to_string(room_key).unwrap_or_else(|_| "default".into());
+
+    // We need to clone the Arc<FireLite> logically. 
+    // Since FL_Engine wraps FireLite (which is not an Arc inside FL_Engine), 
+    // we use a temporary wrap to pass it to the syncer.
+    let db_ptr:Arc<FireLite> = unsafe { Arc::from_raw(&engine_ref.db as *const _) };
+    let syncer = crate::net_sync::NetSyncer::new(
+        db_ptr.clone(),
+        &name_str,
+        &room_str,
+        vec![],
+    );
+    // Important: Forget the raw pointer so we don't drop the engine!
+    std::mem::forget(db_ptr);
+
+    Box::into_raw(Box::new(FL_NetSyncer {
+        inner: Arc::new(syncer),
+    }))
+}
+
+#[cfg(feature = "net-sync")]
+#[no_mangle]
+pub extern "C" fn fl_net_syncer_start(syncer: *mut FL_NetSyncer, port: u16) -> i32 {
+    if syncer.is_null() { return -1; }
+    let s_ref = unsafe { &*syncer };
+    let inner = s_ref.inner.clone();
+
+    // Use block_on to bridge synchronous FFI to the async start method
+    let rt = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => return set_last_error("No tokio runtime found"),
+    };
+
+    match rt.block_on(async move { inner.start(port).await }) {
+        Ok(_) => 0,
+        Err(e) => {
+            set_last_error(e.to_string());
+            -1
+        }
+    }
+}
+
+#[cfg(feature = "net-sync")]
+#[no_mangle]
+pub extern "C" fn fl_net_syncer_status(syncer: *mut FL_NetSyncer) -> *mut c_char {
+    if syncer.is_null() { return ptr::null_mut(); }
+    let s_ref = unsafe { &*syncer };
+    let status = s_ref.inner.status();
+    
+    match serde_json::to_string(&status) {
+        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Err(_) => ptr::null_mut()
+    }
+}
+
+#[cfg(feature = "net-sync")]
+#[no_mangle]
+pub extern "C" fn fl_net_syncer_free(syncer: *mut FL_NetSyncer) {
+    if !syncer.is_null() {
+        let s = unsafe { Box::from_raw(syncer) };
+        s.inner.stop();
     }
 }

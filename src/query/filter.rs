@@ -102,7 +102,9 @@ pub fn compare_values(a: &Value, op: &Operator, b: &Value) -> bool {
 
         // Cross-type comparisons or comparisons involving ServerTimestamp placeholders
         // In Firestore-style engines, comparing different types usually returns false.
-        _ => false,
+        _ => {
+            eval_ordering(a.cmp(b), op)
+        }
     }
 }
 

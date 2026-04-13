@@ -1,13 +1,18 @@
 use crate::document::value::Value;
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::cell::RefCell;
 
 const MAGIC: u8 = 0xF1;
-const VERSION: u8 = 2; // Format version 2: No Catalog / Raw Strings
+const VERSION: u8 = 3; 
+
+thread_local! {
+    static ENCODE_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(64 * 1024));
+}
 
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct FireLiteDoc {
     pub fields: Vec<(Arc<str>, Value)>,
+    pub _time: i64,
 }
 
 impl FireLiteDoc {
@@ -25,57 +30,63 @@ impl FireLiteDoc {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        static BUFFER_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
-        
-        // 1. Get a buffer from the pool or create a new one
-        let mut out = BUFFER_POOL.lock().unwrap().pop().unwrap_or_else(|| Vec::with_capacity(4096));
-        
-        // 2. IMPORTANT: Clear the old data but keep the capacity
-        out.clear(); 
-        
+        let mut out = Vec::with_capacity(512);
         self.encode_into(&mut out);
+        out
+    }
+
+    pub fn encode_buffered(&self) -> Vec<u8> {
+        ENCODE_BUF.with(|buf| {
+            let mut b = buf.borrow_mut();
+            b.clear();
+            self.encode_into(&mut b);
+            b.to_vec() // This is still a clone, but encode_into didn't allocate
+        })
+    }
+
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        out.push(MAGIC);
+        out.push(VERSION);
+        out.extend_from_slice(&self._time.to_le_bytes()); // 8 bytes
+        out.extend_from_slice(&(self.fields.len() as u16).to_le_bytes()); // 2 bytes
         
-        // 3. Clone for the return value, and put the reusable buffer back
-        // Optimization: In a real app, you might return a custom wrapper 
-        // that handles the "put back" logic on Drop.
-        let result = out.clone(); 
-        
-        BUFFER_POOL.lock().unwrap().push(out);
-        
-        result
+        for (key, value) in &self.fields {
+            out.push(key.len() as u8);
+            out.extend_from_slice(key.as_bytes());
+            Self::encode_value_to(value, out);
+        }
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 4 || bytes[0] != MAGIC || bytes[1] != VERSION {
+        if bytes.len() < 12 || bytes[0] != MAGIC || bytes[1] != VERSION {
             return None;
         }
 
         let mut doc = FireLiteDoc::default();
-        let fields_count = u16::from_le_bytes(bytes[2..4].try_into().ok()?);
-        let mut pos = 4;
-
+        doc._time = i64::from_le_bytes(bytes[2..10].try_into().ok()?);
+        let fields_count = u16::from_le_bytes(bytes[10..12].try_into().ok()?);
+        
+        let mut pos = 12;
         for _ in 0..fields_count {
             let len = *bytes.get(pos)? as usize;
             pos += 1;
             let key = std::str::from_utf8(bytes.get(pos..pos + len)?).ok()?;
             pos += len;
-
             let tag = *bytes.get(pos)?;
             pos += 1;
             let v_len = u32::from_le_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?) as usize;
             pos += 4;
             let val_data = bytes.get(pos..pos + v_len)?;
             pos += v_len;
-
             doc.fields.push((Arc::from(key), decode_value(tag, val_data)?));
         }
         Some(doc)
     }
 
-    /// Decodes only specific fields from the binary data without fully parsing the document.
     pub fn decode_projected(bytes: &[u8], projection: &[String]) -> Option<Self> {
         let view = FireLiteDocView::new(bytes)?;
         let mut doc = FireLiteDoc::default();
+        doc._time = view._time; // Preserve time even in projection
 
         for (key, tag, data) in view.iter() {
             if projection.is_empty() || projection.iter().any(|p| p == key) {
@@ -85,185 +96,132 @@ impl FireLiteDoc {
         Some(doc)
     }
 
-    /// Encodes the document into the provided buffer without new allocations.
-    pub fn encode_into(&self, out: &mut Vec<u8>) {
-        out.push(MAGIC);
-        out.push(VERSION);
-        out.extend_from_slice(&(self.fields.len() as u16).to_le_bytes());
-        
-        for (key, value) in &self.fields {
-            // Encode Key
-            out.push(key.len() as u8);
-            out.extend_from_slice(key.as_bytes());
-            
-            // Encode Value
-            Self::encode_value_to(value, out);
-        }
-    }
-
-    fn encode_value_to(v: &Value, out: &mut Vec<u8>) {
-        match v {
-            Value::Null | Value::ServerTimestamp => {
-                out.push(1);
-                out.extend_from_slice(&0u32.to_le_bytes()); // Length: 0
-            }
-            Value::Bool(b) => {
-                out.push(2);
-                out.extend_from_slice(&1u32.to_le_bytes()); // Length: 1
-                out.push(*b as u8);
-            }
-            Value::Int(v) => {
-                out.push(3);
-                out.extend_from_slice(&8u32.to_le_bytes()); // Length: 8
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            Value::Float(v) => {
-                out.push(4);
-                out.extend_from_slice(&8u32.to_le_bytes()); // Length: 8
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            Value::Timestamp(v) => {
-                out.push(7);
-                out.extend_from_slice(&8u32.to_le_bytes()); // Length: 8
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            Value::String(v) => {
-                out.push(5);
-                out.extend_from_slice(&(v.len() as u32).to_le_bytes()); // Length: N
-                out.extend_from_slice(v.as_bytes());
-            }
-            Value::Binary(v) => {
-                out.push(6);
-                out.extend_from_slice(&(v.len() as u32).to_le_bytes()); // Length: N
-                out.extend_from_slice(v);
-            }
-            Value::Map(fields) => {
-                out.push(8); // Tag
-                let mut body = Vec::with_capacity(128);
-                
-                // Write the number of fields (u16)
-                body.extend_from_slice(&(fields.len() as u16).to_le_bytes());
-                
-                for (k, v) in fields {
-                    // Encode Key: [u8 len] [bytes]
-                    body.push(k.len() as u8);
-                    body.extend_from_slice(k.as_bytes());
-                    
-                    // Recursive call: This will now correctly write [Tag][u32 Len][Data]
-                    Self::encode_value_to(v, &mut body);
-                }
-                
-                // Write the TOTAL size of the body to the main buffer
-                out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-                // Write the body
-                out.extend_from_slice(&body);
-            }
-            Value::Array(items) => {
-                out.push(9); // Tag
-                let mut body = Vec::with_capacity(128);
-                
-                // Write the number of items (u32)
-                body.extend_from_slice(&(items.len() as u32).to_le_bytes());
-                
-                for item in items {
-                    // Recursive call handles the item's [Tag][u32 Len][Data]
-                    Self::encode_value_to(item, &mut body);
-                }
-                
-                // Write the TOTAL size of the body to the main buffer
-                out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-                out.extend_from_slice(&body);
-            }
-            Value::Reference { collection, doc_id } => {
-                out.push(10); // Tag
-                
-                // Length calculation: 1 (col_len) + collection + 1 (id_len) + doc_id
-                let total_len = (1 + collection.len() + 1 + doc_id.len()) as u32;
-                out.extend_from_slice(&total_len.to_le_bytes());
-                
-                // Write Collection
-                out.push(collection.len() as u8);
-                out.extend_from_slice(collection.as_bytes());
-                
-                // Write DocID
-                out.push(doc_id.len() as u8);
-                out.extend_from_slice(doc_id.as_bytes());
-            }
-            Value::BlobLink { offset, len } => {
-                out.push(11); // Tag 11
-                out.extend_from_slice(&12u32.to_le_bytes()); // Length: 8 (u64) + 4 (u32) = 12
-                out.extend_from_slice(&offset.to_le_bytes());
-                out.extend_from_slice(&len.to_le_bytes());
-            }
-        }
-    }
-
-    pub fn apply_patch_binary(old_bytes: &[u8], updates: &[(String, Value)]) -> Option<Vec<u8>> {
-        let mut doc = Self::decode(old_bytes)?;
-        for (k, v) in updates {
-            doc.insert(k.clone(), v.clone());
-        }
-        // This now uses the unified encode() logic
-        Some(doc.encode())
+    pub fn get_logical_time(&self) -> i64 {
+        self._time
     }
 
     pub fn to_json(&self) -> serde_json::Value {
         let mut map = serde_json::Map::new();
+        // VIZ FIX: Always include _time in JSON
+        map.insert("_time".to_string(), serde_json::json!(self._time));
         for (k, v) in &self.fields {
             map.insert(k.to_string(), v.to_json());
         }
         serde_json::Value::Object(map)
     }
     
-    /// Converts a document to JSON and includes a virtual `_id` field.
     pub fn to_json_with_id(&self, id: &str) -> serde_json::Value {
-        let mut map = serde_json::Map::new();
-        map.insert("_id".to_string(), serde_json::Value::String(id.to_string()));
-        for (k, v) in &self.fields {
-            map.insert(k.to_string(), v.to_json());
+        let mut json = self.to_json();
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert("id".to_string(), serde_json::Value::String(id.to_string()));
         }
-        serde_json::Value::Object(map)
+        json
+    }
+
+    fn encode_value_to(v: &Value, out: &mut Vec<u8>) {
+        match v {
+            Value::Null | Value::ServerTimestamp => {
+                out.push(1);
+                out.extend_from_slice(&0u32.to_le_bytes());
+            }
+            Value::Bool(b) => {
+                out.push(2);
+                out.extend_from_slice(&1u32.to_le_bytes());
+                out.push(*b as u8);
+            }
+            Value::Int(v) => {
+                out.push(3);
+                out.extend_from_slice(&8u32.to_le_bytes());
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Value::Float(v) => {
+                out.push(4);
+                out.extend_from_slice(&8u32.to_le_bytes());
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Value::String(v) => {
+                out.push(5);
+                out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                out.extend_from_slice(v.as_bytes());
+            }
+            Value::Binary(v) => {
+                out.push(6);
+                out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                out.extend_from_slice(v);
+            }
+            Value::Timestamp(v) => {
+                out.push(7);
+                out.extend_from_slice(&8u32.to_le_bytes());
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Value::Map(fields) => {
+                out.push(8);
+                let mut body = Vec::new();
+                body.extend_from_slice(&(fields.len() as u16).to_le_bytes());
+                for (k, v) in fields {
+                    body.push(k.len() as u8);
+                    body.extend_from_slice(k.as_bytes());
+                    Self::encode_value_to(v, &mut body);
+                }
+                out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                out.extend_from_slice(&body);
+            }
+            Value::Array(items) => {
+                out.push(9);
+                let mut body = Vec::new();
+                body.extend_from_slice(&(items.len() as u32).to_le_bytes());
+                for item in items { Self::encode_value_to(item, &mut body); }
+                out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                out.extend_from_slice(&body);
+            }
+            Value::Reference { collection, doc_id } => {
+                out.push(10);
+                let total_len = (1 + collection.len() + 1 + doc_id.len()) as u32;
+                out.extend_from_slice(&total_len.to_le_bytes());
+                out.push(collection.len() as u8);
+                out.extend_from_slice(collection.as_bytes());
+                out.push(doc_id.len() as u8);
+                out.extend_from_slice(doc_id.as_bytes());
+            }
+            Value::BlobLink { offset, len } => {
+                out.push(11);
+                out.extend_from_slice(&12u32.to_le_bytes());
+                out.extend_from_slice(&offset.to_le_bytes());
+                out.extend_from_slice(&len.to_le_bytes());
+            }
+        }
     }
 }
 
 pub struct FireLiteDocView<'a> {
     bytes: &'a [u8],
     fields_count: u16,
+    pub _time: i64,
 }
 
 impl<'a> FireLiteDocView<'a> {
     pub fn new(bytes: &'a [u8]) -> Option<Self> {
-        if bytes.len() < 4 || bytes[0] != MAGIC || bytes[1] != VERSION { return None; }
-        let fields_count = u16::from_le_bytes(bytes[2..4].try_into().ok()?);
-        Some(Self { bytes, fields_count })
+        if bytes.len() < 12 || bytes[0] != MAGIC || bytes[1] != VERSION { return None; }
+        let _time = i64::from_le_bytes(bytes[2..10].try_into().ok()?);
+        let fields_count = u16::from_le_bytes(bytes[10..12].try_into().ok()?);
+        Some(Self { bytes, fields_count, _time })
     }
-
     pub fn iter(&self) -> FireLiteDocIter<'a> {
-        FireLiteDocIter { bytes: self.bytes, pos: 4, remaining: self.fields_count }
+        FireLiteDocIter { bytes: self.bytes, pos: 12, remaining: self.fields_count }
     }
 }
 
-/// Convenience wrapper for document fields during iteration
 pub struct BorrowedValue<'a> {
     pub tag: u8,
     pub data: &'a [u8],
 }
 
 impl<'a> BorrowedValue<'a> {
-    pub fn to_owned_value(&self) -> Option<Value> {
-        decode_value(self.tag, self.data)
-    }
-
+    pub fn to_owned_value(&self) -> Option<Value> { decode_value(self.tag, self.data) }
     pub fn as_f64(&self) -> Option<f64> {
         match self.tag {
-            3 => { // Int
-                let b = self.data.get(..8)?;
-                Some(i64::from_le_bytes(b.try_into().ok()?) as f64)
-            }
-            4 => { // Float
-                let b = self.data.get(..8)?;
-                Some(f64::from_le_bytes(b.try_into().ok()?))
-            }
+            3 => Some(i64::from_le_bytes(self.data.get(..8)?.try_into().ok()?) as f64),
+            4 => Some(f64::from_le_bytes(self.data.get(..8)?.try_into().ok()?)),
             _ => None,
         }
     }
@@ -276,24 +234,19 @@ pub struct FireLiteDocIter<'a> {
 }
 
 impl<'a> Iterator for FireLiteDocIter<'a> {
-    type Item = (&'a str, u8, &'a [u8]); // (Key, Tag, ValueData)
-
+    type Item = (&'a str, u8, &'a [u8]);
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == 0 { return None; }
         let k_len = *self.bytes.get(self.pos)? as usize;
         self.pos += 1;
         let key = std::str::from_utf8(self.bytes.get(self.pos..self.pos + k_len)?).ok()?;
         self.pos += k_len;
-        
         let tag = *self.bytes.get(self.pos)?;
         self.pos += 1;
-        
         let v_len = u32::from_le_bytes(self.bytes.get(self.pos..self.pos + 4)?.try_into().ok()?) as usize;
         self.pos += 4;
-        
         let data = self.bytes.get(self.pos..self.pos + v_len)?;
         self.pos += v_len;
-        
         self.remaining -= 1;
         Some((key, tag, data))
     }
@@ -343,15 +296,17 @@ pub(crate) fn decode_value(tag: u8, bytes: &[u8]) -> Option<Value> {
             Some(Value::Array(items))
         }
         10 => {
-             let mut pos = 0;
-             let c_len = *bytes.get(pos)? as usize;
-             pos += 1;
-             let collection = std::str::from_utf8(bytes.get(pos..pos+c_len)?).ok()?.to_string();
-             pos += c_len;
-             let d_len = *bytes.get(pos)? as usize;
-             pos += 1;
-             let doc_id = std::str::from_utf8(bytes.get(pos..pos+d_len)?).ok()?.to_string();
-             Some(Value::Reference { collection, doc_id })
+            let mut pos = 0;
+            let c_len = *bytes.get(pos)? as usize;
+            pos += 1;
+            let collection = std::str::from_utf8(bytes.get(pos..pos+c_len)?).ok()?.to_string();
+            pos += c_len;
+            
+            // CRITICAL: Does your decoder expect a second length byte?
+            let d_len = *bytes.get(pos)? as usize; // Make sure this line exists!
+            pos += 1;
+            let doc_id = std::str::from_utf8(bytes.get(pos..pos+d_len)?).ok()?.to_string();
+            Some(Value::Reference { collection, doc_id })
         }
         11 => {
             let offset = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?);

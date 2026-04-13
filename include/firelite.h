@@ -20,7 +20,11 @@ struct FL_Doc;
 
 struct FL_Engine;
 
+struct FL_NetSyncer;
+
 struct FL_Query;
+
+struct FL_ResultSet;
 
 struct FL_Transaction;
 
@@ -113,6 +117,8 @@ void fl_query_free(FL_Query *query);
 
 int32_t fl_query_where_eq_str(FL_Query *query, const char *field, const char *value);
 
+int32_t fl_query_where_eq_bool(FL_Query *query, const char *field, bool value);
+
 int32_t fl_query_where_eq_int(FL_Query *query, const char *field, int64_t value);
 
 int32_t fl_query_where_ne_str(FL_Query *query, const char *field, const char *value);
@@ -150,6 +156,14 @@ int32_t fl_query_offset(FL_Query *query, uintptr_t offset);
 int32_t fl_query_select_field(FL_Query *query, const char *field);
 
 char *fl_query_execute(FL_Engine *engine, const FL_Query *query);
+
+FL_ResultSet *fl_query_execute_to_handles(FL_Engine *engine, const FL_Query *query);
+
+uintptr_t fl_result_set_count(FL_ResultSet *results);
+
+FL_Doc *fl_result_set_get_doc(FL_ResultSet *results, uintptr_t index);
+
+void fl_result_set_free(FL_ResultSet *results);
 
 char *fl_doc_to_json(const FL_Doc *doc);
 
@@ -268,5 +282,13 @@ int32_t fl_query_where_in(FL_Query *query, const char *field, FL_Array *array);
 int32_t fl_engine_snapshot_indices(FL_Engine *engine);
 
 void fl_config_set_compression(FL_Config *config, bool enabled, int32_t level);
+
+FL_NetSyncer *fl_net_syncer_new(FL_Engine *engine, const char *name, const char *room_key);
+
+int32_t fl_net_syncer_start(FL_NetSyncer *syncer, uint16_t port);
+
+char *fl_net_syncer_status(FL_NetSyncer *syncer);
+
+void fl_net_syncer_free(FL_NetSyncer *syncer);
 
 }  // extern "C"

@@ -35,9 +35,13 @@ pub fn encode_scalar(value: &Value) -> Vec<u8> {
         Value::Map(_) => vec![8],
         Value::Array(_) => vec![9],
         Value::Reference { collection, doc_id } => {
-            let mut b = vec![10]; // Tag 10
+            let mut b = Vec::with_capacity(1 + 1 + collection.len() + 1 + doc_id.len());
+            b.push(10); // Tag 10
+            
+            // MATCHING THE firelite_doc.rs ENCODING:
+            b.push(collection.len() as u8);
             b.extend_from_slice(collection.as_bytes());
-            b.push(b':');
+            b.push(doc_id.len() as u8);
             b.extend_from_slice(doc_id.as_bytes());
             b
         },
