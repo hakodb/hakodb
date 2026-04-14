@@ -1618,7 +1618,9 @@ impl FireLite {
 
     pub fn get_version_map(&self) -> std::collections::HashMap<String, i64> {
         let mut map = std::collections::HashMap::new();
-        for col in self.list_collections().unwrap_or_default() {
+        let mut cols = self.list_collections().unwrap_or_default();
+        cols.extend(vec!["__firelite_security".to_string()]); 
+        for col in cols {
             map.insert(col.clone(), self.get_collection_version(&col));
         }
         map

@@ -293,7 +293,11 @@ impl NetSyncer {
                 let mut overall_changed = false;
                 let mut offsets = offsets_tail.lock().unwrap();
 
-                for col in db_tail.list_collections().unwrap_or_default() {
+                // Adding hidden internal firelite security collection into sync
+                let mut cols = db_tail.list_collections().unwrap_or_default();
+                cols.extend(vec!["__firelite_security".to_string()]);
+
+                for col in cols {
                     if excl_tail.contains(&col) { continue; }
                     let shard = db_tail.get_shard(&col);
                     let last_pos = *offsets.get(&col).unwrap_or(&0);
@@ -571,7 +575,10 @@ fn resolve_op_to_bytes(shard_arc: &Arc<RwLock<crate::storage::engine::StorageEng
 async fn handle_bootstrap(db: &Arc<FireLite>, peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, peer_id: &str, excluded: &HashSet<String>) {
     let encryption_key = db.config.encryption_key.as_deref();
 
-    for col in db.list_collections().unwrap_or_default() {
+    let mut cols = db.list_collections().unwrap_or_default();
+    cols.extend(vec!["__firelite_security".to_string()]);
+
+    for col in cols {
         if excluded.contains(&col) { continue; }
         let shard_arc = db.get_shard(&col);
         
