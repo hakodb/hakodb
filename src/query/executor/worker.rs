@@ -508,10 +508,29 @@ fn matches_id_flexible(doc_id: &str, op: &Operator, filter_val: &Value) -> bool 
             Operator::Eq => doc_id == s,
             Operator::Ne => doc_id != s,
             Operator::StartsWith => doc_id.starts_with(s),
-            _ => crate::query::filter::compare_values(&Value::String(doc_id.to_string()), op, filter_val),
+            _ => compare_default_filter(doc_id, op, filter_val),
         },
-        _ => crate::query::filter::compare_values(&Value::String(doc_id.to_string()), op, filter_val),
+        Value::Array(items) => {
+            // Handing "IN" logic: where id in ["6", "9"]
+            if matches!(op, Operator::In) {
+                return items.iter().any(|v| {
+                    if let Value::String(s) = v { s == doc_id } else { false }
+                });
+            } else if matches!(op, Operator::NotIn) {
+                return !items.iter().any(|v| {
+                    if let Value::String(s) = v { s == doc_id } else { false }
+                });
+            } else {
+                return compare_default_filter(doc_id, op, filter_val)
+            }
+        },
+        _ => compare_default_filter(doc_id, op, filter_val)
     }
+}
+
+fn compare_default_filter (doc_id: &str, op: &Operator, filter_val: &Value) -> bool {
+    let id_val = Value::String(doc_id.to_string());
+    crate::query::filter::compare_values(&id_val, op, filter_val)
 }
 
 /// Remaining logic (inflate_blobs, matches_filters_view, etc.) kept for internal use...
