@@ -93,7 +93,7 @@ impl NetSyncer {
             }
         }
 
-        excluded.extend(vec!["__firelite_system".into(), "__firelite_security".into(), "audit_log".into()]);
+        excluded.extend(vec!["__firelite_system".into()]);
 
         Self {
             db: db.clone(), 
@@ -292,7 +292,7 @@ impl NetSyncer {
                 
                 let mut overall_changed = false;
                 let mut offsets = offsets_tail.lock().unwrap();
-                
+
                 for col in db_tail.list_collections().unwrap_or_default() {
                     if excl_tail.contains(&col) { continue; }
                     let shard = db_tail.get_shard(&col);
@@ -498,6 +498,7 @@ async fn handle_peer(
                 NetPacket::Ping { versions } => {
                     if let Ok(mut lp) = last_ping.lock() { *lp = Instant::now(); }
                     for (col, remote_time) in versions {
+                        if excluded.contains(&col) { continue; }
                         if db.get_collection_version(&col) > remote_time {
                             handle_delta_send(&db, &peers_map, &peer_id, &col, remote_time).await;
                         }
@@ -507,6 +508,7 @@ async fn handle_peer(
                     handle_bootstrap(&db, &peers_map, &peer_id, &excluded).await;
                 }
                 NetPacket::Replication { msg_id, collection, ops } => {
+                    if excluded.contains(&collection) {continue;}
                     // Check Cache
                     if msg_id != 0 {
                         let mut cache = seen_cache.lock().await;
