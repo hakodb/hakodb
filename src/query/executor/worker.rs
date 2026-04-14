@@ -12,17 +12,23 @@ pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
     for (id, pointer) in task.docs {
         if let Ok(Some(bytes)) = storage_guard.read_pointer(&pointer) {
             // 1. Zero-allocation filter check
-            if task.plan.filters_satisfied_by_index || matches_filters_view(&id, &bytes, &task.plan) {
-                if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
+            // if task.plan.filters_satisfied_by_index || matches_filters_view(&id, &bytes, &task.plan) {
+            //     if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
                     
-                    // 2. Call the helper function (This removes the warning)
-                    if let Some(bm) = blob_manager {
-                        // We ignore errors here so a single bad blob doesn't crash the whole query
-                        let _ = inflate_blobs(&mut doc, bm);
-                    }
+            //         // 2. Call the helper function (This removes the warning)
+            //         if let Some(bm) = blob_manager {
+            //             // We ignore errors here so a single bad blob doesn't crash the whole query
+            //             let _ = inflate_blobs(&mut doc, bm);
+            //         }
                     
-                    out.push((id, doc));
+            //         out.push((id, doc));
+            //     }
+            // }
+            if let Some(mut doc) = unified_match_decode(&id, &bytes, &task.plan) {
+                if let Some(bm) = blob_manager {
+                    let _ = inflate_blobs(&mut doc, bm);
                 }
+                out.push((id, doc));
             }
         }
     }
@@ -165,6 +171,70 @@ pub(crate) fn matches_filters_view(
     let or_final = plan.or_groups.is_empty() || or_group_results.iter().any(|&m| m);
 
     and_final && or_final
+}
+
+
+fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::query::plan::QueryPlan) -> Option<FireLiteDoc> {
+    let view = FireLiteDocView::new(bytes)?;
+    
+    // 1. Virtual Field Check (id and _time)
+    // We check these first because they require zero field scanning.
+    let mut and_matches = vec![false; plan.filters.len()];
+    let mut or_group_results = vec![false; plan.or_groups.len()];
+
+    for (i, f) in plan.filters.iter().enumerate() {
+        if f.field == "id" {
+            if crate::query::filter::compare_values(&Value::String(doc_id.to_string()), &f.op, &f.value) {
+                and_matches[i] = true;
+            }
+        } else if f.field == "_time" {
+            if crate::query::filter::compare_values(&Value::Int(view._time), &f.op, &f.value) {
+                and_matches[i] = true;
+            }
+        }
+    }
+
+    // 2. Body Field Scanning + Eager Decoding
+    let mut fields = Vec::with_capacity(view.iter().count()); 
+    
+    for (key, tag, data) in view.iter() {
+        // Decode the value once
+        let val = crate::document::firelite_doc::decode_value(tag, data)?;
+
+        // Update AND matches
+        for (i, f) in plan.filters.iter().enumerate() {
+            if !and_matches[i] && key == f.field {
+                if crate::query::filter::compare_values(&val, &f.op, &f.value) {
+                    and_matches[i] = true;
+                }
+            }
+        }
+
+        // Update OR matches
+        for (gi, group) in plan.or_groups.iter().enumerate() {
+            if or_group_results[gi] { continue; }
+            for f in group {
+                if key == f.field {
+                    if crate::query::filter::compare_values(&val, &f.op, &f.value) {
+                        or_group_results[gi] = true;
+                    }
+                }
+            }
+        }
+
+        // Add to our document structure while we have it
+        fields.push((std::sync::Arc::from(key), val));
+    }
+
+    // 3. Final Validation
+    let and_final = plan.filters.is_empty() || and_matches.iter().all(|&m| m);
+    let or_final = plan.or_groups.is_empty() || or_group_results.iter().any(|&m| m);
+
+    if and_final && or_final {
+        Some(FireLiteDoc { fields, _time: view._time })
+    } else {
+        None
+    }
 }
 
 /// Helper function to perform comparisons directly on byte slices.
