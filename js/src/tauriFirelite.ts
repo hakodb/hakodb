@@ -7,14 +7,16 @@ export type FireLitePrimitive =
   | { [key: string]: FireLitePrimitive } 
   | FireLitePrimitive[];
 
-export type FireLiteRecord = { [key: string]: FireLitePrimitive };
+export type FireLiteRecord = Record<string, any>;
 
 export type FilterOperator = 
   | 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' 
   | 'match' | 'contains' | 'startsWith' | 'in' | 'notIn' 
   | 'arrayContains' | 'arrayContainsAny';
 
-
+export interface SetOptions {
+    merge?: boolean;
+}
 
 export type AggregateKind = 'count' | 'sum' | 'avg';
 
@@ -92,14 +94,18 @@ export class CollectionGroupReference {
 }
 
 export class DocumentSnapshot {
+    public readonly _time: number;
     constructor(
         public readonly id: string, 
         private readonly _exists: boolean, 
         private readonly _data?: FireLiteRecord,
         private readonly _ref?: DocumentReference
-    ) {}
+    ) {
+        this._time = ( _data as any)?._time || 0;
+    }
     exists() { return this._exists; }
     data() { return this._data; }
+    get createdAt(): Date { return new Date(this._time / 1000); }
     get ref() { return this._ref || new DocumentReference('', this.id); }
 }
 
@@ -139,29 +145,55 @@ export const doc = (_db: any, colOrPath: string | CollectionReference, id?: stri
     if (typeof colOrPath === 'string') {
         const segments = colOrPath.split('/').filter(Boolean);
         if (id) return new DocumentReference(colOrPath, id);
-        return new DocumentReference(segments[0], segments[1]);
+
+        const docId = segments.pop()!;
+        const colPath = segments.join('/');
+        return new DocumentReference(colPath, docId);
+        // return new DocumentReference(segments[0], segments[1]);
     }
     return new DocumentReference(colOrPath.path, id!);
 };
 
 // --- Write Operations ---
 export const addDoc = async (colRef: CollectionReference, data: FireLiteRecord) => {
-    const id = generateId();
-    const ref = new DocumentReference(colRef.path, id);
-    await setDoc(ref, data);
-    return ref;
+    // Send an empty string as doc_id to trigger Rust-side generation
+    const res = await exec({ 
+        op: 'set', 
+        collection: colRef.path, 
+        doc_id: data.id||"", 
+        data: normalizeValue(data) 
+    });
+    // The Rust backend now returns the generated ID in the response
+    return new DocumentReference(colRef.path, res.id);
 };
 
-export const setDoc = async (ref: DocumentReference, data: FireLiteRecord) => {
-    await exec({ op: 'set', collection: ref.collectionPath, doc_id: ref.id, data: normalizeValue(data) });
+export const setDoc = async (ref: DocumentReference, data: FireLiteRecord, options?: SetOptions) => {
+    const op = options?.merge ? 'patch' : 'set';
+    await exec({ op, collection: ref.collectionPath, doc_id: ref.id, data: normalizeValue(data) });
 };
 
 export const updateDoc = async (ref: DocumentReference, data: Partial<FireLiteRecord>) => {
     await exec({ op: 'patch', collection: ref.collectionPath, doc_id: ref.id, data: normalizeValue(data) });
 };
 
+export const updateDocs = async (q: Query, data: Partial<FireLiteRecord>) => {
+    const params = buildQueryParams(q);
+    return await exec({ 
+        op: 'query', 
+        set: true, 
+        data: normalizeValue(data), 
+        ...params 
+    });
+};
+
 export const deleteDoc = async (ref: DocumentReference) => {
     await exec({ op: 'delete', collection: ref.collectionPath, doc_id: ref.id });
+};
+
+export const deleteDocs = async (q: Query) => {
+    const params = buildQueryParams(q);
+    // Trigger the mass-delete flag in QueryInput
+    return await exec({ op: 'query', delete: true, ...params });
 };
 
 export const getDoc = async (ref: DocumentReference) => {
@@ -204,6 +236,7 @@ export function onSnapshot(
     onNext: (snapshot: DocumentSnapshot) => void,
     onError?: (error: any) => void
 ): () => void;
+
 export function onSnapshot(
     ref: Query | CollectionReference | CollectionGroupReference,
     onNext: (snapshot: QuerySnapshot) => void,
@@ -233,26 +266,41 @@ export function onSnapshot(
                 // 1. Process the Batch of Deltas
                 changes.forEach(change => {
                     const { kind, doc_id, data } = change;
+                    const newTime = data?._time || 0;
 
                     if (kind === 'full') {
                         localCache.clear();
                         const rows = data as any[];
                         rows.forEach(r => {
-                            const id = (r.id || r._id || doc_id).toString();
+                            const id = (r.id || doc_id).toString();
                             localCache.set(id, r);
                             documentChanges.push({ type: 'added', doc: new DocumentSnapshot(id, true, r) });
                         });
                     } 
                     else if (kind === 'update') {
-                        const type = localCache.has(doc_id) ? 'modified' : 'added';
-                        localCache.set(doc_id, data);
-                        documentChanges.push({ type, doc: new DocumentSnapshot(doc_id, true, data) });
+                        const existing = localCache.get(doc_id);
+                        const oldTime = existing?._time || 0;
+
+                        // VERSION CHECK: Only update if the incoming data is newer or same age
+                        if (newTime >= oldTime) {
+                            const type = existing ? 'modified' : 'added';
+                            localCache.set(doc_id, data);
+                            documentChanges.push({ type, doc: new DocumentSnapshot(doc_id, true, data) });
+                        } else {
+                            console.log(`[FireLite] Ignored stale update for ${doc_id} (Incoming: ${newTime}, Local: ${oldTime})`);
+                        }
                     } 
                     else if (kind === 'delete') {
-                        if (localCache.has(doc_id)) {
-                            const oldData = localCache.get(doc_id);
-                            localCache.delete(doc_id);
-                            documentChanges.push({ type: 'removed', doc: new DocumentSnapshot(doc_id, true, oldData) });
+                        const existing = localCache.get(doc_id);
+                        const oldTime = existing?._time || 0;
+
+                        // Only delete if the delete event is newer than the last update we saw
+                        if (newTime >= oldTime) {
+                            if (localCache.has(doc_id)) {
+                                const oldData = localCache.get(doc_id);
+                                localCache.delete(doc_id);
+                                documentChanges.push({ type: 'removed', doc: new DocumentSnapshot(doc_id, true, oldData) });
+                            }
                         }
                     }
                 });
@@ -315,7 +363,7 @@ export function onSnapshot(
 }
 
 // --- Transactions & Batches ---
-export const writeBatch = () => {
+export const writeBatch = (_db: FireLite) => {
     const mutations: any[] = [];
     return {
         set: (ref: DocumentReference, data: FireLiteRecord) => 
@@ -531,4 +579,18 @@ export const getAverageFromServer = async (
     ...params
   });
   return { data: () => ({ value: res.aggregate_result.value }) };
+};
+
+export const setDurability = (mode: 'always' | 'interval' | 'manual' | 'on_commit') => {
+    const modes = { always: 0, interval: 1, manual: 2, on_commit: 3 };
+    return exec({ op: 'set_durability', mode: modes[mode] });
+};
+
+export const setCompression = (enabled: boolean, level: number = 3) => {
+    return exec({ op: 'set_compression', enabled, level });
+};
+
+export const getAuditLog = async (): Promise<AuditEntry[]> => {
+    const res = await exec({ op: 'get_audit_log' });
+    return res.audit_log.entries;
 };
