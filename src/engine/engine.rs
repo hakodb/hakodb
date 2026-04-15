@@ -944,17 +944,20 @@ impl FireLite {
             .push(tx);
         rx
     }
-    fn notify_watchers(&self, col: &str, event: ChangeEvent) {
+
+    pub(crate) fn notify_watchers(&self, col: &str, event: ChangeEvent) {
         if let Some(list) = self.listeners.lock().unwrap().get_mut(col) {
             list.retain(|s| s.send(event.clone()).is_ok());
         }
     }
+
     pub fn compact(&self) -> Result<()> {
         for s in self.shards.read().unwrap().values() {
             s.write().unwrap().compact()?;
         }
         Ok(())
     }
+
     pub fn flush(&self) -> Result<()> {
         for s in self.shards.read().unwrap().values() {
             s.write().unwrap().flush_all()?;
@@ -986,6 +989,7 @@ impl FireLite {
             _ => Err(FireLiteError::Corrupt("Not ref".into())),
         }
     }
+    
     pub fn set_security_rules(&self, rules: Vec<SecurityRule>) {
         *self.security_rules.write().unwrap() = rules;
     }

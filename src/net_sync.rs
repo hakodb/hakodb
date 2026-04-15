@@ -884,8 +884,8 @@ async fn apply_replication_batch(db: Arc<FireLite>, collection: String, ops: Vec
     // 3. PHASE 3: NOTIFY LOCAL SYSTEM
     db.bump_versions_by_keys(affected_keys);
     
-    // We don't notify watchers for replication by default to avoid loops, 
-    // but we MUST update search indexes.
+    // 4. PHASE 4: Hand to Indexer
+    // update search indexes.
     let index_docs: Vec<(String, FireLiteDoc)> = accepted_ops.iter().filter_map(|op| {
         if let WalOp::PutInlined { key, value } = op {
             let doc_id = key.split_once(':').map(|(_, id)| id.to_string()).unwrap_or_default();
@@ -899,6 +899,25 @@ async fn apply_replication_batch(db: Arc<FireLite>, collection: String, ops: Vec
             puts: Arc::new(index_docs), 
             deletes: vec![] 
         });
+    }
+
+    // 5. PHASE 5. Notify Watcher (change event)
+    for op in &accepted_ops {
+        let kind = match op {
+            WalOp::PutInlined { .. } => crate::engine::ChangeKind::Put,
+            WalOp::Delete { .. } => crate::engine::ChangeKind::Delete,
+            _ => continue,
+        };
+
+        let event = crate::engine::ChangeEvent {
+            path: op.get_key().to_string(),
+            kind,
+        };
+
+        // Notify local watchers (Tauri frontend, etc.)
+        // This triggers the UI but the 'Tailer' will skip re-broadcasting 
+        // because the key/timestamp is in the echo_cache.
+        db.notify_watchers(&collection, event);
     }
 }
 
