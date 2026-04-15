@@ -602,7 +602,6 @@ fn json_to_vec(v: &serde_json::Value) -> Result<Vec<(String, Value)>, String> {
     Ok(out)
 }
 
-
 fn json_value_to_value(v: &serde_json::Value) -> Result<Value, String> {
     Value::from_json(v.clone())
 }
