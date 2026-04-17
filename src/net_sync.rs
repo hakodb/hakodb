@@ -886,16 +886,25 @@ async fn apply_replication_batch(db: Arc<FireLite>, collection: String, ops: Vec
     
     // 4. PHASE 4: Hand to Indexer
     // update search indexes.
-    let index_docs: Vec<(String, FireLiteDoc)> = accepted_ops.iter().filter_map(|op| {
+    let index_docs: Vec<(String, Arc<FireLiteDoc>)> = accepted_ops.iter().filter_map(|op| {
         if let WalOp::PutInlined { key, value } = op {
-            let doc_id = key.split_once(':').map(|(_, id)| id.to_string()).unwrap_or_default();
-            FireLiteDoc::decode(value).map(|d| (doc_id, d))
-        } else { None }
+            // Attempt to extract naked ID if using "col:id" format, else use key as is
+            let doc_id = key.split_once(':')
+                .map(|(_, id)| id.to_string())
+                .unwrap_or_else(|| key.clone());
+
+            // Decode the bytes and wrap the resulting document in an Arc immediately
+            FireLiteDoc::decode(value).map(|d| (doc_id, Arc::new(d)))
+        } else { 
+            None 
+        }
     }).collect();
 
     if !index_docs.is_empty() {
+        // Send the batch to the persistent index worker
         let _ = db.index_tx.send(crate::engine::engine::IndexOp::Update { 
             collection: collection.clone(), 
+            // Wrap the whole vector in an Arc as required by the Enum definition
             puts: Arc::new(index_docs), 
             deletes: vec![] 
         });

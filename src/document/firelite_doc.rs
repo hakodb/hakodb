@@ -18,15 +18,22 @@ pub struct FireLiteDoc {
 
 impl FireLiteDoc {
     pub fn get(&self, key: &str) -> Option<&Value> {
-        self.fields.iter().find(|(k, _)| &**k == key).map(|(_, v)| v)
+        // self.fields.iter().find(|(k, _)| &**k == key).map(|(_, v)| v)
+        self.fields.binary_search_by(|(k, _)| k.as_ref().cmp(key))
+            .ok()
+            .map(|pos| &self.fields[pos].1)
     }
 
     pub fn insert(&mut self, key: impl Into<String>, value: Value) {
         let key_str = key.into();
-        if let Some(pos) = self.fields.iter().position(|(k, _)| &**k == key_str) {
-            self.fields[pos].1 = value;
-        } else {
-            self.fields.push((Arc::from(key_str), value));
+        // if let Some(pos) = self.fields.iter().position(|(k, _)| &**k == key_str) {
+        //     self.fields[pos].1 = value;
+        // } else {
+        //     self.fields.push((Arc::from(key_str), value));
+        // }
+        match self.fields.binary_search_by(|(k, _)| k.as_ref().cmp(&key_str)) {
+            Ok(pos) => self.fields[pos].1 = value, // Update existing
+            Err(pos) => self.fields.insert(pos, (Arc::from(key_str), value)), // Insert at sorted position
         }
     }
 
