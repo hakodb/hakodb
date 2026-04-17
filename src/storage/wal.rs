@@ -71,7 +71,7 @@ impl Wal {
             encryption,
             write_buffer: Vec::with_capacity(1024 * 1024), // 1MB WAL buffer
             last_sync: Instant::now(),
-            group_commit_interval: Duration::from_millis(2),
+            group_commit_interval: Duration::from_millis(5),
         })
     }
 
@@ -247,7 +247,7 @@ impl Wal {
                 is_commit && (
                     self.pending_ops_since_sync >= self.group_commit_max_ops
                     || now.duration_since(self.last_sync) >= self.group_commit_interval
-                    || self.write_buffer.len() > 64 * 1024 // Flush if buffer > 64KB
+                    || self.write_buffer.len() > 124 * 1024 // Flush if buffer > 64KB
                 )
             }
 

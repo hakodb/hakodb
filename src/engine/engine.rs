@@ -137,7 +137,8 @@ struct ShardWork {
     ops: Vec<WalOp>,
     keys: Vec<Arc<str>>,
     events: Vec<(String, ChangeEvent)>,
-    index_puts: Vec<(String, FireLiteDoc)>,
+    // index_puts: Vec<(String, FireLiteDoc)>,
+    index_puts: Vec<(String, Arc<FireLiteDoc>)>, 
     blob_queue_items: Vec<BlobWork>,
 }
 
@@ -199,7 +200,8 @@ impl SerializableTransaction {
 pub(crate) enum IndexOp {
     Update {
         collection: String,
-        puts: Arc<Vec<(String, FireLiteDoc)>>, 
+        // puts: Arc<Vec<(String, FireLiteDoc)>>, 
+        puts: Arc<Vec<(String, Arc<FireLiteDoc>)>>, 
         deletes: Vec<(String, FireLiteDoc)>,
     },
 }
@@ -589,7 +591,17 @@ impl FireLite {
             let (col, mut doc_id, mut doc, is_delete) = match m {
                 BatchMutation::Put { collection, doc_id, doc } => (collection, doc_id, doc, false),
                 BatchMutation::Patch { collection, doc_id, updates } => {
-                    let mut current_doc = self.get(&collection, &doc_id)?.unwrap_or_default();
+                    // let mut current_doc = self.get(&collection, &doc_id)?.unwrap_or_default();
+                    // for (k, v) in updates { current_doc.insert(k, v); }
+                    // (collection, doc_id, current_doc, false)
+                    let mut current_doc = {
+                        let shard = self.get_shard(&collection);
+                        let guard = shard.read().unwrap();
+                        guard.get(&doc_id)?
+                            .and_then(|b| FireLiteDoc::decode(&b))
+                            .unwrap_or_default()
+                    };
+                    
                     for (k, v) in updates { current_doc.insert(k, v); }
                     (collection, doc_id, current_doc, false)
                 }
@@ -633,12 +645,17 @@ impl FireLite {
 
             // 4. USE BUFFERED ENCODING
             let skeleton_bytes = doc.encode_buffered();
+            let doc_arc = Arc::new(doc);
             
             // REUSE KEY for WAL and Index
             work.ops.push(WalOp::PutInlined { key: key_arc.to_string(), value: skeleton_bytes });
             work.keys.push(key_arc); // Reuses the same String allocation
-            work.index_puts.push((doc_id, doc));
-            work.events.push((col, ChangeEvent { path: work.keys.last().unwrap().to_string(), kind: ChangeKind::Put }));
+            // work.index_puts.push((doc_id, doc_arc));
+            work.index_puts.push((doc_id, Arc::clone(&doc_arc))); 
+            work.events.push((col, ChangeEvent { 
+                path: work.keys.last().unwrap().to_string(), 
+                kind: ChangeKind::Put 
+            }));
             
             for b in blob_work { work.blob_queue_items.push(b); }
         }
@@ -646,6 +663,8 @@ impl FireLite {
         // --- APPLY SHARD CHANGES ---
         for (col_name, work) in shard_map {
             let shard_arc = self.get_shard(&col_name);
+            let index_entries = work.index_puts; 
+
             {
                 let mut shard = shard_arc.write().unwrap();
                 
@@ -655,11 +674,11 @@ impl FireLite {
                     shard.wal.append_batch_fast(tx_id, &work.ops, false)?;
                 }
 
-                for (doc_id, doc) in &work.index_puts {
-                    shard.update_index_entry(doc_id.clone(), Some(Pointer::BlobPending(Arc::new(doc.clone()))));
+                // Update Shard (Fastest Path: copying pointers)
+                for (doc_id, doc_arc) in &index_entries {
+                    shard.update_index_entry(doc_id.clone(), Some(Pointer::BlobPending(Arc::clone(doc_arc))));
                 }
                 
-                // ... (Rest of the loop: queueing blobs, same as before) ...
                 let mut b_bytes = 0;
                 for b in work.blob_queue_items {
                     if let BlobWork::PutRaw { len, .. } = &b { b_bytes += *len as usize; }
@@ -671,10 +690,11 @@ impl FireLite {
             self.trigger_blob_flush.store(true, Ordering::Release);
             
             // Notify Indexer (Worker 1)
-            if !work.index_puts.is_empty() {
+            // index_entries is already Vec<(String, Arc<FireLiteDoc>)>
+            if !index_entries.is_empty() {
                 let _ = self.index_tx.send(IndexOp::Update { 
                     collection: col_name, 
-                    puts: Arc::new(work.index_puts), 
+                    puts: Arc::new(index_entries), 
                     deletes: vec![] 
                 });
             }
@@ -1439,19 +1459,21 @@ impl FireLite {
     /// Internal helper: Resolves all Value::BlobLink fields in a document
     /// by reading from the collection's blob file.
     fn resolve_doc(&self, doc: &mut FireLiteDoc, collection: &str) -> Result<()> {
-        // 1. Identify valid BlobLinks (ignore placeholders with offset u64::MAX)
-        let needs_resolve = doc.fields.iter().any(|(_, v)| {
-            matches!(v, Value::BlobLink { offset, .. } if *offset != u64::MAX)
-        });
-        if !needs_resolve { return Ok(()); }
+        // PASS 1: Collect mutable references once. 
+        // This replaces the separate .any() and .filter() passes.
+        let blob_values: Vec<&mut Value> = doc.fields.iter_mut()
+            .map(|(_, v)| v)
+            .filter(|v| matches!(v, Value::BlobLink { offset, .. } if *offset != u64::MAX))
+            .collect();
+
+        // If no blobs found, exit immediately without taking any locks.
+        if blob_values.is_empty() { return Ok(()); }
 
         let shard_arc = self.get_shard(collection);
 
-        // 2. Snapshot the Shard state: Disk Manager + Memory Queue
+        // PASS 2: Snapshot Shard State
         let (blob_manager, queue_snapshot) = {
             let shard = shard_arc.read().unwrap();
-            
-            // Build a temporary map of Offset -> Data from the RAM queue
             let mut in_memory = HashMap::new();
             for work in &shard.blob_flush_queue {
                 if let BlobWork::PutRaw { offset, data, .. } = work {
@@ -1463,20 +1485,10 @@ impl FireLite {
 
         let bm = blob_manager.ok_or(FireLiteError::StorageError("No blob manager".into()))?;
 
-        // 3. Filter fields that actually need resolving
-        let blob_values: Vec<&mut Value> = doc.fields.iter_mut()
-            .map(|(_, v)| v)
-            .filter(|v| matches!(v, Value::BlobLink { offset, .. } if *offset != u64::MAX))
-            .collect();
-
-        if blob_values.is_empty() { return Ok(()); }
-
-        // 4. ADAPTIVE RESOLUTION (Memory-First Logic)
+        // ADAPTIVE RESOLUTION
         if blob_values.len() <= 2 {
-            // FAST PATH: Sequential resolution
             for val in blob_values {
                 if let Value::BlobLink { offset, len } = *val {
-                    // Priority 1: RAM Queue, Priority 2: Disk
                     let data = match queue_snapshot.get(&offset) {
                         Some(arc_bytes) => (**arc_bytes).clone(),
                         None => bm.read_at(offset, len)?,
@@ -1485,12 +1497,8 @@ impl FireLite {
                 }
             }
         } else {
-            // PARALLEL PATH: Using Rayon for multi-blob documents
-            // We must wrap the snapshots in Arc to share across Rayon threads if necessary,
-            // but here they are already Arcs or clones.
             let bm_ref = &bm;
             let queue_ref = &queue_snapshot;
-            
             blob_values.into_par_iter().try_for_each(|val| -> Result<()> {
                 if let Value::BlobLink { offset, len } = *val {
                     let data = match queue_ref.get(&offset) {
@@ -1631,9 +1639,15 @@ impl FireLite {
     }
 
     fn generate_sortable_id(&self, timestamp_nanos: i64) -> String {
-        let seq = self.id_sequence.fetch_add(1, Ordering::Relaxed);
+        // let seq = self.id_sequence.fetch_add(1, Ordering::Relaxed);
         // [16 chars Timestamp Hex] + [4 chars Sequence Hex]
-        format!("{:016x}{:04x}", timestamp_nanos, seq)
+        // format!("{:016x}{:04x}", timestamp_nanos, seq)
+        let seq = self.id_sequence.fetch_add(1, Ordering::Relaxed);
+        let mut bytes = [0u8; 20];
+        write_hex_u64(&mut bytes[0..16], timestamp_nanos as u64);
+        write_hex_u16(&mut bytes[16..20], seq);
+        // Safety: We know these bytes are valid ASCII hex
+        unsafe { String::from_utf8_unchecked(bytes.to_vec()) }
     }
 
 }
@@ -1681,13 +1695,14 @@ pub(crate) fn resolve_doc_static(
     shard_arc: &Arc<RwLock<StorageEngine>>, 
     _enc_secret: Option<&str>
 ) -> Result<()> {
-    // 1. Placeholder check
-    let needs_resolve = doc.fields.iter().any(|(_, v)| {
-        matches!(v, Value::BlobLink { offset, .. } if *offset != u64::MAX)
-    });
-    if !needs_resolve { return Ok(()); }
+    // Single-pass collection
+    let blob_values: Vec<&mut Value> = doc.fields.iter_mut()
+        .map(|(_, v)| v)
+        .filter(|v| matches!(v, Value::BlobLink { offset, .. } if *offset != u64::MAX))
+        .collect();
 
-    // 2. RAM-First Access logic
+    if blob_values.is_empty() { return Ok(()); }
+
     let (blob_manager, queue_snapshot) = {
         let shard = shard_arc.read().unwrap();
         let mut in_memory = HashMap::new();
@@ -1701,15 +1716,8 @@ pub(crate) fn resolve_doc_static(
 
     let bm = blob_manager.ok_or(FireLiteError::StorageError("No blob manager".into()))?;
 
-    // 3. Resolve Fields
-    let blob_values: Vec<&mut Value> = doc.fields.iter_mut()
-        .map(|(_, v)| v)
-        .filter(|v| matches!(v, Value::BlobLink { offset, .. } if *offset != u64::MAX))
-        .collect();
-
     for val in blob_values {
         if let Value::BlobLink { offset, len } = *val {
-            // Priority: RAM Queue -> Disk
             let data = match queue_snapshot.get(&offset) {
                 Some(bytes) => (**bytes).clone(),
                 None => bm.read_at(offset, len)?,
@@ -1727,4 +1735,22 @@ pub(crate) fn resolve_doc_static(
 
 fn subcollection_prefix(_collection: &str, doc_id: &str, subcollection: &str) -> String {
     format!("{}/{}", doc_id, subcollection)
+}
+
+#[inline]
+fn write_hex_u64(buf: &mut [u8], mut val: u64) {
+    const HEX_CHARS: &[u8] = b"0123456789abcdef";
+    for i in (0..16).rev() {
+        buf[i] = HEX_CHARS[(val & 0xf) as usize];
+        val >>= 4;
+    }
+}
+
+#[inline]
+fn write_hex_u16(buf: &mut [u8], mut val: u16) {
+    const HEX_CHARS: &[u8] = b"0123456789abcdef";
+    for i in (0..4).rev() {
+        buf[i] = HEX_CHARS[(val & 0xf) as usize];
+        val >>= 4;
+    }
 }
