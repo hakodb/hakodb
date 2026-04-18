@@ -276,7 +276,22 @@ impl FireLiteGateway {
 
                             match event.kind {
                                 crate::engine::ChangeKind::Delete => {
-                                    changes.push(DocumentChange { kind: DeltaKind::Delete, doc_id, data: None });
+                                    // FIX: Create a minimal "Tombstone" with a current timestamp
+                                    // This ensures the frontend's (newTime >= oldTime) check passes.
+                                    let mut tombstone = serde_json::Map::new();
+                                    tombstone.insert(
+                                        "_time".to_string(), 
+                                        serde_json::json!(std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_micros() as i64)
+                                    );
+
+                                    changes.push(DocumentChange { 
+                                        kind: DeltaKind::Delete, 
+                                        doc_id, 
+                                        data: Some(serde_json::Value::Object(tombstone)) 
+                                    });
                                 }
                                 crate::engine::ChangeKind::Put => {
                                     let shard = db.get_shard(&query_template.collection);
