@@ -12,4 +12,4 @@ crate-type = ["cdylib"] # This makes it an FFI library
 firelite = { path = "..", features = ["net-sync"] }
 
 # You might need to duplicate these so the wrapper links correctly
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+# tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
