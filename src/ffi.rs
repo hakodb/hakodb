@@ -601,7 +601,7 @@ pub extern "C" fn fl_batch_set(
     batch: *mut FL_Batch,
     collection: *const c_char,
     doc_id: *const c_char,
-    doc: *const FL_Doc,
+    doc: *mut FL_Doc,
 ) -> i32 {
     if batch.is_null() || doc.is_null() {
         return set_last_error("null batch/doc handle");
@@ -616,11 +616,14 @@ pub extern "C" fn fl_batch_set(
     };
 
     let batch = unsafe { &mut *batch };
-    let doc = unsafe { &*doc };
+    let doc_ptr = unsafe { &mut *doc };
+
+    let internal_doc = std::mem::take(&mut doc_ptr.doc);
+
     batch.ops.push(BatchMutation::Put {
         collection,
         doc_id,
-        doc: doc.doc.clone(),
+        doc: internal_doc,
     });
     clear_last_error();
     0

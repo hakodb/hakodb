@@ -576,10 +576,7 @@ impl FireLite {
     }
 
     fn write_batch_internal(&self, mutations: Vec<BatchMutation>) -> Result<Vec<String>> {
-        // Use nanoseconds for higher precision in ID generation
         let now_nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64;
-        // Keep your existing micros for the _time metadata if you prefer, 
-        // but nanos is better for ID uniqueness.
         let now_micros = now_nanos / 1000; 
 
         let threshold = self.config.value_blob_threshold_bytes;
@@ -591,9 +588,6 @@ impl FireLite {
             let (col, mut doc_id, mut doc, is_delete) = match m {
                 BatchMutation::Put { collection, doc_id, doc } => (collection, doc_id, doc, false),
                 BatchMutation::Patch { collection, doc_id, updates } => {
-                    // let mut current_doc = self.get(&collection, &doc_id)?.unwrap_or_default();
-                    // for (k, v) in updates { current_doc.insert(k, v); }
-                    // (collection, doc_id, current_doc, false)
                     let mut current_doc = {
                         let shard = self.get_shard(&collection);
                         let guard = shard.read().unwrap();
@@ -690,7 +684,6 @@ impl FireLite {
             self.trigger_blob_flush.store(true, Ordering::Release);
             
             // Notify Indexer (Worker 1)
-            // index_entries is already Vec<(String, Arc<FireLiteDoc>)>
             if !index_entries.is_empty() {
                 let _ = self.index_tx.send(IndexOp::Update { 
                     collection: col_name, 
@@ -806,12 +799,6 @@ impl FireLite {
             ok: true, // prev ->results.is_ok()
         });
 
-        // --- NEW: AUTO-RESOLVE BLOB LINKS FOR ALL RESULTS ---
-        // for (_, doc) in &mut results {
-        //     self.resolve_doc(doc, &query.collection)?;
-        // }
-
-        // res
         Ok(results)
     }
 
@@ -889,9 +876,6 @@ impl FireLite {
             let s = shard.read().unwrap();
             // Count documents
             stats.insert(format!("{}_count", name), s.count_prefix(""));
-            
-            // NEW: Monitor the background queue size
-            // This resolves the "never read" warning
             stats.insert(
                 format!("{}_pending_blob_bytes", name), 
                 s.total_pending_blob_bytes.load(Ordering::Relaxed)
@@ -1184,7 +1168,6 @@ impl FireLite {
         }
 
         let mut composite = Vec::new();
-        // Use the manager's own collection grouping instead of the catalog
         for idx in mgr.composite.all_indexes() {
             if let Some(target) = collection {
                 if target != &idx.definition.collection { continue; }
@@ -1430,8 +1413,6 @@ impl FireLite {
         Ok(())
     }
 
-    /// Scans a document for BlobLinks and fetches the data from disk.
-    /// This makes the "Skeleton" transparent to the user.
     pub fn resolve_document_blobs(&self, doc: &mut FireLiteDoc, collection: &str) -> Result<()> {
         self.resolve_doc(doc, collection)
     }
@@ -1456,17 +1437,13 @@ impl FireLite {
         }
     }
 
-    /// Internal helper: Resolves all Value::BlobLink fields in a document
-    /// by reading from the collection's blob file.
     fn resolve_doc(&self, doc: &mut FireLiteDoc, collection: &str) -> Result<()> {
         // PASS 1: Collect mutable references once. 
-        // This replaces the separate .any() and .filter() passes.
         let blob_values: Vec<&mut Value> = doc.fields.iter_mut()
             .map(|(_, v)| v)
             .filter(|v| matches!(v, Value::BlobLink { offset, .. } if *offset != u64::MAX))
             .collect();
 
-        // If no blobs found, exit immediately without taking any locks.
         if blob_values.is_empty() { return Ok(()); }
 
         let shard_arc = self.get_shard(collection);
@@ -1575,7 +1552,6 @@ impl FireLite {
         std::fs::rename(&temp_path, &blob_path)?;
         
         // Re-open the blob file handle in the shard
-        // let new_file = std::fs::OpenOptions::new().read(true).append(true).open(&blob_path)?;
         let new_file = std::fs::OpenOptions::new().read(true).append(true).open(&blob_path)?;
         shard.blob_manager = Some(Arc::new(BlobManager::new(
             Arc::new(new_file),
@@ -1583,7 +1559,6 @@ impl FireLite {
         )));
 
         // 3. Update the Skeletons in the Segment
-        // (This triggers a standard storage Put for the updated skeletons)
         for (key, new_bytes) in updates {
             shard.put(key, &new_bytes)?;
         }
@@ -1639,15 +1614,24 @@ impl FireLite {
     }
 
     fn generate_sortable_id(&self, timestamp_nanos: i64) -> String {
-        // let seq = self.id_sequence.fetch_add(1, Ordering::Relaxed);
-        // [16 chars Timestamp Hex] + [4 chars Sequence Hex]
-        // format!("{:016x}{:04x}", timestamp_nanos, seq)
         let seq = self.id_sequence.fetch_add(1, Ordering::Relaxed);
-        let mut bytes = [0u8; 20];
-        write_hex_u64(&mut bytes[0..16], timestamp_nanos as u64);
-        write_hex_u16(&mut bytes[16..20], seq);
-        // Safety: We know these bytes are valid ASCII hex
-        unsafe { String::from_utf8_unchecked(bytes.to_vec()) }
+        let mut buf = vec![0u8; 20]; // Pre-allocate exactly once
+        
+        const HEX: &[u8] = b"0123456789abcdef";
+        let mut t = timestamp_nanos as u64;
+        let mut s = seq as u64;
+
+        for i in (0..16).rev() {
+            buf[i] = HEX[(t & 0xf) as usize];
+            t >>= 4;
+        }
+        for i in (16..20).rev() {
+            buf[i] = HEX[(s & 0xf) as usize];
+            s >>= 4;
+        }
+
+        // Use from_utf8 to avoid an extra copy
+        unsafe { String::from_utf8_unchecked(buf) }
     }
 
 }
@@ -1735,22 +1719,4 @@ pub(crate) fn resolve_doc_static(
 
 fn subcollection_prefix(_collection: &str, doc_id: &str, subcollection: &str) -> String {
     format!("{}/{}", doc_id, subcollection)
-}
-
-#[inline]
-fn write_hex_u64(buf: &mut [u8], mut val: u64) {
-    const HEX_CHARS: &[u8] = b"0123456789abcdef";
-    for i in (0..16).rev() {
-        buf[i] = HEX_CHARS[(val & 0xf) as usize];
-        val >>= 4;
-    }
-}
-
-#[inline]
-fn write_hex_u16(buf: &mut [u8], mut val: u16) {
-    const HEX_CHARS: &[u8] = b"0123456789abcdef";
-    for i in (0..4).rev() {
-        buf[i] = HEX_CHARS[(val & 0xf) as usize];
-        val >>= 4;
-    }
 }

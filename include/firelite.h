@@ -102,10 +102,7 @@ FL_Batch *fl_batch_new();
 
 void fl_batch_free(FL_Batch *batch);
 
-int32_t fl_batch_set(FL_Batch *batch,
-                     const char *collection,
-                     const char *doc_id,
-                     const FL_Doc *doc);
+int32_t fl_batch_set(FL_Batch *batch, const char *collection, const char *doc_id, FL_Doc *doc);
 
 int32_t fl_batch_delete(FL_Batch *batch, const char *collection, const char *doc_id);
 
