@@ -946,7 +946,6 @@ fn broadcast_mesh(peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, col:
             let mut guard = p_ptr.lock().await;
             for writer in guard.values_mut() { 
                 let peer = writer.peer_addr().unwrap().ip().to_string();
-                println!("Send to : {}", peer);
                 let _ = send_raw(writer, &payload).await; 
 
             }
