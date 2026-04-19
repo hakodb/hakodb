@@ -14,6 +14,7 @@ typedef struct FL_Batch FL_Batch;
 typedef struct FL_Config FL_Config;
 typedef struct FL_Doc FL_Doc;
 typedef struct FL_Engine FL_Engine;
+typedef struct FL_NetSyncer FL_NetSyncer;
 typedef struct FL_Query FL_Query;
 typedef struct FL_Transaction FL_Transaction;
 typedef struct FL_Watch FL_Watch;
@@ -73,6 +74,7 @@ int32_t fl_batch_commit(FL_Engine *engine, FL_Batch *batch);
 FL_Query *fl_query_new(const char *collection);
 void fl_query_free(FL_Query *query);
 int32_t fl_query_where_eq_str(FL_Query *query, const char *field, const char *value);
+int32_t fl_query_where_eq_bool(FL_Query *query, const char *field, bool value);
 int32_t fl_query_where_eq_int(FL_Query *query, const char *field, int64_t value);
 int32_t fl_query_where_ne_str(FL_Query *query, const char *field, const char *value);
 int32_t fl_query_where_ne_int(FL_Query *query, const char *field, int64_t value);
@@ -124,6 +126,11 @@ char *fl_engine_list_collections(FL_Engine *engine);
 char *fl_engine_get_stats(FL_Engine *engine);
 char *fl_engine_get_audit_log(FL_Engine *engine);
 int32_t fl_engine_insert_subdoc(FL_Engine *engine, const char *col, const char *id, const char *sub_col, const char *sub_id, const FL_Doc *doc);
+
+FL_NetSyncer *fl_net_syncer_new(FL_Engine *engine, const char *name, const char *room_key);
+int32_t fl_net_syncer_start(FL_NetSyncer *syncer, uint16_t port);
+char *fl_net_syncer_status(FL_NetSyncer *syncer);
+void fl_net_syncer_free(FL_NetSyncer *syncer);
 
 const char *fl_last_error(void);
 void fl_string_free(char *value);

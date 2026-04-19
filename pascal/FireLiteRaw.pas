@@ -14,6 +14,7 @@ type
   PFL_Query = Pointer;
   PFL_Config = Pointer;
   PFL_Watch = Pointer;
+  PFL_NetSyncer = Pointer;
   PFL_Array = Pointer;       // Added in v0.5.9
   PFL_Transaction = Pointer; // Added in v0.5.9
 
@@ -50,7 +51,8 @@ procedure fl_config_set_encryption_key(config: PFL_Config; key: PChar); cdecl; e
 procedure fl_config_set_audit_log(config: PFL_Config; enabled: cbool; path: PChar); cdecl; external FIRELITE_LIB;
 procedure fl_config_set_query_workers(config: PFL_Config; count: SizeUInt); cdecl; external FIRELITE_LIB;
 procedure fl_config_set_memory_limits(config: PFL_Config; mmap_size, max_inlined_bytes: SizeUInt); cdecl; external FIRELITE_LIB;
-procedure fl_config_set_storage_tuning(config: PFL_Config; page_size, page_cache_capacity, compaction_threshold, group_commit_max_ops: SizeUInt); cdecl; external FIRELITE_LIB;
+procedure fl_config_set_storage_tuning(config: PFL_Config; page_size, compaction_threshold, group_commit_max_ops: SizeUInt); cdecl; external FIRELITE_LIB;
+procedure fl_config_set_compression(config: PFL_Config; enabled: cbool; level: cint32); cdecl; external FIRELITE_LIB;
 
 { Real-time Snapshots }
 function fl_engine_watch(engine: PFL_Engine; collection: PChar; callback: TFL_OnSnapshotCallback; user_data_ptr: Pointer): PFL_Watch; cdecl; external FIRELITE_LIB;
@@ -104,6 +106,7 @@ procedure fl_transaction_free(tx: PFL_Transaction); cdecl; external FIRELITE_LIB
 function fl_query_new(collection: PChar): PFL_Query; cdecl; external FIRELITE_LIB;
 procedure fl_query_free(query: PFL_Query); cdecl; external FIRELITE_LIB;
 function fl_query_where_eq_str(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_where_eq_bool(query: PFL_Query; field: PChar; value: cbool): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_where_eq_int(query: PFL_Query; field: PChar; value: cint64): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_where_ne_str(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_where_ne_int(query: PFL_Query; field: PChar; value: cint64): cint32; cdecl; external FIRELITE_LIB;
@@ -144,6 +147,12 @@ function fl_query_execute_aggregation(engine: PFL_Engine; query: PFL_Query): PCh
 function fl_engine_create_index(engine: PFL_Engine; col, json_def: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_engine_create_simple_index(engine: PFL_Engine; col, field: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_engine_create_fts_index(engine: PFL_Engine; col, field: PChar): cint32; cdecl; external FIRELITE_LIB;
+
+{ Net Sync }
+function fl_net_syncer_new(engine: PFL_Engine; name, room_key: PChar): PFL_NetSyncer; cdecl; external FIRELITE_LIB;
+function fl_net_syncer_start(syncer: PFL_NetSyncer; port: Word): cint32; cdecl; external FIRELITE_LIB;
+function fl_net_syncer_status(syncer: PFL_NetSyncer): PChar; cdecl; external FIRELITE_LIB;
+procedure fl_net_syncer_free(syncer: PFL_NetSyncer); cdecl; external FIRELITE_LIB;
 
 { Errors and Helpers }
 function fl_last_error: PChar; cdecl; external FIRELITE_LIB;

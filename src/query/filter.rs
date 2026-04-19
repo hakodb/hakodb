@@ -1,6 +1,6 @@
+use crate::document::value::Value;
 use std::cmp::Ordering;
 use std::collections::HashSet; // Added for cleaner FTS logic
-use crate::document::value::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Operator {
@@ -43,18 +43,32 @@ pub fn compare_values(a: &Value, op: &Operator, b: &Value) -> bool {
     // (a is the field value, b is the array of allowed values)
     match op {
         Operator::In => {
-            return if let Value::Array(allowed) = b { allowed.contains(a) } else { false };
+            return if let Value::Array(allowed) = b {
+                allowed.contains(a)
+            } else {
+                false
+            };
         }
         Operator::NotIn => {
-            return if let Value::Array(allowed) = b { !allowed.contains(a) } else { true };
+            return if let Value::Array(allowed) = b {
+                !allowed.contains(a)
+            } else {
+                true
+            };
         }
         Operator::ArrayContains => {
-            return if let Value::Array(items) = a { items.contains(b) } else { false };
+            return if let Value::Array(items) = a {
+                items.contains(b)
+            } else {
+                false
+            };
         }
         Operator::ArrayContainsAny => {
             return if let (Value::Array(items), Value::Array(query_items)) = (a, b) {
                 query_items.iter().any(|qi| items.contains(qi))
-            } else { false };
+            } else {
+                false
+            };
         }
         _ => {} // Fall through to standard comparisons
     }
@@ -64,12 +78,12 @@ pub fn compare_values(a: &Value, op: &Operator, b: &Value) -> bool {
             Operator::StartsWith => d.starts_with(f),
             Operator::Contains => d.contains(f),
             Operator::Match => {
-                // We create owned lowercase strings to ensure references created 
+                // We create owned lowercase strings to ensure references created
                 // by split_whitespace() remain valid while checking the HashSet.
                 let d_lower = d.to_lowercase();
                 let f_lower = f.to_lowercase();
                 let doc_words: HashSet<&str> = d_lower.split_whitespace().collect();
-                
+
                 // Return true if every word in the filter exists in the document
                 f_lower.split_whitespace().all(|w| doc_words.contains(w))
             }
@@ -82,29 +96,42 @@ pub fn compare_values(a: &Value, op: &Operator, b: &Value) -> bool {
         (Value::Timestamp(a), Value::Timestamp(b)) => eval_ordering(a.cmp(b), op),
         (Value::Binary(a), Value::Binary(b)) => eval_ordering(a.cmp(b), op),
         (Value::Bool(a), Value::Bool(b)) => eval_ordering(a.cmp(b), op),
-        
+        // Compatibility bridge: some older gateway payloads encoded booleans as 0/1 integers.
+        // Keep equality/ordering behavior stable across mixed bool/int datasets.
+        (Value::Bool(a), Value::Int(b)) => eval_ordering((*a as i64).cmp(b), op),
+        (Value::Int(a), Value::Bool(b)) => eval_ordering(a.cmp(&(*b as i64)), op),
+
         (Value::Float(a), Value::Float(b)) => {
             if let Some(ord) = a.partial_cmp(b) {
                 eval_ordering(ord, op)
             } else {
                 false
             }
-        },
+        }
 
         (Value::Null, Value::Null) => eval_ordering(Ordering::Equal, op),
-        (Value::Int(a_val), Value::Float(b_val)) => eval_ordering((*a_val as f64).total_cmp(b_val), op),
-        (Value::Float(a_val), Value::Int(b_val)) => eval_ordering(a_val.total_cmp(&(*b_val as f64)), op),
-        
-        // Reference comparison
-        (Value::Reference { collection: c1, doc_id: i1 }, Value::Reference { collection: c2, doc_id: i2 }) => {
-            eval_ordering(c1.cmp(c2).then(i1.cmp(i2)), op)
+        (Value::Int(a_val), Value::Float(b_val)) => {
+            eval_ordering((*a_val as f64).total_cmp(b_val), op)
         }
+        (Value::Float(a_val), Value::Int(b_val)) => {
+            eval_ordering(a_val.total_cmp(&(*b_val as f64)), op)
+        }
+
+        // Reference comparison
+        (
+            Value::Reference {
+                collection: c1,
+                doc_id: i1,
+            },
+            Value::Reference {
+                collection: c2,
+                doc_id: i2,
+            },
+        ) => eval_ordering(c1.cmp(c2).then(i1.cmp(i2)), op),
 
         // Cross-type comparisons or comparisons involving ServerTimestamp placeholders
         // In Firestore-style engines, comparing different types usually returns false.
-        _ => {
-            eval_ordering(a.cmp(b), op)
-        }
+        _ => eval_ordering(a.cmp(b), op),
     }
 }
 
@@ -118,12 +145,12 @@ fn eval_ordering(ord: Ordering, op: &Operator) -> bool {
         Operator::Lt => ord == Ordering::Less,
         Operator::Lte => ord == Ordering::Less || ord == Ordering::Equal,
         // String-only operators return false if used on non-string types
-        Operator::Match | 
-        Operator::Contains | 
-        Operator::StartsWith | 
-        Operator::In |        
-        Operator::NotIn | 
-        Operator::ArrayContains | 
-        Operator::ArrayContainsAny => false,
+        Operator::Match
+        | Operator::Contains
+        | Operator::StartsWith
+        | Operator::In
+        | Operator::NotIn
+        | Operator::ArrayContains
+        | Operator::ArrayContainsAny => false,
     }
 }
