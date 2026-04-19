@@ -33,6 +33,7 @@ type (
 	Query       struct{ ptr *C.FL_Query }
 	Batch       struct{ ptr *C.FL_Batch }
 	Transaction struct{ ptr *C.FL_Transaction }
+	NetSyncer   struct{ ptr *C.FL_NetSyncer }
 	Watch       struct {
 		ptr    *C.FL_Watch
 		handle cgo.Handle
@@ -336,6 +337,33 @@ func (e *Engine) StatsJSON() (string, error) {
 }
 func (e *Engine) AuditLogJSON() (string, error) {
 	return ownedCStringJSON(func() *C.char { return C.fl_engine_get_audit_log(e.ptr) })
+}
+
+func (e *Engine) NewNetSyncer(name, roomKey string) (*NetSyncer, error) {
+	cn, fn := cString(name)
+	cr, fr := cString(roomKey)
+	defer fn()
+	defer fr()
+	ptr := C.fl_net_syncer_new(e.ptr, cn, cr)
+	if ptr == nil {
+		return nil, fmt.Errorf("fl_net_syncer_new failed: %s", lastError())
+	}
+	return &NetSyncer{ptr: ptr}, nil
+}
+
+func (n *NetSyncer) Start(port uint16) error {
+	return checkStatus("fl_net_syncer_start", C.fl_net_syncer_start(n.ptr, C.uint16_t(port)))
+}
+
+func (n *NetSyncer) StatusJSON() (string, error) {
+	return ownedCStringJSON(func() *C.char { return C.fl_net_syncer_status(n.ptr) })
+}
+
+func (n *NetSyncer) Free() {
+	if n != nil && n.ptr != nil {
+		C.fl_net_syncer_free(n.ptr)
+		n.ptr = nil
+	}
 }
 
 func (e *Engine) InsertSubDoc(col, id, subCol, subID string, doc *Doc) error {

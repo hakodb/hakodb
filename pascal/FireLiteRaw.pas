@@ -14,6 +14,7 @@ type
   PFL_Query = Pointer;
   PFL_Config = Pointer;
   PFL_Watch = Pointer;
+  PFL_NetSyncer = Pointer;
   PFL_Array = Pointer;       // Added in v0.5.9
   PFL_Transaction = Pointer; // Added in v0.5.9
 
@@ -146,6 +147,12 @@ function fl_query_execute_aggregation(engine: PFL_Engine; query: PFL_Query): PCh
 function fl_engine_create_index(engine: PFL_Engine; col, json_def: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_engine_create_simple_index(engine: PFL_Engine; col, field: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_engine_create_fts_index(engine: PFL_Engine; col, field: PChar): cint32; cdecl; external FIRELITE_LIB;
+
+{ Net Sync }
+function fl_net_syncer_new(engine: PFL_Engine; name, room_key: PChar): PFL_NetSyncer; cdecl; external FIRELITE_LIB;
+function fl_net_syncer_start(syncer: PFL_NetSyncer; port: Word): cint32; cdecl; external FIRELITE_LIB;
+function fl_net_syncer_status(syncer: PFL_NetSyncer): PChar; cdecl; external FIRELITE_LIB;
+procedure fl_net_syncer_free(syncer: PFL_NetSyncer); cdecl; external FIRELITE_LIB;
 
 { Errors and Helpers }
 function fl_last_error: PChar; cdecl; external FIRELITE_LIB;

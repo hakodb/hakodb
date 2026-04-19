@@ -205,6 +205,16 @@ type
     procedure CreateFTSIndex(const Field: string);
   end;
 
+  TFLNetSyncer = class
+  private
+    FHandle: PFL_NetSyncer;
+  public
+    constructor Create(ADBHandle: PFL_Engine; const Name, RoomKey: string);
+    destructor Destroy; override;
+    procedure Start(APort: Word);
+    function StatusJSON: string;
+  end;
+
   TFireLite = class
   private
     FHandle: PFL_Engine;
@@ -217,6 +227,7 @@ type
     function GetStats: string;
     function StartBatch: TFLBatch;
     function StartTransaction: TFLTransaction;
+    function CreateNetSyncer(const Name, RoomKey: string): TFLNetSyncer;
     property Handle: PFL_Engine read FHandle;
   end;
 
@@ -675,6 +686,32 @@ function TFLCollection.WhereEqStr(const Field, Value: string): TFLQuery; begin R
 function TFLCollection.WhereEqInt(const Field: string; Value: Int64): TFLQuery; begin Result := Query.WhereEqInt(Field, Value); end;
 function TFLCollection.Match(const Field, Value: string): TFLQuery; begin Result := Query.Match(Field, Value); end;
 function TFLCollection.Limit(ACount: NativeUInt): TFLQuery; begin Result := Query.Limit(ACount); end;
+
+{ TFLNetSyncer }
+
+constructor TFLNetSyncer.Create(ADBHandle: PFL_Engine; const Name, RoomKey: string);
+begin
+  inherited Create;
+  FHandle := fl_net_syncer_new(ADBHandle, PChar(Name), PChar(RoomKey));
+  if FHandle = nil then
+    raise Exception.Create('CreateNetSyncer failed: ' + string(fl_last_error));
+end;
+
+destructor TFLNetSyncer.Destroy;
+begin
+  if FHandle <> nil then fl_net_syncer_free(FHandle);
+  inherited;
+end;
+
+procedure TFLNetSyncer.Start(APort: Word);
+begin
+  CheckStatus(fl_net_syncer_start(FHandle, APort), 'NetSyncStart');
+end;
+
+function TFLNetSyncer.StatusJSON: string;
+begin
+  Result := ConsumeCString(fl_net_syncer_status(FHandle));
+end;
 procedure TFLCollection.CreateIndex(const Field: string); begin CheckStatus(fl_engine_create_simple_index(FDB.Handle, PChar(FName), PChar(Field)), 'CreateIndex'); end;
 procedure TFLCollection.CreateFTSIndex(const Field: string); begin CheckStatus(fl_engine_create_fts_index(FDB.Handle, PChar(FName), PChar(Field)), 'CreateFTSIndex'); end;
 
@@ -686,6 +723,7 @@ destructor TFireLite.Destroy; begin if FHandle <> nil then fl_engine_free(FHandl
 function TFireLite.Collection(const Name: string): TFLCollection; begin Result := TFLCollection.Create(Self, Name); end;
 function TFireLite.StartBatch: TFLBatch; begin Result := TFLBatch.Create(FHandle); end;
 function TFireLite.StartTransaction: TFLTransaction; begin Result := TFLTransaction.Create(FHandle); end;
+function TFireLite.CreateNetSyncer(const Name, RoomKey: string): TFLNetSyncer; begin Result := TFLNetSyncer.Create(FHandle, Name, RoomKey); end;
 function TFireLite.ListCollections: TStringList; var S: string; P: TJSONParser; A: TJSONArray; I: Integer; begin Result := TStringList.Create; S := ConsumeCString(fl_engine_list_collections(FHandle)); if S = '' then Exit; P := TJSONParser.Create(S); try A := TJSONArray(P.Parse); for I := 0 to A.Count - 1 do Result.Add(A.Strings[I]); finally P.Free; end; end;
 function TFireLite.GetStats: string; begin Result := ConsumeCString(fl_engine_get_stats(FHandle)); end;
 
