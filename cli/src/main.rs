@@ -1,5 +1,5 @@
-use std::str::FromStr;
 use std::io::Read;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -7,14 +7,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 use firelite::config::{DurabilityMode, FireLiteConfig};
 use firelite::document::firelite_doc::FireLiteDoc;
 use firelite::document::value::Value;
-use firelite::engine::{FireLite, BatchMutation};
+use firelite::engine::{BatchMutation, FireLite};
 use firelite::index::composite::definition::SortDirection;
+use firelite::net_sync::{NetSyncer, SyncStatus};
 use firelite::query::filter::Operator;
 use firelite::query::query::{AggregateOp, Query};
-use firelite::net_sync::{NetSyncer, SyncStatus};
-use serde_json::{json, Map, Value as JsonValue};
-use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
+use serde_json::{json, Map, Value as JsonValue};
 
 #[derive(Parser, Debug)]
 #[command(name = "firelite")]
@@ -53,7 +53,8 @@ enum Commands {
         set: bool,
         /// Data for the update (JSON object)
         #[arg(long)]
-        data: Option<String>,/// Read JSON payload from file
+        data: Option<String>,
+        /// Read JSON payload from file
         /// Batch Write
         #[arg(long)]
         fromfile: Option<String>,
@@ -85,7 +86,7 @@ enum Commands {
         batch: Option<bool>,
     },
     /// Delete one document by path: <collection>/<doc_id>
-    Delete { 
+    Delete {
         path: String,
         /// Batch Write
         #[arg(long)]
@@ -130,6 +131,9 @@ enum Commands {
         /// comma separated projection fields
         #[arg(long)]
         select: Option<String>,
+        /// Repeated aggregate: count | sum:<field> | avg:<field>
+        #[arg(long = "aggregate")]
+        aggregates: Vec<String>,
         /// Write JSON output to file path
         #[arg(long)]
         output: Option<String>,
@@ -159,10 +163,7 @@ enum Commands {
     /// Watch changes in a collection
     Watch { collection: String },
     /// Seed a collection with random-ish complex JSON docs (max: 500)
-    Seed {
-        collection: String,
-        docsize: usize,
-    },
+    Seed { collection: String, docsize: usize },
     /// Index operations
     Index {
         #[command(subcommand)]
@@ -205,19 +206,25 @@ enum Commands {
 
         #[arg(long, default_value = "default_key")]
         key: String,
-    }
+    },
 }
 
 #[derive(Subcommand, Debug)]
 enum IndexCommands {
-    Create { collection: String, field: String },
+    Create {
+        collection: String,
+        field: String,
+    },
     CreateComposite {
         collection: String,
         /// Comma separated list: field[:asc|desc],field[:asc|desc]
         #[arg(long)]
         fields: String,
     },
-    CreateFts { collection: String, field: String },
+    CreateFts {
+        collection: String,
+        field: String,
+    },
     List {
         /// Optional collection filter
         collection: Option<String>,
@@ -233,7 +240,7 @@ enum AggregateKindArg {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    
+
     if let Commands::Serve { port, node_id, key } = cli.command {
         return run_server(cli.db, cli.durability, port, node_id, key);
     }
@@ -274,7 +281,8 @@ fn read_payload_input(data: Option<&str>, fromfile: Option<&str>) -> Result<Stri
 fn emit_json(value: &JsonValue, output: Option<&str>) -> Result<()> {
     let rendered = serde_json::to_string_pretty(value)?;
     if let Some(path) = output {
-        std::fs::write(path, rendered).with_context(|| format!("failed to write output file: {path}"))?;
+        std::fs::write(path, rendered)
+            .with_context(|| format!("failed to write output file: {path}"))?;
     } else {
         println!("{rendered}");
     }
@@ -309,7 +317,13 @@ fn split_doc_path_with_fields(path: &str) -> Result<(&str, &str, Vec<String>)> {
     ))
 }
 
-fn get_doc(db: &FireLite, path: &str, output: Option<&str>, is_set: bool, data: Option<&str>) -> Result<()> {
+fn get_doc(
+    db: &FireLite,
+    path: &str,
+    output: Option<&str>,
+    is_set: bool,
+    data: Option<&str>,
+) -> Result<()> {
     let (collection, doc_id, fields) = split_doc_path_with_fields(path)?;
     let out = if fields.is_empty() {
         db.get(collection, doc_id)?
@@ -326,27 +340,33 @@ fn get_doc(db: &FireLite, path: &str, output: Option<&str>, is_set: bool, data: 
             })
             .unwrap_or(JsonValue::Null)
     };
-    if is_set  {
+    if is_set {
         set_doc(db, path, data.expect("Should not empty"), true, false)?;
     }
     emit_json(&out, output)?;
     Ok(())
 }
 
-fn set_doc(db: &FireLite, path: &str, data: &str, merge: bool, is_batch: bool ) -> Result<()> {
+fn set_doc(db: &FireLite, path: &str, data: &str, merge: bool, is_batch: bool) -> Result<()> {
     if is_batch {
         let collection = path; // In batch mode, path is just the collection name
-        let array: JsonValue = serde_json::from_str(data).context("Batch data must be a JSON array")?;
-        let items = array.as_array().ok_or_else(|| anyhow!("--batch requires a JSON array of objects"))?;
-        
+        let array: JsonValue =
+            serde_json::from_str(data).context("Batch data must be a JSON array")?;
+        let items = array
+            .as_array()
+            .ok_or_else(|| anyhow!("--batch requires a JSON array of objects"))?;
+
         let mut mutations = Vec::with_capacity(items.len());
         let mut results = Vec::new();
 
         for (idx, item) in items.iter().enumerate() {
-            let obj = item.as_object().ok_or_else(|| anyhow!("Item at index {} is not an object", idx))?;
-            
+            let obj = item
+                .as_object()
+                .ok_or_else(|| anyhow!("Item at index {} is not an object", idx))?;
+
             // Generate ID if missing
-            let doc_id = obj.get("id")
+            let doc_id = obj
+                .get("id")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(generate_id);
@@ -359,8 +379,13 @@ fn set_doc(db: &FireLite, path: &str, data: &str, merge: bool, is_batch: bool ) 
                 FireLiteDoc::default()
             };
 
-            for (k, v) in raw_data.as_object().ok_or_else(|| anyhow!("Data for item {} is not an object", idx))? {
-                if k == "id" && obj.get("data").is_none() { continue; } // Skip ID if it's top level
+            for (k, v) in raw_data
+                .as_object()
+                .ok_or_else(|| anyhow!("Data for item {} is not an object", idx))?
+            {
+                if k == "id" && obj.get("data").is_none() {
+                    continue;
+                } // Skip ID if it's top level
                 doc.insert(k.clone(), json_to_fire(v.clone())?);
             }
 
@@ -375,7 +400,6 @@ fn set_doc(db: &FireLite, path: &str, data: &str, merge: bool, is_batch: bool ) 
         db.write_batch(mutations)?;
         println!("Ok: {collection}/[{}]", results.join(", "));
     } else {
-
         let (collection, doc_id, fields) = split_doc_path_with_fields(path)?;
         let payload: JsonValue = serde_json::from_str(data).context("data must be valid JSON")?;
         let mut doc = if merge {
@@ -383,7 +407,7 @@ fn set_doc(db: &FireLite, path: &str, data: &str, merge: bool, is_batch: bool ) 
         } else {
             FireLiteDoc::default()
         };
-    
+
         if fields.is_empty() {
             let obj = payload
                 .as_object()
@@ -394,16 +418,16 @@ fn set_doc(db: &FireLite, path: &str, data: &str, merge: bool, is_batch: bool ) 
         } else if fields.len() == 1 && !payload.is_object() {
             doc.insert(fields[0].clone(), json_to_fire(payload)?);
         } else {
-            let obj = payload
-                .as_object()
-                .ok_or_else(|| anyhow!("data must be a JSON object when multiple path fields are provided"))?;
+            let obj = payload.as_object().ok_or_else(|| {
+                anyhow!("data must be a JSON object when multiple path fields are provided")
+            })?;
             for field in fields {
                 if let Some(v) = obj.get(&field) {
                     doc.insert(field, json_to_fire(v.clone())?);
                 }
             }
         }
-    
+
         let id = db.put(collection, doc_id, &doc)?;
         println!("OK: {collection}/{id}");
     }
@@ -420,16 +444,21 @@ fn set_doc(db: &FireLite, path: &str, data: &str, merge: bool, is_batch: bool ) 
 fn delete_doc(db: &FireLite, path: &str, is_batch: bool, data: Option<&str>) -> Result<()> {
     if is_batch {
         let collection = path;
-        let id_input = data.ok_or_else(|| anyhow!("Batch delete requires --data with an array of IDs"))?;
+        let id_input =
+            data.ok_or_else(|| anyhow!("Batch delete requires --data with an array of IDs"))?;
         let array: JsonValue = serde_json::from_str(id_input)?;
-        let ids = array.as_array().ok_or_else(|| anyhow!("--data must be an array of ID strings"))?;
+        let ids = array
+            .as_array()
+            .ok_or_else(|| anyhow!("--data must be an array of ID strings"))?;
 
-        let mutations: Vec<_> = ids.iter().filter_map(|v| v.as_str()).map(|id| {
-            firelite::engine::BatchMutation::Delete {
+        let mutations: Vec<_> = ids
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|id| firelite::engine::BatchMutation::Delete {
                 collection: collection.to_string(),
                 doc_id: id.to_string(),
-            }
-        }).collect();
+            })
+            .collect();
 
         let count = mutations.len();
         db.write_batch(mutations)?;
@@ -458,7 +487,10 @@ fn run_tx_set(db: &FireLite, path: &str, data: &str) -> Result<()> {
     tx.get(db, collection, doc_id)?;
     tx.put(collection, doc_id, doc);
     let ids = tx.commit(db)?;
-    println!("OK: transaction committed for {collection}/{}", ids.into_iter().next().unwrap_or_default());
+    println!(
+        "OK: transaction committed for {collection}/{}",
+        ids.into_iter().next().unwrap_or_default()
+    );
     Ok(())
 }
 
@@ -502,6 +534,7 @@ fn run_query(
     end_at: Option<&str>,
     end_before: Option<&str>,
     select: Option<&str>,
+    aggregates: &[String],
     output: Option<&str>,
     delete_action: bool,
     set_action: bool,
@@ -549,49 +582,57 @@ fn run_query(
         q.end_before = Some(parse_cursor_values(v)?);
     }
 
-
     if delete_action || set_action {
-
         let rows = db.query(q.clone())?;
-    
+
         if delete_action {
             if rows.is_empty() {
                 println!("No documents found matching the criteria. Nothing deleted.");
                 return Ok(());
             }
-            
-            let mutations: Vec<_> = rows.iter().map(|(id, _)| firelite::engine::BatchMutation::Delete {
-                collection: collection.to_string(),
-                doc_id: id.clone(),
-            }).collect();
-    
+
+            let mutations: Vec<_> = rows
+                .iter()
+                .map(|(id, _)| firelite::engine::BatchMutation::Delete {
+                    collection: collection.to_string(),
+                    doc_id: id.clone(),
+                })
+                .collect();
+
             let count = mutations.len();
             db.write_batch(mutations)?;
             println!("OK: mass deleted {} documents from {}", count, collection);
             return Ok(());
         }
-    
+
         if set_action {
             if rows.is_empty() {
                 println!("No documents found matching the criteria. Nothing updated.");
                 return Ok(());
             }
-    
-            let raw_json = action_data.ok_or_else(|| anyhow!("--set requires --data with a JSON object"))?;
-            let payload: JsonValue = serde_json::from_str(raw_json).context("Action data must be a valid JSON object")?;
-            let update_map = payload.as_object().ok_or_else(|| anyhow!("Action data must be a JSON object"))?;
-            
+
+            let raw_json =
+                action_data.ok_or_else(|| anyhow!("--set requires --data with a JSON object"))?;
+            let payload: JsonValue = serde_json::from_str(raw_json)
+                .context("Action data must be a valid JSON object")?;
+            let update_map = payload
+                .as_object()
+                .ok_or_else(|| anyhow!("Action data must be a JSON object"))?;
+
             let mut updates = Vec::new();
             for (k, v) in update_map {
                 updates.push((k.clone(), json_to_fire(v.clone())?));
             }
-    
-            let mutations: Vec<_> = rows.iter().map(|(id, _)| firelite::engine::BatchMutation::Patch {
-                collection: collection.to_string(),
-                doc_id: id.clone(),
-                updates: updates.clone(),
-            }).collect();
-    
+
+            let mutations: Vec<_> = rows
+                .iter()
+                .map(|(id, _)| firelite::engine::BatchMutation::Patch {
+                    collection: collection.to_string(),
+                    doc_id: id.clone(),
+                    updates: updates.clone(),
+                })
+                .collect();
+
             let count = mutations.len();
             db.write_batch(mutations)?;
             println!("OK: mass updated {} documents in {}", count, collection);
@@ -599,6 +640,22 @@ fn run_query(
         }
     }
 
+    if !aggregates.is_empty() {
+        let mut agg_results = Vec::new();
+        for spec in aggregates {
+            let op = parse_aggregate_spec(spec)?;
+            let mut agg_query = q.clone();
+            agg_query = match op {
+                AggregateOp::Count => agg_query.aggregate(AggregateOp::Count),
+                AggregateOp::Sum(field) => agg_query.aggregate(AggregateOp::Sum(field)),
+                AggregateOp::Avg(field) => agg_query.aggregate(AggregateOp::Avg(field)),
+            };
+            let out = db.execute_aggregation(agg_query)?;
+            agg_results.push(serde_json::to_value(out)?);
+        }
+        emit_json(&JsonValue::Array(agg_results), output)?;
+        return Ok(());
+    }
 
     if let Some(select) = select {
         let fields: Vec<String> = select
@@ -639,10 +696,14 @@ fn run_aggregate(
     q = match kind {
         AggregateKindArg::Count => q.aggregate(AggregateOp::Count),
         AggregateKindArg::Sum => q.aggregate(AggregateOp::Sum(
-            field.ok_or_else(|| anyhow!("--field is required for sum"))?.to_string(),
+            field
+                .ok_or_else(|| anyhow!("--field is required for sum"))?
+                .to_string(),
         )),
         AggregateKindArg::Avg => q.aggregate(AggregateOp::Avg(
-            field.ok_or_else(|| anyhow!("--field is required for avg"))?.to_string(),
+            field
+                .ok_or_else(|| anyhow!("--field is required for avg"))?
+                .to_string(),
         )),
     };
     let out = db.execute_aggregation(q)?;
@@ -650,11 +711,35 @@ fn run_aggregate(
     Ok(())
 }
 
+fn parse_aggregate_spec(input: &str) -> Result<AggregateOp> {
+    let raw = input.trim();
+    if raw.eq_ignore_ascii_case("count") {
+        return Ok(AggregateOp::Count);
+    }
+
+    let (kind, field) = raw.split_once(':').ok_or_else(|| {
+        anyhow!("invalid aggregate '{input}', expected count or sum:<field>/avg:<field>")
+    })?;
+    let field = field.trim();
+    if field.is_empty() {
+        bail!("aggregate field cannot be empty in '{input}'");
+    }
+    match kind.to_ascii_lowercase().as_str() {
+        "sum" => Ok(AggregateOp::Sum(field.to_string())),
+        "avg" => Ok(AggregateOp::Avg(field.to_string())),
+        _ => bail!("unsupported aggregate kind in '{input}'"),
+    }
+}
+
 fn watch_collection(db: &FireLite, collection: &str) -> Result<()> {
     println!("Watching [{collection}] ... Ctrl+C to exit");
     let rx = db.watch_collection(collection);
     while let Ok(event) = rx.recv() {
-        println!("{} {}", format!("{:?}", event.kind).to_uppercase(), event.path);
+        println!(
+            "{} {}",
+            format!("{:?}", event.kind).to_uppercase(),
+            event.path
+        );
     }
     Ok(())
 }
@@ -667,7 +752,7 @@ fn seed_collection(db: &FireLite, collection: &str, docsize: usize) -> Result<()
         bail!("docsize max is 500");
     }
 
-        // Example indexes for all 3 index modes
+    // Example indexes for all 3 index modes
     db.create_index(collection, "data")?;
     db.create_fts_index(collection, "description")?;
     let _ = db.create_composite_index(
@@ -714,7 +799,10 @@ fn seed_collection(db: &FireLite, collection: &str, docsize: usize) -> Result<()
                     "country".into(),
                     Value::String(if i % 2 == 0 { "US" } else { "CA" }.to_string()),
                 ),
-                ("flags".into(), Value::Array(vec![Value::Bool(valid), Value::Bool(i % 5 == 0)])),
+                (
+                    "flags".into(),
+                    Value::Array(vec![Value::Bool(valid), Value::Bool(i % 5 == 0)]),
+                ),
             ]),
         );
 
@@ -725,7 +813,6 @@ fn seed_collection(db: &FireLite, collection: &str, docsize: usize) -> Result<()
         });
         // db.put(collection, &id, &doc)?;
     }
-
 
     db.write_batch(mutations)?;
 
@@ -754,7 +841,25 @@ fn run_rest(
             match parts.len() {
                 0 => list_collections(db),
                 1 => run_query(
-                    db, parts[0], filters, &[], &[], None, None, None, None, None, None, None, None, None, None, false, false, None
+                    db,
+                    parts[0],
+                    filters,
+                    &[],
+                    &[],
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    None,
+                    false,
+                    false,
+                    None,
                 ),
                 2 => get_doc(db, path, None, false, None),
                 _ => bail!("unsupported path depth for GET"),
@@ -772,7 +877,7 @@ fn run_rest(
             path,
             data.ok_or_else(|| anyhow!("--data required for PATCH"))?,
             true,
-            false
+            false,
         ),
         "DELETE" => delete_doc(db, path, false, Some(" ")),
         other => bail!("unsupported REST method: {other}"),
@@ -929,49 +1034,117 @@ fn projected_to_json(id: &str, fields: Vec<(String, Value)>) -> JsonValue {
 fn generate_id() -> String {
     // A simple, fast ID based on hex-encoded nanoseconds
     use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     format!("{:x}", now)
 }
 
 // 1. Move the match logic into a reusable function
 fn execute_command(
-    db: &FireLite, 
-    command: Commands, 
-    _db_path: &str, 
+    db: &FireLite,
+    command: Commands,
+    _db_path: &str,
     _durability: DurabilityArg,
-    net: Option<&NetSyncer>
+    net: Option<&NetSyncer>,
 ) -> Result<()> {
     match command {
         Commands::Collections => list_collections(db)?,
-        Commands::Get { path, output, set, fromfile, data } => {
+        Commands::Get {
+            path,
+            output,
+            set,
+            fromfile,
+            data,
+        } => {
             let payload = if set {
                 Some(read_payload_input(data.as_deref(), fromfile.as_deref())?)
             } else {
                 None
             };
             get_doc(db, &path, output.as_deref(), set, payload.as_deref())?
-        },
-        Commands::Set { path, data, fromfile, batch } => {
+        }
+        Commands::Set {
+            path,
+            data,
+            fromfile,
+            batch,
+        } => {
             let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
             set_doc(db, &path, &payload, false, batch.unwrap_or(false))?
         }
-        Commands::Update { path, data, fromfile, batch } => {
+        Commands::Update {
+            path,
+            data,
+            fromfile,
+            batch,
+        } => {
             let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
             set_doc(db, &path, &payload, true, batch.unwrap_or(false))?
         }
-        Commands::Delete { path, batch, data } => delete_doc(db, &path, batch.unwrap_or(false), data.as_deref())?,
-        Commands::Query { collection, filters, and_filters, or_filters, fts, order, limit, offset, start_at, start_after, end_at, end_before, select, output, delete, set, data, fromfile } => {
-            
+        Commands::Delete { path, batch, data } => {
+            delete_doc(db, &path, batch.unwrap_or(false), data.as_deref())?
+        }
+        Commands::Query {
+            collection,
+            filters,
+            and_filters,
+            or_filters,
+            fts,
+            order,
+            limit,
+            offset,
+            start_at,
+            start_after,
+            end_at,
+            end_before,
+            select,
+            aggregates,
+            output,
+            delete,
+            set,
+            data,
+            fromfile,
+        } => {
             let payload = if set {
                 Some(read_payload_input(data.as_deref(), fromfile.as_deref())?)
             } else {
                 None
             };
-            run_query(db, &collection, &filters, &and_filters, &or_filters, fts.as_deref(), order.as_deref(), limit, offset, start_at.as_deref(), start_after.as_deref(), end_at.as_deref(), end_before.as_deref(), select.as_deref(), output.as_deref(), delete, set, payload.as_deref())?
+            run_query(
+                db,
+                &collection,
+                &filters,
+                &and_filters,
+                &or_filters,
+                fts.as_deref(),
+                order.as_deref(),
+                limit,
+                offset,
+                start_at.as_deref(),
+                start_after.as_deref(),
+                end_at.as_deref(),
+                end_before.as_deref(),
+                select.as_deref(),
+                &aggregates,
+                output.as_deref(),
+                delete,
+                set,
+                payload.as_deref(),
+            )?
         }
-        Commands::Aggregate { collection, kind, field, filters } => run_aggregate(db, &collection, kind, field.as_deref(), &filters)?,
+        Commands::Aggregate {
+            collection,
+            kind,
+            field,
+            filters,
+        } => run_aggregate(db, &collection, kind, field.as_deref(), &filters)?,
         Commands::Watch { collection } => watch_collection(db, &collection)?,
-        Commands::Seed { collection, docsize } => seed_collection(db, &collection, docsize)?,
+        Commands::Seed {
+            collection,
+            docsize,
+        } => seed_collection(db, &collection, docsize)?,
         Commands::Index { command } => match command {
             IndexCommands::Create { collection, field } => {
                 db.create_index(&collection, &field)?;
@@ -981,22 +1154,35 @@ fn execute_command(
                 let parts = parse_composite_fields(&fields)?;
                 db.create_composite_index(&collection, parts);
             }
-            IndexCommands::CreateFts { collection, field } => db.create_fts_index(&collection, &field)?,
+            IndexCommands::CreateFts { collection, field } => {
+                db.create_fts_index(&collection, &field)?
+            }
             IndexCommands::List { collection } => {
                 let out = db.list_indexes(collection.as_deref());
                 println!("{}", serde_json::to_string_pretty(&out)?);
             }
         },
-        Commands::TxSet { path, data, fromfile } => {
+        Commands::TxSet {
+            path,
+            data,
+            fromfile,
+        } => {
             let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
             run_tx_set(db, &path, &payload)?
         }
         Commands::Stats => println!("{}", serde_json::to_string_pretty(&db.get_stats())?),
         Commands::Compact => db.compact()?,
-        Commands::Rest { method, path, data, filters } => run_rest(db, &method, &path, data.as_deref(), &filters)?,
+        Commands::Rest {
+            method,
+            path,
+            data,
+            filters,
+        } => run_rest(db, &method, &path, data.as_deref(), &filters)?,
         // For Serve, we handle it separately to avoid infinite recursion
         Commands::Peers => {
-            let status = net.ok_or_else(|| anyhow!("Networking not active."))?.status();
+            let status = net
+                .ok_or_else(|| anyhow!("Networking not active."))?
+                .status();
             println!("\n--- Mesh Network ---");
             println!("Status: {}", format_sync_status(status.status)); // <--- Used here too
             println!("Peers:  {}", status.peer_count);
@@ -1035,44 +1221,49 @@ fn run_server(
 
     rt.block_on(async move {
         let db = Arc::new(open_db(&db_path, durability)?);
-        
+
         // NEW: Init Mesh Syncer
-        let net = NetSyncer::new(
-            db.clone(),
-            &node_id,
-            &key,
-            vec!["app_state".to_string()],
-        );
+        let net = NetSyncer::new(db.clone(), &node_id, &key, vec!["app_state".to_string()]);
 
         net.start(port).await.map_err(|e| anyhow!(e.to_string()))?;
 
         println!("🔥 FireLite v0.6.19 Mesh Shell Active");
         println!("🌐 Node: {} | Room Hash Verified", node_id);
-        
+
         let mut rl = DefaultEditor::new().map_err(|e| anyhow!("Readline error: {}", e))?;
-        
+
         loop {
-            let status = net.status(); 
+            let status = net.status();
             let prompt = format!(
-                "firelite({}:{} | {}) > ", 
-                node_id, 
-                status.peer_count, 
+                "firelite({}:{} | {}) > ",
+                node_id,
+                status.peer_count,
                 format_sync_status(status.status) // <--- Now SyncStatus is used!
             );
-            
+
             match rl.readline(&prompt) {
                 Ok(line) => {
                     let line = line.trim();
-                    if line.is_empty() { continue; }
-                    if line == "exit" || line == "quit" { break; } 
-                    
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if line == "exit" || line == "quit" {
+                        break;
+                    }
+
                     let _ = rl.add_history_entry(line);
                     let cmd_str = format!("firelite {}", line);
                     let args = shlex::split(&cmd_str).unwrap_or_default();
 
                     match Cli::try_parse_from(args) {
                         Ok(repl_cli) => {
-                            if let Err(e) = execute_command(&db, repl_cli.command, &db_path, durability, Some(&net)) {
+                            if let Err(e) = execute_command(
+                                &db,
+                                repl_cli.command,
+                                &db_path,
+                                durability,
+                                Some(&net),
+                            ) {
                                 println!("❌ Error: {}", e);
                             }
                         }
@@ -1080,7 +1271,10 @@ fn run_server(
                     }
                 }
                 Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
-                Err(err) => { println!("Readline Error: {:?}", err); break; }
+                Err(err) => {
+                    println!("Readline Error: {:?}", err);
+                    break;
+                }
             }
         }
         net.stop();

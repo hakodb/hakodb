@@ -119,6 +119,7 @@ type
     FCollection: string;
     FWhereStr: array of record Field, Value, Op: string; end;
     FWhereInt: array of record Field: string; Value: Int64; Op: string; end;
+    FWhereBool: array of record Field: string; Value: Boolean; end;
     FWhereIn: array of record Field: string; Data: TJSONArray; end;
     FWhereNotIn: array of record Field: string; Data: TJSONArray; end;
     FWhereArrayContainsAny: array of record Field: string; Data: TJSONArray; end;
@@ -136,6 +137,7 @@ type
     destructor Destroy; override;
 
     function WhereEqStr(const Field, Value: string): TFLQuery;
+    function WhereEqBool(const Field: string; Value: Boolean): TFLQuery;
     function WhereEqInt(const Field: string; Value: Int64): TFLQuery;
     function WhereNeStr(const Field, Value: string): TFLQuery;
     function WhereNeInt(const Field: string; Value: Int64): TFLQuery;
@@ -307,10 +309,7 @@ end;
 
 function TFLConfig.SetCompression(Enabled: Boolean; Level: Integer): TFLConfig;
 begin
-  if Enabled then
-    fl_config_set_storage_tuning(FHandle, 4096, 1024, NativeUInt(Level), 256)
-  else
-    fl_config_set_storage_tuning(FHandle, 4096, 1024, 0, 256);
+  fl_config_set_compression(FHandle, Enabled, Level);
   Result := Self;
 end;
 
@@ -446,6 +445,9 @@ end;
 
 function TFLQuery.WhereEqStr(const Field, Value: string): TFLQuery;
 var L: Integer; begin L := Length(FWhereStr); SetLength(FWhereStr, L + 1); FWhereStr[L].Field := Field; FWhereStr[L].Value := Value; FWhereStr[L].Op := '=='; Result := Self; end;
+
+function TFLQuery.WhereEqBool(const Field: string; Value: Boolean): TFLQuery;
+var L: Integer; begin L := Length(FWhereBool); SetLength(FWhereBool, L + 1); FWhereBool[L].Field := Field; FWhereBool[L].Value := Value; Result := Self; end;
 
 function TFLQuery.WhereEqInt(const Field: string; Value: Int64): TFLQuery;
 var L: Integer; begin L := Length(FWhereInt); SetLength(FWhereInt, L + 1); FWhereInt[L].Field := Field; FWhereInt[L].Value := Value; FWhereInt[L].Op := 'eq'; Result := Self; end;
@@ -602,6 +604,9 @@ begin
       else if FWhereInt[I].Op = 'lt' then fl_query_where_lt_int(Result, PChar(FWhereInt[I].Field), FWhereInt[I].Value)
       else if FWhereInt[I].Op = 'lte' then fl_query_where_lte_int(Result, PChar(FWhereInt[I].Field), FWhereInt[I].Value)
       else fl_query_where_eq_int(Result, PChar(FWhereInt[I].Field), FWhereInt[I].Value);
+    end;
+    for I := Low(FWhereBool) to High(FWhereBool) do begin
+      fl_query_where_eq_bool(Result, PChar(FWhereBool[I].Field), FWhereBool[I].Value);
     end;
     for I := Low(FWhereIn) to High(FWhereIn) do begin
       TmpArr := fl_array_new;

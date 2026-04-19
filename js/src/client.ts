@@ -81,8 +81,8 @@ export class FireLiteConfig {
     return this;
   }
 
-  setStorageTuning(pageSize: number, pageCache: number, threshold: number, groupCommitMaxOps: number): this {
-    this._native.configSetStorageTuning(this._handle, pageSize, pageCache, threshold, groupCommitMaxOps);
+  setStorageTuning(pageSize: number, threshold: number, groupCommitMaxOps: number): this {
+    this._native.configSetStorageTuning(this._handle, pageSize, threshold, groupCommitMaxOps);
     return this;
   }
 
@@ -414,6 +414,8 @@ export class Query {
           case '==':
             if (typeof filter.value === 'string') {
               ensureOk(native.queryWhereEqStr(handle, filter.field, filter.value), native, 'queryWhereEqStr');
+            } else if (typeof filter.value === 'boolean') {
+              ensureOk(native.queryWhereEqBool(handle, filter.field, filter.value), native, 'queryWhereEqBool');
             } else {
               ensureOk(native.queryWhereEqInt(handle, filter.field, filter.value), native, 'queryWhereEqInt');
             }

@@ -24,7 +24,6 @@ export interface NativeBindings {
   configSetStorageTuning(
     config: Handle, 
     pageSize: number, 
-    pageCacheCapacity: number, 
     threshold: number, 
     groupCommit: number
   ): void;
@@ -62,6 +61,7 @@ export interface NativeBindings {
   queryNew(collection: string): Handle;
   queryFree(query: Handle): void;
   queryWhereEqStr(query: Handle, field: string, value: string): number;
+  queryWhereEqBool(query: Handle, field: string, value: boolean): number;
   queryWhereEqInt(query: Handle, field: string, value: number | bigint): number;
   queryWhereNeStr(query: Handle, field: string, value: string): number;
   queryWhereNeInt(query: Handle, field: string, value: number | bigint): number;
@@ -152,7 +152,7 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     fl_config_set_audit_log: { args: [FFIType.ptr, FFIType.bool, FFIType.cstring], returns: FFIType.void },
     fl_config_set_query_workers: { args: [FFIType.ptr, FFIType.usize], returns: FFIType.void },
     fl_config_set_memory_limits: { args: [FFIType.ptr, FFIType.usize, FFIType.usize], returns: FFIType.void },
-    fl_config_set_storage_tuning: { args: [FFIType.ptr, FFIType.usize, FFIType.usize, FFIType.usize, FFIType.usize], returns: FFIType.void },
+    fl_config_set_storage_tuning: { args: [FFIType.ptr, FFIType.usize, FFIType.usize, FFIType.usize], returns: FFIType.void },
 
     fl_engine_watch: { args: [FFIType.ptr, FFIType.cstring, FFIType.function, FFIType.ptr], returns: FFIType.ptr },
     fl_watch_free: { args: [FFIType.ptr], returns: FFIType.void },
@@ -182,6 +182,7 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     fl_query_new: { args: [FFIType.cstring], returns: FFIType.ptr },
     fl_query_free: { args: [FFIType.ptr], returns: FFIType.void },
     fl_query_where_eq_str: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
+    fl_query_where_eq_bool: { args: [FFIType.ptr, FFIType.cstring, FFIType.bool], returns: FFIType.i32 },
     fl_query_where_eq_int: { args: [FFIType.ptr, FFIType.cstring, FFIType.i64], returns: FFIType.i32 },
     fl_query_where_ne_str: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
     fl_query_where_ne_int: { args: [FFIType.ptr, FFIType.cstring, FFIType.i64], returns: FFIType.i32 },
@@ -262,7 +263,7 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     configSetAuditLog: (c, e, p) => symbols.fl_config_set_audit_log(c, e, toC(p)),
     configSetQueryWorkers: (c, count) => symbols.fl_config_set_query_workers(c, count),
     configSetMemoryLimits: (c, m, mi) => symbols.fl_config_set_memory_limits(c, m, mi),
-    configSetStorageTuning: (c, ps, pcc, th, gc) => symbols.fl_config_set_storage_tuning(c, ps, pcc, th, gc),
+    configSetStorageTuning: (c, ps, th, gc) => symbols.fl_config_set_storage_tuning(c, ps, th, gc),
 
     engineWatch: (engine, collection, callback) => {
       const cb = new JSCallback((c: any, p: any, kind: number) => {
@@ -297,6 +298,7 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     queryNew: (collection) => symbols.fl_query_new(toC(collection)),
     queryFree: (query) => symbols.fl_query_free(query),
     queryWhereEqStr: (query, field, value) => symbols.fl_query_where_eq_str(query, toC(field), toC(value)),
+    queryWhereEqBool: (query, field, value) => symbols.fl_query_where_eq_bool(query, toC(field), value),
     queryWhereEqInt: (query, field, value) => symbols.fl_query_where_eq_int(query, toC(field), BigInt(value)),
     queryWhereNeStr: (query, field, value) => symbols.fl_query_where_ne_str(query, toC(field), toC(value)),
     queryWhereNeInt: (query, field, value) => symbols.fl_query_where_ne_int(query, toC(field), BigInt(value)),
@@ -378,7 +380,7 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_config_set_audit_log: lib.func('void fl_config_set_audit_log(FL_Config* config, bool enabled, const char* path)'),
     fl_config_set_query_workers: lib.func('void fl_config_set_query_workers(FL_Config* config, size_t count)'),
     fl_config_set_memory_limits: lib.func('void fl_config_set_memory_limits(FL_Config* config, size_t mmap_size, size_t max_inlined_bytes)'),
-    fl_config_set_storage_tuning: lib.func('void fl_config_set_storage_tuning(FL_Config* config, size_t page_size, size_t page_cache_capacity, size_t compaction_threshold, size_t group_commit_max_ops)'),
+    fl_config_set_storage_tuning: lib.func('void fl_config_set_storage_tuning(FL_Config* config, size_t page_size, size_t compaction_threshold, size_t group_commit_max_ops)'),
 
     fl_engine_watch: lib.func('FL_Watch* fl_engine_watch(FL_Engine* engine, const char* collection, OnSnapshotCB* callback, void* user_data)'),
     fl_watch_free: lib.func('void fl_watch_free(FL_Watch* watch)'),
@@ -408,6 +410,7 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_query_new: lib.func('FL_Query* fl_query_new(const char* collection)'),
     fl_query_free: lib.func('void fl_query_free(FL_Query* query)'),
     fl_query_where_eq_str: lib.func('int fl_query_where_eq_str(FL_Query* query, const char* field, const char* value)'),
+    fl_query_where_eq_bool: lib.func('int fl_query_where_eq_bool(FL_Query* query, const char* field, bool value)'),
     fl_query_where_eq_int: lib.func('int fl_query_where_eq_int(FL_Query* query, const char* field, int64_t value)'),
     fl_query_where_ne_str: lib.func('int fl_query_where_ne_str(FL_Query* query, const char* field, const char* value)'),
     fl_query_where_ne_int: lib.func('int fl_query_where_ne_int(FL_Query* query, const char* field, int64_t value)'),
@@ -485,7 +488,7 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     configSetAuditLog: (c, e, p) => fn.fl_config_set_audit_log(c, e, p),
     configSetQueryWorkers: (c, count) => fn.fl_config_set_query_workers(c, count),
     configSetMemoryLimits: (c, m, mi) => fn.fl_config_set_memory_limits(c, m, mi),
-    configSetStorageTuning: (c, ps, pcc, th, gc) => fn.fl_config_set_storage_tuning(c, ps, pcc, th, gc),
+    configSetStorageTuning: (c, ps, th, gc) => fn.fl_config_set_storage_tuning(c, ps, th, gc),
 
     engineWatch: (engine, collection, callback) => {
       const wrapper = (c: string, p: string, kind: number, _user: any) => callback(c, p, kind);
@@ -518,6 +521,7 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     queryNew: (collection) => fn.fl_query_new(collection),
     queryFree: (query) => fn.fl_query_free(query),
     queryWhereEqStr: (query, field, value) => fn.fl_query_where_eq_str(query, field, value),
+    queryWhereEqBool: (query, field, value) => fn.fl_query_where_eq_bool(query, field, value),
     queryWhereEqInt: (query, field, value) => fn.fl_query_where_eq_int(query, field, value),
     queryWhereNeStr: (query, field, value) => fn.fl_query_where_ne_str(query, field, value),
     queryWhereNeInt: (query, field, value) => fn.fl_query_where_ne_int(query, field, value),
