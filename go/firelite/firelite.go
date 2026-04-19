@@ -457,6 +457,11 @@ func (q *Query) WhereEqString(field, value string) error {
 	defer fv()
 	return checkStatus("fl_query_where_eq_str", C.fl_query_where_eq_str(q.ptr, cf, cv))
 }
+func (q *Query) WhereEqBool(field string, value bool) error {
+	cf, ff := cString(field)
+	defer ff()
+	return checkStatus("fl_query_where_eq_bool", C.fl_query_where_eq_bool(q.ptr, cf, C.bool(value)))
+}
 func (q *Query) WhereEqInt(field string, value int64) error {
 	cf, ff := cString(field)
 	defer ff()
@@ -794,6 +799,8 @@ func (q *QueryRef) Where(field, op string, value any) *QueryRef {
 			switch v := value.(type) {
 			case string:
 				return raw.WhereEqString(field, v)
+			case bool:
+				return raw.WhereEqBool(field, v)
 			case int:
 				return raw.WhereEqInt(field, int64(v))
 			case int64:

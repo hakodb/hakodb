@@ -6,11 +6,11 @@ It runs in-process (no external service), stores typed binary documents, and pro
 
 ---
 
-## Current Status (v0.5.12 - High Velocity)
+## Current Status (v0.6.17 - High Velocity)
 
 FireLite has evolved from a foundation stage into a **Production-Candidate** engine. The core architecture now supports physical data sharding and near-instant recovery, capable of **20,000+ TPS** and sub-millisecond query responses on standard hardware.
 
-### 🚀 New in v0.5.12
+### 🚀 New in v0.6.17
 
 - **Zero-Copy Projection Pipeline**
   - Queries no longer "inflate" full document objects. 
@@ -189,6 +189,33 @@ await db.close();
   - `boolean` -> `fl_doc_insert_bool`
   - `null` -> `fl_doc_insert_null`
   - `Uint8Array` -> `fl_doc_insert_bin`
+  - `boolean query equality` -> `fl_query_where_eq_bool` (fixes `active == true` filters)
+
+---
+
+## CLI Advanced Chaining
+
+The CLI supports chainable filters/actions in a single command:
+
+```bash
+# query with boolean equality (fixed)
+firelite --db ./firelite.db query users \
+  --where active:eq:true \
+  --order created_at:desc \
+  --limit 20
+
+# query + aggregate in one line
+firelite --db ./firelite.db query users \
+  --where active:eq:true \
+  --aggregate count \
+  --aggregate sum:score \
+  --aggregate avg:score
+
+# chain query + mass patch action
+firelite --db ./firelite.db query users \
+  --where status:eq:active \
+  --set --data '{"tier":"pro"}'
+```
 
 ---
 

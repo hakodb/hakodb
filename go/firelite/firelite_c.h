@@ -73,6 +73,7 @@ int32_t fl_batch_commit(FL_Engine *engine, FL_Batch *batch);
 FL_Query *fl_query_new(const char *collection);
 void fl_query_free(FL_Query *query);
 int32_t fl_query_where_eq_str(FL_Query *query, const char *field, const char *value);
+int32_t fl_query_where_eq_bool(FL_Query *query, const char *field, bool value);
 int32_t fl_query_where_eq_int(FL_Query *query, const char *field, int64_t value);
 int32_t fl_query_where_ne_str(FL_Query *query, const char *field, const char *value);
 int32_t fl_query_where_ne_int(FL_Query *query, const char *field, int64_t value);
