@@ -25,10 +25,14 @@ impl FireLiteDoc {
 
     pub fn insert(&mut self, key: impl Into<String>, value: Value) {
         let key_str = key.into();
-        if let Some(pos) = self.fields.iter().position(|(k, _)| &**k == key_str) {
-            self.fields[pos].1 = value;
-        } else {
-            self.fields.push((Arc::from(key_str), value));
+        // if let Some(pos) = self.fields.iter().position(|(k, _)| &**k == key_str) {
+        //     self.fields[pos].1 = value;
+        // } else {
+        //     self.fields.push((Arc::from(key_str), value));
+        // }
+        match self.fields.binary_search_by(|(k, _)| k.as_ref().cmp(&key_str)) {
+            Ok(pos) => self.fields[pos].1 = value,
+            Err(pos) => self.fields.insert(pos, (Arc::from(key_str), value)),
         }
     }
 
@@ -271,8 +275,15 @@ pub(crate) fn skip_value(tag: u8, bytes: &[u8], pos: &mut usize) -> Option<()> {
 
     match tag {
         3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 => {
-            let v_len = u32::from_le_bytes(bytes.get(*pos..*pos + 4)?.try_into().ok()?) as usize;
-            *pos += 4 + v_len;
+            // let v_len = u32::from_le_bytes(bytes.get(*pos..*pos + 4)?.try_into().ok()?) as usize;
+            // *pos += 4 + v_len;
+            // Some(())
+            if *pos + 4 > bytes.len() { return None; }
+            let v_len = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().ok()?) as usize;
+            *pos += 4;
+            // Ensure the claimed length actually exists in the buffer
+            if *pos + v_len > bytes.len() { return None; }
+            *pos += v_len;
             Some(())
         }
         _ => None,

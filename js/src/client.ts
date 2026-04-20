@@ -81,8 +81,8 @@ export class FireLiteConfig {
     return this;
   }
 
-  setStorageTuning(pageSize: number, pageCache: number, threshold: number, groupCommitMaxOps: number): this {
-    this._native.configSetStorageTuning(this._handle, pageSize, pageCache, threshold, groupCommitMaxOps);
+  setStorageTuning(pageSize: number, threshold: number, groupCommitMaxOps: number): this {
+    this._native.configSetStorageTuning(this._handle, pageSize, threshold, groupCommitMaxOps);
     return this;
   }
 
@@ -239,6 +239,15 @@ export class FireLiteClient {
     return json ? JSON.parse(json) : [];
   }
 
+  createNetSyncer(name: string, roomKey: string): NetSyncer {
+    this.assertOpen();
+    const handle = this.native.netSyncerNew(this.engine, name, roomKey);
+    if (!handle) {
+      throw new Error(`netSyncerNew failed: ${this.native.lastError()}`);
+    }
+    return new NetSyncer(this.native, handle);
+  }
+
   async backup(destinationPath: string): Promise<void> {
     this.assertOpen();
     ensureOk(this.native.engineBackup(this.engine, destinationPath), this.native, 'engineBackup');
@@ -281,6 +290,27 @@ export class FireLiteClient {
 
   private assertOpen(): void {
     if (this.isClosed) throw new Error('FireLiteClient is already closed');
+  }
+}
+
+export class NetSyncer {
+  private closed = false;
+
+  constructor(private readonly native: NativeBindings, private readonly handle: unknown) {}
+
+  async start(port: number): Promise<void> {
+    ensureOk(this.native.netSyncerStart(this.handle, port), this.native, 'netSyncerStart');
+  }
+
+  async status<T = unknown>(): Promise<T | null> {
+    const raw = this.native.netSyncerStatus(this.handle);
+    return raw ? (JSON.parse(raw) as T) : null;
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.native.netSyncerFree(this.handle);
+    this.closed = true;
   }
 }
 
@@ -414,6 +444,8 @@ export class Query {
           case '==':
             if (typeof filter.value === 'string') {
               ensureOk(native.queryWhereEqStr(handle, filter.field, filter.value), native, 'queryWhereEqStr');
+            } else if (typeof filter.value === 'boolean') {
+              ensureOk(native.queryWhereEqBool(handle, filter.field, filter.value), native, 'queryWhereEqBool');
             } else {
               ensureOk(native.queryWhereEqInt(handle, filter.field, filter.value), native, 'queryWhereEqInt');
             }

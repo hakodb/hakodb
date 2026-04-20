@@ -27,7 +27,7 @@ use crate::storage::engine::{StorageEngine, Pointer};
 use crate::util::lock::SafeLock;
 
 use std::cell::RefCell;
-use rayon::prelude::*;
+// use rayon::prelude::*;
 
 static RAYON_INIT: Once = Once::new();
 
@@ -1463,33 +1463,42 @@ impl FireLite {
         let bm = blob_manager.ok_or(FireLiteError::StorageError("No blob manager".into()))?;
 
         // ADAPTIVE RESOLUTION
-        if blob_values.len() <= 2 {
-            for val in blob_values {
-                if let Value::BlobLink { offset, len } = *val {
-                    let data = match queue_snapshot.get(&offset) {
-                        Some(arc_bytes) => (**arc_bytes).clone(),
-                        None => bm.read_at(offset, len)?,
-                    };
-                    *val = self.inflate_bytes(data);
-                }
+        // if blob_values.len() <= 2 {
+        //     for val in blob_values {
+        //         if let Value::BlobLink { offset, len } = *val {
+        //             let data = match queue_snapshot.get(&offset) {
+        //                 Some(arc_bytes) => (**arc_bytes).clone(),
+        //                 None => bm.read_at(offset, len)?,
+        //             };
+        //             *val = self.inflate_bytes(data);
+        //         }
+        //     }
+        // } else {
+        //     let bm_ref = &bm;
+        //     let queue_ref = &queue_snapshot;
+        //     blob_values.into_par_iter().try_for_each(|val| -> Result<()> {
+        //         if let Value::BlobLink { offset, len } = *val {
+        //             let data = match queue_ref.get(&offset) {
+        //                 Some(arc_bytes) => (**arc_bytes).clone(),
+        //                 None => bm_ref.read_at(offset, len)?,
+        //             };
+        //             *val = if let Ok(s) = String::from_utf8(data.clone()) {
+        //                 Value::String(s)
+        //             } else {
+        //                 Value::Binary(data)
+        //             };
+        //         }
+        //         Ok(())
+        //     })?;
+        // }
+        for val in blob_values {
+            if let Value::BlobLink { offset, len } = *val {
+                let data = match queue_snapshot.get(&offset) {
+                    Some(arc_bytes) => (**arc_bytes).clone(),
+                    None => bm.read_at(offset, len)?,
+                };
+                *val = self.inflate_bytes(data);
             }
-        } else {
-            let bm_ref = &bm;
-            let queue_ref = &queue_snapshot;
-            blob_values.into_par_iter().try_for_each(|val| -> Result<()> {
-                if let Value::BlobLink { offset, len } = *val {
-                    let data = match queue_ref.get(&offset) {
-                        Some(arc_bytes) => (**arc_bytes).clone(),
-                        None => bm_ref.read_at(offset, len)?,
-                    };
-                    *val = if let Ok(s) = String::from_utf8(data.clone()) {
-                        Value::String(s)
-                    } else {
-                        Value::Binary(data)
-                    };
-                }
-                Ok(())
-            })?;
         }
         Ok(())
     }

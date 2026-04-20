@@ -372,8 +372,8 @@ Report run_benchmark(BenchConfig cfg) {
     stage("Bulk Delete");
     t_start = now();
     UniqueBatch batch_del(fl_batch_new());
+    char key_buf[16];
     for(int i=0; i<100; i++) {
-        char key_buf[16];
         snprintf(key_buf, sizeof(key_buf), "b_%d", i + 500);
         fl_batch_delete(batch_del.get(), "bench", key_buf);
     }
@@ -403,14 +403,14 @@ int main(int argc, char** argv) {
     }
 
     vector<BenchConfig> suite = {
-        {"Default",      g_docs, 10,  1, 4, false, false, 4,  false},
-        {"Light_App",    g_docs, 10,  2, 4, false, false, 4,  false},
-        {"Strict_Data",  g_docs, 10,  3, 8, true,  false, 8,  false},
-        {"Secure_Data",  g_docs, 10,  1, 8, false, true,  8,  false},
-        {"Zip_Data",  g_docs, 10,  1, 8, true, false,  8,  false},
-        {"Tight_Data",  g_docs, 10,  1, 8, true, true,  8,  false},
+        {"Always",      g_docs, 10,  0, 4, false, false, 4,  false},
+        {"Interval",      g_docs, 10,  1, 4, false, false, 4,  false},
+        {"Manual",    g_docs, 10,  2, 4, false, false, 4,  false},
+        {"OnCommit",  g_docs, 10,  3, 8, true,  false, 8,  false},
+        {"Encrypted",  g_docs, 10,  1, 8, false, true,  8,  false},
+        {"Compressed",  g_docs, 10,  1, 8, true, false,  8,  false},
+        {"Enc_Comp",  g_docs, 10,  1, 8, true, true,  8,  false},
         {"Gaming",       g_docs, 10,  2, 8, false, false, 64, true},
-        {"Light_Sync",   g_docs, 50,  1, 8, false, false, 2,  false},
         {"Busy_Sync",    g_docs, 150, 3, 8, false, false, 64, true}
     };
 
