@@ -204,9 +204,7 @@ impl ParallelQueryExecutor {
 
             // Step A: Attempt to resolve matching Document IDs using RAM indexes
             for filter in &plan.filters {
-                if filter.op == crate::query::filter::Operator::Eq
-                    && !matches!(filter.value, crate::document::value::Value::Bool(_))
-                {
+                if filter.op == crate::query::filter::Operator::Eq {
                     let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
                     if let Some(ids) =
                         indexes.lookup_secondary(&plan.collection, &filter.field, &val_bytes)

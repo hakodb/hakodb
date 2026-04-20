@@ -155,7 +155,7 @@ impl QueryPlanner {
         if use_index_heuristic {
             // Check Secondary Index (Simple Index)
             for filter in &query.filters {
-                if matches!(filter.op, Operator::Eq) && can_use_secondary_eq(&filter.value) {
+                if matches!(filter.op, Operator::Eq) {
                     if let Some(sec_map) = indexes.secondary.get(&query.collection) {
                         if sec_map.contains_key(&filter.field) {
                             let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
@@ -245,11 +245,10 @@ impl QueryPlanner {
         val: &Value,
         indexes: &IndexManager,
     ) -> Option<ScanType> {
-        if can_use_secondary_eq(val)
-            && indexes
-                .secondary
-                .get(col)
-                .map_or(false, |m| m.contains_key(field))
+        if indexes
+            .secondary
+            .get(col)
+            .map_or(false, |m| m.contains_key(field))
         {
             let val_bytes = crate::index::index_key::encode_scalar(val);
             return Some(ScanType::SecondaryIndex {
@@ -404,13 +403,6 @@ impl QueryPlanner {
         }
         None
     }
-}
-
-#[inline]
-fn can_use_secondary_eq(value: &Value) -> bool {
-    // Bool equality currently falls back to full scan to avoid stale/legacy secondary key
-    // mismatches observed in mixed datasets.
-    !matches!(value, Value::Bool(_))
 }
 
 #[cfg(test)]

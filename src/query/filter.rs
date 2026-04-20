@@ -100,6 +100,13 @@ pub fn compare_values(a: &Value, op: &Operator, b: &Value) -> bool {
         // Keep equality/ordering behavior stable across mixed bool/int datasets.
         (Value::Bool(a), Value::Int(b)) => eval_ordering((*a as i64).cmp(b), op),
         (Value::Int(a), Value::Bool(b)) => eval_ordering(a.cmp(&(*b as i64)), op),
+        // Compatibility bridge: bool string literals ("true"/"false") from legacy payloads.
+        (Value::Bool(a), Value::String(s)) => parse_bool_like(s)
+            .map(|b| eval_ordering(a.cmp(&b), op))
+            .unwrap_or(false),
+        (Value::String(s), Value::Bool(b)) => parse_bool_like(s)
+            .map(|a| eval_ordering(a.cmp(b), op))
+            .unwrap_or(false),
 
         (Value::Float(a), Value::Float(b)) => {
             if let Some(ord) = a.partial_cmp(b) {
@@ -132,6 +139,15 @@ pub fn compare_values(a: &Value, op: &Operator, b: &Value) -> bool {
         // Cross-type comparisons or comparisons involving ServerTimestamp placeholders
         // In Firestore-style engines, comparing different types usually returns false.
         _ => eval_ordering(a.cmp(b), op),
+    }
+}
+
+#[inline]
+fn parse_bool_like(input: &str) -> Option<bool> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
     }
 }
 
