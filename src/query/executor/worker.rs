@@ -584,7 +584,16 @@ pub(crate) fn matches_filters_view(doc_id: &str, bytes: &[u8], plan: &crate::que
 
 fn compare_raw_bytes(tag: u8, data: &[u8], op: &Operator, b: &Value) -> bool {
     match tag {
-        3 => data.try_into().map(i64::from_le_bytes).map(|v| crate::query::filter::compare_values(&Value::Int(v), op, b)).unwrap_or(false),
+        // 3 => data.try_into().map(i64::from_le_bytes).map(|v| crate::query::filter::compare_values(&Value::Int(v), op, b)).unwrap_or(false),
+        3 => { 
+            // Correctly decode the Document format: Skip 4-byte len, then decode Varint
+            let mut p = 4; 
+            if let Some(val) = crate::util::varint::decode_varint(data, &mut p) {
+                let decoded = crate::util::varint::zigzag_decode(val);
+                return crate::query::filter::compare_values(&Value::Int(decoded), op, b);
+            }
+            false
+        }
         4 => data.try_into().map(f64::from_le_bytes).map(|v| crate::query::filter::compare_values(&Value::Float(v), op, b)).unwrap_or(false),
         5 => if let Ok(s) = std::str::from_utf8(data) {
             match (op, b) {
@@ -593,7 +602,10 @@ fn compare_raw_bytes(tag: u8, data: &[u8], op: &Operator, b: &Value) -> bool {
                 _ => crate::query::filter::compare_values(&Value::String(s.to_string()), op, b),
             }
         } else { false },
-        2 => crate::query::filter::compare_values(&Value::Bool(data.first().map_or(false, |&v| v == 1)), op, b),
+        0xC2 => crate::query::filter::compare_values(&Value::Bool(true), op, b),
+        0xC3 => crate::query::filter::compare_values(&Value::Bool(false), op, b),
+        0xC0 => crate::query::filter::compare_values(&Value::Null, op, b),
+        // 2 => crate::query::filter::compare_values(&Value::Bool(data.first().map_or(false, |&v| v == 1)), op, b),
         _ => crate::document::firelite_doc::decode_value(tag, data).map(|v| crate::query::filter::compare_values(&v, op, b)).unwrap_or(false),
     }
 }

@@ -12,6 +12,9 @@ pub fn decode_varint(bytes: &[u8], pos: &mut usize) -> Option<u64> {
     while shift < 64 {
         let b = *bytes.get(*pos)? as u64;
         *pos += 1;
+
+        if shift == 63 && b > 1 { return None; }
+
         res |= (b & 0x7F) << shift;
         if b & 0x80 == 0 {
             return Some(res);

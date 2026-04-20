@@ -212,29 +212,81 @@ impl StorageEngine {
         Ok(())
     }
 
+    // pub(crate) fn update_index_entry(&mut self, key: String, new_pointer: Option<Pointer>) {
+    //     if let Some(old_p) = self.index.remove(&key) {
+    //         match old_p {
+    //             Pointer::Inlined(ref d) => { self.inlined_bytes = self.inlined_bytes.saturating_sub(d.len()); }
+    //             Pointer::BlobPendingData { ref skeleton, .. } => { self.inlined_bytes = self.inlined_bytes.saturating_sub(skeleton.len()); }
+    //             _ => {}
+    //         }
+
+    //         if !matches!(old_p, Pointer::Deleted { .. }) {
+    //             if let Some(count) = self.collection_counts.get_mut(&self.logical_name) {
+    //                 *count = count.saturating_sub(1);
+    //             }
+    //         }
+    //     }
+
+    //     --- STEP 2: APPLY NEW ENTRY ---
+    //     if let Some(p) = new_pointer {
+    //         match &p {
+    //             Pointer::Inlined(d) => { self.inlined_bytes += d.len(); }
+    //             Pointer::BlobPendingData { skeleton, .. } => { self.inlined_bytes += skeleton.len(); }
+    //             _ => {}
+    //         }
+    //         self.index.insert(key, p);
+    //     }
+    // }
+    
     pub(crate) fn update_index_entry(&mut self, key: String, new_pointer: Option<Pointer>) {
-        if let Some(old_p) = self.index.remove(&key) {
-            match old_p {
+        // 1. Perform the map operation once.
+        // .insert() returns the previous value if it existed.
+        let old_p = if let Some(p) = &new_pointer {
+            // Track memory stats for the NEW pointer
+            match p {
+                Pointer::Inlined(d) => { self.inlined_bytes += d.len(); }
+                Pointer::BlobPendingData { skeleton, .. } => { self.inlined_bytes += skeleton.len(); }
+                _ => {}
+            }
+            self.index.insert(key, p.clone())
+        } else {
+            self.index.remove(&key)
+        };
+
+        // 2. Adjust stats based on the OLD pointer
+        if let Some(old_val) = old_p {
+            // Subtract memory stats for the OLD pointer
+            match old_val {
                 Pointer::Inlined(ref d) => { self.inlined_bytes = self.inlined_bytes.saturating_sub(d.len()); }
                 Pointer::BlobPendingData { ref skeleton, .. } => { self.inlined_bytes = self.inlined_bytes.saturating_sub(skeleton.len()); }
                 _ => {}
             }
 
-            if !matches!(old_p, Pointer::Deleted { .. }) {
+            // --- COUNT LOGIC ---
+            // If we are replacing a LIVE doc with a DELETED doc: decrement
+            // If we are replacing a LIVE doc with a LIVE doc: no change
+            let old_was_live = !matches!(old_val, Pointer::Deleted { .. });
+            let new_is_live = matches!(new_pointer, Some(p) if !matches!(p, Pointer::Deleted { .. }));
+
+            if old_was_live && !new_is_live {
                 if let Some(count) = self.collection_counts.get_mut(&self.logical_name) {
                     *count = count.saturating_sub(1);
                 }
+            } else if !old_was_live && new_is_live {
+                // Replacing a tombstone with a real doc
+                if let Some(count) = self.collection_counts.get_mut(&self.logical_name) {
+                    *count += 1;
+                }
             }
-        }
-
-        // --- STEP 2: APPLY NEW ENTRY ---
-        if let Some(p) = new_pointer {
-            match &p {
-                Pointer::Inlined(d) => { self.inlined_bytes += d.len(); }
-                Pointer::BlobPendingData { skeleton, .. } => { self.inlined_bytes += skeleton.len(); }
-                _ => {}
+        } else {
+            // Brand new entry (old_p was None)
+            // Increment count only if the new entry is not a tombstone
+            let new_is_live = matches!(new_pointer, Some(p) if !matches!(p, Pointer::Deleted { .. }));
+            if new_is_live {
+                if let Some(count) = self.collection_counts.get_mut(&self.logical_name) {
+                    *count += 1;
+                }
             }
-            self.index.insert(key, p);
         }
     }
 
