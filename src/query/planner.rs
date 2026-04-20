@@ -2,12 +2,12 @@ use super::filter::Operator;
 use super::plan::{QueryPlan, ScanType};
 use super::query::Query;
 use crate::document::value::Value;
+use crate::index::composite::definition::SortDirection;
 use crate::index::composite::range_builder::build_cursor_range;
 use crate::index::composite::range_builder::{
     build_prefix_key, build_prefix_open_end, build_value_key, key_with_upper_sentinel,
 };
 use crate::index::manager::IndexManager;
-use crate::index::composite::definition::SortDirection;
 use std::ops::Bound; // Required for range definitions
 
 pub struct QueryPlanner;
@@ -47,7 +47,9 @@ impl QueryPlanner {
         }
 
         // 3. PRIORITY 3: Composite Index (Filters + OrderBy)
-        if let Some((eq_scan, satisfied, filters_done)) = Self::try_plan_composite_eq(query, indexes) {
+        if let Some((eq_scan, satisfied, filters_done)) =
+            Self::try_plan_composite_eq(query, indexes)
+        {
             let safe_limit = if satisfied { query.limit } else { None };
             return Self::make_plan(query, eq_scan, safe_limit, satisfied, filters_done);
         }
@@ -64,43 +66,58 @@ impl QueryPlanner {
                         && idx.definition.fields[0].field == order.field
                     {
                         let start = match (&query.start_at, &query.start_after) {
-                            (Some(v), _) => Bound::Included(build_cursor_range(&idx.definition, v, false)),
-                            (_, Some(v)) => Bound::Excluded(build_cursor_range(&idx.definition, v, false)),
+                            (Some(v), _) => {
+                                Bound::Included(build_cursor_range(&idx.definition, v, false))
+                            }
+                            (_, Some(v)) => {
+                                Bound::Excluded(build_cursor_range(&idx.definition, v, false))
+                            }
                             _ => Bound::Unbounded,
                         };
                         let end = match (&query.end_at, &query.end_before) {
-                            (Some(v), _) => Bound::Included(build_cursor_range(&idx.definition, v, false)),
-                            (_, Some(v)) => Bound::Excluded(build_cursor_range(&idx.definition, v, false)),
+                            (Some(v), _) => {
+                                Bound::Included(build_cursor_range(&idx.definition, v, false))
+                            }
+                            (_, Some(v)) => {
+                                Bound::Excluded(build_cursor_range(&idx.definition, v, false))
+                            }
                             _ => Bound::Unbounded,
                         };
                         // Cursors are inherently sorted by the index
                         return Self::make_plan(
                             query,
-                            ScanType::CursorIndex { 
+                            ScanType::CursorIndex {
                                 index_id: idx.definition.id,
-                                start, 
+                                start,
                                 end,
-                                reverse: !order.ascending 
+                                reverse: !order.ascending,
                             },
                             query.limit,
                             true,
-                            false
+                            false,
                         );
                     }
-
                 }
 
                 if let Some(sec_map) = indexes.secondary.get(&query.collection) {
                     if sec_map.contains_key(&order.field) {
                         // Encode the anchor values into simple scalar bytes
                         let start = match (&query.start_at, &query.start_after) {
-                            (Some(v), _) if !v.is_empty() => Bound::Included(crate::index::index_key::encode_scalar(&v[0])),
-                            (_, Some(v)) if !v.is_empty() => Bound::Excluded(crate::index::index_key::encode_scalar(&v[0])),
+                            (Some(v), _) if !v.is_empty() => {
+                                Bound::Included(crate::index::index_key::encode_scalar(&v[0]))
+                            }
+                            (_, Some(v)) if !v.is_empty() => {
+                                Bound::Excluded(crate::index::index_key::encode_scalar(&v[0]))
+                            }
                             _ => Bound::Unbounded,
                         };
                         let end = match (&query.end_at, &query.end_before) {
-                            (Some(v), _) if !v.is_empty() => Bound::Included(crate::index::index_key::encode_scalar(&v[0])),
-                            (_, Some(v)) if !v.is_empty() => Bound::Excluded(crate::index::index_key::encode_scalar(&v[0])),
+                            (Some(v), _) if !v.is_empty() => {
+                                Bound::Included(crate::index::index_key::encode_scalar(&v[0]))
+                            }
+                            (_, Some(v)) if !v.is_empty() => {
+                                Bound::Excluded(crate::index::index_key::encode_scalar(&v[0]))
+                            }
                             _ => Bound::Unbounded,
                         };
 
@@ -114,14 +131,12 @@ impl QueryPlanner {
                             },
                             query.limit,
                             true, // Order is satisfied by BTreeMap
-                            false
+                            false,
                         );
                     }
                 }
             }
         }
-
-
 
         if use_index_heuristic {
             if let Some(range_scan) = Self::try_plan_composite_range(query, indexes) {
@@ -130,7 +145,8 @@ impl QueryPlanner {
         }
 
         // 4. Try Union/OR/IN Logic
-        if !query.or_groups.is_empty() || query.filters.iter().any(|f| matches!(f.op, Operator::In)) {
+        if !query.or_groups.is_empty() || query.filters.iter().any(|f| matches!(f.op, Operator::In))
+        {
             if let Some(union_scan) = Self::try_plan_union(query, indexes) {
                 return Self::make_plan(query, union_scan, None, false, false);
             }
@@ -139,16 +155,19 @@ impl QueryPlanner {
         if use_index_heuristic {
             // Check Secondary Index (Simple Index)
             for filter in &query.filters {
-                if matches!(filter.op, Operator::Eq) {
+                if matches!(filter.op, Operator::Eq) && can_use_secondary_eq(&filter.value) {
                     if let Some(sec_map) = indexes.secondary.get(&query.collection) {
                         if sec_map.contains_key(&filter.field) {
                             let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
                             return Self::make_plan(
                                 query,
-                                ScanType::SecondaryIndex { field: filter.field.clone(), value: val_bytes },
+                                ScanType::SecondaryIndex {
+                                    field: filter.field.clone(),
+                                    value: val_bytes,
+                                },
                                 query.limit, // Respect limit at the scan level
-                                false, // Order not satisfied by simple index
-                                false
+                                false,       // Order not satisfied by simple index
+                                false,
                             );
                         }
                     }
@@ -157,17 +176,17 @@ impl QueryPlanner {
         }
 
         // 6. Default: Full Scan
-        Self::make_plan(query, ScanType::FullCollection, None, false,false)
+        Self::make_plan(query, ScanType::FullCollection, None, false, false)
     }
 
-    /// Helper to build the plan object. 
+    /// Helper to build the plan object.
     /// Now takes 'order_satisfied' as an argument.
     fn make_plan(
-        query: &Query, 
-        scan: ScanType, 
-        scan_limit: Option<usize>, 
+        query: &Query,
+        scan: ScanType,
+        scan_limit: Option<usize>,
         order_satisfied: bool,
-        filters_satisfied: bool
+        filters_satisfied: bool,
     ) -> QueryPlan {
         QueryPlan {
             collection: query.collection.clone(),
@@ -226,10 +245,11 @@ impl QueryPlanner {
         val: &Value,
         indexes: &IndexManager,
     ) -> Option<ScanType> {
-        if indexes
-            .secondary
-            .get(col)
-            .map_or(false, |m| m.contains_key(field))
+        if can_use_secondary_eq(val)
+            && indexes
+                .secondary
+                .get(col)
+                .map_or(false, |m| m.contains_key(field))
         {
             let val_bytes = crate::index::index_key::encode_scalar(val);
             return Some(ScanType::SecondaryIndex {
@@ -333,7 +353,10 @@ impl QueryPlanner {
         None
     }
 
-    fn try_plan_composite_eq(query: &Query, indexes: &IndexManager) -> Option<(ScanType, bool, bool)> {
+    fn try_plan_composite_eq(
+        query: &Query,
+        indexes: &IndexManager,
+    ) -> Option<(ScanType, bool, bool)> {
         if query.filters.is_empty() || !query.filters.iter().all(|f| matches!(f.op, Operator::Eq)) {
             return None;
         }
@@ -346,7 +369,9 @@ impl QueryPlanner {
                 if let Some(filter) = query.filters.iter().find(|f| f.field == idx_field.field) {
                     matched_fields.push(idx_field.field.clone());
                     matched_values.push(filter.value.clone());
-                } else { break; }
+                } else {
+                    break;
+                }
             }
 
             // Check if index prefix covers ALL filters
@@ -367,14 +392,25 @@ impl QueryPlanner {
                 }
 
                 return Some((
-                    ScanType::CompositeIndex { fields: matched_fields, values: matched_values, reverse: reverse_scan },
+                    ScanType::CompositeIndex {
+                        fields: matched_fields,
+                        values: matched_values,
+                        reverse: reverse_scan,
+                    },
                     order_satisfied,
-                    true // Filters are fully handled by index
+                    true, // Filters are fully handled by index
                 ));
             }
         }
         None
     }
+}
+
+#[inline]
+fn can_use_secondary_eq(value: &Value) -> bool {
+    // Bool equality currently falls back to full scan to avoid stale/legacy secondary key
+    // mismatches observed in mixed datasets.
+    !matches!(value, Value::Bool(_))
 }
 
 #[cfg(test)]
