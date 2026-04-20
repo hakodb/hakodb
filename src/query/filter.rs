@@ -136,6 +136,18 @@ pub fn compare_values(a: &Value, op: &Operator, b: &Value) -> bool {
             },
         ) => eval_ordering(c1.cmp(c2).then(i1.cmp(i2)), op),
 
+        // Reference comparison
+        (
+            Value::Reference {
+                collection: c1,
+                doc_id: i1,
+            },
+            Value::Reference {
+                collection: c2,
+                doc_id: i2,
+            },
+        ) => eval_ordering(c1.cmp(c2).then(i1.cmp(i2)), op),
+
         // Cross-type comparisons or comparisons involving ServerTimestamp placeholders
         // In Firestore-style engines, comparing different types usually returns false.
         _ => eval_ordering(a.cmp(b), op),
