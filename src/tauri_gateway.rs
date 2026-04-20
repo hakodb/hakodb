@@ -228,7 +228,7 @@ impl FireLiteGateway {
         let subscriptions = Arc::clone(&self.subscriptions);
         
         tokio::task::spawn_blocking(move || {
-            // --- 1. INITIAL BOOTSTRAP ---
+            // --- 1. INITIAL BOOTSTRAP (The "Full" Snapshot) ---
             let initial_rows = match execute_query_input(&db, &query_template) {
                 Ok(rows) => rows,
                 Err(_) => Vec::new(),
@@ -243,11 +243,16 @@ impl FireLiteGateway {
                 }],
             });
 
-            // --- 2. PREPARE MATCHER PLAN ---
+            // --- 2. PREPARE MATCHER PLAN FOR LIVE UPDATES ---
             let mut base_query = crate::query::query::Query::new(&query_template.collection);
             for f in &query_template.filters {
                 base_query = base_query.where_filter(&f.field, map_operator(&f.op), json_value_to_value(&f.value).unwrap_or(Value::Null));
             }
+            // If we are watching a specific ID, add it to the filter plan
+            if let Some(ref tid) = query_template.doc_id_filter {
+                base_query = base_query.where_filter("id", Operator::Eq, Value::String(tid.clone()));
+            }
+
             let filter_plan = {
                 let indexes = db.indexes.read().unwrap();
                 crate::query::planner::QueryPlanner::plan(&base_query, &indexes, 0, 1)
@@ -255,42 +260,33 @@ impl FireLiteGateway {
 
             // --- 3. EVENT LOOP ---
             loop {
+                // Check if unsubscribed
                 if stop_rx.try_recv().is_ok() { break; }
 
                 match rx.recv_timeout(Duration::from_millis(500)) {
                     Ok(first_event) => {
                         let mut events = vec![first_event];
-                        // Drain all pending events to batch them
-                        while let Ok(extra) = rx.try_recv() {
-                            events.push(extra);
-                        }
+                        while let Ok(extra) = rx.try_recv() { events.push(extra); }
 
                         let mut changes = Vec::new();
                         for event in events {
-                            let doc_id = extract_id_from_path(&event.path);
+                            let doc_id = event.path.clone(); // The path is the ID in FireLite
                             
-                            // VARIANT 1: Single Document Filter
-                            if let Some(target_id) = &query_template.doc_id_filter {
+                            // ID Filtering (Optimization: check before reading disk)
+                            if let Some(ref target_id) = query_template.doc_id_filter {
                                 if &doc_id != target_id { continue; }
                             }
 
                             match event.kind {
                                 crate::engine::ChangeKind::Delete => {
-                                    // FIX: Create a minimal "Tombstone" with a current timestamp
-                                    // This ensures the frontend's (newTime >= oldTime) check passes.
-                                    let mut tombstone = serde_json::Map::new();
-                                    tombstone.insert(
-                                        "_time".to_string(), 
-                                        serde_json::json!(std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap()
-                                            .as_micros() as i64)
-                                    );
-
+                                    // Provide a timestamp for the delete so client can ignore stale updates
+                                    let mut meta = serde_json::Map::new();
+                                    meta.insert("_time".to_string(), serde_json::json!(crate::util::clock::unix_millis() * 1000));
+                                    
                                     changes.push(DocumentChange { 
                                         kind: DeltaKind::Delete, 
                                         doc_id, 
-                                        data: Some(serde_json::Value::Object(tombstone)) 
+                                        data: Some(serde_json::Value::Object(meta)) 
                                     });
                                 }
                                 crate::engine::ChangeKind::Put => {
@@ -301,31 +297,40 @@ impl FireLiteGateway {
                                     };
 
                                     if let Ok(Some(bytes)) = bytes_res {
-                                        // VARIANT 2 & 3: Filtered Query / DocChanges
+                                        // Complex Query Filtering
+                                        let doc_time = i64::from_le_bytes(bytes[2..10].try_into().unwrap_or([0;8]));
                                         if crate::query::executor::worker::matches_filters_view(&doc_id, &bytes, &filter_plan) {
-                                            let doc = if let Some(p) = &query_template.projection {
+                                            // Handle Projection
+                                            let doc = if let Some(ref p) = query_template.projection {
                                                 FireLiteDoc::decode_projected(&bytes, p)
                                             } else {
                                                 FireLiteDoc::decode(&bytes)
                                             };
+
                                             if let Some(mut d) = doc {
                                                 let _ = db.resolve_document_blobs(&mut d, &query_template.collection);
                                                 changes.push(DocumentChange { 
                                                     kind: DeltaKind::Update, 
-                                                    doc_id, 
-                                                    data: doc_to_json_value(&d).ok() 
+                                                    doc_id: doc_id.clone(), 
+                                                    data: doc_to_json_value(&doc_id,&d).ok() 
                                                 });
                                             }
                                         } else {
-                                            // Exit Event: Doc updated but no longer matches query filters
-                                            changes.push(DocumentChange { kind: DeltaKind::Delete, doc_id, data: None });
+                                            // This handles the "Exit" case: 
+                                            // Doc existed and matched, but was updated to no longer match.
+                                            let mut meta = serde_json::Map::new();
+                                            meta.insert("_time".to_string(), serde_json::json!(doc_time));
+                                            changes.push(DocumentChange { 
+                                                kind: DeltaKind::Delete, 
+                                                doc_id, 
+                                                data: Some(serde_json::Value::Object(meta)) 
+                                            });
                                         }
                                     }
                                 }
                             }
                         }
 
-                        // Emit batch only if there are relevant changes
                         if !changes.is_empty() {
                             let _ = window.emit(&ename, DeltaPayload {
                                 listener_id: lid.clone(),
@@ -344,9 +349,9 @@ impl FireLiteGateway {
     }
 }
 
-fn extract_id_from_path(path: &str) -> String {
-    path.to_string()
-}
+// fn extract_id_from_path(path: &str) -> String {
+//     path.to_string()
+// }
 
 #[derive(Debug, Clone)]
 struct QueryInput {
@@ -377,7 +382,7 @@ pub async fn firelite_exec<R: Runtime>(
         match op {
             FireLiteOp::Get { collection, doc_id } => {
                 let doc = gateway.db.get(&collection, &doc_id).map_err(|e| e.to_string())?;
-                let data = doc.map(|d| doc_to_json_value(&d)).transpose()?;
+                let data = doc.map(|d| doc_to_json_value(&doc_id, &d)).transpose()?;
                 Ok(FireLiteResponse::Document { data })
             }
             FireLiteOp::Set { collection, doc_id, data } => {
@@ -573,12 +578,12 @@ fn execute_query_input(db: &FireLite, input: &QueryInput) -> Result<Vec<serde_js
     if let Some(projection) = &input.projection {
         if !projection.is_empty() {
             let rows = db.query_projected_zero_copy(query.clone(), projection).map_err(|e| e.to_string())?;
-            return rows.into_iter().map(|(_, fields)| projection_fields_to_json(fields)).collect();
+            return rows.into_iter().map(|(id, fields)| projection_fields_to_json(&id, fields)).collect();
         }
     }
 
     let rows = db.query(query).map_err(|e| e.to_string())?;
-    rows.into_iter().map(|(_, doc)| doc_to_json_value(&doc)).collect()
+    rows.into_iter().map(|(id, doc)| doc_to_json_value(&id, &doc)).collect()
 }
 
 fn map_operator(op: &FilterOperator) -> Operator {
@@ -621,12 +626,19 @@ fn json_value_to_value(v: &serde_json::Value) -> Result<Value, String> {
     Value::from_json(v.clone())
 }
 
-fn doc_to_json_value(doc: &FireLiteDoc) -> Result<serde_json::Value, String> {
-    Ok(doc.to_json())
+fn doc_to_json_value(id: &str, doc: &FireLiteDoc) -> Result<serde_json::Value, String> {
+    // Ok(doc.to_json())
+    let mut json = doc.to_json();
+    if let Some(obj) = json.as_object_mut() {
+        // Force the ID into the JSON response
+        obj.insert("id".to_string(), serde_json::Value::String(id.to_string()));
+    }
+    Ok(json)
 }
 
-fn projection_fields_to_json(fields: Vec<(String, Value)>) -> Result<serde_json::Value, String> {
+fn projection_fields_to_json(id: &str, fields: Vec<(String, Value)>) -> Result<serde_json::Value, String> {
     let mut map = serde_json::Map::new();
+    map.insert("id".to_string(), serde_json::Value::String(id.to_string()));
     for (k, v) in fields {
         map.insert(k, value_to_json(&v)?);
     }

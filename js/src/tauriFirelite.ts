@@ -94,17 +94,23 @@ export class CollectionGroupReference {
 }
 
 export class DocumentSnapshot {
+    public readonly id: string; 
     public readonly _time: number;
     constructor(
-        public readonly id: string, 
+        id: string, 
         private readonly _exists: boolean, 
         private readonly _data?: FireLiteRecord,
         private readonly _ref?: DocumentReference
     ) {
+        this.id = id || _data?.id;
         this._time = ( _data as any)?._time || 0;
     }
     exists() { return this._exists; }
-    data() { return this._data; }
+    data() { 
+        if (!this._data) return undefined;
+        // Return data with the ID included
+        return { ...this._data, id: this.id };
+    }
     get createdAt(): Date { return new Date(this._time / 1000); }
     get ref() { return this._ref || new DocumentReference('', this.id); }
 }
@@ -253,7 +259,6 @@ export function onSnapshot(
     const event_name = `firelite://snapshot/${listener_id}`;
     const params = buildQueryParams(q);
 
-    // Persistent state for this specific listener
     let localCache = new Map<string, any>();
     let unlisten: UnlistenFn;
 
@@ -263,84 +268,83 @@ export function onSnapshot(
                 const { changes } = event.payload;
                 const documentChanges: DocumentChange[] = [];
 
-                // 1. Process the Batch of Deltas
                 changes.forEach(change => {
                     const { kind, doc_id, data } = change;
-                    const newTime = data?._time || 0;
 
+                    const existing = localCache.get(doc_id);
+                    const oldTime = existing?._time || 0;
+                    const eventTime = data?._time || 0;
+
+                    if (data && !data.id) {
+                        data.id = doc_id;
+                    }
+                    
                     if (kind === 'full') {
                         localCache.clear();
-                        const rows = data as any[];
-                        rows.forEach(r => {
-                            const id = (r.id || doc_id).toString();
-                            localCache.set(id, r);
+                        (data as any[]).forEach(r => {
+                            const id = r.id || doc_id;
+                            localCache.set(id.toString(), r);
                             documentChanges.push({ type: 'added', doc: new DocumentSnapshot(id, true, r) });
                         });
                     } 
                     else if (kind === 'update') {
-                        const existing = localCache.get(doc_id);
-                        const oldTime = existing?._time || 0;
-
-                        // VERSION CHECK: Only update if the incoming data is newer or same age
-                        if (newTime >= oldTime) {
+                        if (eventTime >= oldTime) {
                             const type = existing ? 'modified' : 'added';
                             localCache.set(doc_id, data);
                             documentChanges.push({ type, doc: new DocumentSnapshot(doc_id, true, data) });
-                        } else {
-                            console.log(`[FireLite] Ignored stale update for ${doc_id} (Incoming: ${newTime}, Local: ${oldTime})`);
                         }
                     } 
                     else if (kind === 'delete') {
-                        const existing = localCache.get(doc_id);
-                        const oldTime = existing?._time || 0;
-
-                        // Only delete if the delete event is newer than the last update we saw
-                        if (newTime >= oldTime) {
-                            if (localCache.has(doc_id)) {
-                                const oldData = localCache.get(doc_id);
+                        if (existing) {
+                            if (eventTime >= oldTime) {
                                 localCache.delete(doc_id);
-                                documentChanges.push({ type: 'removed', doc: new DocumentSnapshot(doc_id, true, oldData) });
+                                documentChanges.push({ 
+                                    type: 'removed', 
+                                    doc: new DocumentSnapshot(doc_id, false, existing) 
+                                });
+                            } else {
+                                console.log(`[FireLite] Suppressed stale delete for ${doc_id}. Event: ${eventTime}, Local: ${oldTime}`);
                             }
                         }
                     }
                 });
 
-                // 2. Branch Logic: Document vs Query
+                // BRANCH: Single Document Watch
                 if (isDoc) {
                     const docId = (q as DocumentReference).id;
                     const docData = localCache.get(docId);
-                    onNext(new DocumentSnapshot(docId, !!docData, docData));
+                    // For a doc watch, we return a DocumentSnapshot
+                    onNext(new DocumentSnapshot(docId, !!docData, docData, q as DocumentReference));
                 } 
+                // BRANCH: Query Watch
                 else {
-                    // 3. Handle Lists (Sorting & Pagination)
                     let docs = Array.from(localCache.values()).map(r => new DocumentSnapshot(r.id, true, r));
 
-                    // Variant 4: Client-side OrderBy
+                    // Apply OrderBy (FireLite core sorting is for static queries; 
+                    // Snapshots must maintain order as new data streams in)
                     if (params.order_by) {
                         const { field, ascending } = params.order_by;
                         docs.sort((a, b) => {
-                            const valA = a.data()?.[field] ?? '';
-                            const valB = b.data()?.[field] ?? '';
+                            const valA = a.data()?.[field];
+                            const valB = b.data()?.[field];
                             if (valA === valB) return 0;
                             const cmp = valA < valB ? -1 : 1;
                             return ascending ? cmp : -cmp;
                         });
                     }
 
-                    // Variant 4: Client-side Limit & Offset (Pagination)
+                    // Apply Pagination
                     if (params.offset || params.limit) {
-                        const start = params.offset || 0;
-                        const end = params.limit ? start + params.limit : docs.length;
-                        docs = docs.slice(start, end);
+                        const startIdx = params.offset || 0;
+                        const endIdx = params.limit ? startIdx + params.limit : docs.length;
+                        docs = docs.slice(startIdx, endIdx);
                     }
 
-                    // Variant 3: DocChanges
-                    // Trigger callback with the list and the specific delta metadata
                     onNext(new QuerySnapshot(docs, documentChanges));
                 }
             });
 
-            // Register the subscription in the Rust backend
+            // Handshake with Rust
             await exec({
                 op: 'subscribe',
                 listener_id,
@@ -355,7 +359,6 @@ export function onSnapshot(
 
     start();
 
-    // Return Unsubscribe Function
     return () => {
         if (unlisten) unlisten();
         exec({ op: 'unsubscribe', listener_id }).catch(() => {});
