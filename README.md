@@ -40,21 +40,21 @@ FireLite has evolved from a foundation stage into a **Production-Candidate** eng
   - `begin_transaction` + staged mutations + `commit`
   - `begin_serializable_transaction` with conflict-aware commit validation (read/write version checks)
 - Durable storage stack
-  - multi-segment value storage with level tiers (`segment-l{level}-{id}.dat`)
-  - WAL with transactional markers (`BeginTx` / `CommitTx`)
+  - shard-oriented segment storage (`segment-l{level}-{id}.dat`) with tiered compaction
+  - WAL with transactional markers (`BeginTx` / `CommitTx`) and group commit batching
   - committed-op recovery replay
-  - WAL snapshot rewrite after tier compaction for index+data coupling
+  - index snapshot + WAL rewrite flow after compaction/recovery
 - Durability tuning
-  - configurable `DurabilityMode`: `Always`, `Interval`, `Manual`
+  - configurable `DurabilityMode`: `Always`, `Interval`, `Manual`, `OnCommit`
   - group commit control via `group_commit_max_ops`
 - Encryption at rest
   - optional key-based encryption for WAL payloads
   - optional key-based encryption for segment payloads
 - Query features
-  - filters (`Eq`, `Ne`, `Gt`, `Gte`, `Lt`, `Lte`)
-  - ordering and limit
+  - filters (`Eq`, `Ne`, `Gt`, `Gte`, `Lt`, `Lte`, `In`, `NotIn`, `ArrayContains`, `ArrayContainsAny`, `Match`, `Contains`, `StartsWith`)
+  - ordering, limit, offset, and cursor bounds (`startAt/startAfter/endAt/endBefore`)
   - cost-aware planner decision using collection/cardinality heuristics
-  - predicate pushdown shortcut via doc-view prefilter before full decode
+  - predicate pushdown via `FireLiteDocView` prefilter before full decode
   - rich projection pushdown across Rust API, C-FFI, JS client, and Tauri gateway
   - parallel task-sharded execution
 - Indexing: 
@@ -279,6 +279,14 @@ await stop();
 ## Net Sync (LAN Replication)
 
 Net Sync is available with the `net-sync` feature and exposed through the C-FFI.
+
+What it provides:
+
+- mDNS-based peer discovery for local mesh clusters.
+- Room-key isolation using SHA-256 room hashing (`Identify` handshake validation).
+- Delta replication via WAL operation payloads (`Replication` packets).
+- Live node status telemetry (`idle` / `connected` / `syncing`, peer count, known peers).
+- Relay/mesh fan-out controls for multi-hop LAN topologies.
 
 Core FFI functions:
 
