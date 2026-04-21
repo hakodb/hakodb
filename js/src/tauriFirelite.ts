@@ -57,12 +57,23 @@ function generateId() {
 }
 
 function normalizeValue(v: any): any {
+    if (v === undefined || v === null) return null;
     if (v instanceof Uint8Array) return Array.from(v);
-    if (v instanceof Date) return v.getTime() * 1000; 
+    if (v instanceof Date) return v.getTime() * 1000;
+    
+    // Only recurse if it's a basic array or plain object
     if (Array.isArray(v)) return v.map(normalizeValue);
-    if (typeof v === 'object' && v !== null) {
-        if (v instanceof DocumentSnapshot) return v.data(); 
-        return Object.fromEntries(Object.entries(v).map(([k, val]) => [k, normalizeValue(val)]));
+    
+    if (typeof v === 'object') {
+        if (v instanceof DocumentSnapshot) return v.data();
+        const out: any = {};
+        for (const key in v) {
+            // Avoid deep recursion on non-own properties
+            if (Object.prototype.hasOwnProperty.call(v, key)) {
+                out[key] = normalizeValue(v[key]);
+            }
+        }
+        return out;
     }
     return v;
 }
@@ -96,6 +107,7 @@ export class CollectionGroupReference {
 export class DocumentSnapshot {
     public readonly id: string; 
     public readonly _time: number;
+
     constructor(
         id: string, 
         private readonly _exists: boolean, 
@@ -103,16 +115,39 @@ export class DocumentSnapshot {
         private readonly _ref?: DocumentReference
     ) {
         this.id = id || _data?.id;
-        this._time = ( _data as any)?._time || 0;
+        this._time = (_data as any)?._time || 0;
     }
+
     exists() { return this._exists; }
+
     data() { 
         if (!this._data) return undefined;
-        // Return data with the ID included
-        return { ...this._data, id: this.id };
+        // Deep clone and transform special types (Binary/Dates)
+        return this.transformOutput({ ...this._data, id: this.id });
     }
-    get createdAt(): Date { return new Date(this._time / 1000); }
-    get ref() { return this._ref || new DocumentReference('', this.id); }
+
+    private transformOutput(obj: any): any {
+        if (Array.isArray(obj)) return obj.map(v => this.transformOutput(v));
+        if (obj !== null && typeof obj === 'object') {
+            const out: any = {};
+            for (const key in obj) {
+                let val = obj[key];
+                
+                // Handle our optimized Base64 Binary format
+                if (typeof val === 'string' && val.startsWith('__b64__:')) {
+                    const b64String = val.slice(8);
+                    const bin = atob(b64String);
+                    const bytes = new Uint8Array(bin.length);
+                    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                    val = bytes;
+                }
+                
+                out[key] = this.transformOutput(val);
+            }
+            return out;
+        }
+        return obj;
+    }
 }
 
 export interface DocumentChange {
@@ -259,6 +294,7 @@ export function onSnapshot(
     const event_name = `firelite://snapshot/${listener_id}`;
     const params = buildQueryParams(q);
 
+    // This cache persists for the life of the listener
     let localCache = new Map<string, any>();
     let unlisten: UnlistenFn;
 
@@ -267,73 +303,84 @@ export function onSnapshot(
             unlisten = await listen<DeltaPayload>(event_name, (event) => {
                 const { changes } = event.payload;
                 const documentChanges: DocumentChange[] = [];
+                let hasChanged = false;
 
+                // 1. PROCESS CHANGES IN BATCH
                 changes.forEach(change => {
                     const { kind, doc_id, data } = change;
-
                     const existing = localCache.get(doc_id);
+                    
+                    // Metadata for Versioning
                     const oldTime = existing?._time || 0;
                     const eventTime = data?._time || 0;
 
-                    if (data && !data.id) {
-                        data.id = doc_id;
-                    }
-                    
                     if (kind === 'full') {
                         localCache.clear();
                         (data as any[]).forEach(r => {
-                            const id = r.id || doc_id;
-                            localCache.set(id.toString(), r);
-                            documentChanges.push({ type: 'added', doc: new DocumentSnapshot(id, true, r) });
+                            const id = (r.id || doc_id).toString();
+                            localCache.set(id, r);
                         });
+                        hasChanged = true;
                     } 
                     else if (kind === 'update') {
+                        // LAST WRITE WINS: Only update if the incoming data is newer or equal
                         if (eventTime >= oldTime) {
                             const type = existing ? 'modified' : 'added';
                             localCache.set(doc_id, data);
-                            documentChanges.push({ type, doc: new DocumentSnapshot(doc_id, true, data) });
+                            documentChanges.push({ 
+                                type, 
+                                doc: new DocumentSnapshot(doc_id, true, data) 
+                            });
+                            hasChanged = true;
                         }
                     } 
                     else if (kind === 'delete') {
-                        if (existing) {
-                            if (eventTime >= oldTime) {
-                                localCache.delete(doc_id);
-                                documentChanges.push({ 
-                                    type: 'removed', 
-                                    doc: new DocumentSnapshot(doc_id, false, existing) 
-                                });
-                            } else {
-                                console.log(`[FireLite] Suppressed stale delete for ${doc_id}. Event: ${eventTime}, Local: ${oldTime}`);
-                            }
+                        // LAST WRITE WINS DELETE: 
+                        // Only delete if the delete event is newer than our cached version.
+                        // This prevents a delayed delete from an old version of the doc 
+                        // from killing a brand new update.
+                        if (existing && eventTime >= oldTime) {
+                            localCache.delete(doc_id);
+                            documentChanges.push({ 
+                                type: 'removed', 
+                                doc: new DocumentSnapshot(doc_id, false, existing) 
+                            });
+                            hasChanged = true;
+                        } else if (existing) {
+                            console.warn(`[FireLite] Ignored stale delete for ${doc_id}. Event time: ${eventTime}, Local time: ${oldTime}`);
                         }
                     }
                 });
 
-                // BRANCH: Single Document Watch
+                // 2. ONLY TRIGGER UI UPDATE IF DATA ACTUALLY CHANGED
+                if (!hasChanged) return;
+
                 if (isDoc) {
+                    // Document Branch: Return a single DocumentSnapshot
                     const docId = (q as DocumentReference).id;
                     const docData = localCache.get(docId);
-                    // For a doc watch, we return a DocumentSnapshot
                     onNext(new DocumentSnapshot(docId, !!docData, docData, q as DocumentReference));
                 } 
-                // BRANCH: Query Watch
                 else {
-                    let docs = Array.from(localCache.values()).map(r => new DocumentSnapshot(r.id, true, r));
+                    // Query Branch: Return a QuerySnapshot
+                    // Step A: Convert Map to Array
+                    let docs = Array.from(localCache.values()).map(r => 
+                        new DocumentSnapshot(r.id.toString(), true, r)
+                    );
 
-                    // Apply OrderBy (FireLite core sorting is for static queries; 
-                    // Snapshots must maintain order as new data streams in)
+                    // Step B: Maintain Order (Important because Map doesn't guarantee query order)
                     if (params.order_by) {
                         const { field, ascending } = params.order_by;
                         docs.sort((a, b) => {
-                            const valA = a.data()?.[field];
-                            const valB = b.data()?.[field];
+                            const valA = (a as any).data()?.[field];
+                            const valB = (b as any).data()?.[field];
                             if (valA === valB) return 0;
                             const cmp = valA < valB ? -1 : 1;
                             return ascending ? cmp : -cmp;
                         });
                     }
 
-                    // Apply Pagination
+                    // Step C: Apply Pagination (Client-side)
                     if (params.offset || params.limit) {
                         const startIdx = params.offset || 0;
                         const endIdx = params.limit ? startIdx + params.limit : docs.length;
@@ -344,7 +391,7 @@ export function onSnapshot(
                 }
             });
 
-            // Handshake with Rust
+            // 3. REGISTER WITH BACKEND
             await exec({
                 op: 'subscribe',
                 listener_id,
@@ -359,8 +406,10 @@ export function onSnapshot(
 
     start();
 
+    // 4. CLEANUP
     return () => {
         if (unlisten) unlisten();
+        // Fire and forget the unsubscribe to keep the UI snappy
         exec({ op: 'unsubscribe', listener_id }).catch(() => {});
     };
 }
