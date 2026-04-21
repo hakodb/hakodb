@@ -394,6 +394,21 @@ impl ParallelQueryExecutor {
             }
         }
 
+        // Ensure default keys exist for requested operations
+        for op in ops {
+            match op {
+                AggregateOp::Count => {
+                    final_results.entry("count".to_string()).or_insert(0.0);
+                }
+                AggregateOp::Sum(field) => {
+                    final_results.entry(format!("sum_{}", field)).or_insert(0.0);
+                }
+                AggregateOp::Avg(field) => {
+                    final_results.entry(format!("avg_{}", field)).or_insert(0.0);
+                }
+            }
+        }
+
         Ok(final_results)
     }
 
