@@ -93,7 +93,7 @@ pub enum FireLiteResponse {
     AuditLog { entries: Vec<crate::engine::AuditEntry> },
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct FilterInput {
     pub field: String,
@@ -101,7 +101,7 @@ pub struct FilterInput {
     pub value: serde_json::Value,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct OrderByInput {
     pub field: String,
@@ -349,12 +349,8 @@ impl FireLiteGateway {
     }
 }
 
-// fn extract_id_from_path(path: &str) -> String {
-//     path.to_string()
-// }
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct QueryInput {
+#[derive(Debug, Clone)]
+struct QueryInput {
     collection: String,
     filters: Vec<FilterInput>,
     or_groups: Option<Vec<Vec<FilterInput>>>,
@@ -544,7 +540,7 @@ pub async fn firelite_exec<R: Runtime>(
     .unwrap_or_else(|e| Err(format!("Tokio Task Error: {}", e))) 
 }
 
-pub fn execute_query_input(db: &FireLite, input: &QueryInput) -> Result<Vec<serde_json::Value>, String> {
+fn execute_query_input(db: &FireLite, input: &QueryInput) -> Result<Vec<serde_json::Value>, String> {
     let mut query = Query::new(&input.collection);
 
     for filter in &input.filters {

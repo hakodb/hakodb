@@ -78,48 +78,7 @@ function normalizeValue(v: any): any {
     return v;
 }
 
-/** 
- * Helper to ensure the payload matches the Rust QueryInput struct 
- * exactly as it was sent via buildQueryParams() before.
- */
-function buildQueryParamsFromOp(op: any) {
-    return {
-        collection: op.collection,
-        filters: op.filters || [],
-        or_groups: op.or_groups,
-        order_by: op.order_by,
-        limit: op.limit,
-        offset: op.offset,
-        projection: op.projection,
-        start_at: op.start_at,
-        start_after: op.start_after,
-        end_at: op.end_at,
-        end_before: op.end_before
-    };
-}
-
 async function exec(op: any): Promise<any> {
-    // HIGH-SPEED PATH: Queries and Large Gets
-    if (op.op === 'query' && !op.set && !op.delete) {
-        // Construct the same QueryInput struct Rust expects
-        const queryInput = buildQueryParamsFromOp(op);
-
-        const response = await fetch('firelite-data://localhost/query', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(queryInput)
-        });
-
-        if (!response.ok) {
-            const err = await response.text();
-            throw new Error(`FireLite Protocol Error: ${err}`);
-        }
-
-        // fetch().json() is significantly faster than Tauri's internal JSON parsing 
-        // because it runs on a background browser thread.
-        const rows = await response.json();
-        return { query_result: { rows } };
-    }
     // Note: The 'op' field inside the payload is the variant tag
     // The other fields must match the Rust struct fields (snake_case)
     const res = await invoke<any>('firelite_exec', { op });

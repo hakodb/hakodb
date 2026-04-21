@@ -49,7 +49,10 @@ pub struct NetworkStatus {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum NetPacket {
     Identify { id: String, room_hash: [u8; 32] },
-    Ping { versions: HashMap<String, i64> },
+    Ping { 
+        versions: HashMap<String, i64>, 
+        indexes: crate::engine::engine::IndexList,
+    },
     SyncRequest,
     Replication { msg_id: u128, collection: String, ops: Vec<WalOp> },
 }
@@ -403,7 +406,11 @@ impl NetSyncer {
 
                 if should_ping {
                     let my_versions = db_audit.get_version_map();
-                    let packet = NetPacket::Ping { versions: my_versions };
+                    let my_indexes = db_audit.list_indexes(None);
+                    let packet = NetPacket::Ping { 
+                        versions: my_versions, 
+                        indexes: my_indexes
+                    };
                     
                     if let Ok(payload) = bincode::serialize(&packet) {
                         let mut guard = peers_audit.lock().await;
@@ -484,10 +491,14 @@ async fn handle_peer(
 
     // 3. Initial Sync Trigger
     let my_versions = db.get_version_map();
+    let my_indexes = db.list_indexes(None);
     {
         let mut guard = peers_map.lock().await;
         if let Some(w) = guard.get_mut(&peer_id) {
-            let _ = send_packet(w, NetPacket::Ping { versions: my_versions }).await;
+            let _ = send_packet(w, NetPacket::Ping { 
+                versions: my_versions, 
+                indexes: my_indexes
+            }).await;
             let _ = send_packet(w, NetPacket::SyncRequest).await;
         }
     }
@@ -499,8 +510,35 @@ async fn handle_peer(
 
         if let Ok(packet) = bincode::deserialize::<NetPacket>(&raw) {
             match packet {
-                NetPacket::Ping { versions } => {
+                NetPacket::Ping { versions, indexes } => {
                     if let Ok(mut lp) = last_ping.lock() { *lp = Instant::now(); }
+                    
+                    for (col, fields) in indexes.secondary {
+                        for field in fields {
+                            // db.create_index is internal-idempotent (it won't recreate if exists)
+                            let _ = db.create_index(&col, &field);
+                        }
+                    }
+
+                    // 2. Sync FTS Indexes
+                    for (col, fields) in indexes.fts {
+                        for field in fields {
+                            let _ = db.create_fts_index(&col, &field);
+                        }
+                    }
+
+                    // 3. Sync Composite Indexes
+                    use crate::index::composite::definition::SortDirection;
+                    for comp in indexes.composite {
+                        let fields: Vec<(String, SortDirection)> = comp.fields.into_iter().map(|f| {
+                            let dir = if f.direction == "desc" { SortDirection::Desc } else { SortDirection::Asc };
+                            (f.field, dir)
+                        }).collect();
+                        
+                        // This registers the index and starts background backfilling
+                        db.create_composite_index(&comp.collection, fields);
+                    }
+                    
                     for (col, remote_time) in versions {
                         if excluded.contains(&col) { continue; }
                         if db.get_collection_version(&col) > remote_time {
