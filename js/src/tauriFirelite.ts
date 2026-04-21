@@ -57,69 +57,26 @@ function generateId() {
 }
 
 function normalizeValue(v: any): any {
-    if (v === undefined || v === null) return null;
+    if (v === null || typeof v !== 'object') return v; // Fast path for primitives
+    
     if (v instanceof Uint8Array) return Array.from(v);
     if (v instanceof Date) return v.getTime() * 1000;
     
-    // Only recurse if it's a basic array or plain object
-    if (Array.isArray(v)) return v.map(normalizeValue);
-    
-    if (typeof v === 'object') {
-        if (v instanceof DocumentSnapshot) return v.data();
-        const out: any = {};
-        for (const key in v) {
-            // Avoid deep recursion on non-own properties
-            if (Object.prototype.hasOwnProperty.call(v, key)) {
-                out[key] = normalizeValue(v[key]);
-            }
-        }
+    if (Array.isArray(v)) {
+        const len = v.length;
+        const out = new Array(len);
+        for (let i = 0; i < len; i++) out[i] = normalizeValue(v[i]);
         return out;
     }
-    return v;
-}
 
-/** 
- * Helper to ensure the payload matches the Rust QueryInput struct 
- * exactly as it was sent via buildQueryParams() before.
- */
-function buildQueryParamsFromOp(op: any) {
-    return {
-        collection: op.collection,
-        filters: op.filters || [],
-        or_groups: op.or_groups,
-        order_by: op.order_by,
-        limit: op.limit,
-        offset: op.offset,
-        projection: op.projection,
-        start_at: op.start_at,
-        start_after: op.start_after,
-        end_at: op.end_at,
-        end_before: op.end_before
-    };
+    const out: any = {};
+    for (const key in v) {
+        out[key] = normalizeValue(v[key]);
+    }
+    return out;
 }
 
 async function exec(op: any): Promise<any> {
-    // HIGH-SPEED PATH: Queries and Large Gets
-    if (op.op === 'query' && !op.set && !op.delete) {
-        // Construct the same QueryInput struct Rust expects
-        const queryInput = buildQueryParamsFromOp(op);
-
-        const response = await fetch('firelite-data://localhost/query', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(queryInput)
-        });
-
-        if (!response.ok) {
-            const err = await response.text();
-            throw new Error(`FireLite Protocol Error: ${err}`);
-        }
-
-        // fetch().json() is significantly faster than Tauri's internal JSON parsing 
-        // because it runs on a background browser thread.
-        const rows = await response.json();
-        return { query_result: { rows } };
-    }
     // Note: The 'op' field inside the payload is the variant tag
     // The other fields must match the Rust struct fields (snake_case)
     const res = await invoke<any>('firelite_exec', { op });
@@ -148,6 +105,7 @@ export class CollectionGroupReference {
 export class DocumentSnapshot {
     public readonly id: string; 
     public readonly _time: number;
+    private _cachedData?: FireLiteRecord;
 
     constructor(
         id: string, 
@@ -155,16 +113,22 @@ export class DocumentSnapshot {
         private readonly _data?: FireLiteRecord,
         private readonly _ref?: DocumentReference
     ) {
+        // Use the ID from data if the provided ID is null (common in queries)
         this.id = id || _data?.id;
         this._time = (_data as any)?._time || 0;
     }
-
+    
+    get ref() { return this._ref; }
     exists() { return this._exists; }
 
-    data() { 
+    data(): FireLiteRecord | undefined { 
         if (!this._data) return undefined;
-        // Deep clone and transform special types (Binary/Dates)
-        return this.transformOutput({ ...this._data, id: this.id });
+        
+        // FIXED: Correct lazy-cache assignment
+        if (!this._cachedData) {
+            this._cachedData = this.transformOutput({ ...this._data, id: this.id });
+        }
+        return this._cachedData;
     }
 
     private transformOutput(obj: any): any {
@@ -174,7 +138,7 @@ export class DocumentSnapshot {
             for (const key in obj) {
                 let val = obj[key];
                 
-                // Handle our optimized Base64 Binary format
+                // Optimized Binary Handling
                 if (typeof val === 'string' && val.startsWith('__b64__:')) {
                     const b64String = val.slice(8);
                     const bin = atob(b64String);
@@ -182,7 +146,6 @@ export class DocumentSnapshot {
                     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
                     val = bytes;
                 }
-                
                 out[key] = this.transformOutput(val);
             }
             return out;
@@ -258,24 +221,33 @@ export const updateDoc = async (ref: DocumentReference, data: Partial<FireLiteRe
     await exec({ op: 'patch', collection: ref.collectionPath, doc_id: ref.id, data: normalizeValue(data) });
 };
 
-export const updateDocs = async (q: Query, data: Partial<FireLiteRecord>) => {
+export const updateDocs = async (
+    q: Query | CollectionReference | CollectionGroupReference, 
+    data: Partial<FireLiteRecord>
+) => {
     const params = buildQueryParams(q);
-    return await exec({ 
+    const res = await exec({ 
         op: 'query', 
-        set: true, 
-        data: normalizeValue(data), 
+        action: { patch: { data: normalizeValue(data) } }, 
         ...params 
     });
+    return res.bulk_action_result.count;
 };
 
 export const deleteDoc = async (ref: DocumentReference) => {
     await exec({ op: 'delete', collection: ref.collectionPath, doc_id: ref.id });
 };
 
-export const deleteDocs = async (q: Query) => {
+export const deleteDocs = async (
+    q: Query | CollectionReference | CollectionGroupReference
+) => {
     const params = buildQueryParams(q);
-    // Trigger the mass-delete flag in QueryInput
-    return await exec({ op: 'query', delete: true, ...params });
+    const res = await exec({ 
+        op: 'query', 
+        action: 'delete', 
+        ...params 
+    });
+    return res.bulk_action_result.count;
 };
 
 export const getDoc = async (ref: DocumentReference) => {
@@ -301,7 +273,11 @@ export const endBefore = (...values: any[]) => new QueryConstraint('end_before',
 
 export const getDocs = async (q: Query | CollectionReference | CollectionGroupReference) => {
     const params = buildQueryParams(q);
-    const res = await exec({ op: 'query', ...params });
+    const res = await exec({ 
+        op: 'query', 
+        action: 'fetch', // Explicitly request data
+        ...params 
+    });
     const docs = res.query_result.rows.map((r: any) => new DocumentSnapshot(r.id || generateId(), true, r));
     return new QuerySnapshot(docs);
 };
@@ -335,122 +311,83 @@ export function onSnapshot(
     const event_name = `firelite://snapshot/${listener_id}`;
     const params = buildQueryParams(q);
 
-    // This cache persists for the life of the listener
-    let localCache = new Map<string, any>();
+    // 1. Local state (Raw values)
+    const localCache = new Map<string, any>();
     let unlisten: UnlistenFn;
 
     const start = async () => {
         try {
             unlisten = await listen<DeltaPayload>(event_name, (event) => {
                 const { changes } = event.payload;
-                const documentChanges: DocumentChange[] = [];
                 let hasChanged = false;
 
-                // 1. PROCESS CHANGES IN BATCH
                 changes.forEach(change => {
                     const { kind, doc_id, data } = change;
                     const existing = localCache.get(doc_id);
                     
-                    // Metadata for Versioning
                     const oldTime = existing?._time || 0;
-                    const eventTime = data?._time || 0;
+                    const newTime = data?._time || 0;
 
                     if (kind === 'full') {
                         localCache.clear();
-                        (data as any[]).forEach(r => {
-                            const id = (r.id || doc_id).toString();
-                            localCache.set(id, r);
-                        });
+                        (data as any[]).forEach(r => localCache.set(r.id.toString(), r));
                         hasChanged = true;
                     } 
                     else if (kind === 'update') {
-                        // LAST WRITE WINS: Only update if the incoming data is newer or equal
-                        if (eventTime >= oldTime) {
-                            const type = existing ? 'modified' : 'added';
+                        // RESTORED: Logical Timestamp Comparison (LWW)
+                        if (newTime >= oldTime) {
                             localCache.set(doc_id, data);
-                            documentChanges.push({ 
-                                type, 
-                                doc: new DocumentSnapshot(doc_id, true, data) 
-                            });
                             hasChanged = true;
                         }
                     } 
                     else if (kind === 'delete') {
-                        // LAST WRITE WINS DELETE: 
-                        // Only delete if the delete event is newer than our cached version.
-                        // This prevents a delayed delete from an old version of the doc 
-                        // from killing a brand new update.
-                        if (existing && eventTime >= oldTime) {
+                        // RESTORED: Prevent stale deletes from killing new data
+                        if (existing && newTime >= oldTime) {
                             localCache.delete(doc_id);
-                            documentChanges.push({ 
-                                type: 'removed', 
-                                doc: new DocumentSnapshot(doc_id, false, existing) 
-                            });
                             hasChanged = true;
-                        } else if (existing) {
-                            console.warn(`[FireLite] Ignored stale delete for ${doc_id}. Event time: ${eventTime}, Local time: ${oldTime}`);
                         }
                     }
                 });
 
-                // 2. ONLY TRIGGER UI UPDATE IF DATA ACTUALLY CHANGED
                 if (!hasChanged) return;
 
+                // 2. TERMINAL ACTION: Emit to UI
                 if (isDoc) {
-                    // Document Branch: Return a single DocumentSnapshot
-                    const docId = (q as DocumentReference).id;
-                    const docData = localCache.get(docId);
-                    onNext(new DocumentSnapshot(docId, !!docData, docData, q as DocumentReference));
-                } 
-                else {
-                    // Query Branch: Return a QuerySnapshot
-                    // Step A: Convert Map to Array
-                    let docs = Array.from(localCache.values()).map(r => 
-                        new DocumentSnapshot(r.id.toString(), true, r)
-                    );
-
-                    // Step B: Maintain Order (Important because Map doesn't guarantee query order)
+                    const docData = localCache.get((q as DocumentReference).id);
+                    onNext(new DocumentSnapshot((q as DocumentReference).id, !!docData, docData, q as DocumentReference));
+                } else {
+                    // Optimized Re-sorting: Only if order_by is present
+                    let results = Array.from(localCache.values());
+                    
                     if (params.order_by) {
                         const { field, ascending } = params.order_by;
-                        docs.sort((a, b) => {
-                            const valA = (a as any).data()?.[field];
-                            const valB = (b as any).data()?.[field];
+                        results.sort((a, b) => {
+                            const valA = a[field];
+                            const valB = b[field];
                             if (valA === valB) return 0;
-                            const cmp = valA < valB ? -1 : 1;
-                            return ascending ? cmp : -cmp;
+                            return (valA < valB ? -1 : 1) * (ascending ? 1 : -1);
                         });
                     }
 
-                    // Step C: Apply Pagination (Client-side)
                     if (params.offset || params.limit) {
-                        const startIdx = params.offset || 0;
-                        const endIdx = params.limit ? startIdx + params.limit : docs.length;
-                        docs = docs.slice(startIdx, endIdx);
+                        const start = params.offset || 0;
+                        results = results.slice(start, params.limit ? start + params.limit : undefined);
                     }
 
-                    onNext(new QuerySnapshot(docs, documentChanges));
+                    const snapshots = results.map(r => new DocumentSnapshot(r.id.toString(), true, r));
+                    onNext(new QuerySnapshot(snapshots));
                 }
             });
 
-            // 3. REGISTER WITH BACKEND
-            await exec({
-                op: 'subscribe',
-                listener_id,
-                event_name,
-                ...params
-            });
+            await exec({ op: 'subscribe', listener_id, event_name, ...params });
         } catch (err) {
-            if (onError) onError(err);
-            else console.error("FireLite Subscription Error:", err);
+            onError?.(err);
         }
     };
 
     start();
-
-    // 4. CLEANUP
     return () => {
         if (unlisten) unlisten();
-        // Fire and forget the unsubscribe to keep the UI snappy
         exec({ op: 'unsubscribe', listener_id }).catch(() => {});
     };
 }

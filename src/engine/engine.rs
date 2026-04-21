@@ -19,6 +19,7 @@ use crate::index::storage::index_storage::IndexStorage;
 use crate::query::executor::executor::ParallelQueryExecutor;
 use crate::query::planner::QueryPlanner;
 use crate::query::query::Query;
+use crate::query::builder::Collection;
 use crate::storage::wal::WalOp;
 use crate::storage::blob::{BlobManager, BlobWork};
 use crate::storage::engine::{StorageEngine, Pointer};
@@ -771,6 +772,10 @@ impl FireLite {
         Ok(res.into_iter().next().unwrap_or_default())
     }
 
+    pub fn collection(&self, name: &str) -> Collection<'_> {
+        Collection::new(self, name)
+    }
+
     pub fn query(&self, query: Query) -> Result<Vec<(String, FireLiteDoc)>> {
         if !self.allowed(&query.collection, AccessOp::Query) {
             self.record_audit(AuditEntry {
@@ -867,6 +872,42 @@ impl FireLite {
         });
 
         Ok(data?.into_iter().next().unwrap_or_default()) 
+    }
+
+    pub fn delete_where(&self, query: crate::query::query::Query) -> Result<usize> {
+        // 1. Find the matches
+        let results = self.query(query.clone())?;
+        if results.is_empty() { return Ok(0); }
+
+        // 2. Map to delete mutations
+        let count = results.len();
+        let mutations = results.into_iter()
+            .map(|(id, _)| BatchMutation::Delete { 
+                collection: query.collection.clone(), 
+                doc_id: id 
+            })
+            .collect();
+
+        // 3. Execute batch
+        self.write_batch(mutations)?;
+        Ok(count)
+    }
+
+    pub fn patch_where(&self, query: crate::query::query::Query, updates: Vec<(String, Value)>) -> Result<usize> {
+        let results = self.query(query.clone())?;
+        if results.is_empty() { return Ok(0); }
+
+        let count = results.len();
+        let mutations = results.into_iter()
+            .map(|(id, _)| BatchMutation::Patch { 
+                collection: query.collection.clone(), 
+                doc_id: id, 
+                updates: updates.clone() 
+            })
+            .collect();
+
+        self.write_batch(mutations)?;
+        Ok(count)
     }
 
     pub fn get_stats(&self) -> HashMap<String, usize> {

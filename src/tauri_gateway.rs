@@ -26,6 +26,8 @@ pub enum FireLiteOp {
     CreateCompositeIndex { collection: String, fields: Vec<CompositeFieldInput> },
     Query {
         collection: String,
+        #[serde(default)]
+        action: Option<QueryAction>,
         doc_id_filter: Option<String>,
         #[serde(default)]
         filters: Vec<FilterInput>,
@@ -85,15 +87,17 @@ pub enum FireLiteResponse {
     Document { data: Option<serde_json::Value> },
     QueryResult { rows: Vec<serde_json::Value> },
     AggregateResult { value: f64 },
+    Aggregate(f64), 
     SubscriptionAck { listener_id: String },
     Unsubscribed { listener_id: String },
     Stats { details: serde_json::Value },
     Collections { names: Vec<String> },
     Indexes { list: serde_json::Value },
     AuditLog { entries: Vec<crate::engine::AuditEntry> },
+    BulkActionResult { count: usize },
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct FilterInput {
     pub field: String,
@@ -101,7 +105,7 @@ pub struct FilterInput {
     pub value: serde_json::Value,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct OrderByInput {
     pub field: String,
@@ -349,12 +353,8 @@ impl FireLiteGateway {
     }
 }
 
-// fn extract_id_from_path(path: &str) -> String {
-//     path.to_string()
-// }
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct QueryInput {
+#[derive(Debug, Clone)]
+struct QueryInput {
     collection: String,
     filters: Vec<FilterInput>,
     or_groups: Option<Vec<Vec<FilterInput>>>,
@@ -367,6 +367,14 @@ pub struct QueryInput {
     end_at: Option<Vec<serde_json::Value>>,
     end_before: Option<Vec<serde_json::Value>>,
     doc_id_filter: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryAction {
+    Fetch,
+    Delete,
+    Patch { data: serde_json::Value },
 }
 
 #[command]
@@ -413,11 +421,29 @@ pub async fn firelite_exec<R: Runtime>(
                 gateway.db.persist_index_defs().map_err(|e| e.to_string())?;
                 Ok(FireLiteResponse::Ok)
             }
-            FireLiteOp::Query { collection, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before } => {
-                let rows = execute_query_input(&gateway.db, &QueryInput { 
+            FireLiteOp::Query { collection, action, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before } => {
+                let input = QueryInput { 
                     collection, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before 
-                })?;
-                Ok(FireLiteResponse::QueryResult { rows })
+                };
+                
+                // Resolve the standard query object
+                let query_obj = build_query_from_input(&input)?;
+
+                match action.unwrap_or(QueryAction::Fetch) {
+                    QueryAction::Fetch => {
+                        let rows = execute_query_input(&gateway.db, &input)?;
+                        Ok(FireLiteResponse::QueryResult { rows })
+                    }
+                    QueryAction::Delete => {
+                        let count = gateway.db.delete_where(query_obj).map_err(|e| e.to_string())?;
+                        Ok(FireLiteResponse::BulkActionResult { count })
+                    }
+                    QueryAction::Patch { data } => {
+                        let updates = json_to_vec(&data)?;
+                        let count = gateway.db.patch_where(query_obj, updates).map_err(|e| e.to_string())?;
+                        Ok(FireLiteResponse::BulkActionResult { count })
+                    }
+                }
             }
             FireLiteOp::Batch { mutations } => {
                 let mut batch = Vec::with_capacity(mutations.len());
@@ -544,13 +570,20 @@ pub async fn firelite_exec<R: Runtime>(
     .unwrap_or_else(|e| Err(format!("Tokio Task Error: {}", e))) 
 }
 
-pub fn execute_query_input(db: &FireLite, input: &QueryInput) -> Result<Vec<serde_json::Value>, String> {
+
+fn build_query_from_input(input: &QueryInput) -> Result<Query, String> {
     let mut query = Query::new(&input.collection);
 
+    // 1. Add basic filters
     for filter in &input.filters {
-        query = query.where_filter(&filter.field, map_operator(&filter.op), json_value_to_value(&filter.value)?);
+        query = query.where_filter(
+            &filter.field, 
+            map_operator(&filter.op), 
+            json_value_to_value(&filter.value)?
+        );
     }
 
+    // 2. Add OR groups
     if let Some(groups) = &input.or_groups {
         for group in groups {
             let filters: Vec<crate::query::filter::Filter> = group.iter()
@@ -566,24 +599,44 @@ pub fn execute_query_input(db: &FireLite, input: &QueryInput) -> Result<Vec<serd
         }
     }
 
+    // 3. Sorting and Pagination
     if let Some(order) = &input.order_by { query = query.order_by(&order.field, order.ascending); }
     if let Some(limit) = input.limit { query = query.limit(limit); }
     if let Some(offset) = input.offset { query = query.offset(offset); }
 
+    // 4. Cursor support
     if let Some(v) = &input.start_at { query.start_at = Some(v.iter().map(json_value_to_value).collect::<Result<Vec<_>, _>>()?); }
     if let Some(v) = &input.start_after { query.start_after = Some(v.iter().map(json_value_to_value).collect::<Result<Vec<_>, _>>()?); }
     if let Some(v) = &input.end_at { query.end_at = Some(v.iter().map(json_value_to_value).collect::<Result<Vec<_>, _>>()?); }
     if let Some(v) = &input.end_before { query.end_before = Some(v.iter().map(json_value_to_value).collect::<Result<Vec<_>, _>>()?); }
 
+    Ok(query)
+}
+
+
+fn execute_query_input(db: &FireLite, input: &QueryInput) -> Result<Vec<serde_json::Value>, String> {
+    // USE THE NEW HELPER
+    let query = build_query_from_input(input)?;
+
+    // 1. Parallel Zero-Copy Projection Path
     if let Some(projection) = &input.projection {
         if !projection.is_empty() {
             let rows = db.query_projected_zero_copy(query.clone(), projection).map_err(|e| e.to_string())?;
-            return rows.into_iter().map(|(id, fields)| projection_fields_to_json(&id, fields)).collect();
+            // Use rayon to parallelize JSON construction
+            use rayon::prelude::*;
+            return Ok(rows.into_par_iter()
+                .map(|(id, fields)| projection_fields_to_json(&id, fields).unwrap_or(serde_json::Value::Null))
+                .collect());
         }
     }
 
+    // 2. Parallel Standard Query Path
     let rows = db.query(query).map_err(|e| e.to_string())?;
-    rows.into_iter().map(|(id, doc)| doc_to_json_value(&id, &doc)).collect()
+    
+    use rayon::prelude::*;
+    Ok(rows.into_par_iter()
+        .map(|(id, doc)| doc_to_json_value(&id, &doc).unwrap_or(serde_json::Value::Null))
+        .collect())
 }
 
 fn map_operator(op: &FilterOperator) -> Operator {

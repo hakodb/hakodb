@@ -753,6 +753,54 @@ pub extern "C" fn fl_query_where_eq_bool(
     0
 }
 
+/// Executes the query and deletes all matching documents.
+/// Returns the number of deleted documents, or -1 on error.
+#[no_mangle]
+pub extern "C" fn fl_query_delete(engine: *mut FL_Engine, query: *mut FL_Query) -> i32 {
+    safety_shield!(-1, {
+        if engine.is_null() || query.is_null() { return -1; }
+        let engine = unsafe { &*engine };
+        let query_ptr = unsafe { &*query };
+
+        match engine.db.delete_where(query_ptr.query.clone()) {
+            Ok(count) => {
+                clear_last_error();
+                count as i32
+            },
+            Err(e) => set_last_error(e.to_string()),
+        }
+    })
+}
+
+/// Executes the query and applies the updates from 'patch_doc' to all matches.
+/// Returns the number of updated documents, or -1 on error.
+#[no_mangle]
+pub extern "C" fn fl_query_patch(
+    engine: *mut FL_Engine, 
+    query: *mut FL_Query, 
+    patch_doc: *const FL_Doc
+) -> i32 {
+    safety_shield!(-1, {
+        if engine.is_null() || query.is_null() || patch_doc.is_null() { return -1; }
+        let engine = unsafe { &*engine };
+        let query_ptr = unsafe { &*query };
+        let patch_ptr = unsafe { &*patch_doc };
+
+        // Convert FL_Doc fields to the internal updates vector
+        let updates: Vec<(String, Value)> = patch_ptr.doc.fields.iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+
+        match engine.db.patch_where(query_ptr.query.clone(), updates) {
+            Ok(count) => {
+                clear_last_error();
+                count as i32
+            },
+            Err(e) => set_last_error(e.to_string()),
+        }
+    })
+}
+
 fn apply_string_filter(
     query: *mut FL_Query,
     field: *const c_char,
