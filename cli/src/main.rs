@@ -542,11 +542,8 @@ fn run_query(
 ) -> Result<()> {
     let mut q = Query::new(collection);
 
-    for f in filters {
-        let parsed = parse_filter(f)?;
-        q = q.where_filter(&parsed.field, parsed.op, parsed.value);
-    }
-    for f in and_filters {
+    // --- Build Query using new Fluent logic ---
+    for f in filters.iter().chain(and_filters.iter()) {
         let parsed = parse_filter(f)?;
         q = q.where_filter(&parsed.field, parsed.op, parsed.value);
     }
@@ -558,88 +555,45 @@ fn run_query(
         let (field, text) = parse_fts(fts)?;
         q = q.where_filter(field, Operator::Match, Value::String(text.to_string()));
     }
-
     if let Some(order) = order {
         let (field, asc) = parse_order(order)?;
         q = q.order_by(field, asc);
     }
-    if let Some(limit) = limit {
-        q = q.limit(limit);
-    }
-    if let Some(offset) = offset {
-        q = q.offset(offset);
-    }
-    if let Some(v) = start_at {
-        q.start_at = Some(parse_cursor_values(v)?);
-    }
-    if let Some(v) = start_after {
-        q.start_after = Some(parse_cursor_values(v)?);
-    }
-    if let Some(v) = end_at {
-        q.end_at = Some(parse_cursor_values(v)?);
-    }
-    if let Some(v) = end_before {
-        q.end_before = Some(parse_cursor_values(v)?);
+    if let Some(limit) = limit { q = q.limit(limit); }
+    if let Some(offset) = offset { q = q.offset(offset); }
+    
+    // Cursor handling
+    if let Some(v) = start_at { q.start_at = Some(parse_cursor_values(v)?); }
+    if let Some(v) = start_after { q.start_after = Some(parse_cursor_values(v)?); }
+    if let Some(v) = end_at { q.end_at = Some(parse_cursor_values(v)?); }
+    if let Some(v) = end_before { q.end_before = Some(parse_cursor_values(v)?); }
+
+    // --- CORE CHAINING: Mass Delete ---
+    if delete_action {
+        let count = db.delete_where(q.clone())
+            .context("Failed to execute chained delete")?;
+        println!("OK: mass deleted {count} documents from {collection}");
+        return Ok(());
     }
 
-    if delete_action || set_action {
-        let rows = db.query(q.clone())?;
+    // --- CORE CHAINING: Mass Update/Patch ---
+    if set_action {
+        let raw_json = action_data.ok_or_else(|| anyhow!("--set requires --data with a JSON object"))?;
+        let payload: JsonValue = serde_json::from_str(raw_json).context("Action data must be valid JSON")?;
+        let update_map = payload.as_object().ok_or_else(|| anyhow!("Action data must be an object"))?;
 
-        if delete_action {
-            if rows.is_empty() {
-                println!("No documents found matching the criteria. Nothing deleted.");
-                return Ok(());
-            }
-
-            let mutations: Vec<_> = rows
-                .iter()
-                .map(|(id, _)| firelite::engine::BatchMutation::Delete {
-                    collection: collection.to_string(),
-                    doc_id: id.clone(),
-                })
-                .collect();
-
-            let count = mutations.len();
-            db.write_batch(mutations)?;
-            println!("OK: mass deleted {} documents from {}", count, collection);
-            return Ok(());
+        let mut updates = Vec::new();
+        for (k, v) in update_map {
+            updates.push((k.clone(), json_to_fire(v.clone())?));
         }
 
-        if set_action {
-            if rows.is_empty() {
-                println!("No documents found matching the criteria. Nothing updated.");
-                return Ok(());
-            }
-
-            let raw_json =
-                action_data.ok_or_else(|| anyhow!("--set requires --data with a JSON object"))?;
-            let payload: JsonValue = serde_json::from_str(raw_json)
-                .context("Action data must be a valid JSON object")?;
-            let update_map = payload
-                .as_object()
-                .ok_or_else(|| anyhow!("Action data must be a JSON object"))?;
-
-            let mut updates = Vec::new();
-            for (k, v) in update_map {
-                updates.push((k.clone(), json_to_fire(v.clone())?));
-            }
-
-            let mutations: Vec<_> = rows
-                .iter()
-                .map(|(id, _)| firelite::engine::BatchMutation::Patch {
-                    collection: collection.to_string(),
-                    doc_id: id.clone(),
-                    updates: updates.clone(),
-                })
-                .collect();
-
-            let count = mutations.len();
-            db.write_batch(mutations)?;
-            println!("OK: mass updated {} documents in {}", count, collection);
-            return Ok(());
-        }
+        let count = db.patch_where(q.clone(), updates)
+            .context("Failed to execute chained patch")?;
+        println!("OK: mass updated {count} documents in {collection}");
+        return Ok(());
     }
 
+    // --- Aggregates (using improved core aggregate executor) ---
     if !aggregates.is_empty() {
         let mut agg_results = Vec::new();
         for spec in aggregates {
@@ -657,27 +611,22 @@ fn run_query(
         return Ok(());
     }
 
-    if let Some(select) = select {
-        let fields: Vec<String> = select
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToString::to_string)
-            .collect();
+    // --- Standard Data Retrieval ---
+    if let Some(select_str) = select {
+        let fields: Vec<String> = select_str.split(',').map(|s| s.trim().to_string()).collect();
         let rows = db.query_projected_zero_copy(q, &fields)?;
-        let json_rows: Vec<JsonValue> = rows
-            .into_iter()
+        let json_rows: Vec<JsonValue> = rows.into_iter()
             .map(|(id, fields)| projected_to_json(&id, fields))
             .collect();
         emit_json(&JsonValue::Array(json_rows), output)?;
     } else {
         let rows = db.query(q)?;
-        let json_rows: Vec<JsonValue> = rows
-            .into_iter()
+        let json_rows: Vec<JsonValue> = rows.into_iter()
             .map(|(id, doc)| doc_to_json(&id, &doc))
             .collect();
         emit_json(&JsonValue::Array(json_rows), output)?;
     }
+
     Ok(())
 }
 
@@ -693,19 +642,21 @@ fn run_aggregate(
         let parsed = parse_filter(f)?;
         q = q.where_filter(&parsed.field, parsed.op, parsed.value);
     }
+    
+    // Use core AggregateOp definitions
     q = match kind {
         AggregateKindArg::Count => q.aggregate(AggregateOp::Count),
-        AggregateKindArg::Sum => q.aggregate(AggregateOp::Sum(
-            field
-                .ok_or_else(|| anyhow!("--field is required for sum"))?
-                .to_string(),
-        )),
-        AggregateKindArg::Avg => q.aggregate(AggregateOp::Avg(
-            field
-                .ok_or_else(|| anyhow!("--field is required for avg"))?
-                .to_string(),
-        )),
+        AggregateKindArg::Sum => {
+            let f = field.ok_or_else(|| anyhow!("--field required for sum"))?;
+            q.aggregate(AggregateOp::Sum(f.to_string()))
+        },
+        AggregateKindArg::Avg => {
+            let f = field.ok_or_else(|| anyhow!("--field required for avg"))?;
+            q.aggregate(AggregateOp::Avg(f.to_string()))
+        },
     };
+
+    // The core now handles the O(N) scan automatically if no index matches
     let out = db.execute_aggregation(q)?;
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())

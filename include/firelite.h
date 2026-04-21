@@ -116,6 +116,14 @@ int32_t fl_query_where_eq_str(FL_Query *query, const char *field, const char *va
 
 int32_t fl_query_where_eq_bool(FL_Query *query, const char *field, bool value);
 
+/// Executes the query and deletes all matching documents.
+/// Returns the number of deleted documents, or -1 on error.
+int32_t fl_query_delete(FL_Engine *engine, FL_Query *query);
+
+/// Executes the query and applies the updates from 'patch_doc' to all matches.
+/// Returns the number of updated documents, or -1 on error.
+int32_t fl_query_patch(FL_Engine *engine, FL_Query *query, const FL_Doc *patch_doc);
+
 int32_t fl_query_where_eq_int(FL_Query *query, const char *field, int64_t value);
 
 int32_t fl_query_where_ne_str(FL_Query *query, const char *field, const char *value);

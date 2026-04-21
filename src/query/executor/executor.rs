@@ -305,27 +305,24 @@ impl ParallelQueryExecutor {
         let doc_count = docs.len();
         let mut final_results: HashMap<String, f64> = HashMap::new();
 
-        let process_task = |task: QueryTask,
-                            thread_ops: Vec<AggregateOp>|
-         -> HashMap<String, f64> {
+        let process_task = |task: QueryTask, thread_ops: Vec<AggregateOp>| -> HashMap<String, f64> {
             let mut partial_results = HashMap::new();
             let storage_engine = task.storage.as_ref().unwrap().read().unwrap();
 
             for (id, pointer) in task.docs {
                 if let Ok(Some(bytes)) = storage_engine.read_pointer(&pointer) {
+                    // Check if the document matches the WHERE filters first
                     if matches_filters_view(&id, &bytes, &task.plan) {
                         if let Some(view) = FireLiteDocView::new(&bytes) {
                             for op in &thread_ops {
                                 match op {
                                     AggregateOp::Count => {
-                                        *partial_results
-                                            .entry("count".to_string())
-                                            .or_insert(0.0) += 1.0;
+                                        *partial_results.entry("count".to_string()).or_insert(0.0) += 1.0;
                                     }
                                     AggregateOp::Sum(field) | AggregateOp::Avg(field) => {
-                                        if let Some((_, tag, data)) =
-                                            view.iter().find(|(k, _, _)| k == field)
-                                        {
+                                        // IMPROVEMENT: Instead of failing if index is missing, 
+                                        // we scan the document view for the field.
+                                        if let Some((_, tag, data)) = view.iter().find(|(k, _, _)| k == field) {
                                             let borrowed = BorrowedValue { tag, data };
                                             if let Some(num) = borrowed.as_f64() {
                                                 let key = if matches!(op, AggregateOp::Sum(_)) {
@@ -335,9 +332,7 @@ impl ParallelQueryExecutor {
                                                 };
                                                 *partial_results.entry(key).or_insert(0.0) += num;
                                                 if matches!(op, AggregateOp::Avg(_)) {
-                                                    *partial_results
-                                                        .entry(format!("avg_cnt_{}", field))
-                                                        .or_insert(0.0) += 1.0;
+                                                    *partial_results.entry(format!("avg_cnt_{}", field)).or_insert(0.0) += 1.0;
                                                 }
                                             }
                                         }
