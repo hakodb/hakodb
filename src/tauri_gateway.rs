@@ -544,7 +544,7 @@ pub async fn firelite_exec<R: Runtime>(
     .unwrap_or_else(|e| Err(format!("Tokio Task Error: {}", e))) 
 }
 
-fn execute_query_input(db: &FireLite, input: &QueryInput) -> Result<Vec<serde_json::Value>, String> {
+pub(crate) fn execute_query_input(db: &FireLite, input: &QueryInput) -> Result<Vec<serde_json::Value>, String> {
     let mut query = Query::new(&input.collection);
 
     for filter in &input.filters {
