@@ -229,6 +229,13 @@ enum IndexCommands {
         /// Optional collection filter
         collection: Option<String>,
     },
+    /// list index of collection
+    Keys { collection: String },
+    /// Inspec Index of a field 
+    Inspect {
+        collection: String,
+        field: String,
+    }
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -1111,6 +1118,16 @@ fn execute_command(
             IndexCommands::List { collection } => {
                 let out = db.list_indexes(collection.as_deref());
                 println!("{}", serde_json::to_string_pretty(&out)?);
+            }
+            IndexCommands::Keys { collection } => {
+                let keys = db.list_storage_keys(&collection)?;
+                println!("{}", serde_json::to_string_pretty(&keys)?);
+            }
+            IndexCommands::Inspect { collection, field } => {
+                let entries = db.inspect_index(&collection, &field);
+                for entry in entries {
+                    println!("{}", entry);
+                }
             }
         },
         Commands::TxSet {

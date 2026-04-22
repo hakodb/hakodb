@@ -259,7 +259,8 @@ impl FireLiteGateway {
 
             let filter_plan = {
                 let indexes = db.indexes.read().unwrap();
-                crate::query::planner::QueryPlanner::plan(&base_query, &indexes, 0, 1)
+                let is_ready = db.indexes_ready.load(std::sync::atomic::Ordering::Acquire);
+                crate::query::planner::QueryPlanner::plan(&base_query, &indexes, 0, 1,is_ready)
             };
 
             // --- 3. EVENT LOOP ---
