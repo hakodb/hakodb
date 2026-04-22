@@ -138,7 +138,6 @@ struct ShardWork {
     ops: Vec<WalOp>,
     keys: Vec<Arc<str>>,
     events: Vec<(String, ChangeEvent)>,
-    // index_puts: Vec<(String, FireLiteDoc)>,
     index_puts: Vec<(String, Arc<FireLiteDoc>)>, 
     index_deletes: Vec<(String, FireLiteDoc)>,
     blob_queue_items: Vec<BlobWork>,
@@ -306,6 +305,7 @@ impl FireLite {
                             }
                         }
                     }
+
                 }
             }
         });
