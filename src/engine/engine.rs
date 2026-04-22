@@ -612,9 +612,6 @@ impl FireLite {
 
             assigned_ids.push(doc_id.clone());
 
-            // 2. COMPUTE KEY ONCE
-            let key_arc: Arc<str> = Arc::from(doc_id.as_str());
-
             let work = shard_map.entry(col.clone()).or_insert_with(|| ShardWork {
                 ops: Vec::new(), 
                 keys: Vec::new(), 
@@ -624,22 +621,13 @@ impl FireLite {
                 index_deletes: Vec::new()
             });
 
+            // 2. COMPUTE KEY ONCE
+            let key_arc: Arc<str> = Arc::from(doc_id.as_str());
+            work.keys.push(key_arc.clone());
+
             if is_delete {
-                let shard = self.get_shard(&col);
-                let guard = shard.read().unwrap();
-                
-                // CRITICAL: We must get the OLD document content before deleting 
-                // so the indexer knows which entries to remove from the B-Trees.
-                if let Ok(Some(bytes)) = guard.get(&doc_id) {
-                    if let Some(old_doc) = FireLiteDoc::decode(&bytes) {
-                        work.index_deletes.push((doc_id.clone(), old_doc));
-                    }
-                }
-                // let key_clone = key_arc.clone();
-                work.ops.push(WalOp::Delete { key: key_arc.to_string(), timestamp: now_micros });
-                work.keys.push(key_arc);
+                work.ops.push(WalOp::Delete { key: doc_id.clone(), timestamp: now_micros });
                 work.events.push((col, ChangeEvent { path: doc_id, kind: ChangeKind::Delete }));
-                // work.events.push((col, ChangeEvent { path: key_clone.to_string(), kind: ChangeKind::Delete }));
                 continue;
             }
 
@@ -661,7 +649,6 @@ impl FireLite {
             // REUSE KEY for WAL and Index
             work.ops.push(WalOp::PutInlined { key: key_arc.to_string(), value: skeleton_bytes });
             work.keys.push(key_arc); // Reuses the same String allocation
-            // work.index_puts.push((doc_id, doc_arc));
             work.index_puts.push((doc_id, Arc::clone(&doc_arc))); 
             work.events.push((col, ChangeEvent { 
                 path: work.keys.last().unwrap().to_string(), 
@@ -672,13 +659,26 @@ impl FireLite {
         }
 
         // --- APPLY SHARD CHANGES ---
-        for (col_name, work) in shard_map {
+        for (col_name, mut work) in shard_map {
             let shard_arc = self.get_shard(&col_name);
             let index_entries = work.index_puts; 
 
             {
                 let mut shard = shard_arc.write().unwrap();
                 
+                for op in &work.ops {
+                    if let WalOp::Delete { key, .. } = op {
+                        if let Some(old_ptr) = shard.index.get(key) {
+                            // Use the internal read that doesn't require a new lock
+                            if let Ok(Some(bytes)) = shard.read_pointer(old_ptr) {
+                                if let Some(old_doc) = FireLiteDoc::decode(&bytes) {
+                                    work.index_deletes.push((key.clone(), old_doc));
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if !work.ops.is_empty() {
                     let tx_id = shard.next_tx_id;
                     shard.next_tx_id += 1;
@@ -688,6 +688,13 @@ impl FireLite {
                 // Update Shard (Fastest Path: copying pointers)
                 for (doc_id, doc_arc) in &index_entries {
                     shard.update_index_entry(doc_id.clone(), Some(Pointer::BlobPending(Arc::clone(doc_arc))));
+                }
+
+                // Mark deletes in the storage index
+                for op in &work.ops {
+                    if let WalOp::Delete { key, timestamp } = op {
+                        shard.update_index_entry(key.clone(), Some(Pointer::Deleted { timestamp: *timestamp }));
+                    }
                 }
                 
                 let mut b_bytes = 0;
