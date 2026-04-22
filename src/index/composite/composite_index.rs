@@ -23,15 +23,15 @@ impl CompositeIndex {
         }
     }
 
-    pub fn document_values(&self, doc: &FireLiteDoc) -> Option<Vec<Value>> {
+    pub fn document_values(&self, doc_id: &str, doc: &FireLiteDoc) -> Option<Vec<Value>> {
         let mut values = Vec::with_capacity(self.definition.fields.len());
 
         for f in &self.definition.fields {
-            // NEW: Check if the index is requesting the timestamp
-            let v = if f.field == "_time" {
-                Value::Int(doc._time)
-            } else {
-                doc.get(&f.field)?.clone()
+            // NEW: Check if the index is requesting the id and timestamp
+            let v = match f.field.as_str() {
+                "id" => Value::String(doc_id.to_string()), // Index the metadata ID
+                "_time" => Value::Int(doc._time),          // Index the metadata Time
+                _ => doc.get(&f.field)?.clone(),           // Index body fields
             };
             values.push(v);
         }
@@ -40,7 +40,7 @@ impl CompositeIndex {
     }
 
     pub fn index_document(&mut self, doc_id: &str, doc: &FireLiteDoc) {
-        if let Some(values) = self.document_values(doc) {
+        if let Some(values) = self.document_values(&doc_id, doc) {
             self.tree.insert(
                 encode_composite_key(&self.definition, &values, doc_id),
                 // doc_id.to_string(),
@@ -56,7 +56,7 @@ impl CompositeIndex {
         let new_entries = docs
             .into_iter()
             .filter_map(|(doc_id, doc)| {
-                self.document_values(doc).map(|values| {
+                self.document_values(&doc_id, doc).map(|values| {
                     let key = encode_composite_key(&self.definition, &values, doc_id);
                     (key, Arc::from(doc_id))
                 })
@@ -67,7 +67,7 @@ impl CompositeIndex {
     }
 
     pub fn remove_document(&mut self, doc_id: &str, doc: &FireLiteDoc) {
-        if let Some(values) = self.document_values(doc) {
+        if let Some(values) = self.document_values(&doc_id, doc) {
             self.tree
                 .remove(&encode_composite_key(&self.definition, &values, doc_id));
         }
@@ -78,7 +78,7 @@ impl CompositeIndex {
         I: IntoIterator<Item = (&'a str, &'a FireLiteDoc)>,
     {
         for (doc_id, doc) in docs {
-            if let Some(values) = self.document_values(doc) {
+            if let Some(values) = self.document_values(&doc_id, doc) {
                 let key = encode_composite_key(&self.definition, &values, doc_id);
                 self.tree.remove(&key);
             }

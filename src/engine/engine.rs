@@ -140,6 +140,7 @@ struct ShardWork {
     events: Vec<(String, ChangeEvent)>,
     // index_puts: Vec<(String, FireLiteDoc)>,
     index_puts: Vec<(String, Arc<FireLiteDoc>)>, 
+    index_deletes: Vec<(String, FireLiteDoc)>,
     blob_queue_items: Vec<BlobWork>,
 }
 
@@ -231,6 +232,7 @@ pub struct FireLite {
     blob_worker_handle: Mutex<Option<thread::JoinHandle<()>>>,
     pub(crate) trigger_blob_flush: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) id_sequence: std::sync::atomic::AtomicU16,
+    pub(crate) indexes_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FireLite {
@@ -255,6 +257,10 @@ impl FireLite {
         // let (transformation_tx, transformation_rx) = std::sync::mpsc::channel::<TransformTask>();
         let (btx, _brx) = crossbeam_channel::bounded::<BlobWork>(10000);
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+
+        // check if index is ready
+        let indexes_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let indexes_ready_ptr = Arc::clone(&indexes_ready);
 
         // 2. Initialize Core State with EXPLICIT TYPES
         let indexes: Arc<RwLock<IndexManager>> = Arc::new(RwLock::new(IndexManager::default()));
@@ -284,7 +290,7 @@ impl FireLite {
                         for (id, doc) in puts.iter() {
                             IndexingService::apply_put(&mut mgr, &collection, id, doc);
                             for idx in mgr.indexes_for_collection(&collection) {
-                                if let Some(vals) = idx.document_values(&doc) {
+                                if let Some(vals) = idx.document_values(&id, &doc) {
                                     let key_bytes = crate::index::composite::key_encoder::encode_composite_key(&idx.definition, &vals, &id);
                                     let _ = persist.insert(idx.definition.id, key_bytes.to_vec(), id.clone());
                                 }
@@ -293,7 +299,7 @@ impl FireLite {
                         for (id, doc) in deletes {
                             IndexingService::apply_delete(&mut mgr, &collection, &id, &doc);
                             for idx in mgr.indexes_for_collection(&collection) {
-                                if let Some(vals) = idx.document_values(&doc) {
+                                if let Some(vals) = idx.document_values(&id, &doc) {
                                     let key_bytes = crate::index::composite::key_encoder::encode_composite_key(&idx.definition, &vals, &id);
                                     let _ = persist.delete(idx.definition.id, key_bytes.to_vec(), id.clone());
                                 }
@@ -440,6 +446,7 @@ impl FireLite {
             blob_stop_tx: Mutex::new(Some(stop_tx)),
             blob_worker_handle: Mutex::new(Some(blob_worker_handle)),
             id_sequence: std::sync::atomic::AtomicU16::new(0),
+            indexes_ready
         };
 
         let _ = db.restore_index_defs();
@@ -520,6 +527,9 @@ impl FireLite {
                 let _ = crate::index::storage::index_recovery::replay_log(&log_path, &mut mgr.composite);
             }
             
+            // indexes are ready
+            indexes_ready_ptr.store(true, std::sync::atomic::Ordering::Release);
+
             // Note: This thread terminates naturally after recovery, 
             // keeping the idle thread count low.
         });
@@ -584,21 +594,24 @@ impl FireLite {
         let mut shard_map: HashMap<String, ShardWork> = HashMap::new();
         let mut assigned_ids = Vec::with_capacity(mutations.len());
 
+        // Simple local tracker to avoid changing ShardWork
+        // let mut deletes_for_indexer: Vec<(String, String, FireLiteDoc)> = Vec::new();
+
         for m in mutations {
             // 1. Resolve basic info immediately
             let (col, mut doc_id, mut doc, is_delete) = match m {
                 BatchMutation::Put { collection, doc_id, doc } => (collection, doc_id, doc, false),
                 BatchMutation::Patch { collection, doc_id, updates } => {
-                    let mut current_doc = {
-                        let shard = self.get_shard(&collection);
-                        let guard = shard.read().unwrap();
+                    let shard_arc = self.get_shard(&collection);
+                    let current_doc = {
+                        let guard = shard_arc.read().unwrap();
                         guard.get(&doc_id)?
                             .and_then(|b| FireLiteDoc::decode(&b))
                             .unwrap_or_default()
                     };
-                    
-                    for (k, v) in updates { current_doc.insert(k, v); }
-                    (collection, doc_id, current_doc, false)
+                    let mut updated = current_doc;
+                    for (k, v) in updates { updated.insert(k, v); }
+                    (collection, doc_id, updated, false)
                 }
                 BatchMutation::Delete { collection, doc_id } => {
                     (collection, doc_id, FireLiteDoc::default(), true)
@@ -612,18 +625,19 @@ impl FireLite {
             assigned_ids.push(doc_id.clone());
 
             // 2. COMPUTE KEY ONCE
-            let key_arc: Arc<str> = Arc::from(doc_id.as_str());
-
+            
             let work = shard_map.entry(col.clone()).or_insert_with(|| ShardWork {
                 ops: Vec::new(), keys: Vec::new(), events: Vec::new(), 
                 index_puts: Vec::new(), blob_queue_items: Vec::new(),
+                index_deletes: Vec::new()
             });
 
+            let key_arc: Arc<str> = Arc::from(doc_id.as_str());
+            
             if is_delete {
-                let key_clone = key_arc.clone();
-                work.ops.push(WalOp::Delete { key: key_arc.to_string(), timestamp: now_micros });
+                work.ops.push(WalOp::Delete { key: doc_id.clone(), timestamp: now_micros });
                 work.keys.push(key_arc);
-                work.events.push((col, ChangeEvent { path: key_clone.to_string(), kind: ChangeKind::Delete }));
+                work.events.push((col, ChangeEvent { path: doc_id, kind: ChangeKind::Delete }));
                 continue;
             }
 
@@ -644,9 +658,8 @@ impl FireLite {
             
             // REUSE KEY for WAL and Index
             work.ops.push(WalOp::PutInlined { key: key_arc.to_string(), value: skeleton_bytes });
-            work.keys.push(key_arc); // Reuses the same String allocation
-            // work.index_puts.push((doc_id, doc_arc));
             work.index_puts.push((doc_id, Arc::clone(&doc_arc))); 
+            work.keys.push(key_arc); // Reuses the same String allocation
             work.events.push((col, ChangeEvent { 
                 path: work.keys.last().unwrap().to_string(), 
                 kind: ChangeKind::Put 
@@ -656,22 +669,43 @@ impl FireLite {
         }
 
         // --- APPLY SHARD CHANGES ---
-        for (col_name, work) in shard_map {
+        for (col_name, mut work) in shard_map {
             let shard_arc = self.get_shard(&col_name);
-            let index_entries = work.index_puts; 
+            // let index_entries = work.index_puts; 
 
             {
                 let mut shard = shard_arc.write().unwrap();
-                
+            
+                // OPTIMIZATION: Only run the delete-resolution scan if there are actually 
+                // deletes in this specific shard's work.
+                if work.ops.iter().any(|op| matches!(op, WalOp::Delete { .. })) {
+                    for op in &work.ops {
+                        if let WalOp::Delete { key, .. } = op {
+                            if let Some(ptr) = shard.index.get(key) {
+                                if let Ok(Some(bytes)) = shard.read_pointer_internal(ptr, false) {
+                                    if let Some(old_doc) = FireLiteDoc::decode(&bytes) {
+                                        work.index_deletes.push((key.clone(), old_doc));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if !work.ops.is_empty() {
                     let tx_id = shard.next_tx_id;
                     shard.next_tx_id += 1;
                     shard.wal.append_batch_fast(tx_id, &work.ops, false)?;
                 }
 
-                // Update Shard (Fastest Path: copying pointers)
-                for (doc_id, doc_arc) in &index_entries {
+                // Apply storage index changes
+                for (doc_id, doc_arc) in &work.index_puts {
                     shard.update_index_entry(doc_id.clone(), Some(Pointer::BlobPending(Arc::clone(doc_arc))));
+                }
+                for op in &work.ops {
+                    if let WalOp::Delete { key, timestamp } = op {
+                        shard.update_index_entry(key.clone(), Some(Pointer::Deleted { timestamp: *timestamp }));
+                    }
                 }
                 
                 let mut b_bytes = 0;
@@ -685,11 +719,11 @@ impl FireLite {
             self.trigger_blob_flush.store(true, Ordering::Release);
             
             // Notify Indexer (Worker 1)
-            if !index_entries.is_empty() {
+            if !work.index_puts.is_empty() || !work.index_deletes.is_empty() {
                 let _ = self.index_tx.send(IndexOp::Update { 
                     collection: col_name, 
-                    puts: Arc::new(index_entries), 
-                    deletes: vec![] 
+                    puts: Arc::new(work.index_puts), 
+                    deletes: work.index_deletes
                 });
             }
             
@@ -791,7 +825,9 @@ impl FireLite {
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
 
-        let plan = QueryPlanner::plan(&query, &indexes, rows, self.config.query_workers);
+        let is_ready = self.indexes_ready.load(std::sync::atomic::Ordering::Acquire);
+
+        let plan = QueryPlanner::plan(&query, &indexes, rows, self.config.query_workers, is_ready);
 
         // SIMPLE CALL: No blob_file or encryption passed here!
         let results = self.executor.execute(shard_arc, &indexes, plan)?;
@@ -830,7 +866,8 @@ impl FireLite {
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
 
-        let plan = QueryPlanner::plan(&q, &indexes, rows, self.config.query_workers);
+        let is_ready = self.indexes_ready.load(std::sync::atomic::Ordering::Acquire);
+        let plan = QueryPlanner::plan(&q, &indexes, rows, self.config.query_workers, is_ready);
 
         // SIMPLE CALL: Worker handles blob resolution internally
         let results = self.executor.execute_projected(shard_arc, &indexes, plan)?;
@@ -1057,8 +1094,9 @@ impl FireLite {
             .unwrap()
             .count_prefix("");
 
+        let is_ready = self.indexes_ready.load(std::sync::atomic::Ordering::Acquire);
         // FIX: Add self.config.query_workers as the 4th argument
-        let plan = QueryPlanner::plan(&query, &indexes, rows, self.config.query_workers);
+        let plan = QueryPlanner::plan(&query, &indexes, rows, self.config.query_workers, is_ready);
 
         let res = self
             .executor
@@ -1293,6 +1331,9 @@ impl FireLite {
                         .iter()
                         .map(|(doc_id, doc)| (doc_id.as_str(), doc))
                         .filter(|(_, doc)| doc.get(&f_name).is_some()),
+                        // .filter(|(id, doc)| {
+                        //     f_name == "id" || f_name == "_time" || doc.get(&f_name).is_some()
+                        // }),
                 );
                 thread::yield_now();
             }
@@ -1418,7 +1459,7 @@ impl FireLite {
                             composite_idx.index_document(&doc_id, &doc);
 
                             // 2. Insert LEAN KEY into index.log
-                            if let Some(vals) = composite_idx.document_values(&doc) {
+                            if let Some(vals) = composite_idx.document_values(&doc_id, &doc) {
                                 let key_bytes =
                                     crate::index::composite::key_encoder::encode_composite_key(
                                         &composite_idx.definition,
@@ -1452,6 +1493,42 @@ impl FireLite {
         // Snapshot the primary composite index (ID 1)
         persist.snapshot(1).map_err(|e| FireLiteError::Io(e))?;
         Ok(())
+    }
+
+    pub fn list_storage_keys(&self, collection: &str) -> Result<Vec<String>> {
+        let shard = self.get_shard(collection);
+        let guard = shard.read().unwrap();
+        let mut keys: Vec<String> = guard.index.iter()
+            .filter(|(_, ptr)| !matches!(ptr, crate::storage::engine::Pointer::Deleted { .. }))
+            .map(|(k, _)| k.clone())
+            .collect();
+        keys.sort();
+        Ok(keys)
+    }
+
+    /// NEW: Diagnostic to see exactly what strings/values are inside a search index.
+    pub fn inspect_index(&self, collection: &str, field: &str) -> Vec<String> {
+        let mgr = self.indexes.read().unwrap();
+        let mut entries = Vec::new();
+
+        // Check Secondary Indexes
+        if let Some(sec_map) = mgr.secondary.get(collection) {
+            if let Some(idx) = sec_map.get(field) {
+                for (key_bytes, ids) in idx.get_map() {
+                    entries.push(format!("Value: {:?} -> IDs: {:?}", key_bytes, ids));
+                }
+            }
+        }
+
+        // Check Composite Indexes
+        for idx in mgr.composite.indexes_for_collection(collection) {
+            if idx.definition.fields.iter().any(|f| f.field == field) {
+                for (key_bytes, id) in &idx.tree {
+                    entries.push(format!("CompositeKey: {:?} -> ID: {}", key_bytes, id));
+                }
+            }
+        }
+        entries
     }
 
     pub fn resolve_document_blobs(&self, doc: &mut FireLiteDoc, collection: &str) -> Result<()> {

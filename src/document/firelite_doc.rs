@@ -25,11 +25,6 @@ impl FireLiteDoc {
 
     pub fn insert(&mut self, key: impl Into<String>, value: Value) {
         let key_str = key.into();
-        // if let Some(pos) = self.fields.iter().position(|(k, _)| &**k == key_str) {
-        //     self.fields[pos].1 = value;
-        // } else {
-        //     self.fields.push((Arc::from(key_str), value));
-        // }
         match self.fields.binary_search_by(|(k, _)| k.as_ref().cmp(&key_str)) {
             Ok(pos) => self.fields[pos].1 = value,
             Err(pos) => self.fields.insert(pos, (Arc::from(key_str), value)),

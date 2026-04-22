@@ -1,5 +1,6 @@
 use crate::document::firelite_doc::FireLiteDoc;
 use crate::index::manager::IndexManager;
+use crate::document::value::Value;
 
 /// Unified indexing service for all index families.
 /// Keeps update/backfill logic in one place for easier maintenance.
@@ -31,9 +32,16 @@ impl IndexingService {
         for (doc_id, doc) in docs {
             if let Some(sec_map) = manager.secondary.get_mut(collection) {
                 for (field_name, index) in sec_map.iter_mut() {
-                    if let Some(val) = doc.get(field_name) {
+                    // VIRTUAL FIELD MAPPING
+                    let val_opt = match field_name.as_str() {
+                        "id" => Some(Value::String(doc_id.to_string())),
+                        "_time" => Some(Value::Int(doc._time)),
+                        _ => doc.get(field_name).cloned(),
+                    };
+
+                    if let Some(val) = val_opt {
                         index.insert(
-                            crate::index::index_key::encode_scalar(val),
+                            crate::index::index_key::encode_scalar(&val),
                             doc_id.to_string(),
                         );
                     }

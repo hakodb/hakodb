@@ -126,7 +126,7 @@ static uintmax_t get_dir_size(const string& path) {
 // Optimized document creation: Stack buffers avoid heavy allocator churn.
 UniqueDoc make_complex_doc(int i, const string& payload) {
     UniqueDoc d(fl_doc_new());
-    fl_doc_insert_int(d.get(), "id", i);
+    // fl_doc_insert_str(d.get(), "id", i);
     
     char buf[64];
     snprintf(buf, sizeof(buf), "tenant-%d", i % 32);

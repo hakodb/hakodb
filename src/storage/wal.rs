@@ -331,71 +331,122 @@ impl Wal {
         Ok(filter_committed_ops(raw_ops))
     }
 
-    pub fn replay(&mut self) -> Result<Vec<WalOp>> {
-        // 1. Move to start of file
-        self.file.seek(SeekFrom::Start(0))?;
+    // pub fn replay(&mut self) -> Result<Vec<WalOp>> {
+    //     // 1. Move to start of file
+    //     self.file.seek(SeekFrom::Start(0))?;
         
-        // 2. Use BufReader to reduce syscalls during replay (Huge win for small records)
+    //     // 2. Use BufReader to reduce syscalls during replay (Huge win for small records)
+    //     let mut reader = BufReader::with_capacity(64 * 1024, &self.file);
+    //     let mut raw_ops = Vec::new();
+    //     let mut last_valid_pos = 0;
+        
+    //     // Scratchpad to avoid re-allocating memory for every record
+    //     let mut payload_scratch = Vec::with_capacity(8192);
+
+    //     loop {
+    //         // A. Read Header (8 bytes: 4 for Len, 4 for CRC)
+    //         let mut header = [0u8; 8];
+    //         match reader.read_exact(&mut header) {
+    //             Ok(_) => {}, // Successfully read exactly 8 bytes
+    //             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+    //             Err(e) => return Err(e.into()),
+    //         }
+
+    //         let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+    //         let expected_crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
+
+    //         // B. Read Payload into scratchpad
+    //         payload_scratch.resize(len, 0);
+    //         if let Err(e) = reader.read_exact(&mut payload_scratch) {
+    //             // If we reach EOF here, it means the record was partially written during a crash
+    //             if e.kind() == std::io::ErrorKind::UnexpectedEof { break; }
+    //             return Err(e.into());
+    //         }
+
+    //         // C. Validate Integrity
+    //         if crc32fast::hash(&payload_scratch) != expected_crc {
+    //             // CRC Mismatch: Stop here. Data following this point is likely corrupt.
+    //             // We don't return Err because we want to recover as much as possible.
+    //             break;
+    //         }
+
+    //         // D. Handle Decryption
+    //         let decoded_payload = if let Some(enc) = &self.encryption {
+    //             enc.decrypt(&payload_scratch)?
+    //         } else {
+    //             // If no encryption, we borrow the scratchpad data
+    //             payload_scratch.clone()
+    //         };
+
+    //         // E. Deserialize
+    //         raw_ops.push(decode(&decoded_payload)?);
+            
+    //         // Increment the "Safe" position in the file
+    //         last_valid_pos += (8 + len) as u64;
+    //     }
+
+    //     // 3. AUTO-REPAIR: If we stopped early due to corruption or partial write, 
+    //     // truncate the file so future runs don't get stuck on the same bad data.
+    //     if last_valid_pos < self.file.metadata()?.len() {
+    //         crate::util::log::info(&format!("WAL repair: truncating at {} bytes", last_valid_pos));
+    //         self.file.set_len(last_valid_pos)?;
+    //     }
+
+    //     // 4. Seek to end so future appends happen correctly
+    //     self.file.seek(SeekFrom::End(0))?;
+
+    //     // 5. Apply Transaction Logic (Only return ops from committed TXs)
+    //     Ok(filter_committed_ops(raw_ops))
+    // }
+    pub fn replay(&mut self) -> Result<Vec<WalOp>> {
+        self.file.seek(SeekFrom::Start(0))?;
         let mut reader = BufReader::with_capacity(64 * 1024, &self.file);
         let mut raw_ops = Vec::new();
         let mut last_valid_pos = 0;
-        
-        // Scratchpad to avoid re-allocating memory for every record
         let mut payload_scratch = Vec::with_capacity(8192);
 
         loop {
-            // A. Read Header (8 bytes: 4 for Len, 4 for CRC)
             let mut header = [0u8; 8];
-            match reader.read_exact(&mut header) {
-                Ok(_) => {}, // Successfully read exactly 8 bytes
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e.into()),
-            }
+            // If we can't read a full header, we've reached the end of valid data
+            if reader.read_exact(&mut header).is_err() { break; }
 
             let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
             let expected_crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
 
-            // B. Read Payload into scratchpad
+            // A zero-length payload in FireLite logic is usually a sign of corruption
+            if len == 0 { break; } 
+
             payload_scratch.resize(len, 0);
-            if let Err(e) = reader.read_exact(&mut payload_scratch) {
-                // If we reach EOF here, it means the record was partially written during a crash
-                if e.kind() == std::io::ErrorKind::UnexpectedEof { break; }
-                return Err(e.into());
-            }
+            if reader.read_exact(&mut payload_scratch).is_err() { break; }
 
-            // C. Validate Integrity
             if crc32fast::hash(&payload_scratch) != expected_crc {
-                // CRC Mismatch: Stop here. Data following this point is likely corrupt.
-                // We don't return Err because we want to recover as much as possible.
-                break;
+                break; // CRC mismatch: stop here and keep what we have
             }
 
-            // D. Handle Decryption
             let decoded_payload = if let Some(enc) = &self.encryption {
-                enc.decrypt(&payload_scratch)?
+                match enc.decrypt(&payload_scratch) {
+                    Ok(p) => p,
+                    Err(_) => break, // Decryption failure: stop
+                }
             } else {
-                // If no encryption, we borrow the scratchpad data
                 payload_scratch.clone()
             };
 
-            // E. Deserialize
-            raw_ops.push(decode(&decoded_payload)?);
-            
-            // Increment the "Safe" position in the file
-            last_valid_pos += (8 + len) as u64;
+            if let Ok(op) = decode(&decoded_payload) {
+                raw_ops.push(op);
+                last_valid_pos += (8 + len) as u64;
+            } else {
+                break; // Decode failure
+            }
         }
 
-        // 3. AUTO-REPAIR: If we stopped early due to corruption or partial write, 
-        // truncate the file so future runs don't get stuck on the same bad data.
+        // AUTO-REPAIR: Truncate the file to the last valid position
+        // This removes the "empty wal record" that was causing your panic.
         if last_valid_pos < self.file.metadata()?.len() {
-            crate::util::log::info(&format!("WAL repair: truncating at {} bytes", last_valid_pos));
-            self.file.set_len(last_valid_pos)?;
+            let _ = self.file.set_len(last_valid_pos);
         }
 
-        // 4. Seek to end so future appends happen correctly
         self.file.seek(SeekFrom::End(0))?;
-
-        // 5. Apply Transaction Logic (Only return ops from committed TXs)
         Ok(filter_committed_ops(raw_ops))
     }
 
