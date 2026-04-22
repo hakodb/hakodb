@@ -138,8 +138,8 @@ struct ShardWork {
     ops: Vec<WalOp>,
     keys: Vec<Arc<str>>,
     events: Vec<(String, ChangeEvent)>,
-    // index_puts: Vec<(String, FireLiteDoc)>,
     index_puts: Vec<(String, Arc<FireLiteDoc>)>, 
+    index_deletes: Vec<(String, FireLiteDoc)>,
     blob_queue_items: Vec<BlobWork>,
 }
 
@@ -300,6 +300,7 @@ impl FireLite {
                             }
                         }
                     }
+
                 }
             }
         });
@@ -615,15 +616,30 @@ impl FireLite {
             let key_arc: Arc<str> = Arc::from(doc_id.as_str());
 
             let work = shard_map.entry(col.clone()).or_insert_with(|| ShardWork {
-                ops: Vec::new(), keys: Vec::new(), events: Vec::new(), 
-                index_puts: Vec::new(), blob_queue_items: Vec::new(),
+                ops: Vec::new(), 
+                keys: Vec::new(), 
+                events: Vec::new(), 
+                index_puts: Vec::new(), 
+                blob_queue_items: Vec::new(),
+                index_deletes: Vec::new()
             });
 
             if is_delete {
-                let key_clone = key_arc.clone();
+                let shard = self.get_shard(&col);
+                let guard = shard.read().unwrap();
+                
+                // CRITICAL: We must get the OLD document content before deleting 
+                // so the indexer knows which entries to remove from the B-Trees.
+                if let Ok(Some(bytes)) = guard.get(&doc_id) {
+                    if let Some(old_doc) = FireLiteDoc::decode(&bytes) {
+                        work.index_deletes.push((doc_id.clone(), old_doc));
+                    }
+                }
+                // let key_clone = key_arc.clone();
                 work.ops.push(WalOp::Delete { key: key_arc.to_string(), timestamp: now_micros });
                 work.keys.push(key_arc);
-                work.events.push((col, ChangeEvent { path: key_clone.to_string(), kind: ChangeKind::Delete }));
+                work.events.push((col, ChangeEvent { path: doc_id, kind: ChangeKind::Delete }));
+                // work.events.push((col, ChangeEvent { path: key_clone.to_string(), kind: ChangeKind::Delete }));
                 continue;
             }
 
@@ -685,11 +701,11 @@ impl FireLite {
             self.trigger_blob_flush.store(true, Ordering::Release);
             
             // Notify Indexer (Worker 1)
-            if !index_entries.is_empty() {
+            if !index_entries.is_empty() || !work.index_deletes.is_empty() {
                 let _ = self.index_tx.send(IndexOp::Update { 
                     collection: col_name, 
                     puts: Arc::new(index_entries), 
-                    deletes: vec![] 
+                    deletes: work.index_deletes 
                 });
             }
             
