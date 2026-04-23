@@ -302,7 +302,15 @@ impl NetSyncer {
 
                 for col in cols {
                     if excl_tail.contains(&col) { continue; }
-                    let shard = db_tail.get_shard(&col);
+                    // let shard = db_tail.get_shard(&col);
+                    let shard = match db_tail.get_shard(&col) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            // Collection is likely encrypted and we don't have the key.
+                            // Skip silently or log once to avoid spamming the console.
+                            continue; 
+                        }
+                    };
                     let last_pos = *offsets.get(&col).unwrap_or(&0);
                     
                     let tail_data = {
@@ -536,13 +544,21 @@ async fn handle_peer(
                         }).collect();
                         
                         // This registers the index and starts background backfilling
-                        db.create_composite_index(&comp.collection, fields);
+                        let _ = db.create_composite_index(&comp.collection, fields);
                     }
                     
                     for (col, remote_time) in versions {
                         if excluded.contains(&col) { continue; }
-                        if db.get_collection_version(&col) > remote_time {
-                            handle_delta_send(&db, &peers_map, &peer_id, &col, remote_time).await;
+                        // if db.get_collection_version(&col) > remote_time {
+                        //     handle_delta_send(&db, &peers_map, &peer_id, &col, remote_time).await;
+                        // }
+                        if let Ok(local_version) = db.get_collection_version(&col) {
+                            if local_version > remote_time {
+                                handle_delta_send(&db, &peers_map, &peer_id, &col, remote_time).await;
+                            }
+                        } else {
+                            // Log that we couldn't check this collection due to an error
+                            eprintln!("[sync] Skipping collection {}: Shard could not be opened.", col);
                         }
                     }
                 }
@@ -618,7 +634,14 @@ async fn handle_bootstrap(db: &Arc<FireLite>, peers: &Arc<AsyncMutex<HashMap<Str
 
     for col in cols {
         if excluded.contains(&col) { continue; }
-        let shard_arc = db.get_shard(&col);
+        // let shard_arc = db.get_shard(&col);
+        let shard_arc = match db.get_shard(&col) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[sync] Bootstrap skipped collection {}: {}", col, e);
+                continue;
+            }
+        };
         
         // 1. Snapshot the index (Short lock)
         let snapshot: Vec<(String, Pointer)> = {
@@ -676,7 +699,14 @@ async fn handle_delta_send(
     collection: &str, 
     since_time: i64
 ) {
-    let shard_arc = db.get_shard(collection);
+    // let shard_arc = db.get_shard(collection);
+    let shard_arc = match db.get_shard(collection) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[sync] Delta send failed for {}: {}", collection, e);
+            return;
+        }
+    };
     let encryption_key = db.config.encryption_key.as_deref();
 
     // 1. SCAN PHASE (RAM-only)
@@ -794,7 +824,16 @@ async fn send_replication_packet(
 
 #[cfg(feature = "net-sync")]
 async fn apply_replication_batch(db: Arc<FireLite>, collection: String, ops: Vec<WalOp>, echo_cache: Arc<Mutex<HashMap<String, i64>>>,) {
-    let shard_arc = db.get_shard(&collection);
+    // let shard_arc = db.get_shard(&collection);
+    let shard_arc = match db.get_shard(&collection) {
+        Ok(s) => s,
+        Err(e) => {
+            // This is a serious error: we received data but cannot write it
+            // because the local shard is locked/unreadable.
+            eprintln!("[sync] CRITICAL: Cannot apply replication to {}. Shard error: {}", collection, e);
+            return; 
+        }
+    };
     let threshold = db.config.value_blob_threshold_bytes;
     
     let mut accepted_ops = Vec::new();

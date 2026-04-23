@@ -295,7 +295,16 @@ impl FireLiteGateway {
                                     });
                                 }
                                 crate::engine::ChangeKind::Put => {
-                                    let shard = db.get_shard(&query_template.collection);
+                                    // let shard = db.get_shard(&query_template.collection);
+                                    let shard = match db.get_shard(&query_template.collection) {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            // This is a serious error: we received data but cannot write it
+                                            // because the local shard is locked/unreadable.
+                                            eprintln!("[Put] CRITICAL: Cannot put data {}. Shard error: {}", &query_template.collection, e);
+                                            return; 
+                                        }
+                                    };
                                     let bytes_res = {
                                         let storage = shard.read().unwrap();
                                         storage.get(&event.path)
@@ -418,7 +427,7 @@ pub async fn firelite_exec<R: Runtime>(
             }
             FireLiteOp::CreateCompositeIndex { collection, fields } => {
                 let parsed_fields = fields.into_iter().map(|f| (f.field, if f.desc { SortDirection::Desc } else { SortDirection::Asc })).collect();
-                gateway.db.create_composite_index(&collection, parsed_fields);
+                let _ = gateway.db.create_composite_index(&collection, parsed_fields);
                 gateway.db.persist_index_defs().map_err(|e| e.to_string())?;
                 Ok(FireLiteResponse::Ok)
             }

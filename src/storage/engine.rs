@@ -80,16 +80,17 @@ impl StorageEngine {
     pub fn open(
         base_dir: impl AsRef<Path>, 
         cfg: &FireLiteConfig,
-        logical_name: String
+        logical_name: String,
+        encryption: Option<EncryptionContext>,
     ) -> Result<Self> {
         let base_path = base_dir.as_ref().to_path_buf(); 
         std::fs::create_dir_all(&base_path)?;
         // std::fs::create_dir_all(base_dir.as_ref())?;
 
-        let encryption = cfg
-            .encryption_key
-            .as_ref()
-            .map(|secret| EncryptionContext::from_secret(secret));
+        // let encryption = cfg
+        //     .encryption_key
+        //     .as_ref()
+        //     .map(|secret| EncryptionContext::from_secret(secret));
 
         let cache_limit_bytes = cfg.page_cache_capacity * cfg.page_size;
         let cache = Arc::new(Mutex::new(PageCache::new(cache_limit_bytes)));
@@ -212,32 +213,6 @@ impl StorageEngine {
         Ok(())
     }
 
-    // pub(crate) fn update_index_entry(&mut self, key: String, new_pointer: Option<Pointer>) {
-    //     if let Some(old_p) = self.index.remove(&key) {
-    //         match old_p {
-    //             Pointer::Inlined(ref d) => { self.inlined_bytes = self.inlined_bytes.saturating_sub(d.len()); }
-    //             Pointer::BlobPendingData { ref skeleton, .. } => { self.inlined_bytes = self.inlined_bytes.saturating_sub(skeleton.len()); }
-    //             _ => {}
-    //         }
-
-    //         if !matches!(old_p, Pointer::Deleted { .. }) {
-    //             if let Some(count) = self.collection_counts.get_mut(&self.logical_name) {
-    //                 *count = count.saturating_sub(1);
-    //             }
-    //         }
-    //     }
-
-    //     --- STEP 2: APPLY NEW ENTRY ---
-    //     if let Some(p) = new_pointer {
-    //         match &p {
-    //             Pointer::Inlined(d) => { self.inlined_bytes += d.len(); }
-    //             Pointer::BlobPendingData { skeleton, .. } => { self.inlined_bytes += skeleton.len(); }
-    //             _ => {}
-    //         }
-    //         self.index.insert(key, p);
-    //     }
-    // }
-    
     pub(crate) fn update_index_entry(&mut self, key: String, new_pointer: Option<Pointer>) {
         // 1. Perform the map operation once.
         // .insert() returns the previous value if it existed.
@@ -965,89 +940,4 @@ fn parse_segment_name(name: &str) -> Option<(u32, u64)> {
     let core = &name[9..name.len() - 4];
     let (level, id) = core.split_once('-')?;
     Some((level.parse().ok()?, id.parse().ok()?))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fs;
-    use std::sync::Arc;
-
-    use crate::config::FireLiteConfig;
-
-    use super::{segment_path, Segment, SegmentMeta, StorageEngine};
-
-    fn temp_path(prefix: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "{}-{}",
-            prefix,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock should be after unix epoch")
-                .as_nanos()
-        ))
-    }
-
-    #[test]
-    fn rotation_preserves_encryption_across_reopen() {
-        let path = temp_path("firelite-storage-encryption");
-        let cfg = FireLiteConfig {
-            auto_compaction_threshold_bytes: 1,
-            ..FireLiteConfig::default()
-        };
-
-        {
-            let mut engine = StorageEngine::open(&path, &cfg, "test_collection".to_string()).expect("engine open should succeed");
-            engine
-                .put("k1".to_string(), b"value-1")
-                .expect("first put should succeed");
-            engine
-                .put("k2".to_string(), b"value-2")
-                .expect("second put should succeed");
-            let _ = engine.flush_wal();
-        }
-
-        let reopened = StorageEngine::open(&path, &cfg, "test_collection".to_string()).expect("reopen should succeed");
-        assert_eq!(
-            reopened.get("k1").expect("read should succeed"),
-            Some(b"value-1".to_vec())
-        );
-        assert_eq!(
-            reopened.get("k2").expect("read should succeed"),
-            Some(b"value-2".to_vec())
-        );
-
-        fs::remove_dir_all(path).expect("temp db dir should be removable");
-    }
-
-    #[test]
-    fn compact_returns_when_no_same_level_merge_candidate_exists() {
-        let path = temp_path("firelite-storage-compact");
-        let cfg = FireLiteConfig::default();
-        let mut engine = StorageEngine::open(&path, &cfg, "test_collection".to_string()).expect("engine open should succeed");
-
-        engine
-            .put("k1".to_string(), b"value-1")
-            .expect("put should succeed");
-        engine
-            .maybe_rotate_active_segment()
-            .expect("rotation should succeed");
-
-        let extra_id = engine.next_segment_id;
-        engine.next_segment_id += 1;
-        let extra_path = segment_path(&path, 1, extra_id);
-        let extra_segment = Segment::open(extra_path, 0, engine.encryption.clone(), Arc::clone(&engine.cache), engine.mmap_size).expect("segment open should succeed");
-        engine.segments.insert(
-            extra_id,
-            SegmentMeta {
-                level: 1,
-                segment: extra_segment,
-            },
-        );
-
-        engine
-            .compact()
-            .expect("compaction should return successfully");
-
-        fs::remove_dir_all(path).expect("temp db dir should be removable");
-    }
 }

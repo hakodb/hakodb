@@ -23,9 +23,19 @@ struct Cli {
     /// Database path (default: ./firelite.db)
     #[arg(long, global = true, default_value = "./firelite.db")]
     db: String,
+
     /// Durability mode (always | interval | manual | on-commit)
     #[arg(long, global = true, default_value = "on-commit")]
     durability: DurabilityArg,
+
+    /// Encryption secret key (enables storage encryption)
+    #[arg(long, global = true)]
+    encryption_key: Option<String>,
+
+    /// Comma-separated list of collections to encrypt (if empty, all are encrypted)
+    #[arg(long, global = true)]
+    encrypted_cols: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -248,23 +258,39 @@ enum AggregateKindArg {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if let Commands::Serve { port, node_id, key } = cli.command {
-        return run_server(cli.db, cli.durability, port, node_id, key);
+    if let Commands::Serve { port, node_id, key } = &cli.command {
+        return run_server(&cli, *port, node_id.clone(), key.clone());
     }
 
-    let db = open_db(&cli.db, cli.durability)?;
+    let db = open_db(&cli)?;
     execute_command(&db, cli.command, &cli.db, cli.durability, None)
 }
 
-fn open_db(path: &str, durability: DurabilityArg) -> Result<FireLite> {
+fn open_db(cli: &Cli) -> Result<FireLite> {
     let mut cfg = FireLiteConfig::default();
-    cfg.durability_mode = match durability {
+
+    cfg.durability_mode = match cli.durability {
         DurabilityArg::Always => DurabilityMode::Always,
         DurabilityArg::Interval => DurabilityMode::Interval,
         DurabilityArg::Manual => DurabilityMode::Manual,
         DurabilityArg::OnCommit => DurabilityMode::OnCommit,
     };
-    FireLite::open(path, cfg).with_context(|| format!("failed to open db at {path}"))
+
+        // 2. Set Encryption Key
+    cfg.encryption_key = cli.encryption_key.clone();
+
+    // 3. Set Encrypted Collections (Convert comma-string to HashSet)
+    if let Some(cols_str) = &cli.encrypted_cols {
+        let set: std::collections::HashSet<String> = cols_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        cfg.encrypted_cols = Some(set);
+    }
+
+
+    FireLite::open(&cli.db, cfg).with_context(|| format!("failed to open db at {}", &cli.db))
 }
 
 fn read_payload_input(data: Option<&str>, fromfile: Option<&str>) -> Result<String> {
@@ -1110,7 +1136,7 @@ fn execute_command(
             }
             IndexCommands::CreateComposite { collection, fields } => {
                 let parts = parse_composite_fields(&fields)?;
-                db.create_composite_index(&collection, parts);
+                db.create_composite_index(&collection, parts)?;
             }
             IndexCommands::CreateFts { collection, field } => {
                 db.create_fts_index(&collection, &field)?
@@ -1179,8 +1205,7 @@ fn format_sync_status(status: SyncStatus) -> &'static str {
 }
 
 fn run_server(
-    db_path: String,
-    durability: DurabilityArg,
+    cli: &Cli,
     port: u16,
     node_id: String,
     key: String,
@@ -1188,7 +1213,7 @@ fn run_server(
     let rt = tokio::runtime::Runtime::new()?;
 
     rt.block_on(async move {
-        let db = Arc::new(open_db(&db_path, durability)?);
+        let db = Arc::new(open_db(&cli)?);
 
         // NEW: Init Mesh Syncer
         let net = NetSyncer::new(db.clone(), &node_id, &key, vec!["app_state".to_string()]);
@@ -1228,8 +1253,8 @@ fn run_server(
                             if let Err(e) = execute_command(
                                 &db,
                                 repl_cli.command,
-                                &db_path,
-                                durability,
+                                &cli.db,
+                                cli.durability,
                                 Some(&net),
                             ) {
                                 println!("❌ Error: {}", e);
