@@ -5,6 +5,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{channel, Sender};
 use std::time::Duration;
 use std::{ptr, thread};
+use std::collections::HashSet;
 
 // use std::sync::Arc;
 use hashbrown::HashMap;
@@ -197,6 +198,32 @@ pub extern "C" fn fl_config_set_encryption_key(config: *mut FL_Config, key: *con
     if let Some(cfg) = unsafe { config.as_mut() } {
         cfg.inner.encryption_key = cstr_to_string(key).ok();
     }
+}
+
+/// Set which collections should be encrypted. 
+/// collections_json: A JSON array of strings, e.g., '["secrets", "private_messages"]'
+#[no_mangle]
+pub extern "C" fn fl_config_set_encrypted_collections(
+    config: *mut FL_Config,
+    collections_json: *const c_char,
+) -> i32 {
+    let cfg = unsafe { match config.as_mut() {
+        Some(c) => c,
+        None => return -1,
+    }};
+
+    let json_str = match cstr_to_string(collections_json) {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+
+    let cols: HashSet<String> = match serde_json::from_str(&json_str) {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
+
+    cfg.inner.encrypted_cols = Some(cols);
+    0
 }
 
 #[no_mangle]
@@ -1653,7 +1680,13 @@ pub extern "C" fn fl_engine_create_index(
         fields.push((f, dir));
     }
 
-    engine.db.create_composite_index(&col, fields)
+    match engine.db.create_composite_index(&col, fields) {
+        Ok(id) => id,
+        Err(e) => {
+            set_last_error(e.to_string());
+            0 // Return 0 to indicate failure
+        }
+    }
 }
 
 /// Simplified indexer: Create an index for a single field.

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DurabilityMode {
     Always,
@@ -16,6 +18,7 @@ pub struct FireLiteConfig {
     pub durability_mode: DurabilityMode,
     pub group_commit_max_ops: usize,
     pub encryption_key: Option<String>,
+    pub encrypted_cols: Option<HashSet<String>>,
     pub enable_audit_log: bool,
     pub audit_log_path: Option<String>,
     pub max_inlined_memory_bytes: usize,
@@ -36,6 +39,7 @@ impl Default for FireLiteConfig {
             durability_mode: DurabilityMode::Interval,
             group_commit_max_ops: 128,
             encryption_key: None,
+            encrypted_cols: None,
             enable_audit_log: false,
             audit_log_path: None,
             max_inlined_memory_bytes: 64 * 1024 * 1024, // 64MB Default

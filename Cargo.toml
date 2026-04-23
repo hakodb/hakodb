@@ -1,6 +1,6 @@
 [package]
 name = "firelite"
-version = "0.6.48"
+version = "0.6.50"
 edition = "2021"
 
 [lib]

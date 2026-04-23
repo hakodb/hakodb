@@ -47,6 +47,10 @@ void fl_config_set_durability(FL_Config *config, int32_t mode);
 
 void fl_config_set_encryption_key(FL_Config *config, const char *key);
 
+/// Set which collections should be encrypted.
+/// collections_json: A JSON array of strings, e.g., '["secrets", "private_messages"]'
+int32_t fl_config_set_encrypted_collections(FL_Config *config, const char *collections_json);
+
 void fl_config_set_audit_log(FL_Config *config, bool enabled, const char *path);
 
 void fl_config_set_query_workers(FL_Config *config, uintptr_t count);

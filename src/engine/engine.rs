@@ -21,6 +21,7 @@ use crate::query::planner::QueryPlanner;
 use crate::query::query::Query;
 use crate::query::builder::Collection;
 use crate::storage::wal::WalOp;
+use crate::storage::crypto::EncryptionContext;
 use crate::storage::blob::{BlobManager, BlobWork};
 use crate::storage::engine::{StorageEngine, Pointer};
 // use crate::config::DurabilityMode;
@@ -492,8 +493,15 @@ impl FireLite {
             // --- STEP C: Load Shards (and Rebuild if needed) ---
             for col_name in discovered {
                 let path = root_scan.join(&col_name);
+                let enc_context = config_thread.encryption_key.as_ref().and_then(|key| {
+                    let apply = match &config_thread.encrypted_cols {
+                        None => true,
+                        Some(cols) => cols.is_empty() || cols.contains(&col_name),
+                    };
+                    if apply { Some(EncryptionContext::from_secret(key)) } else { None }
+                });
                 // StorageEngine::open now takes the logical name as well
-                if let Ok(mut storage) = StorageEngine::open(path, &config_thread, col_name.clone()) {
+                if let Ok(mut storage) = StorageEngine::open(path, &config_thread, col_name.clone(), enc_context) {
                     
                     // Use the Crossbeam Sender for background blob offloading
                     storage.blob_tx = Some(blob_tx_thread.clone());
@@ -537,21 +545,75 @@ impl FireLite {
         Ok(db)
     }
 
-    pub(crate) fn get_shard(&self, collection: &str) -> Arc<RwLock<StorageEngine>> {
-        // Read lock check first (Fast Path)
-        if let Some(s) = self.shards.read().unwrap().get(collection) {
-            return Arc::clone(s);
+    // pub(crate) fn get_shard(&self, collection: &str) -> Arc<RwLock<StorageEngine>> {
+    //     // Read lock check first (Fast Path)
+    //     if let Some(s) = self.shards.read().unwrap().get(collection) {
+    //         return Arc::clone(s);
+    //     }
+
+
+    //     // Write lock (Creation Path)
+    //     let mut shards = self.shards.write().unwrap();
+    //     shards.entry(collection.to_string()).or_insert_with(|| {
+    //         let path = self.root_path.join(collection);
+    //         let enc_context = self.get_encryption_for_col(collection);
+    //         let mut storage = StorageEngine::open(path, &self.config, collection.to_string(), enc_context)
+    //             .expect("Failed to create collection shard");
+    //         storage.blob_tx = Some(self.blob_tx.clone());
+    //         Arc::new(RwLock::new(storage))
+    //     }).clone()
+    // }
+    pub(crate) fn get_shard(&self, collection: &str) -> Result<Arc<RwLock<StorageEngine>>> {
+        // 1. Check with Read Lock (Fast Path)
+        {
+            let shards = self.shards.read().map_err(|_| FireLiteError::LockPoisoned("shards".into()))?;
+            if let Some(s) = shards.get(collection) {
+                return Ok(Arc::clone(s));
+            }
         }
 
-        // Write lock (Creation Path)
-        let mut shards = self.shards.write().unwrap();
-        shards.entry(collection.to_string()).or_insert_with(|| {
-            let path = self.root_path.join(collection);
-            let mut storage = StorageEngine::open(path, &self.config, collection.to_string())
-                .expect("Failed to create collection shard");
-            storage.blob_tx = Some(self.blob_tx.clone());
-            Arc::new(RwLock::new(storage))
-        }).clone()
+        // 2. Creation Path (Outside of write lock to prevent poisoning during IO)
+        let path = self.root_path.join(collection);
+        let encryption = self.get_encryption_for_col(collection);
+        
+        // This is where the security Err() bubbles up from Wal::replay
+        let mut storage = StorageEngine::open(
+            path, 
+            &self.config, 
+            collection.to_string(), 
+            encryption
+        )?; 
+        
+        storage.blob_tx = Some(self.blob_tx.clone());
+        let shard_arc = Arc::new(RwLock::new(storage));
+
+        // 3. Insert into map with Write Lock
+        let mut shards = self.shards.write().map_err(|_| FireLiteError::LockPoisoned("shards".into()))?;
+        Ok(shards.entry(collection.to_string()).or_insert(shard_arc).clone())
+    }
+
+    pub(crate) fn get_encryption_for_col(&self, collection: &str) -> Option<EncryptionContext> {
+        let key = self.config.encryption_key.as_ref()?;
+        
+        let should_encrypt = match &self.config.encrypted_cols {
+            // If No list is provided, encryption is global (default behavior)
+            None => true,
+            // If a list is provided, check if this collection is in it
+            Some(cols) => {
+                if cols.is_empty() {
+                    true // Or false, depending on your preference. 
+                         // Usually, an empty list means "all" in this context.
+                } else {
+                    cols.contains(&collection.to_string())
+                }
+            }
+        };
+
+        if should_encrypt {
+            Some(EncryptionContext::from_secret(key))
+        } else {
+            None
+        }
     }
 
     pub fn commit_serializable(
@@ -602,7 +664,7 @@ impl FireLite {
             let (col, mut doc_id, mut doc, is_delete) = match m {
                 BatchMutation::Put { collection, doc_id, doc } => (collection, doc_id, doc, false),
                 BatchMutation::Patch { collection, doc_id, updates } => {
-                    let shard_arc = self.get_shard(&collection);
+                    let shard_arc = self.get_shard(&collection)?;
                     let current_doc = {
                         let guard = shard_arc.read().unwrap();
                         guard.get(&doc_id)?
@@ -645,7 +707,7 @@ impl FireLite {
             
             // 3. REUSE KEY for Blobs
             let blob_work = {
-                let shard = self.get_shard(&col);
+                let shard = self.get_shard(&col)?;
                 let guard = shard.read().unwrap();
                 guard.blob_manager.as_ref()
                     .map(|bm| bm.extract_blobs_raw(&col, &key_arc, &mut doc, threshold))
@@ -670,7 +732,7 @@ impl FireLite {
 
         // --- APPLY SHARD CHANGES ---
         for (col_name, mut work) in shard_map {
-            let shard_arc = self.get_shard(&col_name);
+            let shard_arc = self.get_shard(&col_name)?;
             // let index_entries = work.index_puts; 
 
             {
@@ -767,7 +829,7 @@ impl FireLite {
             return Err(FireLiteError::Corrupt("Denied".into()));
         }
 
-        let shard = self.get_shard(collection);
+        let shard = self.get_shard(collection)?;
         let storage = shard.safe_read()?;
         let res = storage
             .get(doc_id)?
@@ -821,7 +883,7 @@ impl FireLite {
             return Err(FireLiteError::Corrupt("Denied".into()));
         }
 
-        let shard_arc = self.get_shard(&query.collection);
+        let shard_arc = self.get_shard(&query.collection)?;
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
 
@@ -862,7 +924,7 @@ impl FireLite {
         let mut q = query.clone();
         q.projection = fields.to_vec();
 
-        let shard_arc = self.get_shard(&q.collection);
+        let shard_arc = self.get_shard(&q.collection)?;
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
 
@@ -1087,7 +1149,7 @@ impl FireLite {
             return Err(FireLiteError::Corrupt("Denied".into()));
         }
 
-        let shard_arc = self.get_shard(&query.collection);
+        let shard_arc = self.get_shard(&query.collection)?;
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc
             .read()
@@ -1294,7 +1356,7 @@ impl FireLite {
         }
 
         // 3. Prepare for background backfilling
-        let shard_arc = self.get_shard(collection);
+        let shard_arc = self.get_shard(collection)?;
         let idx_mgr = Arc::clone(&self.indexes);
         let f_name = field.to_string();
         let col_name = collection.to_string();
@@ -1351,7 +1413,7 @@ impl FireLite {
             .create_fts_index(collection, field);
 
         // 3. Spawn background thread for backfilling
-        let shard_arc = self.get_shard(collection);
+        let shard_arc = self.get_shard(collection)?;
         let idx_mgr = Arc::clone(&self.indexes);
         let f_name = field.to_string();
         let col_name = collection.to_string();
@@ -1406,7 +1468,7 @@ impl FireLite {
         Ok(())
     }
 
-    pub fn create_composite_index(&self, col: &str, fields: Vec<(String, SortDirection)>) -> u32 {
+    pub fn create_composite_index(&self, col: &str, fields: Vec<(String, SortDirection)>) -> Result<u32> {
         {
             let mgr = self.indexes.read().unwrap();
             for idx in mgr.indexes_for_collection(col) {
@@ -1418,7 +1480,7 @@ impl FireLite {
                         .zip(fields.iter())
                         .all(|(a, b)| a.field == b.0 && a.direction == b.1);
                 if same {
-                    return idx.definition.id;
+                    return Ok(idx.definition.id);
                 }
             }
         }
@@ -1426,7 +1488,7 @@ impl FireLite {
         let def = CompositeIndexDefinition::new(col).with_fields(fields);
         let index_id = self.indexes.write().unwrap().create_index(def);
 
-        let shard_arc = self.get_shard(col);
+        let shard_arc = self.get_shard(col)?;
         let idx_mgr = Arc::clone(&self.indexes);
         let persist_ptr = Arc::clone(&self.index_storage); // <--- Required for persistence
         
@@ -1484,7 +1546,7 @@ impl FireLite {
         });
 
         let _ = self.persist_index_defs();
-        index_id
+        Ok(index_id)
     }
 
     /// Explicitly trigger a snapshot (called by Maintenance Thread or FFI)
@@ -1496,7 +1558,7 @@ impl FireLite {
     }
 
     pub fn list_storage_keys(&self, collection: &str) -> Result<Vec<String>> {
-        let shard = self.get_shard(collection);
+        let shard = self.get_shard(collection)?;
         let guard = shard.read().unwrap();
         let mut keys: Vec<String> = guard.index.iter()
             .filter(|(_, ptr)| !matches!(ptr, crate::storage::engine::Pointer::Deleted { .. }))
@@ -1537,7 +1599,7 @@ impl FireLite {
 
     // Helper for projected resolution
     fn resolve_single_value_blob(&self, collection: &str, offset: u64, len: u32) -> Result<Value> {
-        let shard_arc = self.get_shard(collection);
+        let shard_arc = self.get_shard(collection)?;
         let blob_manager = {
             let shard = shard_arc.read().unwrap();
             shard
@@ -1564,7 +1626,7 @@ impl FireLite {
 
         if blob_values.is_empty() { return Ok(()); }
 
-        let shard_arc = self.get_shard(collection);
+        let shard_arc = self.get_shard(collection)?;
 
         // PASS 2: Snapshot Shard State
         let (blob_manager, queue_snapshot) = {
@@ -1580,35 +1642,6 @@ impl FireLite {
 
         let bm = blob_manager.ok_or(FireLiteError::StorageError("No blob manager".into()))?;
 
-        // ADAPTIVE RESOLUTION
-        // if blob_values.len() <= 2 {
-        //     for val in blob_values {
-        //         if let Value::BlobLink { offset, len } = *val {
-        //             let data = match queue_snapshot.get(&offset) {
-        //                 Some(arc_bytes) => (**arc_bytes).clone(),
-        //                 None => bm.read_at(offset, len)?,
-        //             };
-        //             *val = self.inflate_bytes(data);
-        //         }
-        //     }
-        // } else {
-        //     let bm_ref = &bm;
-        //     let queue_ref = &queue_snapshot;
-        //     blob_values.into_par_iter().try_for_each(|val| -> Result<()> {
-        //         if let Value::BlobLink { offset, len } = *val {
-        //             let data = match queue_ref.get(&offset) {
-        //                 Some(arc_bytes) => (**arc_bytes).clone(),
-        //                 None => bm_ref.read_at(offset, len)?,
-        //             };
-        //             *val = if let Ok(s) = String::from_utf8(data.clone()) {
-        //                 Value::String(s)
-        //             } else {
-        //                 Value::Binary(data)
-        //             };
-        //         }
-        //         Ok(())
-        //     })?;
-        // }
         for val in blob_values {
             if let Value::BlobLink { offset, len } = *val {
                 let data = match queue_snapshot.get(&offset) {
@@ -1631,7 +1664,7 @@ impl FireLite {
     }
 
     pub fn vacuum(&self, collection: &str) -> Result<()> {
-        let shard_arc = self.get_shard(collection);
+        let shard_arc = self.get_shard(collection)?;
         let mut shard = shard_arc.write().unwrap();
         
         let blob_path = shard.base_dir().join("blobs.dat");
@@ -1711,13 +1744,13 @@ impl FireLite {
         self.trigger_blob_flush.store(true, Ordering::Release);
     }
 
-    pub fn get_collection_version(&self, collection: &str) -> i64 {
-        let shard = self.get_shard(collection);
+    pub fn get_collection_version(&self, collection: &str) -> Result<i64> {
+        let shard = self.get_shard(collection)?;
         let guard = shard.read().unwrap();
         
         // Strategy: Scan the RAM index for the highest timestamp.
         // Since this is in RAM, it's extremely fast.
-        guard.index.values().map(|ptr| {
+        let max_ts = guard.index.values().map(|ptr| {
             match ptr {
                 Pointer::Inlined(bytes) => {
                     // Extract _time from bytes [2..10] based on your VERSION 3 format
@@ -1727,7 +1760,9 @@ impl FireLite {
                 Pointer::Deleted { timestamp } => *timestamp,
                 _ => 0,
             }
-        }).max().unwrap_or(0)
+        }).max().unwrap_or(0);
+
+        Ok(max_ts)
     }
 
     pub fn get_version_map(&self) -> std::collections::HashMap<String, i64> {
@@ -1735,7 +1770,10 @@ impl FireLite {
         let mut cols = self.list_collections().unwrap_or_default();
         cols.extend(vec!["__firelite_security".to_string()]); 
         for col in cols {
-            map.insert(col.clone(), self.get_collection_version(&col));
+            // map.insert(col.clone(), self.get_collection_version(&col));
+            if let Ok(version) = self.get_collection_version(&col) {
+                map.insert(col, version);
+            }
         }
         map
     }
@@ -1783,7 +1821,11 @@ impl Drop for FireLite {
 
         // 5. FINAL SHARD FLUSH
         let shards_to_flush: Vec<Arc<RwLock<StorageEngine>>> = {
-            self.shards.read().unwrap().values().cloned().collect()
+            // self.shards.read().unwrap().values().cloned().collect()
+            match self.shards.read() {
+                Ok(guard) => guard.values().cloned().collect(),
+                Err(_) => Vec::new(), // If poisoned, we can't safely flush
+            }
         };
 
         for shard in shards_to_flush {
