@@ -588,12 +588,22 @@ pub async fn firelite_exec<R: Runtime>(
 fn build_query_from_input(input: &QueryInput) -> Result<Query, String> {
     let mut query = Query::new(&input.collection);
 
-    // 1. Add basic filters
+    // 1. CRITICAL FIX: Inject doc_id_filter into the Query filters.
+    // The TS client often sends this for single-document snapshots or targeted queries.
+    // If we don't add this here, targeted queries return the whole collection.
+    if let Some(ref id) = input.doc_id_filter {
+        if !id.is_empty() {
+            query = query.where_filter("id", Operator::Eq, Value::String(id.clone()));
+        }
+    }
+
+    // 2. Add Standard Filters (This handles the 'in' operator values)
     for filter in &input.filters {
+        let val = json_value_to_value(&filter.value)?;
         query = query.where_filter(
             &filter.field, 
             map_operator(&filter.op), 
-            json_value_to_value(&filter.value)?
+            val
         );
     }
 
@@ -617,6 +627,9 @@ fn build_query_from_input(input: &QueryInput) -> Result<Query, String> {
     if let Some(order) = &input.order_by { query = query.order_by(&order.field, order.ascending); }
     if let Some(limit) = input.limit { query = query.limit(limit); }
     if let Some(offset) = input.offset { query = query.offset(offset); }
+
+    // 5. Select/Projection
+    if let Some(proj) = &input.projection { query = query.select_fields(proj.clone()); }
 
     // 4. Cursor support
     if let Some(v) = &input.start_at { query.start_at = Some(v.iter().map(json_value_to_value).collect::<Result<Vec<_>, _>>()?); }
