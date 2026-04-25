@@ -439,9 +439,9 @@ pub async fn firelite_exec<R: Runtime>(
                 // Resolve the standard query object
                 let mut query_obj = build_query_from_input(&input)?;
 
-                if let Some(id) = &input.doc_id_filter {
-                    query_obj = query_obj.where_filter("id", Operator::Eq, Value::String(id.to_string()));
-                }
+                // if let Some(id) = &input.doc_id_filter {
+                //     query_obj = query_obj.where_filter("id", Operator::Eq, Value::String(id.to_string()));
+                // }
 
                 match action.unwrap_or(QueryAction::Fetch) {
                     QueryAction::Fetch => {
