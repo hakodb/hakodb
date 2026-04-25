@@ -61,13 +61,16 @@ impl QueryPlanner {
         }
 
         // 3. PRIORITY 3: Range/Cursor Detection
-        if let Some(order) = &query.order_by {
-            let has_bounds = query.start_at.is_some() || query.start_after.is_some() || query.end_at.is_some() || query.end_before.is_some();
+        if let Some(first_order) = query.order_by.first() {
+            let has_bounds = query.start_at.is_some() || query.start_after.is_some() || 
+                            query.end_at.is_some() || query.end_before.is_some();
+            
             if has_bounds {
-                // Check Composite Cursors (e.g. ORDER BY id, _time)
+                // --- A. Check Composite Cursors ---
                 for idx in indexes.indexes_for_collection(&query.collection) {
-                    if !idx.definition.fields.is_empty() && idx.definition.fields[0].field == order.field {
-                        // (Keep your existing Bound mapping logic here...)
+                    // We check if the index matches the first sort field to allow range scanning
+                    if !idx.definition.fields.is_empty() && idx.definition.fields[0].field == first_order.field {
+                        
                         let start = match (&query.start_at, &query.start_after) {
                             (Some(v), _) => Bound::Included(build_cursor_range(&idx.definition, v, false)),
                             (_, Some(v)) => Bound::Excluded(build_cursor_range(&idx.definition, v, false)),
@@ -78,24 +81,28 @@ impl QueryPlanner {
                             (_, Some(v)) => Bound::Excluded(build_cursor_range(&idx.definition, v, false)),
                             _ => Bound::Unbounded,
                         };
+
                         return Self::make_plan(
                             query, 
                             ScanType::CursorIndex { 
                                 index_id: idx.definition.id, 
                                 start, 
                                 end, 
-                                reverse: !order.ascending 
+                                reverse: !first_order.ascending 
                             }, 
                             query.limit, 
-                            true, 
+                            // Note: order_satisfied is true only if the index matches the WHOLE sort chain
+                            // (This logic is handled by your update to try_plan_composite_eq)
+                            false, 
                             false
                         );
                     }
                 }
 
-                // Check Secondary Index Range (Now works for 'id' and '_time' if indexed!)
+                // --- B. Check Secondary Index Range ---
                 if let Some(sec_map) = indexes.secondary.get(&query.collection) {
-                    if sec_map.contains_key(&order.field) {
+                    if sec_map.contains_key(&first_order.field) {
+                        // Secondary indexes only hold ONE value, so we take the first value from the cursor
                         let start = match (&query.start_at, &query.start_after) {
                             (Some(v), _) if !v.is_empty() => Bound::Included(crate::index::index_key::encode_scalar(&v[0])),
                             (_, Some(v)) if !v.is_empty() => Bound::Excluded(crate::index::index_key::encode_scalar(&v[0])),
@@ -110,13 +117,14 @@ impl QueryPlanner {
                         return Self::make_plan(
                             query, 
                             ScanType::SecondaryIndexRange { 
-                                field: order.field.clone(), 
+                                field: first_order.field.clone(), 
                                 start, 
                                 end, 
-                                reverse: !order.ascending 
+                                reverse: !first_order.ascending 
                             }, 
                             query.limit, 
-                            true, 
+                            // Secondary index only satisfies the first sort field
+                            false, 
                             false
                         );
                     }
@@ -369,10 +377,7 @@ impl QueryPlanner {
         None
     }
 
-    fn try_plan_composite_eq(
-        query: &Query,
-        indexes: &IndexManager,
-    ) -> Option<(ScanType, bool, bool)> {
+    fn try_plan_composite_eq(query: &Query, indexes: &IndexManager) -> Option<(ScanType, bool, bool)> {
         if query.filters.is_empty() || !query.filters.iter().all(|f| matches!(f.op, Operator::Eq)) {
             return None;
         }
@@ -381,40 +386,51 @@ impl QueryPlanner {
             let mut matched_fields = Vec::new();
             let mut matched_values = Vec::new();
 
+            // Match Equality Filters first
             for idx_field in &idx.definition.fields {
                 if let Some(filter) = query.filters.iter().find(|f| f.field == idx_field.field) {
                     matched_fields.push(idx_field.field.clone());
                     matched_values.push(filter.value.clone());
-                } else {
-                    break;
-                }
+                } else { break; }
             }
 
-            // Check if index prefix covers ALL filters
-            if !matched_fields.is_empty() && matched_fields.len() == query.filters.len() {
+            if matched_fields.len() == query.filters.len() {
                 let mut order_satisfied = false;
                 let mut reverse_scan = false;
 
-                if let Some(order) = &query.order_by {
-                    if let Some(next_f) = idx.definition.fields.get(matched_fields.len()) {
-                        if next_f.field == order.field {
-                            order_satisfied = true;
-                            // If index is DESC and query is ASC (or vice versa), reverse the scan!
-                            if (next_f.direction == SortDirection::Asc) != order.ascending {
+                // NEW: Check if the Sort Chain follows the equality fields in the index
+                if !query.order_by.is_empty() {
+                    let start_idx = matched_fields.len();
+                    let mut matches_all_sorts = true;
+                    
+                    for (i, q_order) in query.order_by.iter().enumerate() {
+                        if let Some(idx_f) = idx.definition.fields.get(start_idx + i) {
+                            if idx_f.field != q_order.field {
+                                matches_all_sorts = false;
+                                break;
+                            }
+                            // For the first sort field, we decide if we need to scan the index backwards
+                            if i == 0 && (idx_f.direction == SortDirection::Asc) != q_order.ascending {
                                 reverse_scan = true;
                             }
+                            // Note: If subsequent fields have different directions than index, 
+                            // order_satisfied must stay false.
+                            if (idx_f.direction == SortDirection::Asc) != (q_order.ascending != reverse_scan) {
+                                matches_all_sorts = false;
+                                break;
+                            }
+                        } else {
+                            matches_all_sorts = false;
+                            break;
                         }
                     }
+                    order_satisfied = matches_all_sorts;
                 }
 
                 return Some((
-                    ScanType::CompositeIndex {
-                        fields: matched_fields,
-                        values: matched_values,
-                        reverse: reverse_scan,
-                    },
+                    ScanType::CompositeIndex { fields: matched_fields, values: matched_values, reverse: reverse_scan },
                     order_satisfied,
-                    true, // Filters are fully handled by index
+                    true,
                 ));
             }
         }

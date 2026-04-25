@@ -8,7 +8,7 @@ pub struct Query {
     pub collection: String,
     pub filters: Vec<Filter>,
     pub or_groups: Vec<Vec<crate::query::filter::Filter>>,
-    pub order_by: Option<OrderBy>,
+    pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub projection: Vec<String>,
@@ -33,7 +33,7 @@ impl Query {
             collection: collection.to_string(),
             filters: Vec::new(),
             or_groups: Vec::new(),
-            order_by: None,
+            order_by: Vec::new(),
             limit: None,
             offset: None, 
             projection: Vec::new(),
@@ -60,7 +60,7 @@ impl Query {
     }
 
     pub fn order_by(mut self, field: &str, ascending: bool) -> Self {
-        self.order_by = Some(OrderBy {
+        self.order_by.push(OrderBy {
             field: field.to_string(),
             ascending,
         });

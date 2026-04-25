@@ -120,8 +120,8 @@ enum Commands {
         #[arg(long)]
         fts: Option<String>,
         /// order format: field[:asc|desc]
-        #[arg(long)]
-        order: Option<String>,
+        #[arg(long = "order")] // Explicitly name it for clarity
+        order_by: Vec<String>,
         #[arg(long)]
         limit: Option<usize>,
         #[arg(long)]
@@ -559,7 +559,7 @@ fn run_query(
     and_filters: &[String],
     or_filters: &[String],
     fts: Option<&str>,
-    order: Option<&str>,
+    order_by: &[String],
     limit: Option<usize>,
     offset: Option<usize>,
     start_at: Option<&str>,
@@ -588,8 +588,8 @@ fn run_query(
         let (field, text) = parse_fts(fts)?;
         q = q.where_filter(field, Operator::Match, Value::String(text.to_string()));
     }
-    if let Some(order) = order {
-        let (field, asc) = parse_order(order)?;
+    for order_spec in order_by {
+        let (field, asc) = parse_order(&order_spec)?;
         q = q.order_by(field, asc);
     }
     if let Some(limit) = limit { q = q.limit(limit); }
@@ -831,7 +831,7 @@ fn run_rest(
                     &[],
                     &[],
                     None,
-                    None,
+                    &[],
                     None,
                     None,
                     None,
@@ -1076,7 +1076,7 @@ fn execute_command(
             and_filters,
             or_filters,
             fts,
-            order,
+            order_by,
             limit,
             offset,
             start_at,
@@ -1103,7 +1103,7 @@ fn execute_command(
                 &and_filters,
                 &or_filters,
                 fts.as_deref(),
-                order.as_deref(),
+                &order_by,
                 limit,
                 offset,
                 start_at.as_deref(),

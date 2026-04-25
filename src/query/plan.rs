@@ -49,7 +49,7 @@ pub struct QueryPlan {
     pub scan: ScanType,
     pub filters: Vec<Filter>,
     pub or_groups: Vec<Vec<crate::query::filter::Filter>>, // <--- ADD THIS
-    pub order_by: Option<OrderBy>,
+    pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub projection: Vec<String>,
