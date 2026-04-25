@@ -60,7 +60,8 @@ function normalizeValue(v: any): any {
     if (v === null || typeof v !== 'object') return v; // Fast path for primitives
     
     if (v instanceof Uint8Array) return Array.from(v);
-    if (v instanceof Date) return v.getTime() * 1000;
+    // if (v instanceof Date) return v.getTime() * 1000;
+    if (v instanceof Date) return v.getTime();
     
     if (Array.isArray(v)) {
         const len = v.length;
