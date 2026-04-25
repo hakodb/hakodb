@@ -158,18 +158,26 @@ impl QueryPlanner {
                         // SAFEGUARD: The 'contains_key' ensures that even for 'id', we only 
                         // use the index if the user explicitly called create_index('id').
                         if sec_map.contains_key(&filter.field) {
-                            let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
-                            return Self::make_plan(
-                                query, 
-                                ScanType::SecondaryIndex { 
-                                    field: filter.field.clone(), 
-                                    value: 
-                                    val_bytes 
-                                }, 
-                                query.limit, 
-                                false, 
-                                false
-                            );
+                            let is_ambiguous = match &filter.value {
+                                Value::String(s) => s.parse::<i64>().is_ok(),
+                                _ => false
+                            };
+
+                            if !is_ambiguous {
+                                let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
+                                return Self::make_plan(
+                                    query, 
+                                    ScanType::SecondaryIndex { 
+                                        field: filter.field.clone(), 
+                                        value: 
+                                        val_bytes 
+                                    }, 
+                                    query.limit, 
+                                    false, 
+                                    false
+                                );
+                            }
+
                         }
                     }
                 }

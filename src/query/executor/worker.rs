@@ -300,14 +300,81 @@ pub(crate) fn matches_filters_view(doc_id: &str, bytes: &[u8], plan: &crate::que
     validate_final_match(plan, &and_matches, &or_group_results)
 }
 
+// fn compare_raw_bytes(tag: u8, data: &[u8], op: &Operator, b: &Value) -> bool {
+//     // --- 1. Handle Super Tags (Zero-length headers) ---
+//     if tag == 0xC0 { return crate::query::filter::compare_values(&Value::Null, op, b); }
+//     if tag == 0xC2 { return crate::query::filter::compare_values(&Value::Bool(true), op, b); }
+//     if tag == 0xC3 { return crate::query::filter::compare_values(&Value::Bool(false), op, b); }
+//     if (tag & 0xF0) == 0x10 { 
+//         return crate::query::filter::compare_values(&Value::Int((tag & 0x0F) as i64), op, b); 
+//     }
+//     if (tag & 0xF8) == 0x40 { 
+//         let len = (tag & 0x07) as usize;
+//         if let Ok(s) = std::str::from_utf8(&data[..len]) {
+//             return crate::query::filter::compare_values(&Value::String(s.to_string()), op, b);
+//         }
+//         return false;
+//     }
+
+//     // --- 2. Handle Standard Tags (4-byte length prefix + Body) ---
+//     if data.len() < 4 { return false; }
+    
+//     // The actual payload starts after the 4-byte length header
+//     let body = &data[4..];
+
+//     let physical_val = match tag {
+//         3 | 7 => { // Int or Timestamp (Zigzag Varint)
+//             let mut p = 0; 
+//             if let Some(val) = crate::util::varint::decode_varint(body, &mut p) {
+//                 let decoded = crate::util::varint::zigzag_decode(val);
+//                 let val_obj = if tag == 3 { Value::Int(decoded) } else { Value::Timestamp(decoded) };
+//                 return crate::query::filter::compare_values(&val_obj, op, b);
+//             }
+//         }
+//         4 => { // Float (8 bytes LE)
+//             if let Ok(bits) = body.try_into().map(f64::from_le_bytes) {
+//                 return crate::query::filter::compare_values(&Value::Float(bits), op, b);
+//             }
+//         }
+//         5 => { // String
+//             // Fix: We must respect the length provided in the header for exact slices
+//             let v_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+//             if let Some(s_bytes) = body.get(..v_len) {
+//                 if let Ok(s) = std::str::from_utf8(s_bytes) {
+//                     match (op, b) {
+//                         (Operator::Eq, Value::String(t)) => return s == t,
+//                         (Operator::StartsWith, Value::String(t)) => return s.starts_with(t),
+//                         _ => return crate::query::filter::compare_values(&Value::String(s.to_string()), op, b),
+//                     }
+//                 }
+//             }
+//         }
+//         _ => {
+//             // Fallback for complex types (Map, Array, Reference)
+//             if let Some(v) = crate::document::firelite_doc::decode_value(tag, data) {
+//                 return crate::query::filter::compare_values(&v, op, b);
+//             }
+//         }
+//     }
+//     if let Some(val) = physical_val {
+//         // Use the flexible compare_values we just fixed
+//         return crate::query::filter::compare_values(&val, op, query_val);
+//     }
+//     false
+// }
+
 fn compare_raw_bytes(tag: u8, data: &[u8], op: &Operator, b: &Value) -> bool {
-    // --- 1. Handle Super Tags (Zero-length headers) ---
+    // --- 1. Handle Super Tags (Zero-length headers / Tags with inlined data) ---
     if tag == 0xC0 { return crate::query::filter::compare_values(&Value::Null, op, b); }
     if tag == 0xC2 { return crate::query::filter::compare_values(&Value::Bool(true), op, b); }
     if tag == 0xC3 { return crate::query::filter::compare_values(&Value::Bool(false), op, b); }
+    
+    // Tag 0x10 - 0x1F: Small Integers
     if (tag & 0xF0) == 0x10 { 
         return crate::query::filter::compare_values(&Value::Int((tag & 0x0F) as i64), op, b); 
     }
+    
+    // Tag 0x40 - 0x47: Small Strings
     if (tag & 0xF8) == 0x40 { 
         let len = (tag & 0x07) as usize;
         if let Ok(s) = std::str::from_utf8(&data[..len]) {
@@ -319,43 +386,44 @@ fn compare_raw_bytes(tag: u8, data: &[u8], op: &Operator, b: &Value) -> bool {
     // --- 2. Handle Standard Tags (4-byte length prefix + Body) ---
     if data.len() < 4 { return false; }
     
-    // The actual payload starts after the 4-byte length header
+    // Payload starts after 4-byte header
     let body = &data[4..];
 
-    match tag {
+    let physical_val = match tag {
         3 | 7 => { // Int or Timestamp (Zigzag Varint)
             let mut p = 0; 
-            if let Some(val) = crate::util::varint::decode_varint(body, &mut p) {
+            crate::util::varint::decode_varint(body, &mut p).map(|val| {
                 let decoded = crate::util::varint::zigzag_decode(val);
-                let val_obj = if tag == 3 { Value::Int(decoded) } else { Value::Timestamp(decoded) };
-                return crate::query::filter::compare_values(&val_obj, op, b);
-            }
+                if tag == 3 { Value::Int(decoded) } else { Value::Timestamp(decoded) }
+            })
         }
         4 => { // Float (8 bytes LE)
-            if let Ok(bits) = body.try_into().map(f64::from_le_bytes) {
-                return crate::query::filter::compare_values(&Value::Float(bits), op, b);
-            }
+            body.get(..8)
+                .and_then(|slice| slice.try_into().ok())
+                .map(|arr| Value::Float(f64::from_le_bytes(arr)))
         }
         5 => { // String
-            // Fix: We must respect the length provided in the header for exact slices
-            let v_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-            if let Some(s_bytes) = body.get(..v_len) {
-                if let Ok(s) = std::str::from_utf8(s_bytes) {
-                    match (op, b) {
-                        (Operator::Eq, Value::String(t)) => return s == t,
-                        (Operator::StartsWith, Value::String(t)) => return s.starts_with(t),
-                        _ => return crate::query::filter::compare_values(&Value::String(s.to_string()), op, b),
-                    }
-                }
-            }
+            let v_len = u32::from_le_bytes(data[0..4].try_into().unwrap_or([0;4])) as usize;
+            body.get(..v_len)
+                .and_then(|s_bytes| std::str::from_utf8(s_bytes).ok())
+                .map(|s| Value::String(s.to_string()))
+        }
+        6 => { // Binary
+            let v_len = u32::from_le_bytes(data[0..4].try_into().unwrap_or([0;4])) as usize;
+            body.get(..v_len).map(|bytes| Value::Binary(bytes.to_vec()))
         }
         _ => {
-            // Fallback for complex types (Map, Array, Reference)
-            if let Some(v) = crate::document::firelite_doc::decode_value(tag, data) {
-                return crate::query::filter::compare_values(&v, op, b);
-            }
+            // Fallback for complex types (Map, Array, Reference, BlobLink)
+            crate::document::firelite_doc::decode_value(tag, data)
         }
+    };
+
+    // If we successfully resolved a value from the disk, 
+    // run it through the flexible comparison logic.
+    if let Some(val) = physical_val {
+        return crate::query::filter::compare_values(&val, op, b);
     }
+    
     false
 }
 

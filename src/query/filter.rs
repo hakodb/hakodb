@@ -44,14 +44,16 @@ pub fn compare_values(a: &Value, op: &Operator, b: &Value) -> bool {
     match op {
         Operator::In => {
             return if let Value::Array(allowed) = b {
-                allowed.contains(a)
+                // allowed.contains(a)
+                allowed.iter().any(|item| compare_values(a, &Operator::Eq, item))
             } else {
                 false
             };
         }
         Operator::NotIn => {
             return if let Value::Array(allowed) = b {
-                !allowed.contains(a)
+                // !allowed.contains(a)
+                !allowed.iter().any(|item| compare_values(a, &Operator::Eq, item))
             } else {
                 true
             };
@@ -74,6 +76,24 @@ pub fn compare_values(a: &Value, op: &Operator, b: &Value) -> bool {
     }
     match (a, b) {
         // String-specific logic for FTS and standard comparisons
+        (Value::String(s), Value::Int(i)) => {
+            if let Ok(parsed) = s.parse::<i64>() {
+                return eval_ordering(parsed.cmp(i), op);
+            }
+            eval_ordering(a.cmp(b), op)
+        },
+        (Value::Int(i), Value::String(s)) => {
+            if let Ok(parsed) = s.parse::<i64>() {
+                return eval_ordering(i.cmp(&parsed), op);
+            }
+            eval_ordering(a.cmp(b), op)
+        },
+        (Value::String(s), Value::Float(f)) => {
+            if let Ok(parsed) = s.parse::<f64>() {
+                return eval_ordering(parsed.total_cmp(f), op);
+            }
+            eval_ordering(a.cmp(b), op)
+        },
         (Value::String(d), Value::String(f)) => match op {
             Operator::StartsWith => d.starts_with(f),
             Operator::Contains => d.contains(f),
