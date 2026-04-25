@@ -143,17 +143,12 @@ impl ParallelQueryExecutor {
 
         // 6. PHASE 6: FINAL SORTING & SLICING
         // Manual sort if the Index couldn't satisfy the order_by clause
-        if !plan.order_by_satisfied {
-            if let Some(order) = &plan.order_by {
-                results.sort_by(|(id_a, doc_a), (id_b, doc_b)| {
+        if !plan.order_by_satisfied && !plan.order_by.is_empty() {
+            results.sort_by(|(id_a, doc_a), (id_b, doc_b)| {
+                for order in &plan.order_by {
                     let cmp = match order.field.as_str() {
-                        // 1. Sort by the naked ID (String comparison)
                         "id" => id_a.cmp(id_b),
-
-                        // 2. Sort by the native timestamp (i64 comparison)
                         "_time" => doc_a._time.cmp(&doc_b._time),
-
-                        // 3. Fallback to regular document fields
                         _ => {
                             let av = doc_a.get(&order.field);
                             let bv = doc_b.get(&order.field);
@@ -161,13 +156,12 @@ impl ParallelQueryExecutor {
                         }
                     };
 
-                    if order.ascending {
-                        cmp
-                    } else {
-                        cmp.reverse()
+                    if cmp != std::cmp::Ordering::Equal {
+                        return if order.ascending { cmp } else { cmp.reverse() };
                     }
-                });
-            }
+                }
+                std::cmp::Ordering::Equal
+            });
         }
 
         // Apply final Offset/Limit for non-indexed queries
@@ -459,31 +453,23 @@ impl ParallelQueryExecutor {
             }
         }
 
-        if let Some(order) = &plan.order_by {
+        if !plan.order_by_satisfied && !plan.order_by.is_empty() {
             results.sort_by(|(id_a, fields_a), (id_b, fields_b)| {
-                let cmp = match order.field.as_str() {
-                    "id" => id_a.cmp(id_b),
-
-                    // In projected results, _time is already injected into the fields vec
-                    // by FireLiteDoc::decode_projected
-                    _ => {
-                        let av = fields_a
-                            .iter()
-                            .find(|(k, _)| k == &order.field)
-                            .map(|(_, v)| v);
-                        let bv = fields_b
-                            .iter()
-                            .find(|(k, _)| k == &order.field)
-                            .map(|(_, v)| v);
-                        av.cmp(&bv)
+                for order in &plan.order_by {
+                    let cmp = match order.field.as_str() {
+                        "id" => id_a.cmp(id_b),
+                        "_time" => { /* handle time if projected */ id_a.cmp(id_b) } // Placeholder
+                        _ => {
+                            let av = fields_a.iter().find(|(k, _)| k == &order.field).map(|(_, v)| v);
+                            let bv = fields_b.iter().find(|(k, _)| k == &order.field).map(|(_, v)| v);
+                            av.cmp(&bv)
+                        }
+                    };
+                    if cmp != std::cmp::Ordering::Equal {
+                        return if order.ascending { cmp } else { cmp.reverse() };
                     }
-                };
-
-                if order.ascending {
-                    cmp
-                } else {
-                    cmp.reverse()
                 }
+                std::cmp::Ordering::Equal
             });
         }
 

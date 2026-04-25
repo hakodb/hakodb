@@ -32,7 +32,7 @@ pub enum FireLiteOp {
         #[serde(default)]
         filters: Vec<FilterInput>,
         or_groups: Option<Vec<Vec<FilterInput>>>,
-        order_by: Option<OrderByInput>,
+        order_by: Option<Vec<OrderByInput>>,
         limit: Option<usize>,
         offset: Option<usize>,
         projection: Option<Vec<String>>,
@@ -58,7 +58,7 @@ pub enum FireLiteOp {
         #[serde(default)]
         filters: Vec<FilterInput>,
         or_groups: Option<Vec<Vec<FilterInput>>>,
-        order_by: Option<OrderByInput>,
+        order_by: Option<Vec<OrderByInput>>,
         limit: Option<usize>,
         offset: Option<usize>,
         projection: Option<Vec<String>>,
@@ -368,7 +368,7 @@ struct QueryInput {
     collection: String,
     filters: Vec<FilterInput>,
     or_groups: Option<Vec<Vec<FilterInput>>>,
-    order_by: Option<OrderByInput>,
+    order_by: Option<Vec<OrderByInput>>,
     limit: Option<usize>,
     offset: Option<usize>,
     projection: Option<Vec<String>>,
@@ -624,7 +624,13 @@ fn build_query_from_input(input: &QueryInput) -> Result<Query, String> {
     }
 
     // 3. Sorting and Pagination
-    if let Some(order) = &input.order_by { query = query.order_by(&order.field, order.ascending); }
+    // if let Some(order) = &input.order_by { query = query.order_by(&order.field, order.ascending); }
+    if let Some(ref orders) = &input.order_by {
+        for order in orders {
+            query = query.order_by(&order.field, order.ascending);
+        }
+    }
+    
     if let Some(limit) = input.limit { query = query.limit(limit); }
     if let Some(offset) = input.offset { query = query.offset(offset); }
 

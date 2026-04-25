@@ -2000,27 +2000,30 @@ pub extern "C" fn fl_engine_get_by_ref(
 
 /// Internal helper to extract values from an anchor document based on the query's sort order
 fn get_anchor_values(q: &crate::query::query::Query, doc: &FireLiteDoc) -> Option<Vec<Value>> {
-    let order = q.order_by.as_ref()?;
-    let val = doc.get(&order.field)?;
-    Some(vec![val.clone()])
+    if q.order_by.is_empty() { return None; }
+    
+    let mut vals = Vec::with_capacity(q.order_by.len());
+    for order in &q.order_by {
+        vals.push(doc.get(&order.field)?.clone());
+    }
+    Some(vals)
 }
 
 #[no_mangle]
 pub extern "C" fn fl_query_start_after(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> i32 {
-    if query.is_null() || anchor_doc.is_null() {
-        return -1;
-    }
-    let q = unsafe { &mut *query };
-    let doc = unsafe { &*anchor_doc };
+    safety_shield!(-1, {
+        if query.is_null() || anchor_doc.is_null() { return -1; }
+        let q = unsafe { &mut *query };
+        let doc = unsafe { &*anchor_doc };
 
-    if let Some(order) = &q.query.order_by {
-        if let Some(val) = doc.doc.get(&order.field) {
-            q.query.start_after = Some(vec![val.clone()]);
-            return 0;
+        if let Some(vals) = get_anchor_values(&q.query, &doc.doc) {
+            q.query.start_after = Some(vals);
+            0
+        } else {
+            set_last_error("Anchor document missing one or more fields from sort chain");
+            -1
         }
-    }
-    set_last_error("Anchor document missing sort field");
-    -1
+    })
 }
 
 #[no_mangle]
