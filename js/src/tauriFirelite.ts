@@ -59,9 +59,13 @@ function generateId() {
 function normalizeValue(v: any): any {
     if (v === null || typeof v !== 'object') return v; // Fast path for primitives
     
-    if (v instanceof Uint8Array) return Array.from(v);
-    // if (v instanceof Date) return v.getTime() * 1000;
-    if (v instanceof Date) return v.getTime();
+    // if (v instanceof Uint8Array) return Array.from(v);
+    if (v instanceof Uint8Array) {
+        // Match the Rust side's expectation for fast binary transfers
+        const b64 = btoa(String.fromCharCode(...v));
+        return `__b64__:${b64}`;
+    }
+    if (v instanceof Date) return v.getTime() * 1000;
     
     if (Array.isArray(v)) {
         const len = v.length;
@@ -115,7 +119,7 @@ export class DocumentSnapshot {
         private readonly _ref?: DocumentReference
     ) {
         // Use the ID from data if the provided ID is null (common in queries)
-        this.id = id || _data?.id;
+        this.id = id;
         this._time = (_data as any)?._time || 0;
     }
     

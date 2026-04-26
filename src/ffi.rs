@@ -168,6 +168,15 @@ pub extern "C" fn fl_engine_open(path: *const c_char) -> *mut FL_Engine {
 }
 
 #[no_mangle]
+pub extern "C" fn fl_engine_is_indexes_ready(engine: *mut FL_Engine) -> bool {
+    safety_shield!(false, {
+        if engine.is_null() { return false; }
+        let engine = unsafe { &*engine };
+        engine.db.indexes_ready.load(std::sync::atomic::Ordering::Acquire)
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn fl_config_new() -> *mut FL_Config {
     Box::into_raw(Box::new(FL_Config {
         inner: FireLiteConfig::default(),
@@ -268,6 +277,13 @@ pub extern "C" fn fl_config_set_storage_tuning(
         cfg.inner.page_size = page_size;
         cfg.inner.auto_compaction_threshold_bytes = compaction_threshold;
         cfg.inner.group_commit_max_ops = group_commit_max_ops;
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_config_set_blob_threshold(config: *mut FL_Config, threshold_bytes: usize) {
+    if let Some(cfg) = unsafe { config.as_mut() } {
+        cfg.inner.value_blob_threshold_bytes = threshold_bytes;
     }
 }
 
