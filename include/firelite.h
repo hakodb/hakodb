@@ -39,6 +39,8 @@ extern "C" {
 
 FL_Engine *fl_engine_open(const char *path);
 
+bool fl_engine_is_indexes_ready(FL_Engine *engine);
+
 FL_Config *fl_config_new();
 
 void fl_config_free(FL_Config *config);
@@ -63,6 +65,8 @@ void fl_config_set_storage_tuning(FL_Config *config,
                                   uintptr_t page_size,
                                   uintptr_t compaction_threshold,
                                   uintptr_t group_commit_max_ops);
+
+void fl_config_set_blob_threshold(FL_Config *config, uintptr_t threshold_bytes);
 
 /// Opens the engine using a custom config.
 /// Note: This function takes ownership of the config and will free it automatically.

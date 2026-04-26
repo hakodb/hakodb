@@ -233,69 +233,220 @@ impl QueryPlanner {
         for filter in &query.filters {
             if matches!(filter.op, Operator::In) {
                 if let Value::Array(vals) = &filter.value {
+                    let mut scans = Vec::new();
                     for v in vals {
-                        scans.push(Self::get_single_filter_scan(
-                            &query.collection,
-                            &filter.field,
-                            v,
-                            indexes,
-                        )?);
+                        // This ensures each item in the IN array checks for 
+                        // Composite Indexes first, then Secondary Indexes.
+                        if let Some(scan) = Self::get_single_filter_scan(
+                            &query.collection, &filter.field, v, indexes, query
+                        ) {
+                            scans.push(scan);
+                        } else {
+                            // If one item can't hit an index, the whole IN might as well full scan
+                            return None; 
+                        }
                     }
+                    return Some(ScanType::UnionIndex { scans });
                 }
             }
         }
-        for group in &query.or_groups {
-            if group.len() == 1 {
-                let f = &group[0];
-                scans.push(Self::get_single_filter_scan(
-                    &query.collection,
-                    &f.field,
-                    &f.value,
-                    indexes,
-                )?);
-            } else {
-                return None;
+        if !query.or_groups.is_empty() {
+            for group in &query.or_groups {
+                if group.len() == 1 {
+                    let f = &group[0];
+                    scans.push(Self::get_single_filter_scan(
+                        &query.collection,
+                        &f.field,
+                        &f.value,
+                        indexes,
+                        query
+                    )?);
+                } else {
+                    // Complex OR groups (multiple filters in one OR) still fallback to Full Scan
+                    return None;
+                }
             }
+            return Some(ScanType::UnionIndex { scans });
         }
-        if scans.is_empty() {
-            None
-        } else {
-            Some(ScanType::UnionIndex { scans })
-        }
+
+        None
     }
+
+    // fn get_single_filter_scan(
+    //     col: &str,
+    //     field: &str,
+    //     val: &Value,
+    //     indexes: &IndexManager,
+    //     query: &Query,
+    // ) -> Option<ScanType> {
+    //     let mut alternatives = Vec::new();
+    //     alternatives.push(val.clone());
+
+    //     match val {
+    //         Value::String(s) => {
+    //             if let Ok(i) = s.parse::<i64>() { alternatives.push(Value::Int(i)); }
+    //             if let Ok(f) = s.parse::<f64>() { alternatives.push(Value::Float(f)); }
+    //         }
+    //         Value::Int(i) => {
+    //             alternatives.push(Value::String(i.to_string()));
+    //         }
+    //         _ => {}
+    //     }
+
+    //     // 2. If we have multiple types to check, we use a Union Scan
+    //     if alternatives.len() > 1 && matches!(query.filters.iter().find(|f| f.field == field).map(|f| f.op), Some(Operator::Eq)) {
+    //         let mut sub_scans = Vec::new();
+    //         for alt_val in alternatives {
+    //             // Check Composite first
+    //             let mut found = false;
+    //             for idx in indexes.indexes_for_collection(col) {
+    //                 if idx.definition.fields.first().map_or(false, |f| f.field == field) {
+    //                     sub_scans.push(ScanType::CompositeIndex {
+    //                         fields: vec![field.to_string()],
+    //                         values: vec![alt_val.clone()],
+    //                         reverse: false,
+    //                     });
+    //                     found = true;
+    //                     break;
+    //                 }
+    //             }
+    //             // Then Secondary
+    //             if !found {
+    //                 if indexes.secondary.get(col).map_or(false, |m| m.contains_key(field)) {
+    //                     sub_scans.push(ScanType::SecondaryIndex {
+    //                         field: field.to_string(),
+    //                         value: crate::index::index_key::encode_scalar(&alt_val),
+    //                     });
+    //                 }
+    //             }
+    //         }
+    //         if !sub_scans.is_empty() {
+    //             return Some(ScanType::UnionIndex { scans: sub_scans });
+    //         }
+    //     }
+
+    //     // 1. Priority: Composite Index (Point Lookup)
+    //     // Check if this field is the first column in any composite index.
+    //     for idx in indexes.indexes_for_collection(col) {
+    //         if let Some(first_field) = idx.definition.fields.first() {
+    //             if first_field.field == field {
+    //                 // IMPORTANT: We must use the CompositeIndex variant so the 
+    //                 // executor knows to use the Composite logic (prefix + id)
+    //                 return Some(ScanType::CompositeIndex {
+    //                     fields: vec![field.to_string()],
+    //                     values: vec![val.clone()],
+    //                     reverse: false,
+    //                 });
+    //             }
+    //         }
+    //     }
+
+    //     // 2. Priority: Secondary Index
+    //     if let Some(sec_map) = indexes.secondary.get(col) {
+    //         if sec_map.contains_key(field) {
+    //             let val_bytes = crate::index::index_key::encode_scalar(val);
+    //             return Some(ScanType::SecondaryIndex {
+    //                 field: field.to_string(),
+    //                 value: val_bytes,
+    //             });
+    //         }
+    //     }
+
+    //     None
+    // }
 
     fn get_single_filter_scan(
         col: &str,
         field: &str,
         val: &Value,
         indexes: &IndexManager,
+        _query: &Query,
     ) -> Option<ScanType> {
-        if indexes
-            .secondary
-            .get(col)
-            .map_or(false, |m| m.contains_key(field))
-        {
-            let val_bytes = crate::index::index_key::encode_scalar(val);
-            return Some(ScanType::SecondaryIndex {
-                field: field.to_string(),
-                value: val_bytes,
-            });
+        let mut alternatives = Vec::new();
+        alternatives.push(val.clone());
+
+        // 1. Generate alternatives for number-like strings
+        match val {
+            Value::String(s) => {
+                if let Ok(i) = s.parse::<i64>() { alternatives.push(Value::Int(i)); }
+                if let Ok(f) = s.parse::<f64>() { alternatives.push(Value::Float(f)); }
+            }
+            Value::Int(i) => { alternatives.push(Value::String(i.to_string())); }
+            _ => {}
         }
-        if indexes.has_index(col, &[field.to_string()]) {
-            return Some(ScanType::CompositeIndex {
-                fields: vec![field.to_string()],
-                values: vec![val.clone()],
-                reverse: false,
-            });
+
+        let mut sub_scans = Vec::new();
+        for alt_val in &alternatives {
+            let mut found_for_this_type = false;
+            // Look for Composite Index first
+            for idx in indexes.indexes_for_collection(col) {
+                if idx.definition.fields.first().map_or(false, |f| f.field == field) {
+                    sub_scans.push(ScanType::CompositeIndex {
+                        fields: vec![field.to_string()],
+                        values: vec![alt_val.clone()],
+                        reverse: false,
+                    });
+                    found_for_this_type = true;
+                    break; // Found an index for this specific alternative
+                }
+            }
+            
+            // If no composite scan was added for this alternative, check Secondary Index
+            if !found_for_this_type { // Logic: if we didn't just add a composite scan
+                if let Some(sec_map) = indexes.secondary.get(col) {
+                    if sec_map.contains_key(field) {
+                        sub_scans.push(ScanType::SecondaryIndex {
+                            field: field.to_string(),
+                            value: crate::index::index_key::encode_scalar(alt_val),
+                        });
+                    }
+                }
+            }
         }
-        None
+
+        // Return a Union if multiple types are valid, a Single scan if only one, or None
+        if sub_scans.is_empty() {
+            None
+        } else if sub_scans.len() == 1 {
+            sub_scans.pop()
+        } else {
+            // This is the magic: It will check the index for String AND Int versions
+            Some(ScanType::UnionIndex { scans: sub_scans })
+        }
     }
 
+
     fn try_plan_composite_range(query: &Query, indexes: &IndexManager) -> Option<ScanType> {
+        
+        let is_point_lookup = |f: &crate::query::filter::Filter| {
+            matches!(f.op, Operator::Eq) || 
+            (matches!(f.op, Operator::In) && matches!(&f.value, Value::Array(a) if a.len() == 1))
+        };
+
+        if query.filters.is_empty() || !query.filters.iter().all(is_point_lookup) {
+            return None;
+        }
+        
         for idx in indexes.indexes_for_collection(&query.collection) {
             let mut eq_prefix = Vec::new();
             let mut range_filter = None;
             let mut supported = true;
+
+            let mut matched_fields = Vec::new();
+            let mut matched_values = Vec::new();
+
+            for idx_field in &idx.definition.fields {
+                if let Some(filter) = query.filters.iter().find(|f| f.field == idx_field.field) {
+                    matched_fields.push(idx_field.field.clone());
+                    
+                    // Extract value: if array of 1, take the first element
+                    let v = match &filter.value {
+                        Value::Array(a) if a.len() == 1 => a[0].clone(),
+                        other => other.clone(),
+                    };
+                    matched_values.push(v);
+                } else { break; }
+            }
 
             for field in &idx.definition.fields {
                 if let Some(filter) = query.filters.iter().find(|f| f.field == field.field) {
@@ -377,64 +528,178 @@ impl QueryPlanner {
         None
     }
 
+    // fn try_plan_composite_eq(query: &Query, indexes: &IndexManager) -> Option<(ScanType, bool, bool)> {
+    //     // Determine if a filter is a point-lookup (Equality or IN with 1 item)
+    //     let is_point_lookup = |f: &crate::query::filter::Filter| {
+    //         matches!(f.op, Operator::Eq) || 
+    //         (matches!(f.op, Operator::In) && matches!(&f.value, Value::Array(a) if a.len() == 1))
+    //     };
+
+    //     if query.filters.is_empty() || !query.filters.iter().all(is_point_lookup) {
+    //         return None;
+    //     }
+
+    //     for idx in indexes.indexes_for_collection(&query.collection) {
+    //         let mut matched_fields = Vec::new();
+    //         let mut matched_values = Vec::new();
+
+    //         for idx_field in &idx.definition.fields {
+    //             if let Some(filter) = query.filters.iter().find(|f| f.field == idx_field.field) {
+    //                 matched_fields.push(idx_field.field.clone());
+                    
+    //                 // Extract the value regardless of type (String, Bool, etc.)
+    //                 let v = match &filter.value {
+    //                     Value::Array(a) if a.len() == 1 => a[0].clone(),
+    //                     other => other.clone(),
+    //                 };
+    //                 matched_values.push(v);
+    //             } else { break; }
+    //         }
+
+    //         // Must match exactly the number of filters provided
+    //         if matched_fields.len() == query.filters.len() {
+    //             let mut order_satisfied = false;
+    //             let mut reverse_scan = false;
+
+    //             // Handle Multi-field Sort Chain
+    //             if !query.order_by.is_empty() {
+    //                 let start_idx = matched_fields.len();
+    //                 let mut matches_all_sorts = true;
+                    
+    //                 for (i, q_order) in query.order_by.iter().enumerate() {
+    //                     if let Some(idx_f) = idx.definition.fields.get(start_idx + i) {
+    //                         if idx_f.field != q_order.field {
+    //                             matches_all_sorts = false;
+    //                             break;
+    //                         }
+    //                         if i == 0 && (idx_f.direction == SortDirection::Asc) != q_order.ascending {
+    //                             reverse_scan = true;
+    //                         }
+    //                         if (idx_f.direction == SortDirection::Asc) != (q_order.ascending != reverse_scan) {
+    //                             matches_all_sorts = false;
+    //                             break;
+    //                         }
+    //                     } else {
+    //                         matches_all_sorts = false;
+    //                         break;
+    //                     }
+    //                 }
+    //                 order_satisfied = matches_all_sorts;
+    //             }
+
+    //             return Some((
+    //                 ScanType::CompositeIndex { fields: matched_fields, values: matched_values, reverse: reverse_scan },
+    //                 order_satisfied,
+    //                 true,
+    //             ));
+    //         }
+    //     }
+    //     None
+    // }
     fn try_plan_composite_eq(query: &Query, indexes: &IndexManager) -> Option<(ScanType, bool, bool)> {
-        if query.filters.is_empty() || !query.filters.iter().all(|f| matches!(f.op, Operator::Eq)) {
+        let is_point_lookup = |f: &crate::query::filter::Filter| {
+            matches!(f.op, Operator::Eq) || 
+            (matches!(f.op, Operator::In) && matches!(&f.value, Value::Array(a) if a.len() == 1))
+        };
+
+        // We only use this optimization if ALL filters are Equality/Point-lookups
+        if query.filters.is_empty() || !query.filters.iter().all(is_point_lookup) {
             return None;
         }
 
-        for idx in indexes.indexes_for_collection(&query.collection) {
-            let mut matched_fields = Vec::new();
-            let mut matched_values = Vec::new();
+        // 1. Probing: Prepare alternate types for the FIRST filter field
+        let first_filter = &query.filters[0];
+        let mut alternatives = Vec::new();
+        alternatives.push(first_filter.value.clone());
+        match &first_filter.value {
+            Value::String(s) => { if let Ok(i) = s.parse::<i64>() { alternatives.push(Value::Int(i)); } }
+            Value::Int(i) => { alternatives.push(Value::String(i.to_string())); }
+            _ => {}
+        }
 
-            // Match Equality Filters first
-            for idx_field in &idx.definition.fields {
-                if let Some(filter) = query.filters.iter().find(|f| f.field == idx_field.field) {
-                    matched_fields.push(idx_field.field.clone());
-                    matched_values.push(filter.value.clone());
-                } else { break; }
-            }
+        let mut sub_scans = Vec::new();
 
-            if matched_fields.len() == query.filters.len() {
-                let mut order_satisfied = false;
-                let mut reverse_scan = false;
+        // 2. Try to find a matching index for each alternative type
+        for alt_val in alternatives {
+            for idx in indexes.indexes_for_collection(&query.collection) {
+                let mut matched_fields = Vec::new();
+                let mut matched_values = Vec::new();
 
-                // NEW: Check if the Sort Chain follows the equality fields in the index
-                if !query.order_by.is_empty() {
-                    let start_idx = matched_fields.len();
-                    let mut matches_all_sorts = true;
-                    
-                    for (i, q_order) in query.order_by.iter().enumerate() {
-                        if let Some(idx_f) = idx.definition.fields.get(start_idx + i) {
-                            if idx_f.field != q_order.field {
-                                matches_all_sorts = false;
-                                break;
-                            }
-                            // For the first sort field, we decide if we need to scan the index backwards
-                            if i == 0 && (idx_f.direction == SortDirection::Asc) != q_order.ascending {
-                                reverse_scan = true;
-                            }
-                            // Note: If subsequent fields have different directions than index, 
-                            // order_satisfied must stay false.
-                            if (idx_f.direction == SortDirection::Asc) != (q_order.ascending != reverse_scan) {
-                                matches_all_sorts = false;
-                                break;
-                            }
-                        } else {
-                            matches_all_sorts = false;
-                            break;
-                        }
-                    }
-                    order_satisfied = matches_all_sorts;
+                // Match query filters to index prefix
+                for idx_field in &idx.definition.fields {
+                    let val_opt = if matched_fields.is_empty() {
+                        if idx_field.field == first_filter.field { Some(&alt_val) } else { None }
+                    } else {
+                        query.filters.iter().find(|f| f.field == idx_field.field).map(|f| &f.value)
+                    };
+
+                    if let Some(v) = val_opt {
+                        matched_fields.push(idx_field.field.clone());
+                        matched_values.push(match v {
+                            Value::Array(a) if a.len() == 1 => a[0].clone(),
+                            other => other.clone(),
+                        });
+                    } else { break; }
                 }
 
-                return Some((
-                    ScanType::CompositeIndex { fields: matched_fields, values: matched_values, reverse: reverse_scan },
-                    order_satisfied,
-                    true,
-                ));
+                // If this index covers ALL our filters
+                if matched_fields.len() == query.filters.len() {
+                    let mut order_satisfied = false;
+                    let mut reverse_scan = false;
+
+                    // 3. Sorting Logic: Does the index cover the ORDER BY clause?
+                    if !query.order_by.is_empty() {
+                        let start_idx = matched_fields.len();
+                        let mut matches_all_sorts = true;
+                        
+                        for (i, q_order) in query.order_by.iter().enumerate() {
+                            if let Some(idx_f) = idx.definition.fields.get(start_idx + i) {
+                                if idx_f.field != q_order.field {
+                                    matches_all_sorts = false;
+                                    break;
+                                }
+                                // Logic: If the first sort field direction is different from index, 
+                                // we scan the B-Tree backwards (reverse_scan).
+                                if i == 0 && (idx_f.direction == SortDirection::Asc) != q_order.ascending {
+                                    reverse_scan = true;
+                                }
+                                // Subsequent fields must follow the same flip
+                                if (idx_f.direction == SortDirection::Asc) != (q_order.ascending != reverse_scan) {
+                                    matches_all_sorts = false;
+                                    break;
+                                }
+                            } else {
+                                matches_all_sorts = false;
+                                break;
+                            }
+                        }
+                        order_satisfied = matches_all_sorts;
+                    }
+
+                    sub_scans.push((
+                        ScanType::CompositeIndex { 
+                            fields: matched_fields, 
+                            values: matched_values, 
+                            reverse: reverse_scan 
+                        },
+                        order_satisfied
+                    ));
+                    break; // Found the best index for this specific alternative
+                }
             }
         }
-        None
+
+        if sub_scans.is_empty() {
+            None
+        } else if sub_scans.len() == 1 {
+            let (scan, ordered) = sub_scans.pop().unwrap();
+            Some((scan, ordered, true))
+        } else {
+            // We hit multiple types (String and Int). 
+            // We MUST sort in RAM because Union merges different ranges.
+            let scans = sub_scans.into_iter().map(|(s, _)| s).collect();
+            Some((ScanType::UnionIndex { scans }, false, true))
+        }
     }
 }
 

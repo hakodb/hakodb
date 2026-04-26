@@ -74,24 +74,46 @@ pub fn compare_values(a: &Value, op: &Operator, b: &Value) -> bool {
         }
         _ => {} // Fall through to standard comparisons
     }
+
+
+    // 2. Strict type equality (Fast Path)
+    if matches!(op, Operator::Eq) && a == b { return true; }
+
     match (a, b) {
         // String-specific logic for FTS and standard comparisons
-        (Value::String(s), Value::Int(i)) => {
+        // (Value::String(s), Value::Int(i)) => {
+        //     if let Ok(parsed) = s.parse::<i64>() {
+        //         return eval_ordering(parsed.cmp(i), op);
+        //     }
+        //     eval_ordering(a.cmp(b), op)
+        // },
+        // (Value::Int(i), Value::String(s)) => {
+        //     if let Ok(parsed) = s.parse::<i64>() {
+        //         return eval_ordering(i.cmp(&parsed), op);
+        //     }
+        //     eval_ordering(a.cmp(b), op)
+        // },
+        // (Value::String(s), Value::Float(f)) => {
+        //     if let Ok(parsed) = s.parse::<f64>() {
+        //         return eval_ordering(parsed.total_cmp(f), op);
+        //     }
+        //     eval_ordering(a.cmp(b), op)
+        // },
+        (Value::String(s), Value::Int(i)) | (Value::Int(i), Value::String(s)) => {
             if let Ok(parsed) = s.parse::<i64>() {
                 return eval_ordering(parsed.cmp(i), op);
             }
+            // If not a valid number string, return false for Eq, true for Ne
+            if matches!(op, Operator::Eq) { return false; }
+            if matches!(op, Operator::Ne) { return true; }
             eval_ordering(a.cmp(b), op)
         },
-        (Value::Int(i), Value::String(s)) => {
-            if let Ok(parsed) = s.parse::<i64>() {
-                return eval_ordering(i.cmp(&parsed), op);
-            }
-            eval_ordering(a.cmp(b), op)
-        },
-        (Value::String(s), Value::Float(f)) => {
+        (Value::String(s), Value::Float(f)) | (Value::Float(f), Value::String(s)) => {
             if let Ok(parsed) = s.parse::<f64>() {
                 return eval_ordering(parsed.total_cmp(f), op);
             }
+            if matches!(op, Operator::Eq) { return false; }
+            if matches!(op, Operator::Ne) { return true; }
             eval_ordering(a.cmp(b), op)
         },
         (Value::String(d), Value::String(f)) => match op {
@@ -158,7 +180,16 @@ pub fn compare_values(a: &Value, op: &Operator, b: &Value) -> bool {
 
         // Cross-type comparisons or comparisons involving ServerTimestamp placeholders
         // In Firestore-style engines, comparing different types usually returns false.
-        _ => eval_ordering(a.cmp(b), op),
+        // _ => eval_ordering(a.cmp(b), op),
+        _ => {
+            if a.type_weight() != b.type_weight() {
+                // Special case: Allow cross-comparison of Int and Float as "Numbers"
+                let is_numeric = (matches!(a, Value::Int(_)) || matches!(a, Value::Float(_))) &&
+                                 (matches!(b, Value::Int(_)) || matches!(b, Value::Float(_)));
+                if !is_numeric { return eval_ordering(a.type_weight().cmp(&b.type_weight()), op); }
+            }
+            eval_ordering(a.cmp(b), op)
+        }
     }
 }
 

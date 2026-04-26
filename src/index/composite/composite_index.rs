@@ -39,11 +39,20 @@ impl CompositeIndex {
         Some(values)
     }
 
+    // pub fn index_document(&mut self, doc_id: &str, doc: &FireLiteDoc) {
+    //     if let Some(values) = self.document_values(&doc_id, doc) {
+    //         self.tree.insert(
+    //             encode_composite_key(&self.definition, &values, doc_id),
+    //             // doc_id.to_string(),
+    //             Arc::from(doc_id),
+    //         );
+    //     }
+    // }
     pub fn index_document(&mut self, doc_id: &str, doc: &FireLiteDoc) {
-        if let Some(values) = self.document_values(&doc_id, doc) {
+        if let Some(values) = self.document_values(doc_id, doc) {
+            // Use the doc_id exactly as provided
             self.tree.insert(
                 encode_composite_key(&self.definition, &values, doc_id),
-                // doc_id.to_string(),
                 Arc::from(doc_id),
             );
         }

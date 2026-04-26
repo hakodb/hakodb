@@ -21,7 +21,7 @@ pub enum Value {
 
 impl Value {
     /// Internal weight to allow sorting different types against each other.
-    fn type_weight(&self) -> u8 {
+    pub(crate) fn type_weight(&self) -> u8 {
         match self {
             Value::Null => 0,
             Value::Bool(_) => 1,

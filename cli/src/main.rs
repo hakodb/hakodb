@@ -880,11 +880,32 @@ fn parse_filter(input: &str) -> Result<ParsedFilter> {
         bail!("invalid filter '{input}', expected field:op:value");
     }
     let field = strip_wrapping_quotes(parts[0]).trim().to_string();
-    if field.is_empty() {
-        bail!("filter field cannot be empty");
-    }
     let op = parse_operator(parts[1])?;
-    let value = parse_literal_for_operator(&op, strip_wrapping_quotes(parts[2]).trim())?;
+    
+    let value = if matches!(op, Operator::In | Operator::NotIn) {
+        let val_str = parts[2].trim();
+        
+        // Ensure it has brackets
+        if !val_str.starts_with('[') || !val_str.ends_with(']') {
+            bail!("IN operator requires array format: [item1,item2]");
+        }
+
+        let inner = &val_str[1..val_str.len()-1];
+        if inner.trim().is_empty() {
+            Value::Array(vec![])
+        } else {
+            let mut items = Vec::new();
+            // Split by comma, but respect potential JSON inside
+            for raw_item in inner.split(',') {
+                let trimmed = raw_item.trim();
+                // Use parse_literal but fallback to String if parsing fails (for pv1, etc)
+                items.push(parse_literal(trimmed).unwrap_or(Value::String(trimmed.to_string())));
+            }
+            Value::Array(items)
+        }
+    } else {
+        parse_literal_for_operator(&op, parts[2].trim())?
+    };
     Ok(ParsedFilter { field, op, value })
 }
 
@@ -933,8 +954,11 @@ fn parse_fts(input: &str) -> Result<(&str, &str)> {
 
 fn parse_cursor_values(input: &str) -> Result<Vec<Value>> {
     let mut out = Vec::new();
+    // for token in input.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+    //     out.push(parse_literal(strip_wrapping_quotes(token))?);
+    // }
     for token in input.split(',').map(str::trim).filter(|v| !v.is_empty()) {
-        out.push(parse_literal(strip_wrapping_quotes(token))?);
+        out.push(parse_literal(token)?);
     }
     if out.is_empty() {
         bail!("cursor values cannot be empty");
@@ -942,39 +966,57 @@ fn parse_cursor_values(input: &str) -> Result<Vec<Value>> {
     Ok(out)
 }
 
+// fn parse_literal_for_operator(op: &Operator, input: &str) -> Result<Value> {
+//     match op {
+//         Operator::Contains | Operator::StartsWith | Operator::Match => {
+//             Ok(Value::String(input.to_string()))
+//         }
+//         _ => parse_literal(input),
+//     }
+// }
+// In src/main.rs
 fn parse_literal_for_operator(op: &Operator, input: &str) -> Result<Value> {
     match op {
         Operator::Contains | Operator::StartsWith | Operator::Match => {
-            Ok(Value::String(input.to_string()))
+            // Because we bypassed parse_literal, we manually strip quotes here
+            Ok(Value::String(strip_wrapping_quotes(input).to_string()))
         }
         _ => parse_literal(input),
     }
 }
 
 fn parse_literal(input: &str) -> Result<Value> {
-    let lower = input.to_ascii_lowercase();
-    if lower == "null" {
-        return Ok(Value::Null);
+    let trimmed = input.trim();
+    
+    // 1. Explicit String via Quotes (if they survived the shell)
+    if (trimmed.starts_with('"') && trimmed.ends_with('"')) || 
+       (trimmed.starts_with('\'') && trimmed.ends_with('\'')) {
+        return Ok(Value::String(trimmed[1..trimmed.len()-1].to_string()));
     }
-    if lower == "true" {
-        return Ok(Value::Bool(true));
+
+    // 2. Keywords
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "null" => return Ok(Value::Null),
+        "true" => return Ok(Value::Bool(true)),
+        "false" => return Ok(Value::Bool(false)),
+        _ => {}
     }
-    if lower == "false" {
-        return Ok(Value::Bool(false));
+    
+    // 3. Numbers (Standard parsing)
+    if let Ok(i) = i64::from_str(trimmed) { return Ok(Value::Int(i)); }
+    if let Ok(f) = f64::from_str(trimmed) { return Ok(Value::Float(f)); }
+    
+    // 4. JSON fallback (for Maps/complex Arrays)
+    if (trimmed.starts_with('{') && trimmed.ends_with('}')) || 
+       (trimmed.starts_with('[') && trimmed.ends_with(']')) {
+        if let Ok(json) = serde_json::from_str::<JsonValue>(trimmed) {
+            return json_to_fire(json);
+        }
     }
-    if input == "__SERVER_TIMESTAMP__" {
-        return Ok(Value::ServerTimestamp);
-    }
-    if let Ok(i) = i64::from_str(input) {
-        return Ok(Value::Int(i));
-    }
-    if let Ok(f) = f64::from_str(input) {
-        return Ok(Value::Float(f));
-    }
-    if let Ok(json) = serde_json::from_str::<JsonValue>(input) {
-        return json_to_fire(json);
-    }
-    Ok(Value::String(input.to_string()))
+    
+    // 5. Default to String (Catch-all for pv1, status codes, etc)
+    Ok(Value::String(trimmed.to_string()))
 }
 
 fn strip_wrapping_quotes(input: &str) -> &str {

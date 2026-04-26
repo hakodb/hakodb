@@ -248,19 +248,22 @@ impl FireLiteGateway {
             });
 
             // --- 2. PREPARE MATCHER PLAN FOR LIVE UPDATES ---
-            let mut base_query = crate::query::query::Query::new(&query_template.collection);
-            for f in &query_template.filters {
-                base_query = base_query.where_filter(&f.field, map_operator(&f.op), json_value_to_value(&f.value).unwrap_or(Value::Null));
-            }
-            // If we are watching a specific ID, add it to the filter plan
-            if let Some(ref tid) = query_template.doc_id_filter {
-                base_query = base_query.where_filter("id", Operator::Eq, Value::String(tid.clone()));
-            }
+            // let mut base_query = crate::query::query::Query::new(&query_template.collection);
+            // for f in &query_template.filters {
+            //     base_query = base_query.where_filter(&f.field, map_operator(&f.op), json_value_to_value(&f.value).unwrap_or(Value::Null));
+            // }
+            // // If we are watching a specific ID, add it to the filter plan
+            // if let Some(ref tid) = query_template.doc_id_filter {
+            //     base_query = base_query.where_filter("id", Operator::Eq, Value::String(tid.clone()));
+            // }
+            let query_obj = build_query_from_input(&query_template).unwrap_or_else(|_| {
+                crate::query::query::Query::new(&query_template.collection)
+            });
 
             let filter_plan = {
                 let indexes = db.indexes.read().unwrap();
                 let is_ready = db.indexes_ready.load(std::sync::atomic::Ordering::Acquire);
-                crate::query::planner::QueryPlanner::plan(&base_query, &indexes, 0, 1,is_ready)
+                crate::query::planner::QueryPlanner::plan(&query_obj, &indexes, 0, 1,is_ready)
             };
 
             // --- 3. EVENT LOOP ---
@@ -437,7 +440,7 @@ pub async fn firelite_exec<R: Runtime>(
                 };
                 
                 // Resolve the standard query object
-                let mut query_obj = build_query_from_input(&input)?;
+                let query_obj = build_query_from_input(&input)?;
 
                 // if let Some(id) = &input.doc_id_filter {
                 //     query_obj = query_obj.where_filter("id", Operator::Eq, Value::String(id.to_string()));
