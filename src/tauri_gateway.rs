@@ -14,6 +14,10 @@ use crate::index::composite::definition::SortDirection;
 use crate::query::filter::Operator;
 use crate::query::query::Query;
 
+fn to_bin<S: serde::Serialize>(val: &S) -> Result<Vec<u8>, String> {
+    rmp_serde::to_vec_named(val).map_err(|e| e.to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum FireLiteOp {
@@ -248,14 +252,6 @@ impl FireLiteGateway {
             });
 
             // --- 2. PREPARE MATCHER PLAN FOR LIVE UPDATES ---
-            // let mut base_query = crate::query::query::Query::new(&query_template.collection);
-            // for f in &query_template.filters {
-            //     base_query = base_query.where_filter(&f.field, map_operator(&f.op), json_value_to_value(&f.value).unwrap_or(Value::Null));
-            // }
-            // // If we are watching a specific ID, add it to the filter plan
-            // if let Some(ref tid) = query_template.doc_id_filter {
-            //     base_query = base_query.where_filter("id", Operator::Eq, Value::String(tid.clone()));
-            // }
             let query_obj = build_query_from_input(&query_template).unwrap_or_else(|_| {
                 crate::query::query::Query::new(&query_template.collection)
             });
@@ -349,10 +345,14 @@ impl FireLiteGateway {
                         }
 
                         if !changes.is_empty() {
-                            let _ = window.emit(&ename, DeltaPayload {
-                                listener_id: lid.clone(),
-                                changes,
-                            });
+                            let payload = DeltaPayload { listener_id: lid.clone(), changes };
+                            if let Ok(bin) = to_bin(&payload) {
+                                let _ = window.emit(&ename, bin); // Emit raw bytes instead of JSON
+                            }
+                            // let _ = window.emit(&ename, DeltaPayload {
+                            //     listener_id: lid.clone(),
+                            //     changes,
+                            // });
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => continue,
@@ -392,14 +392,15 @@ pub enum QueryAction {
 
 #[command]
 pub async fn firelite_exec<R: Runtime>(
-    window: Window<R>,
+    _window: Window<R>,
     state: State<'_, FireLiteGateway>,
     op: FireLiteOp,
-) -> Result<FireLiteResponse, String> {
-
+) -> Result<Vec<u8>, String> {
     let gateway = state.inner().clone();
-    
-    tokio::task::spawn_blocking(move || {
+
+    // 1. We wrap the logic in spawn_blocking. 
+    // The closure return type is Result<FireLiteResponse, String>
+    let res = tokio::task::spawn_blocking(move || -> Result<FireLiteResponse, String> {
         match op {
             FireLiteOp::Get { collection, doc_id } => {
                 let doc = gateway.db.get(&collection, &doc_id).map_err(|e| e.to_string())?;
@@ -438,13 +439,7 @@ pub async fn firelite_exec<R: Runtime>(
                 let input = QueryInput { 
                     collection, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before 
                 };
-                
-                // Resolve the standard query object
                 let query_obj = build_query_from_input(&input)?;
-
-                // if let Some(id) = &input.doc_id_filter {
-                //     query_obj = query_obj.where_filter("id", Operator::Eq, Value::String(id.to_string()));
-                // }
 
                 match action.unwrap_or(QueryAction::Fetch) {
                     QueryAction::Fetch => {
@@ -482,7 +477,6 @@ pub async fn firelite_exec<R: Runtime>(
                 gateway.db.write_batch(batch).map_err(|e| e.to_string())?;
                 Ok(FireLiteResponse::Ok)
             }
-            // FIX: Included or_groups in pattern (Error E0027/E0425)
             FireLiteOp::Aggregate { collection, filters, or_groups, kind, field } => {
                 let mut query = Query::new(&collection);
                 for filter in filters {
@@ -490,7 +484,6 @@ pub async fn firelite_exec<R: Runtime>(
                 }
                 if let Some(groups) = or_groups {
                     for group in groups {
-                        // FIX: Explicit Type for collect (Error E0282)
                         let filters: Vec<crate::query::filter::Filter> = group.iter()
                             .map(|f: &FilterInput| -> Result<crate::query::filter::Filter, String> { 
                                 Ok(crate::query::filter::Filter { 
@@ -515,7 +508,7 @@ pub async fn firelite_exec<R: Runtime>(
             }
             FireLiteOp::Subscribe { listener_id, collection, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, event_name, start_at, start_after, end_at, end_before } => {
                 gateway.register_subscription(
-                    window,
+                    _window,
                     listener_id.clone(),
                     QueryInput { collection, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before },
                     event_name.unwrap_or_else(|| "firelite://snapshot".to_string()),
@@ -562,8 +555,6 @@ pub async fn firelite_exec<R: Runtime>(
                     3 => DurabilityMode::OnCommit,
                     _ => DurabilityMode::Always,
                 };
-                
-                // FIX: Assumes engine.rs change (Error E0616/E0282)
                 let shards = gateway.db.shards.read().unwrap();
                 for shard in shards.values() {
                     if let Ok(mut s) = shard.write() {
@@ -573,18 +564,15 @@ pub async fn firelite_exec<R: Runtime>(
                 Ok(FireLiteResponse::Ok)
             }
             FireLiteOp::SetCompression { enabled: _, level: _ } => {
-                let shards = gateway.db.shards.read().unwrap();
-                for shard in shards.values() {
-                    if let Ok(mut _s) = shard.write() {
-                        // Logic here once setter is added to StorageEngine
-                    }
-                }
                 Ok(FireLiteResponse::Ok)
             }
         }
     })
     .await
-    .unwrap_or_else(|e| Err(format!("Tokio Task Error: {}", e))) 
+    .map_err(|e| e.to_string())??; // First '?' handles spawn_blocking error, second handles inner String error
+
+    // 2. We now have 'res' as FireLiteResponse. Serialize it to MessagePack.
+    rmp_serde::to_vec_named(&res).map_err(|e| format!("Serialization error: {}", e))
 }
 
 
@@ -741,11 +729,8 @@ fn value_to_json(v: &Value) -> Result<serde_json::Value, String> {
         Value::Int(i) => Ok(serde_json::Value::Number((*i).into())),
         Value::Float(f) => serde_json::Number::from_f64(*f).map(serde_json::Value::Number).ok_or("invalid float".into()),
         Value::String(s) => Ok(serde_json::Value::String(s.clone())),
-        // Value::Binary(bytes) => Ok(serde_json::Value::Array(bytes.iter().map(|b| serde_json::Value::Number((*b as u64).into())).collect())),
         Value::Binary(bytes) => {
-            use base64::{Engine as _, engine::general_purpose};
-            // This is 10x-50x faster to serialize and transfer than an array of numbers
-            Ok(serde_json::Value::String(format!("__b64__:{}", general_purpose::STANDARD.encode(bytes))))
+            Ok(serde_json::json!(bytes)) 
         }
         Value::Timestamp(micros) => Ok(serde_json::Value::Number((*micros).into())),
         Value::Reference { collection, doc_id } => {
