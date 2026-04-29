@@ -14,9 +14,29 @@ use crate::index::composite::definition::SortDirection;
 use crate::query::filter::Operator;
 use crate::query::query::Query;
 
-// fn to_bin<S: serde::Serialize>(val: &S) -> Result<Vec<u8>, String> {
-//     rmp_serde::to_vec_named(val).map_err(|e| e.to_string())
-// }
+fn to_binary_payload<S: serde::Serialize>(val: &S) -> Result<Vec<u8>, String> {
+    let json = serde_json::to_value(val).map_err(|e| e.to_string())?;
+    let flat_value = json_to_rmpv(json);
+    rmp_serde::to_vec(&flat_value).map_err(|e| e.to_string())
+}
+
+fn json_to_rmpv(json: serde_json::Value) -> rmpv::Value {
+    match json {
+        serde_json::Value::Null => rmpv::Value::Nil,
+        serde_json::Value::Bool(b) => rmpv::Value::Boolean(b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() { rmpv::Value::Integer(i.into()) }
+            else { rmpv::Value::F64(n.as_f64().unwrap_or(0.0)) }
+        }
+        serde_json::Value::String(s) => rmpv::Value::String(s.into()),
+        serde_json::Value::Array(arr) => rmpv::Value::Array(arr.into_iter().map(json_to_rmpv).collect()),
+        serde_json::Value::Object(obj) => rmpv::Value::Map(
+            obj.into_iter()
+               .map(|(k, v)| (rmpv::Value::String(k.into()), json_to_rmpv(v)))
+               .collect()
+        ),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -94,8 +114,8 @@ pub enum FireLiteResponse {
     Aggregate(f64), 
     SubscriptionAck { listener_id: String },
     Unsubscribed { listener_id: String },
-    Stats { details: serde_json::Value },
     Collections { names: Vec<String> },
+    Stats { details: serde_json::Value },
     Indexes { list: serde_json::Value },
     AuditLog { entries: Vec<crate::engine::AuditEntry> },
     BulkActionResult { count: usize },
@@ -752,39 +772,5 @@ fn value_to_json(v: &Value) -> Result<serde_json::Value, String> {
             Ok(serde_json::Value::Object(map))
         }
         Value::Array(values) => Ok(serde_json::Value::Array(values.iter().map(value_to_json).collect::<Result<Vec<_>, _>>()?)),
-    }
-}
-
-// This function is the only "bridge" you need.
-// It takes any serializable Rust object (even your existing FireLiteResponse)
-// and turns it into clean, flat MessagePack bytes.
-fn to_binary_payload<S: serde::Serialize>(val: &S) -> Result<Vec<u8>, String> {
-    // 1. Convert the Rust struct/enum to a temporary JSON value
-    let json = serde_json::to_value(val).map_err(|e| e.to_string())?;
-
-    // 2. Transcode that JSON value into a flat MessagePack Value (rmpv)
-    // This step removes the "Enum Tags" that break the frontend
-    let flat_value = json_to_rmpv(json);
-
-    // 3. Serialize to MessagePack bytes
-    rmp_serde::to_vec(&flat_value).map_err(|e| e.to_string())
-}
-
-// The helper that does the heavy lifting (copy/paste this once)
-fn json_to_rmpv(json: serde_json::Value) -> rmpv::Value {
-    match json {
-        serde_json::Value::Null => rmpv::Value::Nil,
-        serde_json::Value::Bool(b) => rmpv::Value::Boolean(b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() { rmpv::Value::Integer(i.into()) }
-            else { rmpv::Value::F64(n.as_f64().unwrap_or(0.0)) }
-        }
-        serde_json::Value::String(s) => rmpv::Value::String(s.into()),
-        serde_json::Value::Array(arr) => rmpv::Value::Array(arr.into_iter().map(json_to_rmpv).collect()),
-        serde_json::Value::Object(obj) => rmpv::Value::Map(
-            obj.into_iter()
-               .map(|(k, v)| (rmpv::Value::String(k.into()), json_to_rmpv(v)))
-               .collect()
-        ),
     }
 }
