@@ -14,9 +14,9 @@ use crate::index::composite::definition::SortDirection;
 use crate::query::filter::Operator;
 use crate::query::query::Query;
 
-fn to_bin<S: serde::Serialize>(val: &S) -> Result<Vec<u8>, String> {
-    rmp_serde::to_vec_named(val).map_err(|e| e.to_string())
-}
+// fn to_bin<S: serde::Serialize>(val: &S) -> Result<Vec<u8>, String> {
+//     rmp_serde::to_vec_named(val).map_err(|e| e.to_string())
+// }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -346,13 +346,9 @@ impl FireLiteGateway {
 
                         if !changes.is_empty() {
                             let payload = DeltaPayload { listener_id: lid.clone(), changes };
-                            if let Ok(bin) = to_bin(&payload) {
-                                let _ = window.emit(&ename, bin); // Emit raw bytes instead of JSON
+                            if let Ok(bin) = to_binary_payload(&payload) {
+                                let _ = window.emit(&ename, bin);
                             }
-                            // let _ = window.emit(&ename, DeltaPayload {
-                            //     listener_id: lid.clone(),
-                            //     changes,
-                            // });
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => continue,
@@ -572,7 +568,8 @@ pub async fn firelite_exec<R: Runtime>(
     .map_err(|e| e.to_string())??; // First '?' handles spawn_blocking error, second handles inner String error
 
     // 2. We now have 'res' as FireLiteResponse. Serialize it to MessagePack.
-    rmp_serde::to_vec_named(&res).map_err(|e| format!("Serialization error: {}", e))
+    // rmp_serde::to_vec_named(&res).map_err(|e| format!("Serialization error: {}", e))
+    to_binary_payload(&res)
 }
 
 
@@ -755,5 +752,39 @@ fn value_to_json(v: &Value) -> Result<serde_json::Value, String> {
             Ok(serde_json::Value::Object(map))
         }
         Value::Array(values) => Ok(serde_json::Value::Array(values.iter().map(value_to_json).collect::<Result<Vec<_>, _>>()?)),
+    }
+}
+
+// This function is the only "bridge" you need.
+// It takes any serializable Rust object (even your existing FireLiteResponse)
+// and turns it into clean, flat MessagePack bytes.
+fn to_binary_payload<S: serde::Serialize>(val: &S) -> Result<Vec<u8>, String> {
+    // 1. Convert the Rust struct/enum to a temporary JSON value
+    let json = serde_json::to_value(val).map_err(|e| e.to_string())?;
+
+    // 2. Transcode that JSON value into a flat MessagePack Value (rmpv)
+    // This step removes the "Enum Tags" that break the frontend
+    let flat_value = json_to_rmpv(json);
+
+    // 3. Serialize to MessagePack bytes
+    rmp_serde::to_vec(&flat_value).map_err(|e| e.to_string())
+}
+
+// The helper that does the heavy lifting (copy/paste this once)
+fn json_to_rmpv(json: serde_json::Value) -> rmpv::Value {
+    match json {
+        serde_json::Value::Null => rmpv::Value::Nil,
+        serde_json::Value::Bool(b) => rmpv::Value::Boolean(b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() { rmpv::Value::Integer(i.into()) }
+            else { rmpv::Value::F64(n.as_f64().unwrap_or(0.0)) }
+        }
+        serde_json::Value::String(s) => rmpv::Value::String(s.into()),
+        serde_json::Value::Array(arr) => rmpv::Value::Array(arr.into_iter().map(json_to_rmpv).collect()),
+        serde_json::Value::Object(obj) => rmpv::Value::Map(
+            obj.into_iter()
+               .map(|(k, v)| (rmpv::Value::String(k.into()), json_to_rmpv(v)))
+               .collect()
+        ),
     }
 }

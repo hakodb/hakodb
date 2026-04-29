@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { decode, encode } from "@msgpack/msgpack";
+import { decode } from "@msgpack/msgpack";
 
 // --- Types & Interfaces ---
 export type FireLitePrimitive = 
@@ -79,8 +79,8 @@ function normalizeValue(v: any): any {
 async function exec(op: any): Promise<any> {
     // Note: The 'op' field inside the payload is the variant tag
     // The other fields must match the Rust struct fields (snake_case)
-    const bytes = await invoke<Uint8Array>('firelite_exec', { op });
-    const res = decode(bytes) as any;
+    const bytes = await invoke<number[]>('firelite_exec', { op });
+    const res = decode(new Uint8Array(bytes)) as any;
     
     if (res?.error) throw new Error(res.error);
     return res;
@@ -298,7 +298,8 @@ export function onSnapshot(
     const start = async () => {
         try {
             unlisten = await listen<Uint8Array>(event_name, (event) => {
-                const payload = decode(event.payload) as DeltaPayload;
+                // const payload = decode(event.payload) as DeltaPayload;
+                const payload = decode(new Uint8Array(event.payload)) as DeltaPayload;
                 const { changes } = payload;
                 // const { changes } = event.payload;
                 let hasChanged = false;
