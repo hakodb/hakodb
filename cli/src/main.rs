@@ -1,6 +1,7 @@
 use std::io::Read;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -35,6 +36,14 @@ struct Cli {
     /// Comma-separated list of collections to encrypt (if empty, all are encrypted)
     #[arg(long, global = true)]
     encrypted_cols: Option<String>,
+
+    /// Show execution time for the operation
+    #[arg(long, global = true)]
+    time: bool,
+
+    /// Show count of results (for queries and collections)
+    #[arg(long, global = true)]
+    count: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -263,7 +272,7 @@ fn main() -> Result<()> {
     }
 
     let db = open_db(&cli)?;
-    execute_command(&db, cli.command, &cli.db, cli.durability, None)
+    execute_command(&db, cli.command, &cli.db, cli.durability, None, cli.time, cli.count)
 }
 
 fn open_db(cli: &Cli) -> Result<FireLite> {
@@ -356,7 +365,9 @@ fn get_doc(
     output: Option<&str>,
     is_set: bool,
     data: Option<&str>,
+    show_time: bool
 ) -> Result<()> {
+    let start_time = Instant::now();
     let (collection, doc_id, fields) = split_doc_path_with_fields(path)?;
     let out = if fields.is_empty() {
         db.get(collection, doc_id)?
@@ -374,13 +385,18 @@ fn get_doc(
             .unwrap_or(JsonValue::Null)
     };
     if is_set {
-        set_doc(db, path, data.expect("Should not empty"), true, false)?;
+        set_doc(db, path, data.expect("Should not empty"), true, false, false)?;
     }
+    let elapsed = start_time.elapsed();
     emit_json(&out, output)?;
+    if show_time {
+        eprintln!("Execution time: {:?}", elapsed);
+    }
     Ok(())
 }
 
-fn set_doc(db: &FireLite, path: &str, data: &str, merge: bool, is_batch: bool) -> Result<()> {
+fn set_doc(db: &FireLite, path: &str, data: &str, merge: bool, is_batch: bool, show_time: bool) -> Result<()> {
+    let start_time = Instant::now();
     if is_batch {
         let collection = path; // In batch mode, path is just the collection name
         let array: JsonValue =
@@ -464,17 +480,14 @@ fn set_doc(db: &FireLite, path: &str, data: &str, merge: bool, is_batch: bool) -
         let id = db.put(collection, doc_id, &doc)?;
         println!("OK: {collection}/{id}");
     }
+    if show_time {
+        eprintln!("Execution time: {:?}", start_time.elapsed());
+    }
     Ok(())
 }
 
-// fn delete_doc(db: &FireLite, path: &str) -> Result<()> {
-//     let (collection, doc_id) = split_doc_path(path)?;
-//     db.delete(collection, doc_id)?;
-//     println!("OK: deleted {collection}/{doc_id}");
-//     Ok(())
-// }
-
-fn delete_doc(db: &FireLite, path: &str, is_batch: bool, data: Option<&str>) -> Result<()> {
+fn delete_doc(db: &FireLite, path: &str, is_batch: bool, data: Option<&str>, show_time: bool) -> Result<()> {
+    let start_time = Instant::now();
     if is_batch {
         let collection = path;
         let id_input =
@@ -500,6 +513,9 @@ fn delete_doc(db: &FireLite, path: &str, is_batch: bool, data: Option<&str>) -> 
         let (collection, doc_id) = split_doc_path(path)?;
         let id = db.delete(collection, doc_id)?;
         println!("OK: deleted {collection}/{id}");
+    }
+    if show_time {
+        eprintln!("Execution time: {:?}", start_time.elapsed());
     }
     Ok(())
 }
@@ -572,7 +588,10 @@ fn run_query(
     delete_action: bool,
     set_action: bool,
     action_data: Option<&str>,
+    show_count: bool,
+    show_time: bool
 ) -> Result<()> {
+    let start_time = Instant::now();
     let mut q = Query::new(collection);
 
     // --- Build Query using new Fluent logic ---
@@ -606,6 +625,9 @@ fn run_query(
         let count = db.delete_where(q.clone())
             .context("Failed to execute chained delete")?;
         println!("OK: mass deleted {count} documents from {collection}");
+        if show_time {
+            eprintln!("Execution time: {:?}", start_time.elapsed());
+        }
         return Ok(());
     }
 
@@ -623,6 +645,9 @@ fn run_query(
         let count = db.patch_where(q.clone(), updates)
             .context("Failed to execute chained patch")?;
         println!("OK: mass updated {count} documents in {collection}");
+        if show_time {
+            eprintln!("Execution time: {:?}", start_time.elapsed());
+        }
         return Ok(());
     }
 
@@ -640,7 +665,11 @@ fn run_query(
             let out = db.execute_aggregation(agg_query)?;
             agg_results.push(serde_json::to_value(out)?);
         }
+        let elapsed = start_time.elapsed();
         emit_json(&JsonValue::Array(agg_results), output)?;
+        if show_time {
+            eprintln!("Execution time: {:?}", elapsed);
+        }
         return Ok(());
     }
 
@@ -648,16 +677,28 @@ fn run_query(
     if let Some(select_str) = select {
         let fields: Vec<String> = select_str.split(',').map(|s| s.trim().to_string()).collect();
         let rows = db.query_projected_zero_copy(q, &fields)?;
+        let elapsed = start_time.elapsed();
+        let cnt = rows.len();
         let json_rows: Vec<JsonValue> = rows.into_iter()
-            .map(|(id, fields)| projected_to_json(&id, fields))
-            .collect();
+        .map(|(id, fields)| projected_to_json(&id, fields))
+        .collect();
         emit_json(&JsonValue::Array(json_rows), output)?;
+        if show_count { eprintln!("Results count: {}", cnt); }
+        if show_time {
+            eprintln!("Execution time: {:?}", elapsed);
+        }
     } else {
         let rows = db.query(q)?;
+        let elapsed = start_time.elapsed();
+        let cnt = rows.len();
         let json_rows: Vec<JsonValue> = rows.into_iter()
-            .map(|(id, doc)| doc_to_json(&id, &doc))
-            .collect();
+        .map(|(id, doc)| doc_to_json(&id, &doc))
+        .collect();
         emit_json(&JsonValue::Array(json_rows), output)?;
+        if show_count { eprintln!("Results count: {}", cnt); }
+        if show_time {
+            eprintln!("Execution time: {:?}", elapsed);
+        }
     }
 
     Ok(())
@@ -669,7 +710,9 @@ fn run_aggregate(
     kind: AggregateKindArg,
     field: Option<&str>,
     filters: &[String],
+    show_time: bool
 ) -> Result<()> {
+    let start_time = Instant::now();
     let mut q = Query::new(collection);
     for f in filters {
         let parsed = parse_filter(f)?;
@@ -691,7 +734,11 @@ fn run_aggregate(
 
     // The core now handles the O(N) scan automatically if no index matches
     let out = db.execute_aggregation(q)?;
+    let elapsed = start_time.elapsed();
     println!("{}", serde_json::to_string_pretty(&out)?);
+    if show_time {
+        eprintln!("Execution time: {:?}", elapsed);
+    }
     Ok(())
 }
 
@@ -844,8 +891,10 @@ fn run_rest(
                     false,
                     false,
                     None,
+                    false,
+                    false
                 ),
-                2 => get_doc(db, path, None, false, None),
+                2 => get_doc(db, path, None, false, None, false),
                 _ => bail!("unsupported path depth for GET"),
             }
         }
@@ -855,6 +904,7 @@ fn run_rest(
             data.ok_or_else(|| anyhow!("--data required for {method}"))?,
             false,
             false,
+            false
         ),
         "PATCH" => set_doc(
             db,
@@ -862,8 +912,9 @@ fn run_rest(
             data.ok_or_else(|| anyhow!("--data required for PATCH"))?,
             true,
             false,
+            false
         ),
-        "DELETE" => delete_doc(db, path, false, Some(" ")),
+        "DELETE" => delete_doc(db, path, false, Some(" "), false),
         other => bail!("unsupported REST method: {other}"),
     }
 }
@@ -966,15 +1017,6 @@ fn parse_cursor_values(input: &str) -> Result<Vec<Value>> {
     Ok(out)
 }
 
-// fn parse_literal_for_operator(op: &Operator, input: &str) -> Result<Value> {
-//     match op {
-//         Operator::Contains | Operator::StartsWith | Operator::Match => {
-//             Ok(Value::String(input.to_string()))
-//         }
-//         _ => parse_literal(input),
-//     }
-// }
-// In src/main.rs
 fn parse_literal_for_operator(op: &Operator, input: &str) -> Result<Value> {
     match op {
         Operator::Contains | Operator::StartsWith | Operator::Match => {
@@ -1074,7 +1116,10 @@ fn execute_command(
     _db_path: &str,
     _durability: DurabilityArg,
     net: Option<&NetSyncer>,
+    show_time: bool,   // New parameter
+    show_count: bool,
 ) -> Result<()> {
+    // let start_time = Instant::now();
     match command {
         Commands::Collections => list_collections(db)?,
         Commands::Get {
@@ -1089,7 +1134,7 @@ fn execute_command(
             } else {
                 None
             };
-            get_doc(db, &path, output.as_deref(), set, payload.as_deref())?
+            get_doc(db, &path, output.as_deref(), set, payload.as_deref(), show_time)?
         }
         Commands::Set {
             path,
@@ -1098,7 +1143,7 @@ fn execute_command(
             batch,
         } => {
             let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
-            set_doc(db, &path, &payload, false, batch.unwrap_or(false))?
+            set_doc(db, &path, &payload, false, batch.unwrap_or(false), show_time)?
         }
         Commands::Update {
             path,
@@ -1107,10 +1152,10 @@ fn execute_command(
             batch,
         } => {
             let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
-            set_doc(db, &path, &payload, true, batch.unwrap_or(false))?
+            set_doc(db, &path, &payload, true, batch.unwrap_or(false), show_time)?
         }
         Commands::Delete { path, batch, data } => {
-            delete_doc(db, &path, batch.unwrap_or(false), data.as_deref())?
+            delete_doc(db, &path, batch.unwrap_or(false), data.as_deref(), show_time)?
         }
         Commands::Query {
             collection,
@@ -1158,6 +1203,8 @@ fn execute_command(
                 delete,
                 set,
                 payload.as_deref(),
+                show_count,
+                show_time
             )?
         }
         Commands::Aggregate {
@@ -1165,7 +1212,7 @@ fn execute_command(
             kind,
             field,
             filters,
-        } => run_aggregate(db, &collection, kind, field.as_deref(), &filters)?,
+        } => run_aggregate(db, &collection, kind, field.as_deref(), &filters, show_time)?,
         Commands::Watch { collection } => watch_collection(db, &collection)?,
         Commands::Seed {
             collection,
@@ -1235,6 +1282,11 @@ fn execute_command(
         Commands::Serve { .. } => bail!("Server already running"),
         // _ => bail!("Command not supported in this mode"),
     }
+
+    // if show_time {
+    //     eprintln!("Execution time: {:?}", start_time.elapsed());
+    // }
+
     Ok(())
 }
 
@@ -1298,6 +1350,8 @@ fn run_server(
                                 &cli.db,
                                 cli.durability,
                                 Some(&net),
+                                repl_cli.time || cli.time, 
+                                repl_cli.count || cli.count
                             ) {
                                 println!("❌ Error: {}", e);
                             }

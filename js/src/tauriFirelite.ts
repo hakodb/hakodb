@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { decode, encode } from "@msgpack/msgpack";
 
 // --- Types & Interfaces ---
 export type FireLitePrimitive = 
@@ -59,19 +60,13 @@ function generateId() {
 function normalizeValue(v: any): any {
     if (v === null || typeof v !== 'object') return v; // Fast path for primitives
     
-    // if (v instanceof Uint8Array) return Array.from(v);
     if (v instanceof Uint8Array) {
-        // Match the Rust side's expectation for fast binary transfers
-        const b64 = btoa(String.fromCharCode(...v));
-        return `__b64__:${b64}`;
+        return v;
     }
     if (v instanceof Date) return v.getTime() * 1000;
     
     if (Array.isArray(v)) {
-        const len = v.length;
-        const out = new Array(len);
-        for (let i = 0; i < len; i++) out[i] = normalizeValue(v[i]);
-        return out;
+        return v.map(normalizeValue);
     }
 
     const out: any = {};
@@ -84,7 +79,9 @@ function normalizeValue(v: any): any {
 async function exec(op: any): Promise<any> {
     // Note: The 'op' field inside the payload is the variant tag
     // The other fields must match the Rust struct fields (snake_case)
-    const res = await invoke<any>('firelite_exec', { op });
+    const bytes = await invoke<Uint8Array>('firelite_exec', { op });
+    const res = decode(bytes) as any;
+    
     if (res?.error) throw new Error(res.error);
     return res;
 }
@@ -129,34 +126,12 @@ export class DocumentSnapshot {
     data(): FireLiteRecord | undefined { 
         if (!this._data) return undefined;
         
-        // FIXED: Correct lazy-cache assignment
         if (!this._cachedData) {
-            this._cachedData = this.transformOutput({ ...this._data, id: this.id });
+            this._cachedData = { ...this._data, id: this.id };
         }
         return this._cachedData;
     }
 
-    private transformOutput(obj: any): any {
-        if (Array.isArray(obj)) return obj.map(v => this.transformOutput(v));
-        if (obj !== null && typeof obj === 'object') {
-            const out: any = {};
-            for (const key in obj) {
-                let val = obj[key];
-                
-                // Optimized Binary Handling
-                if (typeof val === 'string' && val.startsWith('__b64__:')) {
-                    const b64String = val.slice(8);
-                    const bin = atob(b64String);
-                    const bytes = new Uint8Array(bin.length);
-                    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-                    val = bytes;
-                }
-                out[key] = this.transformOutput(val);
-            }
-            return out;
-        }
-        return obj;
-    }
 }
 
 export interface DocumentChange {
@@ -322,8 +297,10 @@ export function onSnapshot(
 
     const start = async () => {
         try {
-            unlisten = await listen<DeltaPayload>(event_name, (event) => {
-                const { changes } = event.payload;
+            unlisten = await listen<Uint8Array>(event_name, (event) => {
+                const payload = decode(event.payload) as DeltaPayload;
+                const { changes } = payload;
+                // const { changes } = event.payload;
                 let hasChanged = false;
 
                 changes.forEach(change => {
