@@ -276,15 +276,6 @@ impl FireLiteGateway {
                 let _ = window.emit(&ename, bin);
             }
             
-            // let _ = window.emit(&ename, DeltaPayload {
-            //     listener_id: lid.clone(),
-            //     changes: vec![DocumentChange {
-            //         kind: DeltaKind::Full,
-            //         doc_id: "_all_".into(),
-            //         data: Some(serde_json::Value::Array(initial_rows)),
-            //     }],
-            // });
-
             // --- 2. PREPARE MATCHER PLAN FOR LIVE UPDATES ---
             let query_obj = build_query_from_input(&query_template).unwrap_or_else(|_| {
                 crate::query::query::Query::new(&query_template.collection)
