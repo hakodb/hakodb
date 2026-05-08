@@ -21,23 +21,23 @@ fn to_binary_payload<S: serde::Serialize>(val: &S) -> Result<Vec<u8>, String> {
     rmp_serde::to_vec_named(val).map_err(|e| e.to_string())
 }
 
-fn json_to_rmpv(json: serde_json::Value) -> rmpv::Value {
-    match json {
-        serde_json::Value::Null => rmpv::Value::Nil,
-        serde_json::Value::Bool(b) => rmpv::Value::Boolean(b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() { rmpv::Value::Integer(i.into()) }
-            else { rmpv::Value::F64(n.as_f64().unwrap_or(0.0)) }
-        }
-        serde_json::Value::String(s) => rmpv::Value::String(s.into()),
-        serde_json::Value::Array(arr) => rmpv::Value::Array(arr.into_iter().map(json_to_rmpv).collect()),
-        serde_json::Value::Object(obj) => rmpv::Value::Map(
-            obj.into_iter()
-               .map(|(k, v)| (rmpv::Value::String(k.into()), json_to_rmpv(v)))
-               .collect()
-        ),
-    }
-}
+// fn json_to_rmpv(json: serde_json::Value) -> rmpv::Value {
+//     match json {
+//         serde_json::Value::Null => rmpv::Value::Nil,
+//         serde_json::Value::Bool(b) => rmpv::Value::Boolean(b),
+//         serde_json::Value::Number(n) => {
+//             if let Some(i) = n.as_i64() { rmpv::Value::Integer(i.into()) }
+//             else { rmpv::Value::F64(n.as_f64().unwrap_or(0.0)) }
+//         }
+//         serde_json::Value::String(s) => rmpv::Value::String(s.into()),
+//         serde_json::Value::Array(arr) => rmpv::Value::Array(arr.into_iter().map(json_to_rmpv).collect()),
+//         serde_json::Value::Object(obj) => rmpv::Value::Map(
+//             obj.into_iter()
+//                .map(|(k, v)| (rmpv::Value::String(k.into()), json_to_rmpv(v)))
+//                .collect()
+//         ),
+//     }
+// }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
