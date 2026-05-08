@@ -60,17 +60,112 @@ impl QueryPlanner {
             );
         }
 
-        // 3. PRIORITY 3: Range/Cursor Detection
-        if let Some(first_order) = query.order_by.first() {
-            let has_bounds = query.start_at.is_some() || query.start_after.is_some() || 
-                            query.end_at.is_some() || query.end_before.is_some();
+        // // 3. PRIORITY 3: Range/Cursor Detection
+        // if let Some(first_order) = query.order_by.first() {
+        //     let has_bounds = query.start_at.is_some() || query.start_after.is_some() || 
+        //                     query.end_at.is_some() || query.end_before.is_some();
             
-            if has_bounds {
-                // --- A. Check Composite Cursors ---
-                for idx in indexes.indexes_for_collection(&query.collection) {
-                    // We check if the index matches the first sort field to allow range scanning
-                    if !idx.definition.fields.is_empty() && idx.definition.fields[0].field == first_order.field {
-                        
+        //     if has_bounds {
+        //         // Check Composite Indices for both Cursors AND pure OrderBy Pagination
+        //         for idx in indexes.indexes_for_collection(&query.collection) {
+        //             if !idx.definition.fields.is_empty() && idx.definition.fields[0].field == first_order.field {
+        //                 // Verify the entire order_by chain matches the index perfectly
+        //                 let mut matches_all = true;
+        //                 let mut reverse_scan = false;
+        //                 for (i, q_order) in query.order_by.iter().enumerate() {
+        //                     if let Some(idx_f) = idx.definition.fields.get(i) {
+        //                         if idx_f.field != q_order.field { matches_all = false; break; }
+        //                         if i == 0 && (idx_f.direction == SortDirection::Asc) != q_order.ascending {
+        //                             reverse_scan = true;
+        //                         }
+        //                         if (idx_f.direction == SortDirection::Asc) != (q_order.ascending != reverse_scan) {
+        //                             matches_all = false; break;
+        //                         }
+        //                     } else { matches_all = false; break; }
+        //                 }
+
+        //                 if matches_all {
+        //                     let start = match (&query.start_at, &query.start_after) {
+        //                         (Some(v), _) => Bound::Included(build_cursor_range(&idx.definition, v, false)),
+        //                         (_, Some(v)) => Bound::Excluded(build_cursor_range(&idx.definition, v, false)),
+        //                         _ => Bound::Unbounded,
+        //                     };
+        //                     let end = match (&query.end_at, &query.end_before) {
+        //                         (Some(v), _) => Bound::Included(build_cursor_range(&idx.definition, v, false)),
+        //                         (_, Some(v)) => Bound::Excluded(build_cursor_range(&idx.definition, v, false)),
+        //                         _ => Bound::Unbounded,
+        //                     };
+
+        //                     // CRITICAL FIX: If there are no filters, the index 100% satisfies the query
+        //                     let filters_empty = query.filters.is_empty() && query.or_groups.is_empty();
+        //                     let safe_limit = if filters_empty {
+        //                         query.limit.map(|l| l + query.offset.unwrap_or(0))
+        //                     } else { None };
+
+        //                     return Self::make_plan(
+        //                         query, 
+        //                         ScanType::CursorIndex { index_id: idx.definition.id, start, end, reverse: reverse_scan }, 
+        //                         safe_limit, 
+        //                         true, // order_satisfied
+        //                         filters_empty
+        //                     );
+        //                 }
+        //             }
+        //         }
+
+        //         // --- B. Check Secondary Index Range ---
+        //         if let Some(sec_map) = indexes.secondary.get(&query.collection) {
+        //             if sec_map.contains_key(&first_order.field) {
+        //                 // Secondary indexes only hold ONE value, so we take the first value from the cursor
+        //                 let start = match (&query.start_at, &query.start_after) {
+        //                     (Some(v), _) if !v.is_empty() => Bound::Included(crate::index::index_key::encode_scalar(&v[0])),
+        //                     (_, Some(v)) if !v.is_empty() => Bound::Excluded(crate::index::index_key::encode_scalar(&v[0])),
+        //                     _ => Bound::Unbounded,
+        //                 };
+        //                 let end = match (&query.end_at, &query.end_before) {
+        //                     (Some(v), _) if !v.is_empty() => Bound::Included(crate::index::index_key::encode_scalar(&v[0])),
+        //                     (_, Some(v)) if !v.is_empty() => Bound::Excluded(crate::index::index_key::encode_scalar(&v[0])),
+        //                     _ => Bound::Unbounded,
+        //                 };
+
+        //                 return Self::make_plan(
+        //                     query, 
+        //                     ScanType::SecondaryIndexRange { 
+        //                         field: first_order.field.clone(), 
+        //                         start, 
+        //                         end, 
+        //                         reverse: !first_order.ascending 
+        //                     }, 
+        //                     query.limit, 
+        //                     // Secondary index only satisfies the first sort field
+        //                     false, 
+        //                     false
+        //                 );
+        //             }
+        //         }
+        //     }
+        // }
+
+        // 3. PRIORITY 3: Range / Cursor / Pure Pagination Detection
+        if let Some(first_order) = query.order_by.first() {
+            // Check Composite Indices for both Cursors AND pure OrderBy Pagination
+            for idx in indexes.indexes_for_collection(&query.collection) {
+                if !idx.definition.fields.is_empty() && idx.definition.fields[0].field == first_order.field {
+                    let mut matches_all = true;
+                    let mut reverse_scan = false;
+                    for (i, q_order) in query.order_by.iter().enumerate() {
+                        if let Some(idx_f) = idx.definition.fields.get(i) {
+                            if idx_f.field != q_order.field { matches_all = false; break; }
+                            if i == 0 && (idx_f.direction == SortDirection::Asc) != q_order.ascending {
+                                reverse_scan = true;
+                            }
+                            if (idx_f.direction == SortDirection::Asc) != (q_order.ascending != reverse_scan) {
+                                matches_all = false; break;
+                            }
+                        } else { matches_all = false; break; }
+                    }
+
+                    if matches_all {
                         let start = match (&query.start_at, &query.start_after) {
                             (Some(v), _) => Bound::Included(build_cursor_range(&idx.definition, v, false)),
                             (_, Some(v)) => Bound::Excluded(build_cursor_range(&idx.definition, v, false)),
@@ -82,52 +177,49 @@ impl QueryPlanner {
                             _ => Bound::Unbounded,
                         };
 
+                        let filters_empty = query.filters.is_empty() && query.or_groups.is_empty();
+                        let safe_limit = if filters_empty {
+                            query.limit.map(|l| l + query.offset.unwrap_or(0))
+                        } else { None };
+
                         return Self::make_plan(
                             query, 
-                            ScanType::CursorIndex { 
-                                index_id: idx.definition.id, 
-                                start, 
-                                end, 
-                                reverse: !first_order.ascending 
-                            }, 
-                            query.limit, 
-                            // Note: order_satisfied is true only if the index matches the WHOLE sort chain
-                            // (This logic is handled by your update to try_plan_composite_eq)
-                            false, 
-                            false
+                            ScanType::CompositeIndexRange { index_id: idx.definition.id, ranges: vec![(start, end)], reverse: reverse_scan }, 
+                            safe_limit, 
+                            true, // order_satisfied
+                            filters_empty
                         );
                     }
                 }
+            }
 
-                // --- B. Check Secondary Index Range ---
-                if let Some(sec_map) = indexes.secondary.get(&query.collection) {
-                    if sec_map.contains_key(&first_order.field) {
-                        // Secondary indexes only hold ONE value, so we take the first value from the cursor
-                        let start = match (&query.start_at, &query.start_after) {
-                            (Some(v), _) if !v.is_empty() => Bound::Included(crate::index::index_key::encode_scalar(&v[0])),
-                            (_, Some(v)) if !v.is_empty() => Bound::Excluded(crate::index::index_key::encode_scalar(&v[0])),
-                            _ => Bound::Unbounded,
-                        };
-                        let end = match (&query.end_at, &query.end_before) {
-                            (Some(v), _) if !v.is_empty() => Bound::Included(crate::index::index_key::encode_scalar(&v[0])),
-                            (_, Some(v)) if !v.is_empty() => Bound::Excluded(crate::index::index_key::encode_scalar(&v[0])),
-                            _ => Bound::Unbounded,
-                        };
+            // Secondary Index Range Fallback
+            if let Some(sec_map) = indexes.secondary.get(&query.collection) {
+                if sec_map.contains_key(&first_order.field) {
+                    let start = match (&query.start_at, &query.start_after) {
+                        (Some(v), _) if !v.is_empty() => Bound::Included(crate::index::index_key::encode_scalar(&v[0])),
+                        (_, Some(v)) if !v.is_empty() => Bound::Excluded(crate::index::index_key::encode_scalar(&v[0])),
+                        _ => Bound::Unbounded,
+                    };
+                    let end = match (&query.end_at, &query.end_before) {
+                        (Some(v), _) if !v.is_empty() => Bound::Included(crate::index::index_key::encode_scalar(&v[0])),
+                        (_, Some(v)) if !v.is_empty() => Bound::Excluded(crate::index::index_key::encode_scalar(&v[0])),
+                        _ => Bound::Unbounded,
+                    };
 
-                        return Self::make_plan(
-                            query, 
-                            ScanType::SecondaryIndexRange { 
-                                field: first_order.field.clone(), 
-                                start, 
-                                end, 
-                                reverse: !first_order.ascending 
-                            }, 
-                            query.limit, 
-                            // Secondary index only satisfies the first sort field
-                            false, 
-                            false
-                        );
-                    }
+                    let order_satisfied = query.order_by.len() == 1;
+                    let filters_empty = query.filters.is_empty() && query.or_groups.is_empty();
+                    let safe_limit = if order_satisfied && filters_empty {
+                        query.limit.map(|l| l + query.offset.unwrap_or(0))
+                    } else { None };
+
+                    return Self::make_plan(
+                        query, 
+                        ScanType::SecondaryIndexRange { field: first_order.field.clone(), start, end, reverse: !first_order.ascending }, 
+                        safe_limit, 
+                        order_satisfied, 
+                        filters_empty
+                    );
                 }
             }
         }
@@ -163,8 +255,6 @@ impl QueryPlanner {
             for filter in &query.filters {
                 if matches!(filter.op, Operator::Eq) {
                     if let Some(sec_map) = indexes.secondary.get(&query.collection) {
-                        // SAFEGUARD: The 'contains_key' ensures that even for 'id', we only 
-                        // use the index if the user explicitly called create_index('id').
                         if sec_map.contains_key(&filter.field) {
                             let is_ambiguous = match &filter.value {
                                 Value::String(s) => s.parse::<i64>().is_ok(),
@@ -173,19 +263,21 @@ impl QueryPlanner {
 
                             if !is_ambiguous {
                                 let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
+                                
+                                // CRITICAL FIX: Mark filters satisfied if this is the ONLY filter
+                                let filters_satisfied = query.filters.len() == 1 && query.or_groups.is_empty();
+                                let safe_limit = if filters_satisfied { 
+                                    query.limit.map(|l| l + query.offset.unwrap_or(0)) 
+                                } else { None };
+
                                 return Self::make_plan(
                                     query, 
-                                    ScanType::SecondaryIndex { 
-                                        field: filter.field.clone(), 
-                                        value: 
-                                        val_bytes 
-                                    }, 
-                                    query.limit, 
+                                    ScanType::SecondaryIndex { field: filter.field.clone(), value: val_bytes }, 
+                                    safe_limit, 
                                     false, 
-                                    false
+                                    filters_satisfied
                                 );
                             }
-
                         }
                     }
                 }
@@ -195,13 +287,8 @@ impl QueryPlanner {
         // 7. DEFAULT FALLBACK: Full Collection Scan
         // This is the "Safety Net". If no index was found for 'id:eq', 
         // it lands here and the Worker checks the storage keys manually.
-        Self::make_plan(
-            query, 
-            ScanType::FullCollection, 
-            None, 
-            false, 
-            false
-        )
+        let no_filters = query.filters.is_empty() && query.or_groups.is_empty();
+        Self::make_plan(query, ScanType::FullCollection, None, false, no_filters)
     }
 
     /// Helper to build the plan object.
@@ -213,6 +300,9 @@ impl QueryPlanner {
         order_satisfied: bool,
         filters_satisfied: bool,
     ) -> QueryPlan {
+        // If there's no specific sort requested, then the index's natural order is acceptable
+        let actual_order_satisfied = query.order_by.is_empty() || order_satisfied;
+
         QueryPlan {
             collection: query.collection.clone(),
             scan,
@@ -223,7 +313,7 @@ impl QueryPlanner {
             scan_limit,
             offset: query.offset,
             projection: query.projection.clone(),
-            order_by_satisfied: order_satisfied,
+            order_by_satisfied: actual_order_satisfied,
             filters_satisfied_by_index: filters_satisfied,
         }
     }
@@ -470,13 +560,13 @@ impl QueryPlanner {
                 }
             }
 
-            if !supported {
+            if !supported || (eq_prefix.is_empty() && range_filter.is_none()) {
                 continue;
             }
 
-            if eq_prefix.is_empty() && range_filter.is_none() {
-                continue;
-            }
+            // if eq_prefix.is_empty() && range_filter.is_none() {
+            //     continue;
+            // }
 
             let eq_prefix_key = build_prefix_key(&idx.definition, &eq_prefix);
             let eq_prefix_end = build_prefix_open_end(&eq_prefix_key);
@@ -522,6 +612,7 @@ impl QueryPlanner {
             return Some(ScanType::CompositeIndexRange {
                 index_id: idx.definition.id,
                 ranges,
+                reverse: false
             });
         }
 
@@ -693,12 +784,13 @@ impl QueryPlanner {
             None
         } else if sub_scans.len() == 1 {
             let (scan, ordered) = sub_scans.pop().unwrap();
-            Some((scan, ordered, true))
+            // Some((scan, ordered, true))
+            Some((scan, ordered, query.or_groups.is_empty()))
         } else {
             // We hit multiple types (String and Int). 
             // We MUST sort in RAM because Union merges different ranges.
             let scans = sub_scans.into_iter().map(|(s, _)| s).collect();
-            Some((ScanType::UnionIndex { scans }, false, true))
+            Some((ScanType::UnionIndex { scans }, false, query.or_groups.is_empty()))
         }
     }
 }

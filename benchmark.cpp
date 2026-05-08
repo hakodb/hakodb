@@ -173,28 +173,28 @@ Report run_benchmark(BenchConfig cfg) {
 
     try { fs::remove_all(path); } catch (...) {}
 
-    stage("Engine Open");
+    // stage("Engine Open");
     auto t_bench = now();
     FL_Engine* db = fl_engine_open_with_config(path.c_str(), create_config_ptr(cfg));
     if (!db) { res.success = false; return res; }
     res.startup_ms = diff_ms(t_bench);
-    cout << res.startup_ms << "ms";
+    // cout << res.startup_ms << "ms";
 
-    stage("Snapshot Setup (Watch)");
+    // stage("Snapshot Setup (Watch)");
     g_snapshot_received.store(0, std::memory_order_relaxed);
     UniqueWatch watcher(fl_engine_watch(db, "bench", bench_on_snapshot, nullptr));
-    cout << "ACTIVE";
+    // cout << "ACTIVE";
 
-    stage("Indexing..");
+    // stage("Indexing..");
     fl_engine_create_simple_index(db, "bench", "active"); 
     fl_engine_create_simple_index(db, "bench", "tenant"); 
     fl_engine_create_simple_index(db, "bench", "id"); 
     fl_engine_create_index(db, "bench", "[{\"field\": \"id\", \"desc\": false}]");
     fl_engine_create_index(db, "bench", "[{\"field\": \"tenant\", \"desc\": false}, {\"field\": \"score\", \"desc\": true}]");
-    cout << "Ready";
+    // cout << "Ready";
 
     // 1. WRITE TEST
-    stage("Single Write WPS");
+    // stage("Single Write WPS");
     auto t_start = now();
     int s_write_count = 100;
     for (int i = 0; i < s_write_count; i++) {
@@ -204,9 +204,9 @@ Report run_benchmark(BenchConfig cfg) {
         fl_engine_insert(db, "bench", key_buf, d.get());
     }
     res.single_wps = to_throughput(s_write_count, diff_ms(t_start));
-    cout << fixed << setprecision(0) << res.single_wps << " wps";
+    // cout << fixed << setprecision(0) << res.single_wps << " wps";
 
-    stage("Batch Write WPS");
+    // stage("Batch Write WPS");
     t_start = now();
     int b_total = cfg.total_docs - 100;
     for (int i = 0; i < b_total; i += cfg.batch_size) {
@@ -221,23 +221,23 @@ Report run_benchmark(BenchConfig cfg) {
         fl_batch_commit(db, b.get());
     }
     res.batch_wps = to_throughput(b_total, diff_ms(t_start));
-    cout << res.batch_wps << " wps";
+    // cout << res.batch_wps << " wps";
 
-    stage("Waiting for indexes..");
+    // stage("Waiting for indexes..");
     this_thread::sleep_for(chrono::milliseconds(1500));
-    cout << "Done";
+    // cout << "Done";
 
     // 2. READ TEST
-    stage("Point Read RPS (Seq)");
+    // stage("Point Read RPS (Seq)");
     t_start = now();
     int seq_read_count = 200;
     for (int i = 0; i < seq_read_count; i++) {
         UniqueDoc d(fl_engine_get(db, "bench", "b_100"));
     }
     res.s_read_rps = to_throughput(seq_read_count, diff_ms(t_start));
-    cout << res.s_read_rps << " rps";
+    // cout << res.s_read_rps << " rps";
 
-    stage("Point Read RPS (Par)");
+    // stage("Point Read RPS (Par)");
     t_start = now();
     vector<thread> pool;
     int par_read_per_thread = 50;
@@ -250,10 +250,10 @@ Report run_benchmark(BenchConfig cfg) {
     }
     for(auto& t : pool) t.join();
     res.p_read_rps = to_throughput(cfg.threads * par_read_per_thread, diff_ms(t_start));
-    cout << res.p_read_rps << " rps";
+    // cout << res.p_read_rps << " rps";
 
     // 3. BULK UPDATE & SERIALIZABLE TX
-    stage("Bulk Update WPS");
+    // stage("Bulk Update WPS");
     t_start = now();
     int upd_count = 100;
     UniqueBatch batch_upd(fl_batch_new());
@@ -266,9 +266,9 @@ Report run_benchmark(BenchConfig cfg) {
     }
     fl_batch_commit(db, batch_upd.get());
     res.bulk_upd_wps = to_throughput(upd_count, diff_ms(t_start));
-    cout << res.bulk_upd_wps << " wps";
+    // cout << res.bulk_upd_wps << " wps";
 
-    stage("Serializable Tx WPS");
+    // stage("Serializable Tx WPS");
     t_start = now();
     int tx_count = 50;
     for (int i = 0; i < tx_count; i++) {
@@ -281,10 +281,10 @@ Report run_benchmark(BenchConfig cfg) {
         }
     }
     res.tx_wps = to_throughput(tx_count, diff_ms(t_start));
-    cout << res.tx_wps << " wps";
+    // cout << res.tx_wps << " wps";
 
     // 4. RANGE QUERY (QPS)
-    stage("Range Query QPS");
+    // stage("Range Query QPS");
     int mid = b_total / 2;
     UniqueQuery q_off(fl_query_new("bench"));
     fl_query_order_by(q_off.get(), "id", true); 
@@ -292,7 +292,7 @@ Report run_benchmark(BenchConfig cfg) {
     fl_query_limit(q_off.get(), 5);
     
     t_start = now(); 
-    for(int i=0; i<20; i++) UniqueString qo(fl_query_execute(db, q_off.get())); 
+    for(int i=0; i<20; i++) UniqueResultSet qo(fl_query_execute_to_handles(db, q_off.get())); 
     res.offset_qps = to_throughput(20, diff_ms(t_start));
 
     char mid_buf[16]; snprintf(mid_buf, sizeof(mid_buf), "b_%d", mid);
@@ -303,12 +303,12 @@ Report run_benchmark(BenchConfig cfg) {
     fl_query_limit(q_cur.get(), 5);
     
     t_start = now(); 
-    for(int i=0; i<20; i++) UniqueString qc(fl_query_execute(db, q_cur.get())); 
+    for(int i=0; i<20; i++) UniqueResultSet qc(fl_query_execute_to_handles(db, q_cur.get())); 
     res.cursor_qps = to_throughput(20, diff_ms(t_start));
-    cout << (int)res.cursor_qps << " qps";
+    // cout << (int)res.cursor_qps << " qps";
 
     // 5. QUERY STRESS TEST
-    stage("Stress GET RPS");
+    // stage("Stress GET RPS");
     t_start = now();
     int stress_loops = 300;
     for(int i=0; i<stress_loops; i++) {
@@ -319,9 +319,9 @@ Report run_benchmark(BenchConfig cfg) {
         }
     }
     res.stress_get_rps = to_throughput(stress_loops * 50, diff_ms(t_start));
-    cout << (int)res.stress_get_rps << " rps";
+    // cout << (int)res.stress_get_rps << " rps";
 
-    stage("Query Stress QPS");
+    // stage("Query Stress QPS");
     t_start = now();
     for(int i=0; i<stress_loops; i++) {
         UniqueQuery q(fl_query_new("bench"));
@@ -330,9 +330,9 @@ Report run_benchmark(BenchConfig cfg) {
         UniqueResultSet rs(fl_query_execute_to_handles(db, q.get()));
     }
     res.stress_query_qps = to_throughput(stress_loops, diff_ms(t_start));
-    cout << (int)res.stress_query_qps << " qps";
+    // cout << (int)res.stress_query_qps << " qps";
 
-    stage("Composite Query QPS");
+    // stage("Composite Query QPS");
     t_start = now();
     for(int i=0; i<stress_loops; i++) {
         UniqueQuery q(fl_query_new("bench"));
@@ -342,19 +342,19 @@ Report run_benchmark(BenchConfig cfg) {
         UniqueResultSet rs(fl_query_execute_to_handles(db, q.get()));
     }
     res.comp_query_qps = to_throughput(stress_loops, diff_ms(t_start));
-    cout << (int)res.comp_query_qps << " qps";
+    // cout << (int)res.comp_query_qps << " qps";
 
     // 6. AGGREGATION
-    stage("Aggregation QPS");
+    // stage("Aggregation QPS");
     UniqueQuery aq(fl_query_new("bench"));
     fl_query_aggregate_sum(aq.get(), "id");
     t_start = now(); 
     for(int i=0; i<50; i++) UniqueString agg_result(fl_query_execute_aggregation(db, aq.get())); 
     res.agg_qps = to_throughput(50, diff_ms(t_start));
-    cout << (int)res.agg_qps << " qps";
+    // cout << (int)res.agg_qps << " qps";
 
     // 7. BULK DELETE
-    stage("Bulk Delete WPS");
+    // stage("Bulk Delete WPS");
     t_start = now();
     int del_count = 100;
     UniqueBatch batch_del(fl_batch_new());
@@ -365,14 +365,14 @@ Report run_benchmark(BenchConfig cfg) {
     }
     fl_batch_commit(db, batch_del.get());
     res.bulk_del_wps = to_throughput(del_count, diff_ms(t_start));
-    cout << (int)res.bulk_del_wps << " wps";
+    // cout << (int)res.bulk_del_wps << " wps";
 
     // 8. SHUTDOWN
-    stage("Shutdown (Flush)");
+    // stage("Shutdown (Flush)");
     t_start = now();
     fl_engine_free(db);
     res.shutdown_ms = diff_ms(t_start);
-    cout << res.shutdown_ms << "ms";
+    // cout << res.shutdown_ms << "ms";
 
     res.storage_mb = (double)get_dir_size(path) / (1024.0 * 1024.0);
     return res;
@@ -403,9 +403,10 @@ int main(int argc, char** argv) {
 
     vector<Report> results;
     for (const auto& cfg : suite) {
-        cout << "\n>> PROFILE: " << cfg.name << flush;
+        cout << "\n>> PROFILE: " << setw(12) <<  cfg.name << flush;
         results.push_back(run_benchmark(cfg));
         this_thread::sleep_for(chrono::milliseconds(200));
+        cout << setw(6) <<  "Done";
     }
 
     cout << "\n\n" << string(170, '=') << "\n";
