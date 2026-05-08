@@ -16,6 +16,7 @@ pub enum ScanType {
     CompositeIndexRange {
         index_id: u32,
         ranges: Vec<(Bound<SmallVec<[u8; 32]>>, Bound<SmallVec<[u8; 32]>>)>,
+        reverse: bool,
     },
     SecondaryIndexRange {
         field: String,

@@ -9,17 +9,27 @@ pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
     let storage_guard = task.storage.as_ref().unwrap().read().unwrap();
     let blob_manager = storage_guard.blob_manager.as_ref();
 
-    // OPTIMIZATION: Pre-stringify any numeric ID filters once per task
     let optimized_plan = prepare_optimized_plan(&task.plan);
 
     for (id, pointer) in task.docs {
         if let Ok(Some(bytes)) = storage_guard.read_pointer(&pointer) {
-            // HIGH PERFORMANCE: Single-pass filtering and full decoding
-            if let Some(mut doc) = unified_match_decode(&id, &bytes, &optimized_plan) {
-                if let Some(bm) = blob_manager {
-                    let _ = inflate_blobs(&mut doc, bm);
+            
+            // CRITICAL FIX: If index handled everything, bypass `unified_match_decode` completely
+            if task.plan.filters_satisfied_by_index {
+                if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
+                    if let Some(bm) = blob_manager {
+                        let _ = inflate_blobs(&mut doc, bm);
+                    }
+                    out.push((id, doc));
                 }
-                out.push((id, doc));
+            } else {
+                // Slower Path: Query contains filters that the index couldn't verify
+                if let Some(mut doc) = unified_match_decode(&id, &bytes, &optimized_plan) {
+                    if let Some(bm) = blob_manager {
+                        let _ = inflate_blobs(&mut doc, bm);
+                    }
+                    out.push((id, doc));
+                }
             }
         }
     }
@@ -54,7 +64,7 @@ pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)
 }
 
 /// Pre-converts numeric 'id' filters into strings to avoid allocations in the document loop.
-fn prepare_optimized_plan(plan: &crate::query::plan::QueryPlan) -> crate::query::plan::QueryPlan {
+pub(crate) fn prepare_optimized_plan(plan: &crate::query::plan::QueryPlan) -> crate::query::plan::QueryPlan {
     let mut p = plan.clone();
     let stringify_id = |f: &mut crate::query::filter::Filter| {
         if f.field == "id" {
@@ -74,7 +84,7 @@ fn prepare_optimized_plan(plan: &crate::query::plan::QueryPlan) -> crate::query:
 }
 
 /// Unified decoder for full documents. Combines filter checking with object construction.
-fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::query::plan::QueryPlan) -> Option<FireLiteDoc> {
+pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::query::plan::QueryPlan) -> Option<FireLiteDoc> {
     let view = FireLiteDocView::new(bytes)?;
     
     let mut and_matches = vec![false; plan.filters.len()];
@@ -102,7 +112,7 @@ fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::query::plan::Q
 }
 
 /// Unified decoder for projected queries. Only decodes fields needed for filters or results.
-fn unified_match_projected(doc_id: &str, bytes: &[u8], plan: &crate::query::plan::QueryPlan) -> Option<Vec<(String, Value)>> {
+pub(crate) fn unified_match_projected(doc_id: &str, bytes: &[u8], plan: &crate::query::plan::QueryPlan) -> Option<Vec<(String, Value)>> {
     let view = FireLiteDocView::new(bytes)?;
     let mut and_matches = vec![false; plan.filters.len()];
     let mut or_group_results = vec![false; plan.or_groups.len()];
@@ -253,7 +263,7 @@ fn compare_default_filter (doc_id: &str, op: &Operator, filter_val: &Value) -> b
 
 /// Remaining logic (inflate_blobs, matches_filters_view, etc.) kept for internal use...
 
-fn inflate_blobs(doc: &mut FireLiteDoc, blob_manager: &crate::storage::blob::BlobManager) -> Result<(), crate::error::FireLiteError> {
+pub(crate) fn inflate_blobs(doc: &mut FireLiteDoc, blob_manager: &crate::storage::blob::BlobManager) -> Result<(), crate::error::FireLiteError> {
     let links: Vec<&mut Value> = doc.fields.iter_mut()
         .map(|(_, v)| v)
         .filter(|v| matches!(v, Value::BlobLink { .. }))
@@ -427,7 +437,7 @@ fn compare_raw_bytes(tag: u8, data: &[u8], op: &Operator, b: &Value) -> bool {
     false
 }
 
-fn resolve_single_blob_in_worker(
+pub(crate) fn resolve_single_blob_in_worker(
     blob_manager: &crate::storage::blob::BlobManager,
     offset: u64, 
     len: u32,

@@ -70,6 +70,63 @@ impl ParallelQueryExecutor {
             }
         }
 
+        let doc_count = keys_from_index.len();
+
+        // --- THE FIX: ULTRA-FAST PATH FOR SMALL QUERIES ---
+        // Bypasses physical sorting, Rayon dispatch, and HashMap recreation overhead.
+        if doc_count <= 250 {
+            let storage_guard = storage_arc.read().unwrap();
+            let blob_manager = storage_guard.blob_manager.as_ref();
+            let optimized_plan = crate::query::executor::worker::prepare_optimized_plan(&plan);
+            let mut results = Vec::with_capacity(doc_count);
+
+            for (id, ptr) in keys_from_index {
+                if let Ok(Some(bytes)) = storage_guard.read_pointer(&ptr) {
+                    if plan.filters_satisfied_by_index {
+                        if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
+                            if let Some(bm) = blob_manager {
+                                let _ = crate::query::executor::worker::inflate_blobs(&mut doc, bm);
+                            }
+                            results.push((id, doc));
+                        }
+                    } else {
+                        if let Some(mut doc) = crate::query::executor::worker::unified_match_decode(&id, &bytes, &optimized_plan) {
+                            if let Some(bm) = blob_manager {
+                                let _ = crate::query::executor::worker::inflate_blobs(&mut doc, bm);
+                            }
+                            results.push((id, doc));
+                        }
+                    }
+                }
+            }
+
+            // 6. PHASE 6: FINAL SORTING & SLICING
+            if !plan.order_by_satisfied && !plan.order_by.is_empty() {
+                results.sort_by(|(id_a, doc_a), (id_b, doc_b)| {
+                    for order in &plan.order_by {
+                        let cmp = match order.field.as_str() {
+                            "id" => id_a.cmp(id_b),
+                            "_time" => doc_a._time.cmp(&doc_b._time),
+                            _ => doc_a.get(&order.field).cmp(&doc_b.get(&order.field)),
+                        };
+                        if cmp != std::cmp::Ordering::Equal {
+                            return if order.ascending { cmp } else { cmp.reverse() };
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+            }
+
+            if offset_to_apply_later > 0 {
+                results = results.into_iter().skip(offset_to_apply_later).collect();
+            }
+            if let Some(limit) = plan.limit {
+                results.truncate(limit);
+            }
+
+            return Ok(results);
+        }
+
         // 3. PHASE 3: PHYSICAL SORT (The "Sweep" optimization)
         // Record logical position to restore order later
         let mut work_items: Vec<(usize, String, Pointer)> = keys_from_index
@@ -425,32 +482,74 @@ impl ParallelQueryExecutor {
         };
 
         let mut results: Vec<(String, Vec<(String, Value)>)> = Vec::new();
-        let doc_count = docs.len();
+        // let doc_count = docs.len();
 
-        if doc_count < 1000 || self.workers <= 1 {
-            let task = QueryTask {
-                docs,
-                plan: plan.clone(),
-                storage: Some(storage_arc.clone()),
-            };
-            results = run_task_projected(task);
+        // if doc_count < 1000 || self.workers <= 1 {
+        //     let task = QueryTask {
+        //         docs,
+        //         plan: plan.clone(),
+        //         storage: Some(storage_arc.clone()),
+        //     };
+        //     results = run_task_projected(task);
+        // } else {
+        //     let optimal_workers = self.workers.min((doc_count / 500).max(1));
+        //     let tasks = shard_tasks(
+        //         docs,
+        //         optimal_workers,
+        //         plan.clone(),
+        //         Some(storage_arc.clone()),
+        //     );
+
+        //     let mut handles = Vec::new();
+        //     for task in tasks {
+        //         handles.push(thread::spawn(move || run_task_projected(task)));
+        //     }
+
+        //     for handle in handles {
+        //         results.extend(handle.join().unwrap_or_default());
+        //     }
+        // }
+
+        // Apply Offset/Limit to Index results early if satisfied
+        let mut docs_to_process = docs;
+        let mut offset_to_apply_later = plan.offset.unwrap_or(0);
+        if plan.order_by_satisfied && offset_to_apply_later > 0 {
+            let skip = offset_to_apply_later.min(docs_to_process.len());
+            docs_to_process.drain(0..skip);
+            offset_to_apply_later = 0;
+        }
+        if plan.order_by_satisfied && plan.filters_satisfied_by_index {
+            if let Some(limit) = plan.limit { docs_to_process.truncate(limit); }
+        }
+        let doc_count = docs_to_process.len();
+
+        // --- FAST PATH ---
+        if doc_count <= 250 {
+            let storage_guard = storage_arc.read().unwrap();
+            let blob_manager = storage_guard.blob_manager.clone();
+            let optimized_plan = crate::query::executor::worker::prepare_optimized_plan(&plan);
+
+            for (id, pointer) in docs_to_process {
+                if let Ok(Some(bytes)) = storage_guard.read_pointer(&pointer) {
+                    if let Some(mut fields) = crate::query::executor::worker::unified_match_projected(&id, &bytes, &optimized_plan) {
+                        if let Some(ref manager) = blob_manager {
+                            for (_, val) in fields.iter_mut() {
+                                if let Value::BlobLink { offset, len } = *val {
+                                    *val = crate::query::executor::worker::resolve_single_blob_in_worker(manager, offset, len);
+                                }
+                            }
+                        }
+                        results.push((id, fields));
+                    }
+                }
+            }
         } else {
+            // SLOW PATH (Rayon Tasks)
             let optimal_workers = self.workers.min((doc_count / 500).max(1));
-            let tasks = shard_tasks(
-                docs,
-                optimal_workers,
-                plan.clone(),
-                Some(storage_arc.clone()),
-            );
-
+            let tasks = shard_tasks(docs_to_process, optimal_workers, plan.clone(), Some(storage_arc.clone()));
             let mut handles = Vec::new();
-            for task in tasks {
-                handles.push(thread::spawn(move || run_task_projected(task)));
-            }
-
-            for handle in handles {
-                results.extend(handle.join().unwrap_or_default());
-            }
+            for task in tasks { handles.push(thread::spawn(move || run_task_projected(task))); }
+            for handle in handles { results.extend(handle.join().unwrap_or_default()); }
         }
 
         if !plan.order_by_satisfied && !plan.order_by.is_empty() {
@@ -473,15 +572,20 @@ impl ParallelQueryExecutor {
             });
         }
 
-        let mut final_results = if let Some(offset) = plan.offset {
-            results.into_iter().skip(offset).collect()
-        } else {
-            results
-        };
+        // let mut final_results = if let Some(offset) = plan.offset {
+        //     results.into_iter().skip(offset).collect()
+        // } else {
+        //     results
+        // };
 
-        if let Some(limit) = plan.limit {
-            final_results.truncate(limit);
-        }
+        // if let Some(limit) = plan.limit {
+        //     final_results.truncate(limit);
+        // }
+        let mut final_results = if offset_to_apply_later > 0 {
+            results.into_iter().skip(offset_to_apply_later).collect()
+        } else { results };
+
+        if let Some(limit) = plan.limit { final_results.truncate(limit); }
 
         Ok(final_results)
     }
@@ -510,17 +614,38 @@ impl ParallelQueryExecutor {
             }
 
             ScanType::SecondaryIndex { field, value } => {
+                // let mut out = Vec::new();
+                // if let Some(sec_map) = indexes.secondary.get(collection) {
+                //     if let Some(index) = sec_map.get(field) {
+                //         for doc_id in index.range_scan(value, value).iter() {
+                //             let key = Self::make_key(collection, doc_id);
+                //             if let Some(ptr) = storage.index.get(&key) {
+                //                 // FIX: Ensure we don't return a deleted pointer found in secondary index
+                //                 if !matches!(ptr, Pointer::Deleted { .. }) {
+                //                     out.push((key, ptr.clone()));
+                //                     if out.len() >= max_ids {
+                //                         break;
+                //                     }
+                //                 }
+                //             }
+                //         }
+                //     }
+                // }
+                // Ok(out)
                 let mut out = Vec::new();
                 if let Some(sec_map) = indexes.secondary.get(collection) {
                     if let Some(index) = sec_map.get(field) {
-                        for doc_id in index.range_scan(value, value).iter() {
-                            let key = Self::make_key(collection, doc_id);
-                            if let Some(ptr) = storage.index.get(&key) {
-                                // FIX: Ensure we don't return a deleted pointer found in secondary index
-                                if !matches!(ptr, Pointer::Deleted { .. }) {
-                                    out.push((key, ptr.clone()));
-                                    if out.len() >= max_ids {
-                                        break;
+                        
+                        // CRITICAL FIX: Direct `get()` on the BTreeMap prevents array allocation
+                        if let Some(doc_ids) = index.get_map().get(value) {
+                            for doc_id in doc_ids {
+                                let key = Self::make_key(collection, doc_id);
+                                if let Some(ptr) = storage.index.get(&key) {
+                                    if !matches!(ptr, Pointer::Deleted { .. }) {
+                                        out.push((key, ptr.clone()));
+                                        if out.len() >= max_ids {
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -570,61 +695,123 @@ impl ParallelQueryExecutor {
                 Ok(out)
             }
 
-            ScanType::CompositeIndexRange { index_id, ranges } => {
+            // ScanType::CompositeIndexRange { index_id, ranges } => {
+            //     let mut out = Vec::new();
+            //     if let Some(idx) = indexes.composite.get(*index_id) {
+            //         for (start_bound, end_bound) in ranges {
+            //             // The logic here is correct, but we must ensure the 'manager' 
+            //             // used the correct encoding.
+            //             // BTreeMap::range works on the SmallVec keys directly.
+            //             for (_, doc_id) in idx.tree.range((start_bound.clone(), end_bound.clone())) {
+            //                 if let Some(ptr) = storage.index.get(doc_id.as_ref()) {
+            //                     if !matches!(ptr, Pointer::Deleted { .. }) {
+            //                         out.push((doc_id.to_string(), ptr.clone()));
+            //                     }
+            //                 }
+            //                 if out.len() >= max_ids { break; }
+            //             }
+            //         }
+            //     }
+            //     Ok(out)
+            // }
+
+            ScanType::CompositeIndexRange { index_id, ranges, reverse } => {
                 let mut out = Vec::new();
                 if let Some(idx) = indexes.composite.get(*index_id) {
                     for (start_bound, end_bound) in ranges {
-                        // The logic here is correct, but we must ensure the 'manager' 
-                        // used the correct encoding.
-                        // BTreeMap::range works on the SmallVec keys directly.
-                        for (_, doc_id) in idx.tree.range((start_bound.clone(), end_bound.clone())) {
-                            if let Some(ptr) = storage.index.get(doc_id.as_ref()) {
-                                if !matches!(ptr, Pointer::Deleted { .. }) {
-                                    out.push((doc_id.to_string(), ptr.clone()));
+                        let iter = idx.tree.range((start_bound.clone(), end_bound.clone()));
+                        
+                        if *reverse {
+                            for (_, doc_id) in iter.rev() {
+                                if let Some(ptr) = storage.index.get(doc_id.as_ref()) {
+                                    if !matches!(ptr, Pointer::Deleted { .. }) {
+                                        out.push((doc_id.to_string(), ptr.clone()));
+                                    }
                                 }
+                                if out.len() >= max_ids { break; }
                             }
-                            if out.len() >= max_ids { break; }
+                        } else {
+                            for (_, doc_id) in iter {
+                                if let Some(ptr) = storage.index.get(doc_id.as_ref()) {
+                                    if !matches!(ptr, Pointer::Deleted { .. }) {
+                                        out.push((doc_id.to_string(), ptr.clone()));
+                                    }
+                                }
+                                if out.len() >= max_ids { break; }
+                            }
                         }
+                        if out.len() >= max_ids { break; }
                     }
                 }
                 Ok(out)
             }
 
-            ScanType::SecondaryIndexRange {
-                field,
-                start,
-                end,
-                reverse,
-            } => {
+            // ScanType::SecondaryIndexRange { field, start, end, reverse } => {
+            //     let mut out = Vec::new();
+            //     if let Some(sec_map) = indexes.secondary.get(collection) {
+            //         if let Some(index) = sec_map.get(field) {
+            //             let range_iter = index.get_map().range((start.clone(), end.clone()));
+                        
+            //             // CRITICAL FIX: Iterate lazily
+            //             if *reverse {
+            //                 for (_, ids) in range_iter.rev() {
+            //                     for doc_id in ids {
+            //                         if let Some(ptr) = storage.index.get(doc_id) {
+            //                             if !matches!(ptr, Pointer::Deleted { .. }) {
+            //                                 out.push((doc_id.clone(), ptr.clone()));
+            //                                 if out.len() >= max_ids { break; }
+            //                             }
+            //                         }
+            //                     }
+            //                     if out.len() >= max_ids { break; }
+            //                 }
+            //             } else {
+            //                 for (_, ids) in range_iter {
+            //                     for doc_id in ids {
+            //                         if let Some(ptr) = storage.index.get(doc_id) {
+            //                             if !matches!(ptr, Pointer::Deleted { .. }) {
+            //                                 out.push((doc_id.clone(), ptr.clone()));
+            //                                 if out.len() >= max_ids { break; }
+            //                             }
+            //                         }
+            //                     }
+            //                     if out.len() >= max_ids { break; }
+            //                 }
+            //             }
+            //         }
+            //     }
+            //     Ok(out)
+            // }
+
+            ScanType::SecondaryIndexRange { field, start, end, reverse } => {
                 let mut out = Vec::new();
                 if let Some(sec_map) = indexes.secondary.get(collection) {
                     if let Some(index) = sec_map.get(field) {
-                        let remaining = max_ids.saturating_sub(out.len());
-
-                        // Perform range scan on the BTreeMap
                         let range_iter = index.get_map().range((start.clone(), end.clone()));
-
-                        // Collect doc IDs based on direction
-                        let doc_ids: Vec<String> = if *reverse {
-                            range_iter
-                                .rev()
-                                .flat_map(|(_, ids)| ids.iter().cloned())
-                                .collect()
-                        } else {
-                            range_iter
-                                .flat_map(|(_, ids)| ids.iter().cloned())
-                                .collect()
-                        };
-
-                        // Map Doc IDs to Physical Pointers
-                        for doc_id in doc_ids.into_iter().take(remaining) {
-                            if let Some(ptr) = storage.index.get(&doc_id) {
-                                if !matches!(ptr, Pointer::Deleted { .. }) {
-                                    out.push((doc_id, ptr.clone()));
-                                    if out.len() >= max_ids {
-                                        break;
+                        
+                        if *reverse {
+                            for (_, ids) in range_iter.rev() {
+                                for doc_id in ids.iter().rev() { 
+                                    if let Some(ptr) = storage.index.get(doc_id) {
+                                        if !matches!(ptr, Pointer::Deleted { .. }) {
+                                            out.push((doc_id.clone(), ptr.clone()));
+                                            if out.len() >= max_ids { break; }
+                                        }
                                     }
                                 }
+                                if out.len() >= max_ids { break; }
+                            }
+                        } else {
+                            for (_, ids) in range_iter {
+                                for doc_id in ids {
+                                    if let Some(ptr) = storage.index.get(doc_id) {
+                                        if !matches!(ptr, Pointer::Deleted { .. }) {
+                                            out.push((doc_id.clone(), ptr.clone()));
+                                            if out.len() >= max_ids { break; }
+                                        }
+                                    }
+                                }
+                                if out.len() >= max_ids { break; }
                             }
                         }
                     }
@@ -632,31 +819,27 @@ impl ParallelQueryExecutor {
                 Ok(out)
             }
 
-            ScanType::CursorIndex {
-                index_id,
-                start,
-                end,
-                reverse,
-            } => {
+            ScanType::CursorIndex { index_id, start, end, reverse } => {
                 let mut out = Vec::new();
                 if let Some(idx) = indexes.composite.get(*index_id) {
-                    let remaining = max_ids.saturating_sub(out.len());
                     let iter = idx.tree.range((start.clone(), end.clone()));
-
-                    let doc_ids: Vec<_> = if *reverse {
-                        iter.rev().map(|(_, id)| id.clone()).collect()
+                    
+                    // CRITICAL FIX: Iterate lazily to prevent massive memory allocation
+                    if *reverse {
+                        for (_, doc_id) in iter.rev() {
+                            if let Some(ptr) = storage.index.get(doc_id.as_ref()) {
+                                if !matches!(ptr, Pointer::Deleted { .. }) {
+                                    out.push((doc_id.to_string(), ptr.clone()));
+                                    if out.len() >= max_ids { break; }
+                                }
+                            }
+                        }
                     } else {
-                        iter.map(|(_, id)| id.clone()).collect()
-                    };
-
-                    for doc_id in doc_ids.into_iter().take(remaining) {
-                        let key = Self::make_key(collection, &doc_id);
-                        if let Some(ptr) = storage.index.get(&key) {
-                            // out.push((key, ptr.clone()));
-                            if !matches!(ptr, Pointer::Deleted { .. }) {
-                                out.push((key, ptr.clone()));
-                                if out.len() >= max_ids {
-                                    break;
+                        for (_, doc_id) in iter {
+                            if let Some(ptr) = storage.index.get(doc_id.as_ref()) {
+                                if !matches!(ptr, Pointer::Deleted { .. }) {
+                                    out.push((doc_id.to_string(), ptr.clone()));
+                                    if out.len() >= max_ids { break; }
                                 }
                             }
                         }

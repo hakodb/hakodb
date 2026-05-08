@@ -292,7 +292,7 @@ Report run_benchmark(BenchConfig cfg) {
     fl_query_limit(q_off.get(), 5);
     
     t_start = now(); 
-    for(int i=0; i<20; i++) UniqueString qo(fl_query_execute(db, q_off.get())); 
+    for(int i=0; i<20; i++) UniqueResultSet qo(fl_query_execute_to_handles(db, q_off.get())); 
     res.offset_qps = to_throughput(20, diff_ms(t_start));
 
     char mid_buf[16]; snprintf(mid_buf, sizeof(mid_buf), "b_%d", mid);
@@ -303,7 +303,7 @@ Report run_benchmark(BenchConfig cfg) {
     fl_query_limit(q_cur.get(), 5);
     
     t_start = now(); 
-    for(int i=0; i<20; i++) UniqueString qc(fl_query_execute(db, q_cur.get())); 
+    for(int i=0; i<20; i++) UniqueResultSet qc(fl_query_execute_to_handles(db, q_cur.get())); 
     res.cursor_qps = to_throughput(20, diff_ms(t_start));
     // cout << (int)res.cursor_qps << " qps";
 

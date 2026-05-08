@@ -39,6 +39,7 @@ pub struct FL_Engine {
 
 #[allow(non_camel_case_types)]
 pub struct FL_Doc {
+    pub id: String,
     doc: FireLiteDoc,
 }
 
@@ -408,9 +409,19 @@ pub extern "C" fn fl_engine_free(engine: *mut FL_Engine) {
     })
 }
 
+// #[no_mangle]
+// pub extern "C" fn fl_doc_new() -> *mut FL_Doc {
+//     Box::into_raw(Box::new(FL_Doc {
+//         // id: doc_id.clone(),
+//         doc: FireLiteDoc::default(),
+//     }))
+// }
+
+// 2. Update creation points
 #[no_mangle]
 pub extern "C" fn fl_doc_new() -> *mut FL_Doc {
     Box::into_raw(Box::new(FL_Doc {
+        id: String::new(),
         doc: FireLiteDoc::default(),
     }))
 }
@@ -590,7 +601,7 @@ pub extern "C" fn fl_engine_get(
         };
         let engine = unsafe { &mut *engine };
         match engine.db.get(&collection, &doc_id) {
-            Ok(Some(doc)) => Box::into_raw(Box::new(FL_Doc { doc })),
+            Ok(Some(doc)) => Box::into_raw(Box::new(FL_Doc { id: doc_id.clone(), doc })),
             _ => std::ptr::null_mut(),
         }
     })
@@ -749,24 +760,25 @@ pub extern "C" fn fl_query_where_eq_str(
     field: *const c_char,
     value: *const c_char,
 ) -> i32 {
-    if query.is_null() {
-        return set_last_error("null query handle");
-    }
-    let field = match cstr_to_string(field) {
-        Ok(v) => v,
-        Err(e) => return set_last_error(e),
-    };
-    let value = match cstr_to_string(value) {
-        Ok(v) => v,
-        Err(e) => return set_last_error(e),
-    };
-    let query = unsafe { &mut *query };
-    query.query = query
-        .query
-        .clone()
-        .where_filter(&field, Operator::Eq, Value::String(value));
-    clear_last_error();
-    0
+    // if query.is_null() {
+    //     return set_last_error("null query handle");
+    // }
+    // let field = match cstr_to_string(field) {
+    //     Ok(v) => v,
+    //     Err(e) => return set_last_error(e),
+    // };
+    // let value = match cstr_to_string(value) {
+    //     Ok(v) => v,
+    //     Err(e) => return set_last_error(e),
+    // };
+    // let query = unsafe { &mut *query };
+    // query.query = query
+    //     .query
+    //     .clone()
+    //     .where_filter(&field, Operator::Eq, Value::String(value));
+    // clear_last_error();
+    // 0
+    apply_string_filter(query, field, value, Operator::Eq)
 }
 
 #[no_mangle]
@@ -775,23 +787,35 @@ pub extern "C" fn fl_query_where_eq_bool(
     field: *const c_char,
     value: bool, // Receive the bool directly
 ) -> i32 {
-    if query.is_null() {
-        return set_last_error("null query handle");
-    }
+    // if query.is_null() {
+    //     return set_last_error("null query handle");
+    // }
 
-    let field = match cstr_to_string(field) {
-        Ok(v) => v,
-        Err(e) => return set_last_error(e),
-    };
+    // let field = match cstr_to_string(field) {
+    //     Ok(v) => v,
+    //     Err(e) => return set_last_error(e),
+    // };
 
+    // let query_ptr = unsafe { &mut *query };
+
+    // // Update the query with Value::Bool directly
+    // query_ptr.query = query_ptr
+    //     .query
+    //     .clone()
+    //     .where_filter(&field, Operator::Eq, Value::Bool(value));
+
+    // clear_last_error();
+    // 0
+    if query.is_null() { return set_last_error("null query handle"); }
+    let field = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e), };
     let query_ptr = unsafe { &mut *query };
-
-    // Update the query with Value::Bool directly
-    query_ptr.query = query_ptr
-        .query
-        .clone()
-        .where_filter(&field, Operator::Eq, Value::Bool(value));
-
+    
+    // FIX: Push directly
+    query_ptr.query.filters.push(crate::query::filter::Filter {
+        field,
+        op: Operator::Eq,
+        value: Value::Bool(value)
+    });
     clear_last_error();
     0
 }
@@ -850,39 +874,64 @@ fn apply_string_filter(
     value: *const c_char,
     op: Operator,
 ) -> i32 {
-    if query.is_null() {
-        return set_last_error("null query handle");
-    }
-    let field = match cstr_to_string(field) {
-        Ok(v) => v,
-        Err(e) => return set_last_error(e),
-    };
-    let value = match cstr_to_string(value) {
-        Ok(v) => v,
-        Err(e) => return set_last_error(e),
-    };
+    // if query.is_null() {
+    //     return set_last_error("null query handle");
+    // }
+    // let field = match cstr_to_string(field) {
+    //     Ok(v) => v,
+    //     Err(e) => return set_last_error(e),
+    // };
+    // let value = match cstr_to_string(value) {
+    //     Ok(v) => v,
+    //     Err(e) => return set_last_error(e),
+    // };
+    // let query = unsafe { &mut *query };
+    // query.query = query
+    //     .query
+    //     .clone()
+    //     .where_filter(&field, op, Value::String(value));
+    // clear_last_error();
+    // 0
+    if query.is_null() { return set_last_error("null query handle"); }
+    let field = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e), };
+    let value = match cstr_to_string(value) { Ok(v) => v, Err(e) => return set_last_error(e), };
     let query = unsafe { &mut *query };
-    query.query = query
-        .query
-        .clone()
-        .where_filter(&field, op, Value::String(value));
+    
+    // FIX: Push directly without cloning the query struct
+    query.query.filters.push(crate::query::filter::Filter {
+        field,
+        op,
+        value: Value::String(value)
+    });
     clear_last_error();
     0
 }
 
 fn apply_int_filter(query: *mut FL_Query, field: *const c_char, value: i64, op: Operator) -> i32 {
-    if query.is_null() {
-        return set_last_error("null query handle");
-    }
-    let field = match cstr_to_string(field) {
-        Ok(v) => v,
-        Err(e) => return set_last_error(e),
-    };
+    // if query.is_null() {
+    //     return set_last_error("null query handle");
+    // }
+    // let field = match cstr_to_string(field) {
+    //     Ok(v) => v,
+    //     Err(e) => return set_last_error(e),
+    // };
+    // let query = unsafe { &mut *query };
+    // query.query = query
+    //     .query
+    //     .clone()
+    //     .where_filter(&field, op, Value::Int(value));
+    // clear_last_error();
+    // 0
+    if query.is_null() { return set_last_error("null query handle"); }
+    let field = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e), };
     let query = unsafe { &mut *query };
-    query.query = query
-        .query
-        .clone()
-        .where_filter(&field, op, Value::Int(value));
+    
+    // FIX: Push directly
+    query.query.filters.push(crate::query::filter::Filter {
+        field,
+        op,
+        value: Value::Int(value)
+    });
     clear_last_error();
     0
 }
@@ -893,20 +942,21 @@ pub extern "C" fn fl_query_where_eq_int(
     field: *const c_char,
     value: i64,
 ) -> i32 {
-    if query.is_null() {
-        return set_last_error("null query handle");
-    }
-    let field = match cstr_to_string(field) {
-        Ok(v) => v,
-        Err(e) => return set_last_error(e),
-    };
-    let query = unsafe { &mut *query };
-    query.query = query
-        .query
-        .clone()
-        .where_filter(&field, Operator::Eq, Value::Int(value));
-    clear_last_error();
-    0
+    // if query.is_null() {
+    //     return set_last_error("null query handle");
+    // }
+    // let field = match cstr_to_string(field) {
+    //     Ok(v) => v,
+    //     Err(e) => return set_last_error(e),
+    // };
+    // let query = unsafe { &mut *query };
+    // query.query = query
+    //     .query
+    //     .clone()
+    //     .where_filter(&field, Operator::Eq, Value::Int(value));
+    // clear_last_error();
+    // 0
+    apply_int_filter(query, field, value, Operator::Eq)
 }
 
 #[no_mangle]
@@ -1073,15 +1123,26 @@ pub extern "C" fn fl_query_order_by(
     field: *const c_char,
     ascending: bool,
 ) -> i32 {
-    if query.is_null() {
-        return set_last_error("null query handle");
-    }
-    let field = match cstr_to_string(field) {
-        Ok(v) => v,
-        Err(e) => return set_last_error(e),
-    };
+    // if query.is_null() {
+    //     return set_last_error("null query handle");
+    // }
+    // let field = match cstr_to_string(field) {
+    //     Ok(v) => v,
+    //     Err(e) => return set_last_error(e),
+    // };
+    // let query = unsafe { &mut *query };
+    // query.query = query.query.clone().order_by(&field, ascending);
+    // clear_last_error();
+    // 0
+    if query.is_null() { return set_last_error("null query handle"); }
+    let field = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e), };
     let query = unsafe { &mut *query };
-    query.query = query.query.clone().order_by(&field, ascending);
+    
+    // FIX: Push directly
+    query.query.order_by.push(crate::query::order::OrderBy {
+        field,
+        ascending,
+    });
     clear_last_error();
     0
 }
@@ -1109,15 +1170,23 @@ pub extern "C" fn fl_query_offset(query: *mut FL_Query, offset: usize) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn fl_query_select_field(query: *mut FL_Query, field: *const c_char) -> i32 {
-    if query.is_null() {
-        return set_last_error("null query handle");
-    }
-    let field = match cstr_to_string(field) {
-        Ok(v) => v,
-        Err(e) => return set_last_error(e),
-    };
+    // if query.is_null() {
+    //     return set_last_error("null query handle");
+    // }
+    // let field = match cstr_to_string(field) {
+    //     Ok(v) => v,
+    //     Err(e) => return set_last_error(e),
+    // };
+    // let query = unsafe { &mut *query };
+    // query.query = query.query.clone().select(&field);
+    // clear_last_error();
+    // 0
+    if query.is_null() { return set_last_error("null query handle"); }
+    let field = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e), };
     let query = unsafe { &mut *query };
-    query.query = query.query.clone().select(&field);
+    
+    // FIX: Push directly
+    query.query.projection.push(field);
     clear_last_error();
     0
 }
@@ -1183,6 +1252,29 @@ pub extern "C" fn fl_query_execute(engine: *mut FL_Engine, query: *const FL_Quer
     })
 }
 
+// #[no_mangle]
+// pub extern "C" fn fl_query_execute_to_handles(
+//     engine: *mut FL_Engine,
+//     query: *const FL_Query,
+// ) -> *mut FL_ResultSet {
+//     safety_shield!(std::ptr::null_mut(), {
+//         let engine = unsafe { &*engine };
+//         let query_obj = unsafe { &*query };
+
+//         // 1. Run the actual query (Fast logic)
+//         let results = engine.db.query(query_obj.query.clone()).unwrap_or_default();
+
+//         // 2. Convert each result into a handle (*mut FL_Doc), just like 'get' does
+//         let doc_handles: Vec<*mut FL_Doc> = results
+//             .into_iter()
+//             .map(|(_id, doc)| Box::into_raw(Box::new(FL_Doc { doc })))
+//             .collect();
+
+//         // 3. Wrap the list of handles in a ResultSet handle
+//         Box::into_raw(Box::new(FL_ResultSet { docs: doc_handles }))
+//     })
+// }
+
 #[no_mangle]
 pub extern "C" fn fl_query_execute_to_handles(
     engine: *mut FL_Engine,
@@ -1191,17 +1283,13 @@ pub extern "C" fn fl_query_execute_to_handles(
     safety_shield!(std::ptr::null_mut(), {
         let engine = unsafe { &*engine };
         let query_obj = unsafe { &*query };
-
-        // 1. Run the actual query (Fast logic)
         let results = engine.db.query(query_obj.query.clone()).unwrap_or_default();
 
-        // 2. Convert each result into a handle (*mut FL_Doc), just like 'get' does
         let doc_handles: Vec<*mut FL_Doc> = results
             .into_iter()
-            .map(|(_id, doc)| Box::into_raw(Box::new(FL_Doc { doc })))
+            .map(|(id, doc)| Box::into_raw(Box::new(FL_Doc { id, doc })))
             .collect();
 
-        // 3. Wrap the list of handles in a ResultSet handle
         Box::into_raw(Box::new(FL_ResultSet { docs: doc_handles }))
     })
 }
@@ -1434,20 +1522,21 @@ pub extern "C" fn fl_query_where_match(
     field: *const c_char,
     value: *const c_char,
 ) -> i32 {
-    let f = match cstr_to_string(field) {
-        Ok(v) => v,
-        Err(e) => return set_last_error(e),
-    };
-    let v = match cstr_to_string(value) {
-        Ok(v) => v,
-        Err(e) => return set_last_error(e),
-    };
-    let q = unsafe { &mut *query };
-    q.query = q
-        .query
-        .clone()
-        .where_filter(&f, Operator::Match, Value::String(v));
-    0
+    // let f = match cstr_to_string(field) {
+    //     Ok(v) => v,
+    //     Err(e) => return set_last_error(e),
+    // };
+    // let v = match cstr_to_string(value) {
+    //     Ok(v) => v,
+    //     Err(e) => return set_last_error(e),
+    // };
+    // let q = unsafe { &mut *query };
+    // q.query = q
+    //     .query
+    //     .clone()
+    //     .where_filter(&f, Operator::Match, Value::String(v));
+    // 0
+    apply_string_filter(query, field, value, Operator::Match)
 }
 
 #[no_mangle]
@@ -1456,20 +1545,21 @@ pub extern "C" fn fl_query_where_contains(
     field: *const c_char,
     value: *const c_char,
 ) -> i32 {
-    let f = match cstr_to_string(field) {
-        Ok(v) => v,
-        Err(e) => return set_last_error(e),
-    };
-    let v = match cstr_to_string(value) {
-        Ok(v) => v,
-        Err(e) => return set_last_error(e),
-    };
-    let q = unsafe { &mut *query };
-    q.query = q
-        .query
-        .clone()
-        .where_filter(&f, Operator::Contains, Value::String(v));
-    0
+    // let f = match cstr_to_string(field) {
+    //     Ok(v) => v,
+    //     Err(e) => return set_last_error(e),
+    // };
+    // let v = match cstr_to_string(value) {
+    //     Ok(v) => v,
+    //     Err(e) => return set_last_error(e),
+    // };
+    // let q = unsafe { &mut *query };
+    // q.query = q
+    //     .query
+    //     .clone()
+    //     .where_filter(&f, Operator::Contains, Value::String(v));
+    // 0
+    apply_string_filter(query, field, value, Operator::Contains)
 }
 
 #[no_mangle]
@@ -1478,20 +1568,21 @@ pub extern "C" fn fl_query_where_starts_with(
     field: *const c_char,
     value: *const c_char,
 ) -> i32 {
-    let f = match cstr_to_string(field) {
-        Ok(v) => v,
-        Err(e) => return set_last_error(e),
-    };
-    let v = match cstr_to_string(value) {
-        Ok(v) => v,
-        Err(e) => return set_last_error(e),
-    };
-    let q = unsafe { &mut *query };
-    q.query = q
-        .query
-        .clone()
-        .where_filter(&f, Operator::StartsWith, Value::String(v));
-    0
+    // let f = match cstr_to_string(field) {
+    //     Ok(v) => v,
+    //     Err(e) => return set_last_error(e),
+    // };
+    // let v = match cstr_to_string(value) {
+    //     Ok(v) => v,
+    //     Err(e) => return set_last_error(e),
+    // };
+    // let q = unsafe { &mut *query };
+    // q.query = q
+    //     .query
+    //     .clone()
+    //     .where_filter(&f, Operator::StartsWith, Value::String(v));
+    // 0
+    apply_string_filter(query, field, value, Operator::StartsWith)
 }
 
 #[no_mangle]
@@ -1820,7 +1911,7 @@ pub extern "C" fn fl_transaction_get(
     };
 
     match tx.tx.get(&engine.db, &col, &id) {
-        Ok(Some(doc)) => Box::into_raw(Box::new(FL_Doc { doc })),
+        Ok(Some(doc)) => Box::into_raw(Box::new(FL_Doc { doc, id: id.clone() })),
         _ => ptr::null_mut(),
     }
 }
@@ -2004,7 +2095,7 @@ pub extern "C" fn fl_engine_get_by_ref(
 
         // 2. Resolve the reference using the engine
         match engine.db.get_by_reference(val) {
-            Ok(Some(target_doc)) => Box::into_raw(Box::new(FL_Doc { doc: target_doc })),
+            Ok(Some(target_doc)) => Box::into_raw(Box::new(FL_Doc { doc: target_doc, id: doc_ptr.id.clone() })),
             Ok(None) => ptr::null_mut(), // Document doesn't exist (Dangling reference)
             Err(e) => {
                 set_last_error(e.to_string());
@@ -2014,16 +2105,50 @@ pub extern "C" fn fl_engine_get_by_ref(
     })
 }
 
-/// Internal helper to extract values from an anchor document based on the query's sort order
-fn get_anchor_values(q: &crate::query::query::Query, doc: &FireLiteDoc) -> Option<Vec<Value>> {
+// /// Internal helper to extract values from an anchor document based on the query's sort order
+// fn get_anchor_values(q: &crate::query::query::Query, doc: &FireLiteDoc) -> Option<Vec<Value>> {
+//     if q.order_by.is_empty() { return None; }
+    
+//     let mut vals = Vec::with_capacity(q.order_by.len());
+//     for order in &q.order_by {
+//         vals.push(doc.get(&order.field)?.clone());
+//     }
+//     Some(vals)
+// }
+// 3. Fix get_anchor_values logic
+fn get_anchor_values(q: &crate::query::query::Query, fl_doc: &FL_Doc) -> Option<Vec<Value>> {
     if q.order_by.is_empty() { return None; }
     
     let mut vals = Vec::with_capacity(q.order_by.len());
     for order in &q.order_by {
-        vals.push(doc.get(&order.field)?.clone());
+        // MAGIC FIX: Extract internal metadata manually
+        if order.field == "id" {
+            vals.push(Value::String(fl_doc.id.clone()));
+        } else if order.field == "_time" {
+            vals.push(Value::Int(fl_doc.doc._time));
+        } else {
+            vals.push(fl_doc.doc.get(&order.field)?.clone());
+        }
     }
     Some(vals)
 }
+
+// #[no_mangle]
+// pub extern "C" fn fl_query_start_after(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> i32 {
+//     safety_shield!(-1, {
+//         if query.is_null() || anchor_doc.is_null() { return -1; }
+//         let q = unsafe { &mut *query };
+//         let doc = unsafe { &*anchor_doc };
+
+//         if let Some(vals) = get_anchor_values(&q.query, &doc.doc) {
+//             q.query.start_after = Some(vals);
+//             0
+//         } else {
+//             set_last_error("Anchor document missing one or more fields from sort chain");
+//             -1
+//         }
+//     })
+// }
 
 #[no_mangle]
 pub extern "C" fn fl_query_start_after(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> i32 {
@@ -2031,8 +2156,8 @@ pub extern "C" fn fl_query_start_after(query: *mut FL_Query, anchor_doc: *const 
         if query.is_null() || anchor_doc.is_null() { return -1; }
         let q = unsafe { &mut *query };
         let doc = unsafe { &*anchor_doc };
-
-        if let Some(vals) = get_anchor_values(&q.query, &doc.doc) {
+        
+        if let Some(vals) = get_anchor_values(&q.query, doc) {
             q.query.start_after = Some(vals);
             0
         } else {
@@ -2042,19 +2167,36 @@ pub extern "C" fn fl_query_start_after(query: *mut FL_Query, anchor_doc: *const 
     })
 }
 
+// #[no_mangle]
+// pub extern "C" fn fl_query_start_at(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> i32 {
+//     safety_shield!(-1, {
+//         if query.is_null() || anchor_doc.is_null() {
+//             return -1;
+//         }
+//         let q = unsafe { &mut *query };
+//         let doc = unsafe { &*anchor_doc };
+//         if let Some(vals) = get_anchor_values(&q.query, &doc.doc) {
+//             q.query.start_at = Some(vals);
+//             0
+//         } else {
+//             set_last_error("Anchor document missing sort field");
+//             -1
+//         }
+//     })
+// }
+// 4. Update pointer usages for the anchor logic
 #[no_mangle]
 pub extern "C" fn fl_query_start_at(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> i32 {
     safety_shield!(-1, {
-        if query.is_null() || anchor_doc.is_null() {
-            return -1;
-        }
+        if query.is_null() || anchor_doc.is_null() { return -1; }
         let q = unsafe { &mut *query };
         let doc = unsafe { &*anchor_doc };
-        if let Some(vals) = get_anchor_values(&q.query, &doc.doc) {
+        
+        if let Some(vals) = get_anchor_values(&q.query, doc) {
             q.query.start_at = Some(vals);
             0
         } else {
-            set_last_error("Anchor document missing sort field");
+            set_last_error("Anchor document missing one or more fields from sort chain");
             -1
         }
     })
@@ -2068,7 +2210,7 @@ pub extern "C" fn fl_query_end_at(query: *mut FL_Query, anchor_doc: *const FL_Do
         }
         let q = unsafe { &mut *query };
         let doc = unsafe { &*anchor_doc };
-        if let Some(vals) = get_anchor_values(&q.query, &doc.doc) {
+        if let Some(vals) = get_anchor_values(&q.query, doc) {
             q.query.end_at = Some(vals);
             0
         } else {
@@ -2086,7 +2228,7 @@ pub extern "C" fn fl_query_end_before(query: *mut FL_Query, anchor_doc: *const F
         }
         let q = unsafe { &mut *query };
         let doc = unsafe { &*anchor_doc };
-        if let Some(vals) = get_anchor_values(&q.query, &doc.doc) {
+        if let Some(vals) = get_anchor_values(&q.query, doc) {
             q.query.end_before = Some(vals);
             0
         } else {

@@ -81,7 +81,6 @@ async function exec(op: any): Promise<any> {
     // The other fields must match the Rust struct fields (snake_case)
     const bytes = await invoke<number[]>('firelite_exec', { op });
     const res = decode(new Uint8Array(bytes)) as any;
-    
     if (res?.error) throw new Error(res.error);
     return res;
 }
@@ -298,9 +297,11 @@ export function onSnapshot(
     const start = async () => {
         try {
             unlisten = await listen<Uint8Array>(event_name, (event) => {
+
                 // const payload = decode(event.payload) as DeltaPayload;
                 const payload = decode(new Uint8Array(event.payload)) as DeltaPayload;
                 const { changes } = payload;
+                
                 // const { changes } = event.payload;
                 let hasChanged = false;
 
@@ -342,13 +343,19 @@ export function onSnapshot(
                     // Optimized Re-sorting: Only if order_by is present
                     let results = Array.from(localCache.values());
                     
-                    if (params.order_by) {
-                        const { field, ascending } = params.order_by;
+                    if (params.order_by && Array.isArray(params.order_by)) {
                         results.sort((a, b) => {
-                            const valA = a[field];
-                            const valB = b[field];
-                            if (valA === valB) return 0;
-                            return (valA < valB ? -1 : 1) * (ascending ? 1 : -1);
+                            for (const order of params.order_by||[]) {
+                                const { field, ascending } = order;
+                                const valA = a[field];
+                                const valB = b[field];
+
+                                if (valA === valB) continue;
+
+                                const cmp = valA < valB ? -1 : 1;
+                                return ascending ? cmp : -cmp;
+                            }
+                            return 0;
                         });
                     }
 
@@ -506,7 +513,7 @@ function buildQueryParams(q: Query | CollectionReference | CollectionGroupRefere
     
     const filters: any[] = [];
     const or_groups: any[][] = [];
-    let order_by: any = undefined;
+    let order_by: any[] = [];
     let limit: number | undefined = undefined;
     let offset: number | undefined = undefined;
     let projection: string[] | undefined = undefined;
@@ -532,7 +539,7 @@ function buildQueryParams(q: Query | CollectionReference | CollectionGroupRefere
                     value: normalizeValue(cc.data.value) 
                 }))); 
                 break;
-            case 'order_by': order_by = c.data; break;
+            case 'order_by': order_by.push(c.data); break;
             case 'limit': limit = c.data; break;
             case 'offset': offset = c.data; break;
             case 'select': projection = c.data; break;
@@ -554,7 +561,7 @@ function buildQueryParams(q: Query | CollectionReference | CollectionGroupRefere
         doc_id_filter: undefined, // Not used for collection-wide queries
         filters,
         or_groups: or_groups.length > 0 ? or_groups : undefined,
-        order_by,
+        order_by: order_by.length > 0 ? order_by : undefined,
         limit,
         offset,
         projection,

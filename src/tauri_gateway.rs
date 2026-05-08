@@ -15,9 +15,10 @@ use crate::query::filter::Operator;
 use crate::query::query::Query;
 
 fn to_binary_payload<S: serde::Serialize>(val: &S) -> Result<Vec<u8>, String> {
-    let json = serde_json::to_value(val).map_err(|e| e.to_string())?;
-    let flat_value = json_to_rmpv(json);
-    rmp_serde::to_vec(&flat_value).map_err(|e| e.to_string())
+    // let json = serde_json::to_value(val).map_err(|e| e.to_string())?;
+    // let flat_value = json_to_rmpv(json);
+    // rmp_serde::to_vec(&flat_value).map_err(|e| e.to_string())
+    rmp_serde::to_vec_named(val).map_err(|e| e.to_string())
 }
 
 fn json_to_rmpv(json: serde_json::Value) -> rmpv::Value {
