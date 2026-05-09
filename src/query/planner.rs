@@ -785,12 +785,15 @@ impl QueryPlanner {
         } else if sub_scans.len() == 1 {
             let (scan, ordered) = sub_scans.pop().unwrap();
             // Some((scan, ordered, true))
-            Some((scan, ordered, query.or_groups.is_empty()))
+            let has_in_filter = query.filters.iter().any(|f| f.op == Operator::In);
+            let filters_done = query.or_groups.is_empty() && !has_in_filter;
+            
+            Some((scan, ordered, filters_done))
         } else {
             // We hit multiple types (String and Int). 
             // We MUST sort in RAM because Union merges different ranges.
             let scans = sub_scans.into_iter().map(|(s, _)| s).collect();
-            Some((ScanType::UnionIndex { scans }, false, query.or_groups.is_empty()))
+            Some((ScanType::UnionIndex { scans }, false, false))
         }
     }
 }
