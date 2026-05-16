@@ -169,17 +169,45 @@ impl IndexManager {
             .map_err(|e| FireLiteError::Corrupt(format!("Index export failed: {}", e)))
     }
 
-    pub fn import_state(&mut self, bytes: &[u8]) -> Result<(), FireLiteError> {
-        // By importing hashbrown::HashMap at the top, 'HashMap' here 
-        // now correctly refers to the hashbrown version.
+    // pub fn import_state(&mut self, bytes: &[u8]) -> Result<(), FireLiteError> {
+    //     // By importing hashbrown::HashMap at the top, 'HashMap' here 
+    //     // now correctly refers to the hashbrown version.
+    //     let (sec, fts): (
+    //         HashMap<String, HashMap<String, crate::index::secondary_index::SecondaryIndex>>,
+    //         HashMap<String, HashMap<String, crate::index::inverted_index::InvertedIndex>>
+    //     ) = bincode::deserialize(bytes)
+    //         .map_err(|e| FireLiteError::Corrupt(format!("Index import failed: {}", e)))?;
+        
+    //     self.secondary = sec;
+    //     self.fts = fts;
+    //     Ok(())
+    // }
+     pub fn import_state(&mut self, bytes: &[u8]) -> Result<(), FireLiteError> {
         let (sec, fts): (
             HashMap<String, HashMap<String, crate::index::secondary_index::SecondaryIndex>>,
             HashMap<String, HashMap<String, crate::index::inverted_index::InvertedIndex>>
         ) = bincode::deserialize(bytes)
             .map_err(|e| FireLiteError::Corrupt(format!("Index import failed: {}", e)))?;
         
-        self.secondary = sec;
-        self.fts = fts;
+        // Merge the RAM data into existing definitions instead of blindly overwriting
+        for (col, fields) in sec {
+            let col_map = self.secondary.entry(col).or_default();
+            for (field, index) in fields {
+                if let Some(existing_index) = col_map.get_mut(&field) {
+                    *existing_index = index;
+                }
+            }
+        }
+
+        for (col, fields) in fts {
+            let col_map = self.fts.entry(col).or_default();
+            for (field, index) in fields {
+                if let Some(existing_index) = col_map.get_mut(&field) {
+                    *existing_index = index;
+                }
+            }
+        }
+
         Ok(())
     }
 }

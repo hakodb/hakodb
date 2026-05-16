@@ -59,4 +59,8 @@ impl IndexStorage {
         &self.log_path
     }
 
+    pub fn flush_log(&mut self) -> std::io::Result<()> {
+        self.log.flush()
+    }
+
 }

@@ -656,33 +656,23 @@ impl ParallelQueryExecutor {
             }
 
             ScanType::CompositeIndex {
-                fields,
+                index_id,
+                fields: _,
                 values,
                 reverse,
             } => {
                 let mut out = Vec::new();
-                if let Some(doc_ids) = indexes.exact_match_doc_ids(collection, fields, values) {
+                if let Some(idx) = indexes.composite.get(*index_id) {
+                    let range = crate::index::composite::range_builder::build_prefix_range(&idx.definition, values);
+                    let doc_ids = idx.range_scan(&range.start, &range.end);
+                    
                     let iter: Box<dyn Iterator<Item = _>> = if *reverse {
                         Box::new(doc_ids.iter().rev())
                     } else {
                         Box::new(doc_ids.iter())
                     };
 
-                    // for doc_id in iter.take(max_ids) {
-                    //     let key = Self::make_key(collection, &doc_id);
-                    //     if let Some(ptr) = storage.index.get(&key) {
-                    //         // out.push((key, ptr.clone()));
-                    //         if !matches!(ptr, Pointer::Deleted { .. }) {
-                    //             out.push((key, ptr.clone()));
-                    //             if out.len() >= max_ids {
-                    //                 break;
-                    //             }
-                    //         }
-                    //     }
-                    // }
-
                     for doc_id in iter {
-                        // FIX: Use doc_id exactly as returned
                         if let Some(ptr) = storage.index.get(doc_id.as_ref()) {
                             if !matches!(ptr, Pointer::Deleted { .. }) {
                                 out.push((doc_id.to_string(), ptr.clone()));
@@ -690,30 +680,9 @@ impl ParallelQueryExecutor {
                         }
                         if out.len() >= max_ids { break; }
                     }
-
                 }
                 Ok(out)
             }
-
-            // ScanType::CompositeIndexRange { index_id, ranges } => {
-            //     let mut out = Vec::new();
-            //     if let Some(idx) = indexes.composite.get(*index_id) {
-            //         for (start_bound, end_bound) in ranges {
-            //             // The logic here is correct, but we must ensure the 'manager' 
-            //             // used the correct encoding.
-            //             // BTreeMap::range works on the SmallVec keys directly.
-            //             for (_, doc_id) in idx.tree.range((start_bound.clone(), end_bound.clone())) {
-            //                 if let Some(ptr) = storage.index.get(doc_id.as_ref()) {
-            //                     if !matches!(ptr, Pointer::Deleted { .. }) {
-            //                         out.push((doc_id.to_string(), ptr.clone()));
-            //                     }
-            //                 }
-            //                 if out.len() >= max_ids { break; }
-            //             }
-            //         }
-            //     }
-            //     Ok(out)
-            // }
 
             ScanType::CompositeIndexRange { index_id, ranges, reverse } => {
                 let mut out = Vec::new();
