@@ -9,6 +9,7 @@ use super::order::OrderBy;
 pub enum ScanType {
     FullCollection,
     CompositeIndex {
+        index_id: u32,
         fields: Vec<String>,
         values: Vec<Value>,
         reverse: bool,

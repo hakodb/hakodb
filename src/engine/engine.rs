@@ -305,6 +305,8 @@ impl FireLite {
                                 }
                             }
                         }
+                        // Physically flush the Composite Index buffer to disk so queries find it instantly
+                        let _ = persist.flush_log();
                     }
 
                 }
@@ -318,6 +320,9 @@ impl FireLite {
         let audit_data_clone = Arc::clone(&audit_data);
         let shards_sys_clone = Arc::clone(&shards);
         let index_sys_ptr = Arc::clone(&index_storage);
+
+        let indexes_sys_ptr = Arc::clone(&indexes);
+        let root_path_sys = root_path.clone();
 
         let system_handle_thread = thread::spawn(move || {
             let mut last_maint = Instant::now();
@@ -347,6 +352,13 @@ impl FireLite {
                     if let Ok(mut persist) = index_sys_ptr.try_lock() {
                         if let Ok(_) = persist.snapshot(1) { let _ = persist.reset_log(); }
                     }
+                    
+                    // Periodically snapshot RAM indexes (prevent loss on crash)
+                    let snapshot_path = root_path_sys.join("_indices").join("ram_indexes.bin");
+                    if let Ok(mgr) = indexes_sys_ptr.try_read() {
+                        if let Ok(bytes) = mgr.export_state() { let _ = std::fs::write(snapshot_path, bytes); }
+                    }
+
                     trigger_for_system.store(true, Ordering::Release);
                     last_maint = Instant::now();
                 }
