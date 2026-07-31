@@ -1,37 +1,43 @@
 use std::collections::BTreeMap;
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 
-#[derive(Clone)]
 pub struct ConsistentHashRing {
-    nodes: BTreeMap<u64, String>,
+    vnodes_per_node: usize,
+    ring: BTreeMap<u64, usize>,
 }
 
 impl ConsistentHashRing {
-    pub fn new(nodes: &[String], vnodes: usize) -> Self {
-        let mut ring = BTreeMap::new();
-        for node in nodes {
-            for vnode_id in 0..vnodes {
-                let mut hasher = DefaultHasher::new();
-                format!("{}-vnode-{}", node, vnode_id).hash(&mut hasher);
-                ring.insert(hasher.finish(), node.clone());
-            }
+    pub fn new() -> Self {
+        Self {
+            vnodes_per_node: 100,
+            ring: BTreeMap::new(),
         }
-        Self { nodes: ring }
     }
 
-    pub fn get_owner_node(&self, doc_id: &str) -> Option<String> {
-        if self.nodes.is_empty() {
-            return None;
+    pub fn add_node(&mut self, node_id: usize) {
+        for vnode in 0..self.vnodes_per_node {
+            let key = format!("NODE_{}_VNODE_{}", node_id, vnode);
+            let hash = Self::hash_key(&key);
+            self.ring.insert(hash, node_id);
         }
+    }
 
+    pub fn get_node(&self, key: &str) -> usize {
+        if self.ring.is_empty() {
+            return 0;
+        }
+        let hash = Self::hash_key(key);
+        if let Some((_, &node_id)) = self.ring.range(hash..).next() {
+            node_id
+        } else {
+            *self.ring.values().next().unwrap()
+        }
+    }
+
+    fn hash_key(key: &str) -> u64 {
         let mut hasher = DefaultHasher::new();
-        doc_id.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        match self.nodes.range(hash..).next() {
-            Some((_, node_uri)) => Some(node_uri.clone()),
-            None => self.nodes.values().next().cloned(),
-        }
+        key.hash(&mut hasher);
+        hasher.finish()
     }
 }

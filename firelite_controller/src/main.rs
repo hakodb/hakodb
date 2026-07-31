@@ -1,130 +1,81 @@
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{ws::WebSocket, State, WebSocketUpgrade},
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
-use reqwest::Client as HttpClient;
-use serde_json::Value;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
+use clap::Parser;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tracing::{info, error};
 
 mod node_manager;
 mod ring;
 
-use node_manager::NodeManager;
-use ring::ConsistentHashRing;
+use node_manager::{ClusterConfig, ClusterManager};
 
-#[derive(Clone)]
-pub struct ControllerState {
-    pub http_client: HttpClient,
-    pub node_manager: NodeManager,
-    pub read_rr_counter: Arc<AtomicUsize>,
-    pub vnodes: usize,
+#[derive(Parser, Debug)]
+#[command(author, version, about = "FireLite Cloud Controller Daemon")]
+struct Args {
+    #[arg(short, long, default_value = "config.json")]
+    config: String,
 }
 
 #[tokio::main]
-async fn main() {
-    let nodes = vec![
-        "http://127.0.0.1:8081".to_string(),
-        "http://127.0.0.1:8082".to_string(),
-        "http://127.0.0.1:8083".to_string(),
-    ];
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
 
-    let http_client = HttpClient::new();
-    let node_manager = NodeManager::new(nodes);
+    let args = Args::parse();
+    let config = ClusterConfig::load_or_default(&args.config)?;
+    
+    info!("Starting FireLite Controller with {} shards...", config.num_instances);
+    let manager = Arc::new(ClusterManager::new(config.clone()).await?);
 
-    // Spawn background health checker
-    let nm_clone = node_manager.clone();
-    let client_clone = http_client.clone();
+    // Launch dedicated TCP Listener in background
+    let tcp_manager = Arc::clone(&manager);
+    let tcp_port = config.tcp_port;
     tokio::spawn(async move {
-        nm_clone.start_health_check_loop(client_clone).await;
+        if let Err(e) = tcp_manager.start_tcp_listener(tcp_port).await {
+            error!("TCP server error: {}", e);
+        }
     });
 
-    let state = ControllerState {
-        http_client,
-        node_manager,
-        read_rr_counter: Arc::new(AtomicUsize::new(0)),
-        vnodes: 10,
-    };
-
+    // HTTP & WebSocket API Gateway
     let app = Router::new()
-        .route("/api/v1/:collection/doc/:id", post(handle_write))
-        .route("/api/v1/:collection/doc/:id", get(handle_read))
-        .with_state(state);
+        .route("/health", get(|| async { "OK" }))
+        .route("/ws/sync", get(ws_handler))
+        .route("/api/v1/query", post(api_query_handler))
+        .with_state(manager);
 
-    let addr = "0.0.0.0:8000";
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    println!("🚀 FireLite Cloud Controller listening on http://{}", addr);
-    axum::serve(listener, app).await.unwrap();
+    let addr: SocketAddr = format!("0.0.0.0:{}", config.http_port).parse()?;
+    info!("FireLite Controller HTTP/WS listening on http://{}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
 }
 
-async fn handle_write(
-    State(state): State<ControllerState>,
-    Path((collection, doc_id)): Path<(String, String)>,
-    Json(payload): Json<Value>,
-) -> Result<Json<Value>, StatusCode> {
-    let active_nodes = state.node_manager.active_nodes.read().await;
-    if active_nodes.is_empty() {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    // FIXED: Dynamically recompute ring from currently healthy nodes
-    let dynamic_ring = ConsistentHashRing::new(&active_nodes, state.vnodes);
-    let target_node = dynamic_ring
-        .get_owner_node(&doc_id)
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-
-    let target_url = format!("{}/api/v1/{}/doc/{}", target_node, collection, doc_id);
-
-    let response = state
-        .http_client
-        .post(&target_url)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
-
-    if response.status().is_success() {
-        let res_json = response
-            .json::<Value>()
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        Ok(Json(res_json))
-    } else {
-        Err(StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
-    }
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(manager): State<Arc<ClusterManager>>,
+) -> impl IntoResponse {
+    ws.on_upgrade(|socket| async move {
+        if let Err(e) = manager.handle_websocket(socket).await {
+            error!("WebSocket stream error: {}", e);
+        }
+    })
 }
 
-async fn handle_read(
-    State(state): State<ControllerState>,
-    Path((collection, doc_id)): Path<(String, String)>,
-) -> Result<Json<Value>, StatusCode> {
-    let active_nodes = state.node_manager.active_nodes.read().await;
-    if active_nodes.is_empty() {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    let idx = state.read_rr_counter.fetch_add(1, Ordering::Relaxed) % active_nodes.len();
-    let target_node = &active_nodes[idx];
-    let target_url = format!("{}/api/v1/{}/doc/{}", target_node, collection, doc_id);
-
-    let response = state
-        .http_client
-        .get(&target_url)
-        .send()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
-
-    if response.status().is_success() {
-        let res_json = response
-            .json::<Value>()
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        Ok(Json(res_json))
-    } else {
-        Err(StatusCode::NOT_FOUND)
+async fn api_query_handler(
+    State(manager): State<Arc<ClusterManager>>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    match manager.route_query(payload).await {
+        Ok(res) => (axum::http::StatusCode::OK, Json(res)),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
     }
 }

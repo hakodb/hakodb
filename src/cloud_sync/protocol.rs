@@ -1,68 +1,46 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
-/// Vector Clock state tracking (Collection Name -> Sequence ID / High-Water Mark)
-pub type VectorClock = HashMap<String, u64>;
-
+/// Handshake frame sent upon initiating connection
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlobData {
-    pub hash: String,
-    pub data: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HandshakeRequest {
-    pub node_id: String,
+pub struct ClientHandshake {
+    pub client_id: String,
     pub auth_token: String,
-    pub vector_clock: VectorClock,
+    pub protocol_version: u32,
 }
 
+/// Server Handshake response
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HandshakeResponse {
-    pub server_id: String,
-    pub accepted: bool,
-    pub server_clock: VectorClock,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SyncOp {
-    Upsert {
-        collection: String,
-        doc_id: String,
-        version: u64,
-        payload_bytes: Vec<u8>,        // Raw FireLiteDoc v5 binary
-        attached_blobs: Vec<BlobData>, // Attached offloaded large binaries
-    },
-    Delete {
-        collection: String,
-        doc_id: String,
-        version: u64,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncBatch {
-    pub sender_id: String,
-    pub ops: Vec<SyncOp>,
-    pub vector_clock: VectorClock,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncResponse {
+pub struct ServerHandshakeResponse {
     pub success: bool,
-    pub ops_applied: usize,
-    pub updated_clock: VectorClock,
+    pub server_version: String,
+    pub assigned_shard: usize,
+    pub message: Option<String>,
 }
 
-/// Heartbeat frame: keeps connections alive AND reconciles missing updates
+/// Binary wire frames streaming across client & cloud controller
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum HeartbeatFrame {
-    Ping {
-        client_id: String,
-        clock: VectorClock,
+pub enum SyncFrame {
+    /// Authentication handshake
+    Handshake(ClientHandshake),
+    
+    /// Write-Ahead Log (WAL) or CRDT state delta payload
+    Delta {
+        sender_id: String,
+        payload: Vec<u8>,
     },
-    Pong {
-        server_clock: VectorClock,
-        missed_ops: Vec<SyncOp>,
+    
+    /// Sequence acknowledgement
+    Ack {
+        sequence_number: u64,
+    },
+    
+    /// Synchronization request for a range of logical timestamps
+    FetchMissing {
+        since_sequence: u64,
+    },
+
+    /// Server error frame
+    Error {
+        message: String,
     },
 }

@@ -1,5 +1,6 @@
 use std::cell::RefCell;
-use std::ffi::{CStr, CString};
+use crate::engine::Engine;
+use std::ffi::{c_char, CStr, CString};
 use std::os::raw::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{channel, Sender};

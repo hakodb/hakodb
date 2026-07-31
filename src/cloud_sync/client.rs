@@ -1,41 +1,52 @@
-use tokio::time::{interval, Duration};
 use std::sync::Arc;
-use crate::cloud_sync::{
-    protocol::{HeartbeatFrame, SyncBatch},
-    CloudSyncEngine,
-};
+use tokio::sync::mpsc;
+use tracing::{info, error};
 
-/// Client background worker handling periodic Heartbeat Pings and outbound pushes
+use crate::cloud_sync::config::{CloudSyncConfig, TransportMode};
+use crate::cloud_sync::transport::tcp_tls::TcpTransport;
+use crate::cloud_sync::transport::http_api::WebSocketTransport;
+
 pub struct CloudSyncClient {
-    engine: Arc<CloudSyncEngine>,
-    target_url: String,
+    config: CloudSyncConfig,
+    tx_outbound: mpsc::Sender<Vec<u8>>,
 }
 
 impl CloudSyncClient {
-    pub fn new(engine: Arc<CloudSyncEngine>, target_url: impl Into<String>) -> Self {
-        Self {
-            engine,
-            target_url: target_url.into(),
-        }
-    }
-
-    pub async fn start_heartbeat_loop(&self, ping_interval_secs: u64) {
-        let mut timer = interval(Duration::from_secs(ping_interval_secs));
-        let engine = self.engine.clone();
+    pub async fn start(config: CloudSyncConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(1024);
+        let client_cfg = config.clone();
 
         tokio::spawn(async move {
             loop {
-                timer.tick().await;
-
-                let current_clock = engine.vector_clock.read().await.clone();
-                let ping = HeartbeatFrame::Ping {
-                    client_id: engine.config.node_id.clone(),
-                    clock: current_clock,
+                info!("Initializing CloudSync transport loop...");
+                let result = match &client_cfg.mode {
+                    TransportMode::TcpDedicated { endpoint, use_tls } => {
+                        TcpTransport::run(endpoint, *use_tls, &client_cfg, rx).await
+                    }
+                    TransportMode::WebSocketApi { ws_url, .. } => {
+                        WebSocketTransport::run(ws_url, &client_cfg, rx).await
+                    }
                 };
 
-                let _bytes = bincode::serialize(&ping).unwrap();
-                // Send _bytes over active WebSocket connection to firelite_controller
+                if let Err(e) = result {
+                    error!("CloudSync Connection lost: {}. Retrying...", e);
+                }
+
+                if !client_cfg.auto_reconnect {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
             }
         });
+
+        Ok(Self {
+            config,
+            tx_outbound: tx,
+        })
+    }
+
+    pub async fn push_delta(&self, delta_bytes: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+        self.tx_outbound.send(delta_bytes).await?;
+        Ok(())
     }
 }
