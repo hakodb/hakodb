@@ -5,3 +5,5 @@ benchmark.obj
 *.dll
 /benc*
 /backup*
+/jniLibs
+/.vscode
