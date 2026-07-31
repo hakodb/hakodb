@@ -4,10 +4,10 @@ pub mod client;
 pub mod protocol;
 pub mod transport;
 
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
+use tokio::fs::{create_dir_all, OpenOptions};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
 use auth::CloudAuthenticator;
@@ -73,7 +73,7 @@ impl CloudSyncEngine {
     }
 
     /// Ingests an incoming SyncBatch.
-    /// Writes attached blobs to disk statically before committing document mutations.
+    /// Writes attached blobs to disk asynchronously before committing document mutations.
     pub async fn apply_sync_batch(&self, batch: SyncBatch) -> Result<SyncResponse, String> {
         let mut ops_applied = 0;
         let mut applied_ops_for_broadcast = Vec::new();
@@ -87,9 +87,9 @@ impl CloudSyncEngine {
                     ref payload_bytes,
                     ref attached_blobs,
                 } => {
-                    // 1. Statically persist attached blobs to disk FIRST
+                    // 1. Persist attached blobs asynchronously to disk FIRST
                     if !attached_blobs.is_empty() {
-                        self.save_blobs_statically(attached_blobs)?;
+                        self.save_blobs_statically(attached_blobs).await?;
                     }
 
                     // 2. Commit document bytes to internal FireLite collection
@@ -107,14 +107,17 @@ impl CloudSyncEngine {
             }
         }
 
-        // Update sequence vector clock
-        let mut clock = self.vector_clock.write().await;
-        for (col, seq) in batch.vector_clock {
-            let entry = clock.entry(col).or_insert(0);
-            if seq > *entry {
-                *entry = seq;
+        // FIXED: Scope write lock execution so it drops immediately after updating, preventing deadlocks
+        let current_clock = {
+            let mut clock = self.vector_clock.write().await;
+            for (col, seq) in batch.vector_clock {
+                let entry = clock.entry(col).or_insert(0);
+                if seq > *entry {
+                    *entry = seq;
+                }
             }
-        }
+            clock.clone()
+        };
 
         // Queue ops for micro-batching WebSocket broadcast to other connected clients
         if !applied_ops_for_broadcast.is_empty() {
@@ -124,7 +127,7 @@ impl CloudSyncEngine {
         Ok(SyncResponse {
             success: true,
             ops_applied,
-            updated_clock: clock.clone(),
+            updated_clock: current_clock,
         })
     }
 
@@ -148,11 +151,12 @@ impl CloudSyncEngine {
         missed_ops
     }
 
-    /// Helper to statically write incoming binary blobs to local blobs directory
-    fn save_blobs_statically(&self, blobs: &[BlobData]) -> Result<(), String> {
+    /// FIXED: Fully asynchronous disk persistence for incoming binary blobs
+    async fn save_blobs_statically(&self, blobs: &[BlobData]) -> Result<(), String> {
         let blobs_dir = Path::new(&self.config.db_path).join("blobs");
         if !blobs_dir.exists() {
-            std::fs::create_dir_all(&blobs_dir)
+            create_dir_all(&blobs_dir)
+                .await
                 .map_err(|e| format!("Failed to create blobs directory: {:?}", e))?;
         }
 
@@ -163,9 +167,11 @@ impl CloudSyncEngine {
                     .create(true)
                     .write(true)
                     .open(&blob_file_path)
+                    .await
                     .map_err(|e| format!("Failed to open blob file: {:?}", e))?;
 
                 file.write_all(&blob.data)
+                    .await
                     .map_err(|e| format!("Failed to write blob data: {:?}", e))?;
             }
         }

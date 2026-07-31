@@ -20,9 +20,9 @@ use ring::ConsistentHashRing;
 #[derive(Clone)]
 pub struct ControllerState {
     pub http_client: HttpClient,
-    pub hash_ring: ConsistentHashRing,
     pub node_manager: NodeManager,
     pub read_rr_counter: Arc<AtomicUsize>,
+    pub vnodes: usize,
 }
 
 #[tokio::main]
@@ -34,7 +34,7 @@ async fn main() {
     ];
 
     let http_client = HttpClient::new();
-    let node_manager = NodeManager::new(nodes.clone());
+    let node_manager = NodeManager::new(nodes);
 
     // Spawn background health checker
     let nm_clone = node_manager.clone();
@@ -45,15 +45,13 @@ async fn main() {
 
     let state = ControllerState {
         http_client,
-        hash_ring: ConsistentHashRing::new(nodes.clone(), 10),
         node_manager,
         read_rr_counter: Arc::new(AtomicUsize::new(0)),
+        vnodes: 10,
     };
 
     let app = Router::new()
-        // Deterministic Write Routes -> Owner node derived via HashRing
         .route("/api/v1/:collection/doc/:id", post(handle_write))
-        // Load Balanced Read Routes -> Round Robin distribution
         .route("/api/v1/:collection/doc/:id", get(handle_read))
         .with_state(state);
 
@@ -68,8 +66,14 @@ async fn handle_write(
     Path((collection, doc_id)): Path<(String, String)>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    let target_node = state
-        .hash_ring
+    let active_nodes = state.node_manager.active_nodes.read().await;
+    if active_nodes.is_empty() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // FIXED: Dynamically recompute ring from currently healthy nodes
+    let dynamic_ring = ConsistentHashRing::new(&active_nodes, state.vnodes);
+    let target_node = dynamic_ring
         .get_owner_node(&doc_id)
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 

@@ -8,9 +8,9 @@ pub struct ConsistentHashRing {
 }
 
 impl ConsistentHashRing {
-    pub fn new(nodes: Vec<String>, vnodes: usize) -> Self {
+    pub fn new(nodes: &[String], vnodes: usize) -> Self {
         let mut ring = BTreeMap::new();
-        for node in &nodes {
+        for node in nodes {
             for vnode_id in 0..vnodes {
                 let mut hasher = DefaultHasher::new();
                 format!("{}-vnode-{}", node, vnode_id).hash(&mut hasher);
