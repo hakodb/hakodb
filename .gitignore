@@ -3,5 +3,9 @@
 benchmark.obj
 *.exe
 *.dll
-/benc*
+*.zip
+/benches*
 /backup*
+*/jniLibs
+/jniLibs
+/.vscode

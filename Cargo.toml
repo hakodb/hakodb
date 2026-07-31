@@ -54,4 +54,5 @@ members = [
     ".",          
     "cli",  
     "fsync",
+    "firelite_controller"
 ]
