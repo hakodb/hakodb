@@ -1,6 +1,6 @@
 [package]
 name = "firelite-fsync"
-version = "0.6.20"
+version = "0.6.64"
 edition = "2021"
 
 [lib]
@@ -9,7 +9,7 @@ crate-type = ["cdylib"] # This makes it an FFI library
 
 [dependencies]
 # We point to the parent folder and force the feature on
-firelite = { path = "..", features = ["net-sync"] }
+firelite = { path = "..", features = ["net-sync", "cloud-sync"] }
 
 # You might need to duplicate these so the wrapper links correctly
 # tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }

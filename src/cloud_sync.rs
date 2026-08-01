@@ -9,8 +9,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "cloud-sync")]
 use crate::document::firelite_doc::FireLiteDoc;
-// #[cfg(feature = "cloud-sync")]
-// use crate::document::value::Value;
 #[cfg(feature = "cloud-sync")]
 use crate::engine::{BatchMutation, FireLite};
 #[cfg(feature = "cloud-sync")]
@@ -101,6 +99,8 @@ pub struct CloudSync {
     ingest_tx: mpsc::Sender<IngestItem>,
     ingest_rx: Arc<AsyncMutex<Option<mpsc::Receiver<IngestItem>>>>,
     active_peers: Arc<AsyncRwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    // Outbound client queue (Client mode -> Server)
+    outbound_tx: Arc<AsyncMutex<Option<mpsc::Sender<CloudPacket>>>>,
 }
 
 #[cfg(feature = "cloud-sync")]
@@ -136,6 +136,7 @@ impl CloudSync {
             ingest_tx: tx,
             ingest_rx: Arc::new(AsyncMutex::new(Some(rx))),
             active_peers: Arc::new(AsyncRwLock::new(HashMap::new())),
+            outbound_tx: Arc::new(AsyncMutex::new(None)),
         }
     }
 
@@ -162,19 +163,17 @@ impl CloudSync {
     }
 
     // ========================================================================
-    // BATCH AGGREGATOR: SOLVES SINGLE-WRITE LOCK BOTTLE-NECK
+    // BATCH AGGREGATOR: SOLVES SINGLE-WRITE LOCK BOTTLENECK
     // ========================================================================
 
     /// Spawns a background task that drains the `ingest_tx` MPSC queue every 5ms 
-    /// or 500 items, executing a SINGLE `write_batch` call. This converts 50,000 
-    /// individual lock acquisitions/sec into ~100 batch lock acquisitions/sec.
+    /// or 512 items, executing a SINGLE `write_batch` call.
     fn spawn_batch_flusher(&self) {
         let rx_option = self.ingest_rx.clone();
         let db = self.db.clone();
         let running = self.running.clone();
         let echo_cache = self.echo_cache.clone();
         let active_peers = self.active_peers.clone();
-        let server_client_id = self.client_id.clone();
 
         tokio::spawn(async move {
             let mut rx = match rx_option.lock().await.take() {
@@ -188,7 +187,7 @@ impl CloudSync {
             while running.load(Ordering::Relaxed) {
                 tokio::select! {
                     _ = interval.tick() => {
-                        Self::flush_ingest_buffer(&db, &mut batch_buffer, &echo_cache, &active_peers, &server_client_id).await;
+                        Self::flush_ingest_buffer(&db, &mut batch_buffer, &echo_cache, &active_peers).await;
                     }
                     item = rx.recv() => {
                         match item {
@@ -199,7 +198,7 @@ impl CloudSync {
 
                                 let total_pending: usize = batch_buffer.values().map(|v| v.len()).sum();
                                 if total_pending >= 512 {
-                                    Self::flush_ingest_buffer(&db, &mut batch_buffer, &echo_cache, &active_peers, &server_client_id).await;
+                                    Self::flush_ingest_buffer(&db, &mut batch_buffer, &echo_cache, &active_peers).await;
                                 }
                             }
                             None => break,
@@ -215,10 +214,18 @@ impl CloudSync {
         buffer: &mut HashMap<String, Vec<(WalOp, Option<String>)>>,
         echo_cache: &Arc<StdMutex<HashMap<String, i64>>>,
         peers: &Arc<AsyncRwLock<HashMap<String, mpsc::Sender<Message>>>>,
-        server_client_id: &str,
     ) {
         if buffer.is_empty() {
             return;
+        }
+
+        // Bounded echo_cache pruning (Prune entries older than 5 mins when > 10k items)
+        {
+            let mut cache = echo_cache.lock().unwrap();
+            if cache.len() > 10_000 {
+                let cutoff = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64) - 300_000_000;
+                cache.retain(|_, &mut ts| ts > cutoff);
+            }
         }
 
         for (col, items) in buffer.drain() {
@@ -227,13 +234,22 @@ impl CloudSync {
             }
 
             let mut mutations = Vec::with_capacity(items.len());
-            let mut relay_ops = Vec::with_capacity(items.len());
+            // Map sender_client_id -> list of ops to relay to other clients
+            let mut sender_relays: HashMap<Option<String>, Vec<WalOp>> = HashMap::new();
 
-            for (op, _sender_id) in &items {
+            for (op, sender_id) in &items {
                 match op {
                     WalOp::PutInlined { key, value } => {
                         if let Some(doc) = FireLiteDoc::decode(value) {
                             let ts = doc.get_logical_time();
+
+                            // Pre-LWW check: Skip if local DB already has a newer version
+                            if let Ok(Some(existing_doc)) = db.get(&col, key) {
+                                if existing_doc.get_logical_time() >= ts {
+                                    continue;
+                                }
+                            }
+
                             {
                                 let mut cache = echo_cache.lock().unwrap();
                                 cache.insert(key.clone(), ts);
@@ -243,7 +259,10 @@ impl CloudSync {
                                 doc_id: key.clone(),
                                 doc,
                             });
-                            relay_ops.push(op.clone());
+                            sender_relays
+                                .entry(sender_id.clone())
+                                .or_default()
+                                .push(op.clone());
                         }
                     }
                     WalOp::Delete { key, timestamp } => {
@@ -255,26 +274,34 @@ impl CloudSync {
                             collection: col.clone(),
                             doc_id: key.clone(),
                         });
-                        relay_ops.push(op.clone());
+                        sender_relays
+                            .entry(sender_id.clone())
+                            .or_default()
+                            .push(op.clone());
                     }
                     _ => {}
                 }
             }
 
-            // Execute single write_batch call (1 Lock acquisition for the entire batch!)
+            // Execute single write_batch call on spawn_blocking (prevents blocking Tokio reactor)
             if !mutations.is_empty() {
-                let _ = db.write_batch(mutations);
+                let db_clone = db.clone();
+                let _ = tokio::task::spawn_blocking(move || db_clone.write_batch(mutations)).await;
             }
 
-            // Fan-out/Relay packet to all connected clients except origin sender
-            if !relay_ops.is_empty() {
+            // Fan-out/Relay packets to all connected clients EXCEPT origin sender
+            for (origin_sender, ops) in sender_relays {
+                if ops.is_empty() {
+                    continue;
+                }
+
                 let packet = CloudPacket::Replication {
                     msg_id: SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_micros(),
                     collection: col.clone(),
-                    ops: relay_ops,
+                    ops,
                 };
 
                 if let Ok(bytes) = rmp_serde::to_vec_named(&packet) {
@@ -282,7 +309,8 @@ impl CloudSync {
                     let peers_guard = peers.read().await;
 
                     for (client_id, tx) in peers_guard.iter() {
-                        if client_id != server_client_id {
+                        // Skip sending back to originating client!
+                        if Some(client_id) != origin_sender.as_ref() {
                             let _ = tx.try_send(msg.clone());
                         }
                     }
@@ -418,7 +446,6 @@ impl CloudSync {
                                 for (col, remote_ts) in versions {
                                     if let Ok(local_version) = db.get_collection_version(&col) {
                                         if local_version > remote_ts {
-                                            // Trigger Delta Replication catchup
                                             Self::send_catchup_deltas(
                                                 &db,
                                                 &col,
@@ -514,7 +541,15 @@ impl CloudSync {
         let room_key_str = self.client_id.clone();
         let running = self.running.clone();
         let ingest_tx = self.ingest_tx.clone();
+        let echo_cache = self.echo_cache.clone();
 
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<CloudPacket>(10_000);
+        *self.outbound_tx.lock().await = Some(outbound_tx);
+
+        // 1. Spawn Outbound Client WAL Tailer (Pushes local writes to Cloud Server)
+        self.spawn_client_outbound_tailer(echo_cache);
+
+        // 2. WebSocket Receiver & Connection Supervisor
         tokio::spawn(async move {
             while running.load(Ordering::Relaxed) {
                 if let Ok((ws_stream, _)) =
@@ -522,7 +557,7 @@ impl CloudSync {
                 {
                     let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
-                    // Authenticate
+                    // Handshake
                     let auth_packet = CloudPacket::Authenticate {
                         token: auth_token.clone(),
                         client_id: client_id.clone(),
@@ -539,40 +574,135 @@ impl CloudSync {
                         if let Ok(CloudPacket::AuthResult { success: true, .. }) =
                             rmp_serde::from_slice(&bytes)
                         {
-                            // Send Local Versions to Request Catchup
+                            // Catchup Ping
                             let ping = CloudPacket::VersionPing {
                                 versions: db.get_version_map(),
                             };
                             let ping_bytes = rmp_serde::to_vec_named(&ping).unwrap();
                             let _ = ws_tx.send(Message::Binary(ping_bytes.into())).await;
 
-                            // Incoming Client Loop
-                            while let Some(Ok(msg)) = ws_rx.next().await {
-                                if let Message::Binary(b) = msg {
-                                    if let Ok(CloudPacket::Replication { collection, ops, .. }) =
-                                        rmp_serde::from_slice(&b)
-                                    {
-                                        for op in ops {
-                                            let _ = ingest_tx
-                                                .send(IngestItem {
-                                                    collection: collection.clone(),
-                                                    op,
-                                                    sender_client_id: None,
-                                                })
-                                                .await;
+                            // Loop: Forward Outbound Packets to WS
+                            loop {
+                                tokio::select! {
+                                    Some(packet) = outbound_rx.recv() => {
+                                        if let Ok(b) = rmp_serde::to_vec_named(&packet) {
+                                            if ws_tx.send(Message::Binary(b.into())).await.is_err() {
+                                                break;
+                                            }
                                         }
                                     }
+                                    Some(Ok(msg)) = ws_rx.next() => {
+                                        if let Message::Binary(b) = msg {
+                                            if let Ok(CloudPacket::Replication { collection, ops, .. }) =
+                                                rmp_serde::from_slice(&b)
+                                            {
+                                                for op in ops {
+                                                    let _ = ingest_tx
+                                                        .send(IngestItem {
+                                                            collection: collection.clone(),
+                                                            op,
+                                                            sender_client_id: None,
+                                                        })
+                                                        .await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    else => break,
                                 }
                             }
                         }
                     }
                 }
 
-                // Reconnect delay
+                // Reconnect Backoff
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
         });
 
         Ok(())
+    }
+
+    /// Tails local WAL changes on the client and sends them upstream to Cloud Server.
+    fn spawn_client_outbound_tailer(&self, echo_cache: Arc<StdMutex<HashMap<String, i64>>>) {
+        let db = self.db.clone();
+        let outbound_tx_option = self.outbound_tx.clone();
+        let running = self.running.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut offsets: HashMap<String, u64> = HashMap::new();
+
+            while running.load(Ordering::Relaxed) {
+                let outbound_guard = outbound_tx_option.blocking_lock();
+                let Some(ref tx) = *outbound_guard else {
+                    std::thread::sleep(Duration::from_millis(500));
+                    continue;
+                };
+
+                let cols = db.list_collections().unwrap_or_default();
+
+                for col in cols {
+                    if let Ok(shard) = db.get_shard(&col) {
+                        let last_pos = *offsets.get(&col).unwrap_or(&0);
+                        let tail_res = {
+                            let guard = shard.read().unwrap();
+                            guard.wal.tail(last_pos)
+                        };
+
+                        if let Ok((ops, new_pos)) = tail_res {
+                            if !ops.is_empty() {
+                                let mut to_send = Vec::new();
+
+                                for op in ops {
+                                    let key = op.get_key();
+                                    let wal_ts = match &op {
+                                        WalOp::PutInlined { value, .. } => {
+                                            i64::from_le_bytes(value[2..10].try_into().unwrap_or([0; 8]))
+                                        }
+                                        WalOp::Delete { timestamp, .. } => *timestamp,
+                                        _ => 0,
+                                    };
+
+                                    // Skip local echo of writes that came from Cloud Server
+                                    let is_echo = {
+                                        let mut cache = echo_cache.lock().unwrap();
+                                        if let Some(&cached_ts) = cache.get(key) {
+                                            if cached_ts == wal_ts {
+                                                cache.remove(key);
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        } else {
+                                            false
+                                        }
+                                    };
+
+                                    if !is_echo {
+                                        to_send.push(op);
+                                    }
+                                }
+
+                                if !to_send.is_empty() {
+                                    let packet = CloudPacket::Replication {
+                                        msg_id: SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_micros(),
+                                        collection: col.clone(),
+                                        ops: to_send,
+                                    };
+                                    let _ = tx.blocking_send(packet);
+                                }
+
+                                offsets.insert(col, new_pos);
+                            }
+                        }
+                    }
+                }
+
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
     }
 }
