@@ -34,11 +34,6 @@ use tokio_tungstenite::tungstenite::Message;
 // ============================================================================
 
 #[cfg(feature = "cloud-sync")]
-fn init_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
-#[cfg(feature = "cloud-sync")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CloudSyncMode {
@@ -156,9 +151,6 @@ impl CloudSync {
         if self.running.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-
-        // Initialize Rustls CryptoProvider (Prevents Rustls 0.23 process-level panic)
-        init_crypto_provider();
 
         // 1. Start the High-Performance Ingest Flusher
         self.spawn_batch_flusher();
@@ -343,7 +335,12 @@ impl CloudSync {
         let active_peers = self.active_peers.clone();
         let running = self.running.clone();
         let seen_messages = self.seen_messages.clone();
+        let echo_cache = self.echo_cache.clone();
 
+        // 1. Spawn Server Local WAL Tailer (Broadcasts server-side writes to all connected clients)
+        self.spawn_server_outbound_tailer(echo_cache);
+
+        // 2. Accept Incoming WebSocket Clients
         tokio::spawn(async move {
             while running.load(Ordering::Relaxed) {
                 if let Ok((stream, _)) = listener.accept().await {
@@ -388,7 +385,6 @@ impl CloudSync {
         let mut client_id = String::new();
         let mut authenticated = false;
 
-        // Authenticate Client
         if let Some(Ok(Message::Binary(bytes))) = ws_rx.next().await {
             if let Ok(CloudPacket::Authenticate {
                 token: _,
@@ -467,7 +463,7 @@ impl CloudSync {
                                 }
                             }
                             CloudPacket::VersionPing { versions: client_versions } => {
-                                // 1. SYMMETRICAL REPLY: Send Server's VersionMap back to Client!
+                                // 1. SYMMETRICAL REPLY: Send Server's VersionMap back to Client
                                 let server_versions = db.get_version_map();
                                 let reply = CloudPacket::VersionPing {
                                     versions: server_versions.clone(),
@@ -565,6 +561,115 @@ impl CloudSync {
         }
     }
 
+    /// Tails local WAL changes on the SERVER and broadcasts server-side writes to all connected clients.
+    fn spawn_server_outbound_tailer(&self, echo_cache: Arc<StdMutex<HashMap<String, i64>>>) {
+        let db = self.db.clone();
+        let active_peers = self.active_peers.clone();
+        let running = self.running.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut offsets: HashMap<String, u64> = HashMap::new();
+
+            while running.load(Ordering::Relaxed) {
+                let cols = db.list_collections().unwrap_or_default();
+
+                for col in cols {
+                    if let Ok(shard_arc) = db.get_shard(&col) {
+                        let last_pos = *offsets.get(&col).unwrap_or(&0);
+                        let tail_res = {
+                            let guard = shard_arc.read().unwrap();
+                            guard.wal.tail(last_pos)
+                        };
+
+                        if let Ok((ops, new_pos)) = tail_res {
+                            if !ops.is_empty() {
+                                let mut to_send = Vec::new();
+
+                                for op in ops {
+                                    let key = op.get_key();
+                                    let wal_ts = match &op {
+                                        WalOp::PutInlined { value, .. } => {
+                                            i64::from_le_bytes(value[2..10].try_into().unwrap_or([0; 8]))
+                                        }
+                                        WalOp::Delete { timestamp, .. } => *timestamp,
+                                        _ => 0,
+                                    };
+
+                                    // Skip writes originating from client WebSockets (already handled)
+                                    let is_echo = {
+                                        let mut cache = echo_cache.lock().unwrap();
+                                        if let Some(&cached_ts) = cache.get(key) {
+                                            if cached_ts == wal_ts {
+                                                cache.remove(key);
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        } else {
+                                            false
+                                        }
+                                    };
+
+                                    if !is_echo {
+                                        let final_op = match op {
+                                            WalOp::PutInlined { ref key, ref value } => {
+                                                if let Some(mut doc) = FireLiteDoc::decode(value) {
+                                                    let has_blobs = doc.fields.iter().any(|(_, v)| matches!(v, Value::BlobLink { .. }));
+                                                    if has_blobs {
+                                                        let enc_key = db.config.encryption_key.as_deref();
+                                                        if crate::engine::engine::resolve_doc_static(&mut doc, &shard_arc, enc_key).is_ok() {
+                                                            WalOp::PutInlined { key: key.clone(), value: doc.encode_buffered() }
+                                                        } else {
+                                                            op
+                                                        }
+                                                    } else {
+                                                        op
+                                                    }
+                                                } else {
+                                                    op
+                                                }
+                                            }
+                                            _ => op,
+                                        };
+
+                                        to_send.push(final_op);
+                                    }
+                                }
+
+                                if !to_send.is_empty() {
+                                    let packet = CloudPacket::Replication {
+                                        msg_id: SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_micros(),
+                                        collection: col.clone(),
+                                        ops: to_send,
+                                    };
+
+                                    if let Ok(bytes) = rmp_serde::to_vec_named(&packet) {
+                                        let msg = Message::Binary(bytes.into());
+                                        let rt = tokio::runtime::Handle::current();
+                                        let peers_ptr = active_peers.clone();
+                                        rt.block_on(async move {
+                                            let peers_guard = peers_ptr.read().await;
+                                            for tx in peers_guard.values() {
+                                                let _ = tx.try_send(msg.clone());
+                                            }
+                                        });
+                                    }
+                                }
+
+                                offsets.insert(col, new_pos);
+                            }
+                        }
+                    }
+                }
+
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        });
+    }
+
     // ========================================================================
     // CLIENT MODE
     // ========================================================================
@@ -616,7 +721,6 @@ impl CloudSync {
                         if let Ok(CloudPacket::AuthResult { success: true, .. }) =
                             rmp_serde::from_slice(&bytes)
                         {
-                            // Send Client VersionMap to initiate symmetrical handshake
                             let ping = CloudPacket::VersionPing {
                                 versions: db.get_version_map(),
                             };
@@ -636,8 +740,6 @@ impl CloudSync {
                                         if let Message::Binary(b) = msg {
                                             if let Ok(packet) = rmp_serde::from_slice::<CloudPacket>(&b) {
                                                 match packet {
-                                                    // 2. CLIENT HANDLES SERVER'S VERSION MAP:
-                                                    // If Client has NEWER data than Server, push deltas upstream!
                                                     CloudPacket::VersionPing { versions: server_versions } => {
                                                         let client_versions = db.get_version_map();
                                                         for (col, client_ts) in client_versions {
@@ -688,7 +790,6 @@ impl CloudSync {
         Ok(())
     }
 
-    /// Client helper to send deltas since `server_ts` upstream when Server is lagging behind Client
     async fn push_client_deltas_upstream(
         db: &Arc<FireLite>,
         collection: &str,
@@ -839,7 +940,7 @@ impl CloudSync {
                     }
                 }
 
-                std::thread::sleep(Duration::from_millis(200));
+                std::thread::sleep(Duration::from_millis(150));
             }
         });
     }
