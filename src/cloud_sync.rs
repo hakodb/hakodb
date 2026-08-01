@@ -34,6 +34,11 @@ use tokio_tungstenite::tungstenite::Message;
 // ============================================================================
 
 #[cfg(feature = "cloud-sync")]
+fn init_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+#[cfg(feature = "cloud-sync")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CloudSyncMode {
@@ -151,6 +156,9 @@ impl CloudSync {
         if self.running.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+
+        // Initialize Rustls CryptoProvider (Prevents Rustls 0.23 process-level panic)
+        init_crypto_provider();
 
         // 1. Start the High-Performance Ingest Flusher
         self.spawn_batch_flusher();
