@@ -6,27 +6,27 @@ It runs in-process (no external service), stores typed binary documents, and pro
 
 ---
 
-## Current Status (v0.6.64 - High Velocity)
+## Current Status (v0.6.65 - High Velocity)
 
-FireLite has evolved from a foundation stage into a **Production-Candidate** engine. The core architecture now supports physical data sharding and near-instant recovery, capable of **20,000+ TPS** and sub-millisecond query responses on standard hardware.
+FireLite has evolved into a **Production-Candidate** engine. The core architecture supports physical data sharding, zero-copy field projection, near-instant recovery, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 
-### 🚀 New in v0.6.64
+### 🚀 New in v0.6.65
 
-- **Cloud Sync Engine (`cloud-sync` feature)**
-  - Centralized Cloud Sync over WebSockets + MessagePack (`CloudSyncMode::Server` and `CloudSyncMode::Client`).
-  - Secure room hashing, JWT/Token authentication, and automated delta catchups.
-- **In-Memory Micro-Batch Flusher (High-Throughput Write Aggregator)**
+- **Bi-directional Cloud Sync (`cloud-sync` feature)**
+  - Full client-server real-time synchronization over WebSockets (`ws://` / `wss://`) and MessagePack.
+  - Supports both `CloudSyncMode::Server` and `CloudSyncMode::Client`.
+- **Symmetrical Two-Way Catchup (`VersionPing` Handshake)**
+  - Automated 2-way version exchange on connection ensures fresh/restarted servers or returning offline clients catch up 100% of missed updates automatically.
+- **Server Outbound WAL Tailer**
+  - Live server-side writes (via CLI, FFI, or direct `db.put()`) are automatically captured and fan-out broadcasted to all connected room subscribers in real time.
+- **Automatic URL Normalization & TLS**
+  - Automatically converts `https://` to `wss://` and `http://` to `ws://`, enabling seamless connection to cloud proxies (GitHub Codespaces, Cloudflare Tunnels, AWS ALB, Heroku).
+- **High-Throughput Micro-Batch Flusher**
   - Drains and coalesces incoming client stream mutations every **5ms** or **512 ops**.
   - Reduces FireLite write lock acquisitions by **500x**, resolving single-write bottlenecks on busy central servers.
-- **Virtual Collection Partitioning**
-  - Enables routing writes across virtual collection buckets (`hash(doc_id) % N`).
-  - Scales concurrent writes linearly across independent shard locks.
-- **Zero-Copy Projection Pipeline**
-  - Queries no longer "inflate" full document objects. 
-  - Direct binary "cherry-picking" of fields from memory-mapped slices.
-- **Unified Processed Cache (Decompression Cache)**
-  - Decryption and Decompression (Zstd) are performed **once** per block; subsequent reads are served at raw RAM speed.
+- **Memory-Bounded Anti-Echo & Deduplication**
+  - Self-pruning `echo_cache` (cleans entries older than 5 minutes when exceeding 10,000 items) + `msg_id` deduplication prevents infinite loopbacks and stale re-transmissions.
 
 
 ### 🚀 New in v0.6.33
@@ -118,10 +118,6 @@ FireLite has evolved from a foundation stage into a **Production-Candidate** eng
 - Net Sync over FFI
   - sync lifecycle FFI: `fl_net_syncer_new`, `fl_net_syncer_start`, `fl_net_syncer_status`, `fl_net_syncer_free`
   - wrapped in Go, JS/TS, and Pascal gateways for SDK-level peer sync control
-
-### Still Missing for Full Production Readiness
-
-- Distributed/cloud-grade security primitives (authn/authz federation, remote policy service)
 
 ---
 
@@ -320,24 +316,36 @@ All FFI-based gateways (Go / JS-TS / Pascal) include wrappers for these APIs.
 
 ## Cloud Sync (Centralized Cloud Replication)
 
-The cloud-sync feature provides cloud-level synchronization over WebSockets and
-MessagePack. It allows FireLite instances to act as a Central Cloud Server or a
-Cloud Client.
+The `cloud-sync` feature provides cloud-level, bi-directional synchronization over WebSockets and MessagePack. It allows FireLite instances to run as a **Central Cloud Server** or a **Cloud Client**.
 
-Architecture Overview
+### Enable Feature
 
-  - Server Mode: Acts as the central hub. Validates client tokens, coalesces
-    incoming streams into high-throughput micro-batches, updates local state,
-    and relays delta packets to room members.
-  - Client Mode: Connects to the Cloud Server via WebSockets, tails local
-    FireLite collection changes, streams deltas to the server, and applies
-    remote changes locally using LWW (Last-Write-Wins) timestamp filtering.
+Add the following to your `Cargo.toml`:
 
-1. Cloud Sync Server Mode Example
+```toml
+[dependencies]
+firelite = { version = "0.6.65", features = ["cloud-sync"] }
+tokio = { version = "1", features = ["full"] }
+```
 
-The server handles thousands of concurrent client connections over WebSockets.
-Incoming writes from all clients are queued and committed in 5ms micro-batches
-to avoid write lock contention.
+### Architecture Overview
+
+- **Server Mode (`CloudSyncMode::Server`)**:
+  - Acts as the central hub handling thousands of concurrent WebSocket connections.
+  - Ingress Batch Flusher coalesces incoming stream mutations into 5ms micro-batches, preventing write lock bottlenecks.
+  - Server Outbound WAL Tailer monitors local server writes (via CLI, FFI, or `db.put()`) and broadcasts them to room subscribers.
+- **Client Mode (`CloudSyncMode::Client`)**:
+  - Connects to the Cloud Server via `ws://` or `wss://` (supports auto-conversion from `https://`).
+  - Outbound Client WAL Tailer tails local embedded database changes and streams them upstream.
+  - Applies incoming remote changes locally using LWW (Last-Write-Wins) timestamp filtering.
+- **Symmetrical 2-Way Handshake (`VersionPing`)**:
+  - Exchanged automatically on connection so either side (server or client) receives any missed deltas if it was offline or restarted.
+
+---
+
+### 1. Cloud Sync Server Mode Example
+
+The server handles thousands of concurrent client connections. Incoming writes from all clients are queued and committed in 5ms micro-batches.
 
 ```rust
 use std::sync::Arc;
@@ -371,10 +379,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-2. Cloud Sync Client Mode Example
+---
 
-Clients connect to the Cloud Sync Server, sync local changes, and receive live
-delta updates from other clients in the same room.
+### 2. Cloud Sync Client Mode Example
+
+Clients connect to the Cloud Sync Server, sync local offline changes, and receive live delta updates from other clients in the same room.
 
 ```rust
 use std::sync::Arc;
@@ -389,7 +398,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Open local embedded FireLite database on the client
     let db = Arc::new(FireLite::open("./data/client_db", FireLiteConfig::default())?);
 
-    // 2. Initialize CloudSync in Client Mode
+    // 2. Initialize CloudSync in Client Mode (Accepts https:// or wss://)
     let cloud_client = CloudSync::new(
         db.clone(),
         CloudSyncMode::Client,
@@ -399,7 +408,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 3. Connect to the Central Cloud Server
-    cloud_client.start("ws://127.0.0.1:8080").await?;
+    cloud_client.start("wss://my-cloud-server.app.dev").await?;
     println!("⚡ Connected to Cloud Sync Server");
 
     // 4. Perform local writes (automatically synced to Cloud Server in the background)
@@ -415,6 +424,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+---
 
 
 ## Lazarus / Free Pascal (FPC) Wrapper
