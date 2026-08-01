@@ -10,6 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "cloud-sync")]
 use crate::document::firelite_doc::FireLiteDoc;
 #[cfg(feature = "cloud-sync")]
+use crate::document::value::Value;
+#[cfg(feature = "cloud-sync")]
 use crate::engine::{BatchMutation, FireLite};
 #[cfg(feature = "cloud-sync")]
 use crate::error::{FireLiteError, Result as FLResult};
@@ -30,6 +32,11 @@ use tokio_tungstenite::tungstenite::Message;
 // ============================================================================
 // DATA STRUCTURES & PROTOCOL PACKETS
 // ============================================================================
+
+#[cfg(feature = "cloud-sync")]
+fn init_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
 
 #[cfg(feature = "cloud-sync")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,7 +61,7 @@ pub enum CloudPacket {
         success: bool,
         error: Option<String>,
     },
-    /// Version handshake to catch up on missed deltas
+    /// Version handshake exchanged symmetrically to catch up on missed deltas
     VersionPing {
         versions: HashMap<String, i64>,
     },
@@ -91,10 +98,12 @@ pub struct CloudSync {
     db: Arc<FireLite>,
     mode: CloudSyncMode,
     room_hash: [u8; 32],
+    room_key: String,
     client_id: String,
     auth_token: String,
     running: Arc<AtomicBool>,
     echo_cache: Arc<StdMutex<HashMap<String, i64>>>,
+    seen_messages: Arc<AsyncMutex<Vec<u128>>>,
     // Ingress Buffer for High-Throughput Batch Coalescing
     ingest_tx: mpsc::Sender<IngestItem>,
     ingest_rx: Arc<AsyncMutex<Option<mpsc::Receiver<IngestItem>>>>,
@@ -129,10 +138,12 @@ impl CloudSync {
             db,
             mode,
             room_hash,
+            room_key: room_key.to_string(),
             client_id: client_id.to_string(),
             auth_token: auth_token.to_string(),
             running: Arc::new(AtomicBool::new(false)),
             echo_cache: Arc::new(StdMutex::new(HashMap::new())),
+            seen_messages: Arc::new(AsyncMutex::new(Vec::with_capacity(1000))),
             ingest_tx: tx,
             ingest_rx: Arc::new(AsyncMutex::new(Some(rx))),
             active_peers: Arc::new(AsyncRwLock::new(HashMap::new())),
@@ -143,8 +154,11 @@ impl CloudSync {
     /// Spawns the Cloud Sync system.
     pub async fn start(&self, bind_or_server_url: &str) -> FLResult<()> {
         if self.running.swap(true, Ordering::SeqCst) {
-            return Ok(()); // Already running
+            return Ok(());
         }
+
+        // Initialize Rustls CryptoProvider (Prevents Rustls 0.23 process-level panic)
+        init_crypto_provider();
 
         // 1. Start the High-Performance Ingest Flusher
         self.spawn_batch_flusher();
@@ -166,8 +180,6 @@ impl CloudSync {
     // BATCH AGGREGATOR: SOLVES SINGLE-WRITE LOCK BOTTLENECK
     // ========================================================================
 
-    /// Spawns a background task that drains the `ingest_tx` MPSC queue every 5ms 
-    /// or 512 items, executing a SINGLE `write_batch` call.
     fn spawn_batch_flusher(&self) {
         let rx_option = self.ingest_rx.clone();
         let db = self.db.clone();
@@ -219,7 +231,7 @@ impl CloudSync {
             return;
         }
 
-        // Bounded echo_cache pruning (Prune entries older than 5 mins when > 10k items)
+        // Auto-prune echo_cache (Entries older than 5 mins when > 10k items)
         {
             let mut cache = echo_cache.lock().unwrap();
             if cache.len() > 10_000 {
@@ -234,7 +246,6 @@ impl CloudSync {
             }
 
             let mut mutations = Vec::with_capacity(items.len());
-            // Map sender_client_id -> list of ops to relay to other clients
             let mut sender_relays: HashMap<Option<String>, Vec<WalOp>> = HashMap::new();
 
             for (op, sender_id) in &items {
@@ -243,7 +254,7 @@ impl CloudSync {
                         if let Some(doc) = FireLiteDoc::decode(value) {
                             let ts = doc.get_logical_time();
 
-                            // Pre-LWW check: Skip if local DB already has a newer version
+                            // LWW Check
                             if let Ok(Some(existing_doc)) = db.get(&col, key) {
                                 if existing_doc.get_logical_time() >= ts {
                                     continue;
@@ -283,13 +294,12 @@ impl CloudSync {
                 }
             }
 
-            // Execute single write_batch call on spawn_blocking (prevents blocking Tokio reactor)
             if !mutations.is_empty() {
                 let db_clone = db.clone();
                 let _ = tokio::task::spawn_blocking(move || db_clone.write_batch(mutations)).await;
             }
 
-            // Fan-out/Relay packets to all connected clients EXCEPT origin sender
+            // Relay packet to all connected room members EXCEPT origin sender
             for (origin_sender, ops) in sender_relays {
                 if ops.is_empty() {
                     continue;
@@ -309,7 +319,6 @@ impl CloudSync {
                     let peers_guard = peers.read().await;
 
                     for (client_id, tx) in peers_guard.iter() {
-                        // Skip sending back to originating client!
                         if Some(client_id) != origin_sender.as_ref() {
                             let _ = tx.try_send(msg.clone());
                         }
@@ -320,7 +329,7 @@ impl CloudSync {
     }
 
     // ========================================================================
-    // SERVER MODE: WebSocket Hub
+    // SERVER MODE
     // ========================================================================
 
     async fn start_server_mode(&self, bind_addr: &str) -> FLResult<()> {
@@ -333,6 +342,7 @@ impl CloudSync {
         let room_hash = self.room_hash;
         let active_peers = self.active_peers.clone();
         let running = self.running.clone();
+        let seen_messages = self.seen_messages.clone();
 
         tokio::spawn(async move {
             while running.load(Ordering::Relaxed) {
@@ -340,6 +350,7 @@ impl CloudSync {
                     let ingest_tx = ingest_tx.clone();
                     let db = db.clone();
                     let active_peers = active_peers.clone();
+                    let seen_messages = seen_messages.clone();
 
                     tokio::spawn(async move {
                         if let Ok(ws_stream) = tokio_tungstenite::accept_async(stream).await {
@@ -349,6 +360,7 @@ impl CloudSync {
                                 db,
                                 room_hash,
                                 active_peers,
+                                seen_messages,
                             )
                             .await;
                         }
@@ -366,6 +378,7 @@ impl CloudSync {
         db: Arc<FireLite>,
         expected_room_hash: [u8; 32],
         peers: Arc<AsyncRwLock<HashMap<String, mpsc::Sender<Message>>>>,
+        seen_messages: Arc<AsyncMutex<Vec<u128>>>,
     ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
@@ -375,7 +388,7 @@ impl CloudSync {
         let mut client_id = String::new();
         let mut authenticated = false;
 
-        // 1. Authenticate Client
+        // Authenticate Client
         if let Some(Ok(Message::Binary(bytes))) = ws_rx.next().await {
             if let Ok(CloudPacket::Authenticate {
                 token: _,
@@ -414,7 +427,6 @@ impl CloudSync {
             return;
         }
 
-        // 2. Spawn Outbound Network Task for this Client
         let send_task = tokio::spawn(async move {
             while let Some(msg) = client_rx.recv().await {
                 if ws_tx.send(msg).await.is_err() {
@@ -423,15 +435,27 @@ impl CloudSync {
             }
         });
 
-        // 3. Process Inbound Packets
         while let Some(Ok(msg)) = ws_rx.next().await {
             match msg {
                 Message::Binary(bytes) => {
                     if let Ok(packet) = rmp_serde::from_slice::<CloudPacket>(&bytes) {
                         match packet {
                             CloudPacket::Replication {
-                                collection, ops, ..
+                                msg_id,
+                                collection,
+                                ops,
                             } => {
+                                if msg_id != 0 {
+                                    let mut seen = seen_messages.lock().await;
+                                    if seen.contains(&msg_id) {
+                                        continue;
+                                    }
+                                    seen.push(msg_id);
+                                    if seen.len() > 1000 {
+                                        seen.remove(0);
+                                    }
+                                }
+
                                 for op in ops {
                                     let _ = ingest_tx
                                         .send(IngestItem {
@@ -442,8 +466,21 @@ impl CloudSync {
                                         .await;
                                 }
                             }
-                            CloudPacket::VersionPing { versions } => {
-                                for (col, remote_ts) in versions {
+                            CloudPacket::VersionPing { versions: client_versions } => {
+                                // 1. SYMMETRICAL REPLY: Send Server's VersionMap back to Client!
+                                let server_versions = db.get_version_map();
+                                let reply = CloudPacket::VersionPing {
+                                    versions: server_versions.clone(),
+                                };
+                                if let Ok(reply_bytes) = rmp_serde::to_vec_named(&reply) {
+                                    let peers_guard = peers.read().await;
+                                    if let Some(tx) = peers_guard.get(&client_id) {
+                                        let _ = tx.try_send(Message::Binary(reply_bytes.into()));
+                                    }
+                                }
+
+                                // 2. Send Deltas for collections where Server is ahead of Client
+                                for (col, remote_ts) in client_versions {
                                     if let Ok(local_version) = db.get_collection_version(&col) {
                                         if local_version > remote_ts {
                                             Self::send_catchup_deltas(
@@ -468,7 +505,6 @@ impl CloudSync {
             }
         }
 
-        // Clean up disconnect
         send_task.abort();
         peers.write().await.remove(&client_id);
     }
@@ -530,34 +566,41 @@ impl CloudSync {
     }
 
     // ========================================================================
-    // CLIENT MODE: Connects to Cloud Server
+    // CLIENT MODE
     // ========================================================================
 
     async fn start_client_mode(&self, server_url: &str) -> FLResult<()> {
-        let server_url = server_url.to_string();
+        let mut ws_url = server_url.trim().to_string();
+        if ws_url.starts_with("https://") {
+            ws_url = ws_url.replacen("https://", "wss://", 1);
+        } else if ws_url.starts_with("http://") {
+            ws_url = ws_url.replacen("http://", "ws://", 1);
+        }
+        if !ws_url.starts_with("ws://") && !ws_url.starts_with("wss://") {
+            ws_url = format!("wss://{}", ws_url);
+        }
+
         let db = self.db.clone();
         let client_id = self.client_id.clone();
         let auth_token = self.auth_token.clone();
-        let room_key_str = self.client_id.clone();
+        let room_key_str = self.room_key.clone();
         let running = self.running.clone();
         let ingest_tx = self.ingest_tx.clone();
         let echo_cache = self.echo_cache.clone();
+        let seen_messages = self.seen_messages.clone();
 
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<CloudPacket>(10_000);
-        *self.outbound_tx.lock().await = Some(outbound_tx);
+        *self.outbound_tx.lock().await = Some(outbound_tx.clone());
 
-        // 1. Spawn Outbound Client WAL Tailer (Pushes local writes to Cloud Server)
         self.spawn_client_outbound_tailer(echo_cache);
 
-        // 2. WebSocket Receiver & Connection Supervisor
         tokio::spawn(async move {
             while running.load(Ordering::Relaxed) {
                 if let Ok((ws_stream, _)) =
-                    tokio_tungstenite::connect_async(&server_url).await
+                    tokio_tungstenite::connect_async(&ws_url).await
                 {
                     let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
-                    // Handshake
                     let auth_packet = CloudPacket::Authenticate {
                         token: auth_token.clone(),
                         client_id: client_id.clone(),
@@ -569,19 +612,17 @@ impl CloudSync {
                         continue;
                     }
 
-                    // Await Auth Confirmation
                     if let Some(Ok(Message::Binary(bytes))) = ws_rx.next().await {
                         if let Ok(CloudPacket::AuthResult { success: true, .. }) =
                             rmp_serde::from_slice(&bytes)
                         {
-                            // Catchup Ping
+                            // Send Client VersionMap to initiate symmetrical handshake
                             let ping = CloudPacket::VersionPing {
                                 versions: db.get_version_map(),
                             };
                             let ping_bytes = rmp_serde::to_vec_named(&ping).unwrap();
                             let _ = ws_tx.send(Message::Binary(ping_bytes.into())).await;
 
-                            // Loop: Forward Outbound Packets to WS
                             loop {
                                 tokio::select! {
                                     Some(packet) = outbound_rx.recv() => {
@@ -593,17 +634,42 @@ impl CloudSync {
                                     }
                                     Some(Ok(msg)) = ws_rx.next() => {
                                         if let Message::Binary(b) = msg {
-                                            if let Ok(CloudPacket::Replication { collection, ops, .. }) =
-                                                rmp_serde::from_slice(&b)
-                                            {
-                                                for op in ops {
-                                                    let _ = ingest_tx
-                                                        .send(IngestItem {
-                                                            collection: collection.clone(),
-                                                            op,
-                                                            sender_client_id: None,
-                                                        })
-                                                        .await;
+                                            if let Ok(packet) = rmp_serde::from_slice::<CloudPacket>(&b) {
+                                                match packet {
+                                                    // 2. CLIENT HANDLES SERVER'S VERSION MAP:
+                                                    // If Client has NEWER data than Server, push deltas upstream!
+                                                    CloudPacket::VersionPing { versions: server_versions } => {
+                                                        let client_versions = db.get_version_map();
+                                                        for (col, client_ts) in client_versions {
+                                                            let server_ts = server_versions.get(&col).copied().unwrap_or(0);
+                                                            if client_ts > server_ts {
+                                                                Self::push_client_deltas_upstream(&db, &col, server_ts, &outbound_tx).await;
+                                                            }
+                                                        }
+                                                    }
+                                                    CloudPacket::Replication { msg_id, collection, ops, .. } => {
+                                                        if msg_id != 0 {
+                                                            let mut seen = seen_messages.lock().await;
+                                                            if seen.contains(&msg_id) {
+                                                                continue;
+                                                            }
+                                                            seen.push(msg_id);
+                                                            if seen.len() > 1000 {
+                                                                seen.remove(0);
+                                                            }
+                                                        }
+
+                                                        for op in ops {
+                                                            let _ = ingest_tx
+                                                                .send(IngestItem {
+                                                                    collection: collection.clone(),
+                                                                    op,
+                                                                    sender_client_id: None,
+                                                                })
+                                                                .await;
+                                                        }
+                                                    }
+                                                    _ => {}
                                                 }
                                             }
                                         }
@@ -615,7 +681,6 @@ impl CloudSync {
                     }
                 }
 
-                // Reconnect Backoff
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
         });
@@ -623,7 +688,60 @@ impl CloudSync {
         Ok(())
     }
 
-    /// Tails local WAL changes on the client and sends them upstream to Cloud Server.
+    /// Client helper to send deltas since `server_ts` upstream when Server is lagging behind Client
+    async fn push_client_deltas_upstream(
+        db: &Arc<FireLite>,
+        collection: &str,
+        server_ts: i64,
+        outbound_tx: &mpsc::Sender<CloudPacket>,
+    ) {
+        if let Ok(shard_arc) = db.get_shard(collection) {
+            let changed_items: Vec<(String, crate::storage::engine::Pointer)> = {
+                let guard = shard_arc.read().unwrap();
+                guard
+                    .index
+                    .iter()
+                    .filter_map(|(k, ptr)| {
+                        let ts = match ptr {
+                            crate::storage::engine::Pointer::Deleted { timestamp } => *timestamp,
+                            crate::storage::engine::Pointer::Inlined(bytes) => {
+                                i64::from_le_bytes(bytes[2..10].try_into().unwrap_or([0; 8]))
+                            }
+                            _ => 0,
+                        };
+                        if ts > server_ts {
+                            Some((k.clone(), ptr.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            };
+
+            let mut ops = Vec::new();
+            {
+                let guard = shard_arc.read().unwrap();
+                for (key, ptr) in changed_items {
+                    if let Ok(Some(bytes)) = guard.read_pointer_internal(&ptr, false) {
+                        ops.push(WalOp::PutInlined { key, value: bytes });
+                    }
+                }
+            }
+
+            if !ops.is_empty() {
+                let packet = CloudPacket::Replication {
+                    msg_id: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros(),
+                    collection: collection.to_string(),
+                    ops,
+                };
+                let _ = outbound_tx.send(packet).await;
+            }
+        }
+    }
+
     fn spawn_client_outbound_tailer(&self, echo_cache: Arc<StdMutex<HashMap<String, i64>>>) {
         let db = self.db.clone();
         let outbound_tx_option = self.outbound_tx.clone();
@@ -642,10 +760,10 @@ impl CloudSync {
                 let cols = db.list_collections().unwrap_or_default();
 
                 for col in cols {
-                    if let Ok(shard) = db.get_shard(&col) {
+                    if let Ok(shard_arc) = db.get_shard(&col) {
                         let last_pos = *offsets.get(&col).unwrap_or(&0);
                         let tail_res = {
-                            let guard = shard.read().unwrap();
+                            let guard = shard_arc.read().unwrap();
                             guard.wal.tail(last_pos)
                         };
 
@@ -663,7 +781,6 @@ impl CloudSync {
                                         _ => 0,
                                     };
 
-                                    // Skip local echo of writes that came from Cloud Server
                                     let is_echo = {
                                         let mut cache = echo_cache.lock().unwrap();
                                         if let Some(&cached_ts) = cache.get(key) {
@@ -679,7 +796,28 @@ impl CloudSync {
                                     };
 
                                     if !is_echo {
-                                        to_send.push(op);
+                                        let final_op = match op {
+                                            WalOp::PutInlined { ref key, ref value } => {
+                                                if let Some(mut doc) = FireLiteDoc::decode(value) {
+                                                    let has_blobs = doc.fields.iter().any(|(_, v)| matches!(v, Value::BlobLink { .. }));
+                                                    if has_blobs {
+                                                        let enc_key = db.config.encryption_key.as_deref();
+                                                        if crate::engine::engine::resolve_doc_static(&mut doc, &shard_arc, enc_key).is_ok() {
+                                                            WalOp::PutInlined { key: key.clone(), value: doc.encode_buffered() }
+                                                        } else {
+                                                            op
+                                                        }
+                                                    } else {
+                                                        op
+                                                    }
+                                                } else {
+                                                    op
+                                                }
+                                            }
+                                            _ => op,
+                                        };
+
+                                        to_send.push(final_op);
                                     }
                                 }
 
