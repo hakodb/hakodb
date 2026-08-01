@@ -6,9 +6,28 @@ It runs in-process (no external service), stores typed binary documents, and pro
 
 ---
 
-## Current Status (v0.6.33 - High Velocity)
+## Current Status (v0.6.64 - High Velocity)
 
 FireLite has evolved from a foundation stage into a **Production-Candidate** engine. The core architecture now supports physical data sharding and near-instant recovery, capable of **20,000+ TPS** and sub-millisecond query responses on standard hardware.
+
+
+### 🚀 New in v0.6.64
+
+- **Cloud Sync Engine (`cloud-sync` feature)**
+  - Centralized Cloud Sync over WebSockets + MessagePack (`CloudSyncMode::Server` and `CloudSyncMode::Client`).
+  - Secure room hashing, JWT/Token authentication, and automated delta catchups.
+- **In-Memory Micro-Batch Flusher (High-Throughput Write Aggregator)**
+  - Drains and coalesces incoming client stream mutations every **5ms** or **512 ops**.
+  - Reduces FireLite write lock acquisitions by **500x**, resolving single-write bottlenecks on busy central servers.
+- **Virtual Collection Partitioning**
+  - Enables routing writes across virtual collection buckets (`hash(doc_id) % N`).
+  - Scales concurrent writes linearly across independent shard locks.
+- **Zero-Copy Projection Pipeline**
+  - Queries no longer "inflate" full document objects. 
+  - Direct binary "cherry-picking" of fields from memory-mapped slices.
+- **Unified Processed Cache (Decompression Cache)**
+  - Decryption and Decompression (Zstd) are performed **once** per block; subsequent reads are served at raw RAM speed.
+
 
 ### 🚀 New in v0.6.33
 
@@ -298,6 +317,105 @@ Core FFI functions:
 All FFI-based gateways (Go / JS-TS / Pascal) include wrappers for these APIs.
 
 ---
+
+## Cloud Sync (Centralized Cloud Replication)
+
+The cloud-sync feature provides cloud-level synchronization over WebSockets and
+MessagePack. It allows FireLite instances to act as a Central Cloud Server or a
+Cloud Client.
+
+Architecture Overview
+
+  - Server Mode: Acts as the central hub. Validates client tokens, coalesces
+    incoming streams into high-throughput micro-batches, updates local state,
+    and relays delta packets to room members.
+  - Client Mode: Connects to the Cloud Server via WebSockets, tails local
+    FireLite collection changes, streams deltas to the server, and applies
+    remote changes locally using LWW (Last-Write-Wins) timestamp filtering.
+
+1. Cloud Sync Server Mode Example
+
+The server handles thousands of concurrent client connections over WebSockets.
+Incoming writes from all clients are queued and committed in 5ms micro-batches
+to avoid write lock contention.
+
+```rust
+use std::sync::Arc;
+use firelite::config::FireLiteConfig;
+use firelite::engine::FireLite;
+use firelite::cloud_sync::{CloudSync, CloudSyncMode};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Open local FireLite instance for the Server
+    let db = Arc::new(FireLite::open("./data/cloud_server_db", FireLiteConfig::default())?);
+
+    // 2. Initialize CloudSync in Server Mode
+    let cloud_server = CloudSync::new(
+        db.clone(),
+        CloudSyncMode::Server,
+        "server_node_01",         // Server Node ID
+        "secret_game_room_key",   // Room Key (SHA-256 hashed for room isolation)
+        "master_jwt_secret",      // Authentication Secret
+    );
+
+    // 3. Start WebSocket Server listening on port 8080
+    cloud_server.start("0.0.0.0:8080").await?;
+
+    println!("🔥 FireLite Cloud Sync Server listening on ws://0.0.0.0:8080");
+
+    // Keep server alive
+    tokio::signal::ctrl_c().await?;
+    cloud_server.stop();
+    Ok(())
+}
+```
+
+2. Cloud Sync Client Mode Example
+
+Clients connect to the Cloud Sync Server, sync local changes, and receive live
+delta updates from other clients in the same room.
+
+```rust
+use std::sync::Arc;
+use firelite::config::FireLiteConfig;
+use firelite::document::firelite_doc::FireLiteDoc;
+use firelite::document::value::Value;
+use firelite::engine::FireLite;
+use firelite::cloud_sync::{CloudSync, CloudSyncMode};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Open local embedded FireLite database on the client
+    let db = Arc::new(FireLite::open("./data/client_db", FireLiteConfig::default())?);
+
+    // 2. Initialize CloudSync in Client Mode
+    let cloud_client = CloudSync::new(
+        db.clone(),
+        CloudSyncMode::Client,
+        "user_client_42",          // Client ID
+        "secret_game_room_key",    // Must match Server Room Key
+        "user_jwt_token_123",      // Authentication Token
+    );
+
+    // 3. Connect to the Central Cloud Server
+    cloud_client.start("ws://127.0.0.1:8080").await?;
+    println!("⚡ Connected to Cloud Sync Server");
+
+    // 4. Perform local writes (automatically synced to Cloud Server in the background)
+    let mut doc = FireLiteDoc::default();
+    doc.insert("username", Value::String("player_one".to_string()));
+    doc.insert("score", Value::Int(9500));
+
+    db.put("players", "user_42", &doc)?;
+
+    // Keep client running
+    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+    cloud_client.stop();
+    Ok(())
+}
+```
+
 
 ## Lazarus / Free Pascal (FPC) Wrapper
 

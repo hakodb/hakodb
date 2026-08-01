@@ -14,6 +14,8 @@ struct FL_Array;
 
 struct FL_Batch;
 
+struct FL_CloudSync;
+
 struct FL_Config;
 
 struct FL_Doc;
@@ -303,5 +305,17 @@ int32_t fl_net_syncer_start(FL_NetSyncer *syncer, uint16_t port);
 char *fl_net_syncer_status(FL_NetSyncer *syncer);
 
 void fl_net_syncer_free(FL_NetSyncer *syncer);
+
+FL_CloudSync *fl_cloud_sync_new(FL_Engine *engine,
+                                int32_t mode,
+                                const char *client_id,
+                                const char *room_key,
+                                const char *auth_token);
+
+int32_t fl_cloud_sync_start(FL_CloudSync *cloud_sync, const char *address);
+
+void fl_cloud_sync_stop(FL_CloudSync *cloud_sync);
+
+void fl_cloud_sync_free(FL_CloudSync *cloud_sync);
 
 }  // extern "C"

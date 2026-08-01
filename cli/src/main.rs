@@ -10,12 +10,17 @@ use firelite::document::firelite_doc::FireLiteDoc;
 use firelite::document::value::Value;
 use firelite::engine::{BatchMutation, FireLite};
 use firelite::index::composite::definition::SortDirection;
-use firelite::net_sync::{NetSyncer, SyncStatus};
 use firelite::query::filter::Operator;
 use firelite::query::query::{AggregateOp, Query};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use serde_json::{json, Map, Value as JsonValue};
+
+#[cfg(feature = "net-sync")]
+use firelite::net_sync::{NetSyncer, SyncStatus};
+
+#[cfg(feature = "cloud-sync")]
+use firelite::cloud_sync::{CloudSync, CloudSyncMode};
 
 #[derive(Parser, Debug)]
 #[command(name = "firelite")]
@@ -225,6 +230,18 @@ enum Commands {
 
         #[arg(long, default_value = "default_key")]
         key: String,
+
+        /// Cloud Sync Server bind address (e.g. 0.0.0.0:8080)
+        #[arg(long)]
+        bind: Option<String>,
+
+        /// Cloud Sync Client target server URL (e.g. ws://127.0.0.1:8080)
+        #[arg(long)]
+        server: Option<String>,
+
+        /// Auth Token for Cloud Sync
+        #[arg(long, default_value = "default_token")]
+        token: String,
     },
 }
 
@@ -267,8 +284,14 @@ enum AggregateKindArg {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if let Commands::Serve { port, node_id, key } = &cli.command {
-        return run_server(&cli, *port, node_id.clone(), key.clone());
+    if let Commands::Serve { 
+        port, 
+        node_id, 
+        key,         
+        bind,
+        server,
+        token, } = &cli.command {
+        return run_server(&cli, Some(*port), node_id, key, bind.as_deref(), server.as_deref(), token);
     }
 
     let db = open_db(&cli)?;
@@ -1263,18 +1286,23 @@ fn execute_command(
         } => run_rest(db, &method, &path, data.as_deref(), &filters)?,
         // For Serve, we handle it separately to avoid infinite recursion
         Commands::Peers => {
-            let status = net
-                .ok_or_else(|| anyhow!("Networking not active."))?
-                .status();
-            println!("\n--- Mesh Network ---");
-            println!("Status: {}", format_sync_status(status.status)); // <--- Used here too
-            println!("Peers:  {}", status.peer_count);
-            println!("\n{:<20} | {:<10}", "PEER ID", "NETWORK");
-            println!("{}", "-".repeat(35));
-            for id in status.known_peers {
-                println!("{:<20} | ONLINE", id);
+            #[cfg(feature = "net-sync")]
+            if let Some(_n) = net {
+                let status = net
+                    .ok_or_else(|| anyhow!("Networking not active."))?
+                    .status();
+                println!("\n--- Mesh Network ---");
+                println!("Status: {}", format_sync_status(status.status)); // <--- Used here too
+                println!("Peers:  {}", status.peer_count);
+                println!("\n{:<20} | {:<10}", "PEER ID", "NETWORK");
+                println!("{}", "-".repeat(35));
+                for id in status.known_peers {
+                    println!("{:<20} | ONLINE", id);
+                }
+                println!();
+            } else {
+                println!("LAN Net Sync not enabled for this session.");
             }
-            println!();
         }
         Commands::Exit | Commands::Quit => {
             // Handled by the loop break
@@ -1300,33 +1328,88 @@ fn format_sync_status(status: SyncStatus) -> &'static str {
 
 fn run_server(
     cli: &Cli,
-    port: u16,
-    node_id: String,
-    key: String,
+    port: Option<u16>,
+    node_id: &str,
+    key: &str,
+    bind_addr: Option<&str>,
+    server_url: Option<&str>,
+    token: &str,
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
     rt.block_on(async move {
-        let db = Arc::new(open_db(&cli)?);
+        let db = Arc::new(open_db(cli)?);
 
-        // NEW: Init Mesh Syncer
-        let net = NetSyncer::new(db.clone(), &node_id, &key, vec!["app_state".to_string()]);
+        // 1. Initialize LAN Net Sync (if --port provided)
+        #[cfg(feature = "net-sync")]
+        let net_syncer = if let Some(p) = port {
+            let syncer = NetSyncer::new(db.clone(), node_id, key, vec!["app_state".to_string()]);
+            syncer.start(p).await.map_err(|e| anyhow!(e.to_string()))?;
+            Some(syncer)
+        } else {
+            None
+        };
 
-        net.start(port).await.map_err(|e| anyhow!(e.to_string()))?;
+        // 2. Initialize Cloud Sync (if --bind or --server provided)
+        #[cfg(feature = "cloud-sync")]
+        let cloud_syncer = if let Some(b) = bind_addr {
+            let cs = CloudSync::new(
+                db.clone(),
+                CloudSyncMode::Server,
+                node_id,
+                key,
+                token,
+            );
+            cs.start(b).await.map_err(|e| anyhow!(e.to_string()))?;
+            Some((cs, format!("Server ({})", b)))
+        } else if let Some(s) = server_url {
+            let cs = CloudSync::new(
+                db.clone(),
+                CloudSyncMode::Client,
+                node_id,
+                key,
+                token,
+            );
+            cs.start(s).await.map_err(|e| anyhow!(e.to_string()))?;
+            Some((cs, format!("Client -> {}", s)))
+        } else {
+            None
+        };
 
-        println!("🔥 FireLite v0.6.19 Mesh Shell Active");
-        println!("🌐 Node: {} | Room Hash Verified", node_id);
+        println!("🔥 FireLite v0.6.64 Server Active");
+        println!("🆔 Node ID: {}", node_id);
+
+        #[cfg(feature = "net-sync")]
+        if let Some(p) = port {
+            println!("🌐 LAN Net Sync: Active on port {}", p);
+        }
+
+        #[cfg(feature = "cloud-sync")]
+        if let Some((_, ref desc)) = cloud_syncer {
+            println!("☁️  Cloud Sync: Active [{}]", desc);
+        }
 
         let mut rl = DefaultEditor::new().map_err(|e| anyhow!("Readline error: {}", e))?;
 
         loop {
-            let status = net.status();
-            let prompt = format!(
-                "firelite({}:{} | {}) > ",
-                node_id,
-                status.peer_count,
-                format_sync_status(status.status) // <--- Now SyncStatus is used!
-            );
+            let mut status_str = String::from("Standalone");
+
+            #[cfg(feature = "net-sync")]
+            if let Some(ref net) = net_syncer {
+                let status = net.status();
+                status_str = format!("LAN:{} (Peers:{})", format_sync_status(status.status), status.peer_count);
+            }
+
+            #[cfg(feature = "cloud-sync")]
+            if let Some((_, ref desc)) = cloud_syncer {
+                if status_str == "Standalone" {
+                    status_str = format!("Cloud:{}", desc);
+                } else {
+                    status_str = format!("Hybrid [{}+Cloud]", status_str);
+                }
+            }
+
+            let prompt = format!("firelite({} | {}) > ", node_id, status_str);
 
             match rl.readline(&prompt) {
                 Ok(line) => {
@@ -1344,14 +1427,19 @@ fn run_server(
 
                     match Cli::try_parse_from(args) {
                         Ok(repl_cli) => {
+                            #[cfg(feature = "net-sync")]
+                            let net_ref = net_syncer.as_ref();
+                            #[cfg(not(feature = "net-sync"))]
+                            let net_ref = None;
+
                             if let Err(e) = execute_command(
                                 &db,
                                 repl_cli.command,
                                 &cli.db,
                                 cli.durability,
-                                Some(&net),
-                                repl_cli.time || cli.time, 
-                                repl_cli.count || cli.count
+                                net_ref,
+                                repl_cli.time || cli.time,
+                                repl_cli.count || cli.count,
                             ) {
                                 println!("❌ Error: {}", e);
                             }
@@ -1366,7 +1454,18 @@ fn run_server(
                 }
             }
         }
-        net.stop();
+
+        // #[cfg(feature = "net-sync")]
+        if let Some(net) = net_syncer {
+            net.stop();
+        }
+
+        // #[cfg(feature = "cloud-sync")]
+        if let Some((cs, _)) = cloud_syncer {
+            cs.stop();
+        }
+
         Ok(())
     })
 }
+

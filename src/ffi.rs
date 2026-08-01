@@ -1,7 +1,7 @@
 use std::cell::RefCell;
-use crate::engine::Engine;
+// use crate::engine::Engine;
 use std::ffi::{c_char, CStr, CString};
-use std::os::raw::c_char;
+// use std::os::raw::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{channel, Sender};
 use std::time::Duration;
@@ -94,6 +94,16 @@ pub struct FL_ResultSet {
 #[allow(non_camel_case_types)]
 pub struct FL_NetSyncer {
     inner: std::sync::Arc<crate::net_sync::NetSyncer>,
+}
+
+// ============================================================================
+// CLOUD SYNC FFI BINDINGS
+// ============================================================================
+
+#[cfg(feature = "cloud-sync")]
+#[allow(non_camel_case_types)]
+pub struct FL_CloudSync {
+    inner: std::sync::Arc<crate::cloud_sync::CloudSync>,
 }
 
 thread_local! {
@@ -2431,5 +2441,89 @@ pub extern "C" fn fl_net_syncer_free(syncer: *mut FL_NetSyncer) {
     if !syncer.is_null() {
         let s = unsafe { Box::from_raw(syncer) };
         s.inner.stop();
+    }
+}
+
+
+// CLOUD SYNC
+#[cfg(feature = "cloud-sync")]
+#[no_mangle]
+pub extern "C" fn fl_cloud_sync_new(
+    engine: *mut FL_Engine,
+    mode: i32, // 0 = Server, 1 = Client
+    client_id: *const c_char,
+    room_key: *const c_char,
+    auth_token: *const c_char,
+) -> *mut FL_CloudSync {
+    if engine.is_null() {
+        return ptr::null_mut();
+    }
+    let engine_ref = unsafe { &*engine };
+    let cid_str = cstr_to_string(client_id).unwrap_or_else(|_| "node".into());
+    let room_str = cstr_to_string(room_key).unwrap_or_else(|_| "default".into());
+    let token_str = cstr_to_string(auth_token).unwrap_or_default();
+
+    let sync_mode = match mode {
+        0 => crate::cloud_sync::CloudSyncMode::Server,
+        _ => crate::cloud_sync::CloudSyncMode::Client,
+    };
+
+    let db_ptr:std::sync::Arc<crate::engine::FireLite> = unsafe { std::sync::Arc::from_raw(&engine_ref.db as *const _) };
+    let cloud_sync = crate::cloud_sync::CloudSync::new(
+        db_ptr.clone(),
+        sync_mode,
+        &cid_str,
+        &room_str,
+        &token_str,
+    );
+    std::mem::forget(db_ptr);
+
+    Box::into_raw(Box::new(FL_CloudSync {
+        inner: std::sync::Arc::new(cloud_sync),
+    }))
+}
+
+#[cfg(feature = "cloud-sync")]
+#[no_mangle]
+pub extern "C" fn fl_cloud_sync_start(cloud_sync: *mut FL_CloudSync, address: *const c_char) -> i32 {
+    if cloud_sync.is_null() {
+        return -1;
+    }
+    let cs_ref = unsafe { &*cloud_sync };
+    let addr_str = match cstr_to_string(address) {
+        Ok(a) => a,
+        Err(e) => return set_last_error(e),
+    };
+    let inner = cs_ref.inner.clone();
+
+    let rt = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => return set_last_error("No tokio runtime found"),
+    };
+
+    match rt.block_on(async move { inner.start(&addr_str).await }) {
+        Ok(_) => 0,
+        Err(e) => {
+            set_last_error(e.to_string());
+            -1
+        }
+    }
+}
+
+#[cfg(feature = "cloud-sync")]
+#[no_mangle]
+pub extern "C" fn fl_cloud_sync_stop(cloud_sync: *mut FL_CloudSync) {
+    if !cloud_sync.is_null() {
+        let cs_ref = unsafe { &*cloud_sync };
+        cs_ref.inner.stop();
+    }
+}
+
+#[cfg(feature = "cloud-sync")]
+#[no_mangle]
+pub extern "C" fn fl_cloud_sync_free(cloud_sync: *mut FL_CloudSync) {
+    if !cloud_sync.is_null() {
+        let cs = unsafe { Box::from_raw(cloud_sync) };
+        cs.inner.stop();
     }
 }

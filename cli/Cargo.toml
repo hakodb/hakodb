@@ -3,8 +3,13 @@ name = "firelite-cli"
 version = "0.2.1"
 edition = "2021"
 
+[features]
+default = ["net-sync", "cloud-sync"]
+net-sync = ["firelite/net-sync"]
+cloud-sync = ["firelite/cloud-sync"]
+
 [dependencies]
-firelite = { path = "../", features = ["net-sync"] } 
+firelite = { path = "../" } 
 serde_json = "1.0"
 clap = { version = "4.6.0", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
