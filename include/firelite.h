@@ -314,6 +314,8 @@ FL_CloudSync *fl_cloud_sync_new(FL_Engine *engine,
 
 int32_t fl_cloud_sync_start(FL_CloudSync *cloud_sync, const char *address);
 
+char *fl_cloud_sync_status(FL_CloudSync *cloud_sync);
+
 void fl_cloud_sync_stop(FL_CloudSync *cloud_sync);
 
 void fl_cloud_sync_free(FL_CloudSync *cloud_sync);

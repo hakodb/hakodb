@@ -35,7 +35,8 @@ macro_rules! safety_shield {
 
 #[allow(non_camel_case_types)]
 pub struct FL_Engine {
-    db: FireLite,
+    // db: FireLite,
+    db: std::sync::Arc<FireLite>,
 }
 
 #[allow(non_camel_case_types)]
@@ -170,7 +171,8 @@ pub extern "C" fn fl_engine_open(path: *const c_char) -> *mut FL_Engine {
     match FireLite::open(path, FireLiteConfig::default()) {
         Ok(db) => {
             clear_last_error();
-            Box::into_raw(Box::new(FL_Engine { db }))
+            // Box::into_raw(Box::new(FL_Engine { db }))
+            Box::into_raw(Box::new(FL_Engine { db: std::sync::Arc::new(db) }))
         }
         Err(e) => {
             set_last_error(e.to_string());
@@ -326,7 +328,8 @@ pub extern "C" fn fl_engine_open_with_config(
         match FireLite::open(path_str, cfg_box.inner) {
             Ok(db) => {
                 clear_last_error();
-                Box::into_raw(Box::new(FL_Engine { db }))
+                // Box::into_raw(Box::new(FL_Engine { db }))
+                Box::into_raw(Box::new(FL_Engine { db: std::sync::Arc::new(db) }))
             }
             Err(e) => {
                 set_last_error(e.to_string());
@@ -2385,16 +2388,17 @@ pub extern "C" fn fl_net_syncer_new(
     // We need to clone the Arc<FireLite> logically. 
     // Since FL_Engine wraps FireLite (which is not an Arc inside FL_Engine), 
     // we use a temporary wrap to pass it to the syncer.
-    let db_ptr:std::sync::Arc<FireLite> = unsafe { std::sync::Arc::from_raw(&engine_ref.db as *const _) };
+    // let db_ptr:std::sync::Arc<FireLite> = unsafe { std::sync::Arc::from_raw(&engine_ref.db as *const _) };
     let syncer = crate::net_sync::NetSyncer::new(
-        db_ptr.clone(),
+        engine_ref.db.clone(),
         &name_str,
         &room_str,
         vec![],
     );
     // Important: Forget the raw pointer so we don't drop the engine!
-    std::mem::forget(db_ptr);
+    // std::mem::forget(db_ptr);
 
+    clear_last_error();
     Box::into_raw(Box::new(FL_NetSyncer {
         inner: std::sync::Arc::new(syncer),
     }))
@@ -2455,75 +2459,127 @@ pub extern "C" fn fl_cloud_sync_new(
     room_key: *const c_char,
     auth_token: *const c_char,
 ) -> *mut FL_CloudSync {
-    if engine.is_null() {
-        return ptr::null_mut();
-    }
-    let engine_ref = unsafe { &*engine };
-    let cid_str = cstr_to_string(client_id).unwrap_or_else(|_| "node".into());
-    let room_str = cstr_to_string(room_key).unwrap_or_else(|_| "default".into());
-    let token_str = cstr_to_string(auth_token).unwrap_or_default();
+    safety_shield!(ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error("Null engine handle");
+            return ptr::null_mut();
+        }
 
-    let sync_mode = match mode {
-        0 => crate::cloud_sync::CloudSyncMode::Server,
-        _ => crate::cloud_sync::CloudSyncMode::Client,
-    };
+        let engine_ref = unsafe { &*engine };
+        let cid_str = cstr_to_string(client_id).unwrap_or_else(|_| "node".into());
+        let room_str = cstr_to_string(room_key).unwrap_or_else(|_| "default".into());
+        let token_str = cstr_to_string(auth_token).unwrap_or_default();
 
-    let db_ptr:std::sync::Arc<crate::engine::FireLite> = unsafe { std::sync::Arc::from_raw(&engine_ref.db as *const _) };
-    let cloud_sync = crate::cloud_sync::CloudSync::new(
-        db_ptr.clone(),
-        sync_mode,
-        &cid_str,
-        &room_str,
-        &token_str,
-    );
-    std::mem::forget(db_ptr);
+        let sync_mode = match mode {
+            0 => crate::cloud_sync::CloudSyncMode::Server,
+            _ => crate::cloud_sync::CloudSyncMode::Client,
+        };
 
-    Box::into_raw(Box::new(FL_CloudSync {
-        inner: std::sync::Arc::new(cloud_sync),
-    }))
+        // 100% Safe Arc cloning (No UB / No Arc::from_raw hack)
+        let cloud_sync = crate::cloud_sync::CloudSync::new(
+            engine_ref.db.clone(),
+            sync_mode,
+            &cid_str,
+            &room_str,
+            &token_str,
+        );
+
+        clear_last_error();
+        Box::into_raw(Box::new(FL_CloudSync {
+            inner: std::sync::Arc::new(cloud_sync),
+        }))
+    })
 }
 
 #[cfg(feature = "cloud-sync")]
 #[no_mangle]
 pub extern "C" fn fl_cloud_sync_start(cloud_sync: *mut FL_CloudSync, address: *const c_char) -> i32 {
-    if cloud_sync.is_null() {
-        return -1;
-    }
-    let cs_ref = unsafe { &*cloud_sync };
-    let addr_str = match cstr_to_string(address) {
-        Ok(a) => a,
-        Err(e) => return set_last_error(e),
-    };
-    let inner = cs_ref.inner.clone();
-
-    let rt = match tokio::runtime::Handle::try_current() {
-        Ok(h) => h,
-        Err(_) => return set_last_error("No tokio runtime found"),
-    };
-
-    match rt.block_on(async move { inner.start(&addr_str).await }) {
-        Ok(_) => 0,
-        Err(e) => {
-            set_last_error(e.to_string());
-            -1
+    safety_shield!(-1, {
+        if cloud_sync.is_null() {
+            return set_last_error("Null cloud_sync handle");
         }
-    }
+        let cs_ref = unsafe { &*cloud_sync };
+        let addr_str = match cstr_to_string(address) {
+            Ok(a) => a,
+            Err(e) => return set_last_error(e),
+        };
+        let inner = cs_ref.inner.clone();
+
+        // Support both existing Tokio threads and plain C/C++ threads
+        let run_sync = async move { inner.start(&addr_str).await };
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            match handle.block_on(run_sync) {
+                Ok(_) => {
+                    clear_last_error();
+                    0
+                }
+                Err(e) => set_last_error(e.to_string()),
+            }
+        } else {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(r) => r,
+                Err(e) => return set_last_error(format!("Failed to create Tokio runtime: {}", e)),
+            };
+            match rt.block_on(run_sync) {
+                Ok(_) => {
+                    clear_last_error();
+                    0
+                }
+                Err(e) => set_last_error(e.to_string()),
+            }
+        }
+    })
+}
+
+#[cfg(feature = "cloud-sync")]
+#[no_mangle]
+pub extern "C" fn fl_cloud_sync_status(cloud_sync: *mut FL_CloudSync) -> *mut c_char {
+    safety_shield!(ptr::null_mut(), {
+        if cloud_sync.is_null() {
+            set_last_error("Null cloud_sync handle");
+            return ptr::null_mut();
+        }
+        let cs_ref = unsafe { &*cloud_sync };
+        // Returns JSON string representation of current CloudStatus
+        let status = cs_ref.inner.status();
+        match serde_json::to_string(&status) {
+            Ok(json) => match CString::new(json) {
+                Ok(c_str) => {
+                    clear_last_error();
+                    c_str.into_raw()
+                }
+                Err(e) => {
+                    set_last_error(e.to_string());
+                    ptr::null_mut()
+                }
+            },
+            Err(e) => {
+                set_last_error(e.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
 }
 
 #[cfg(feature = "cloud-sync")]
 #[no_mangle]
 pub extern "C" fn fl_cloud_sync_stop(cloud_sync: *mut FL_CloudSync) {
-    if !cloud_sync.is_null() {
-        let cs_ref = unsafe { &*cloud_sync };
-        cs_ref.inner.stop();
-    }
+    safety_shield!((), {
+        if !cloud_sync.is_null() {
+            let cs_ref = unsafe { &*cloud_sync };
+            cs_ref.inner.stop();
+        }
+    })
 }
 
 #[cfg(feature = "cloud-sync")]
 #[no_mangle]
 pub extern "C" fn fl_cloud_sync_free(cloud_sync: *mut FL_CloudSync) {
-    if !cloud_sync.is_null() {
-        let cs = unsafe { Box::from_raw(cloud_sync) };
-        cs.inner.stop();
-    }
+    safety_shield!((), {
+        if !cloud_sync.is_null() {
+            let cs = unsafe { Box::from_raw(cloud_sync) };
+            cs.inner.stop();
+        }
+    })
 }

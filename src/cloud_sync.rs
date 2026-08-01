@@ -176,6 +176,22 @@ impl CloudSync {
         self.running.store(false, Ordering::SeqCst);
     }
 
+    pub fn status(&self) -> CloudStatus {
+        let active_clients = if let Ok(guard) = self.active_peers.try_read() {
+            guard.len()
+        } else {
+            0
+        };
+
+        CloudStatus {
+            mode: self.mode,
+            connected: self.running.load(Ordering::Relaxed),
+            room_key: self.room_key.clone(),
+            active_clients,
+            queued_writes: 0,
+        }
+    }
+
     // ========================================================================
     // BATCH AGGREGATOR: SOLVES SINGLE-WRITE LOCK BOTTLENECK
     // ========================================================================
