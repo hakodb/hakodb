@@ -437,7 +437,7 @@ A production-focused Pascal wrapper is available under `pascal/`:
   - external imports with `cdecl` for Windows/Linux/macOS dynamic libraries.
 - `pascal/FireLite.pas`
   - object-oriented API: `TFireLite`, `TFLCollection`, `TFLDocument`, `TFLQuery`, `TFLBatch`, `TFLTransaction`
-  - fluent Firestore-like flow (`Collection(...).Doc(...).Set/Get/Delete`, query chaining)
+  - fluent Firestore-like flow (`Collection(...).Doc(...).SetDoc/Get/Delete`, query chaining)
   - projection pushdown (`Select([...])`) wired to `fl_query_select_field`
   - advanced filters (`WhereNotIn`, `ArrayContains`, `ArrayContainsAny`) mapped to FFI
   - callback-based `OnSnapshot` via a polling thread and optional `TThread.Queue` UI dispatch.
@@ -455,7 +455,7 @@ begin
     Col := DB.Collection('users');
     Doc := TFLDocument.Create.InsertStr('name', 'alice').InsertInt('age', 30);
     try
-      Col.Doc('u1').Set(Doc);
+      Col.Doc('u1').SetDoc(Doc);
     finally
       Doc.Free;
     end;

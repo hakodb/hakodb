@@ -9,15 +9,22 @@ export type WatchCallback = (collection: string, path: string, kind: number) => 
 
 export interface NativeBindings {
   engineOpen(path: string): Handle;
+  engineIsIndexesReady(engine: Handle): boolean;
   engineOpenWithConfig(path: string, config: Handle): Handle;
   engineFree(engine: Handle): void;
   engineBackup(engine: Handle, path: string): number; // Added
+  engineCompact(engine: Handle): number;
+  engineGetStats(engine: Handle): string | null;
+  engineGetAuditLog(engine: Handle): string | null;
+  engineSnapshotIndices(engine: Handle): number;
+  engineListIndexes(engine: Handle, collection: string | null): string | null;
 
   // Configuration Builder
   configNew(): Handle;
   configFree(config: Handle): void;
   configSetDurability(config: Handle, mode: number): void;
   configSetEncryptionKey(config: Handle, key: string | null): void;
+  configSetEncryptedCollections(config: Handle, collectionsJson: string | null): number;
   configSetAuditLog(config: Handle, enabled: boolean, path: string | null): void;
   configSetQueryWorkers(config: Handle, count: number): void;
   configSetMemoryLimits(config: Handle, mmap: number, maxInlined: number): void;
@@ -27,6 +34,8 @@ export interface NativeBindings {
     threshold: number, 
     groupCommit: number
   ): void;
+  configSetBlobThreshold(config: Handle, thresholdBytes: number): void;
+  configSetCompression(config: Handle, enabled: boolean, level: number): void;
 
   // Real-time Watch
   engineWatch(engine: Handle, collection: string, callback: WatchCallback): Handle;
@@ -43,12 +52,17 @@ export interface NativeBindings {
   docInsertBin(doc: Handle, key: string, bytes: Uint8Array): number;
   docInsertTimestamp(doc: Handle, key: string, micros: bigint): number; // Added
   docInsertServerTimestamp(doc: Handle, key: string): number; // Added
+  docInsertReference(doc: Handle, key: string, targetCollection: string, targetId: string): number;
   docToJson(doc: Handle): string | null;
 
   // Engine CRUD
   engineInsert(engine: Handle, collection: string, docId: string, doc: Handle): number;
   engineGet(engine: Handle, collection: string, docId: string): Handle;
   engineDelete(engine: Handle, collection: string, docId: string): number;
+  enginePatch(engine: Handle, collection: string, docId: string, updates: Handle): number;
+  engineInsertSubDoc(engine: Handle, col: string, id: string, subCol: string, subId: string, doc: Handle): number;
+  engineGetByRef(engine: Handle, doc: Handle, fieldKey: string): Handle;
+  engineCreateIndex(engine: Handle, collection: string, fieldsJson: string): number;
 
   // Atomic Batch
   batchNew(): Handle;
@@ -56,6 +70,13 @@ export interface NativeBindings {
   batchSet(batch: Handle, collection: string, docId: string, doc: Handle): number;
   batchDelete(batch: Handle, collection: string, docId: string): number;
   batchCommit(engine: Handle, batch: Handle): number;
+
+  // Serializable Transactions
+  transactionBegin(engine: Handle): Handle;
+  transactionGet(engine: Handle, tx: Handle, collection: string, docId: string): Handle;
+  transactionSet(tx: Handle, collection: string, docId: string, doc: Handle): number;
+  transactionCommit(engine: Handle, tx: Handle): number;
+  transactionFree(tx: Handle): void;
 
   // Query API
   queryNew(collection: string): Handle;
@@ -78,11 +99,19 @@ export interface NativeBindings {
   queryOffset(query: Handle, offset: number): number;
   querySelectField(query: Handle, field: string): number;
   queryExecute(engine: Handle, query: Handle): string | null;
+  queryDelete(engine: Handle, query: Handle): number;
+  queryPatch(engine: Handle, query: Handle, patchDoc: Handle): number;
+  queryExecuteToHandles(engine: Handle, query: Handle): Handle;
+  resultSetCount(results: Handle): number;
+  resultSetGetDoc(results: Handle, index: number): Handle;
+  resultSetFree(results: Handle): void;
 
   // Full-Text Search Queries (Added)
   queryWhereMatch(query: Handle, field: string, value: string): number;
   queryWhereContains(query: Handle, field: string, value: string): number;
   queryWhereStartsWith(query: Handle, field: string, value: string): number;
+  queryWhereOrStr(query: Handle, field: string, value: string): number;
+  queryWhereOrInt(query: Handle, field: string, value: number | bigint): number;
 
   // Aggregation API
   queryAggregateCount(query: Handle): number;
@@ -97,6 +126,13 @@ export interface NativeBindings {
   netSyncerStart(syncer: Handle, port: number): number;
   netSyncerStatus(syncer: Handle): string | null;
   netSyncerFree(syncer: Handle): void;
+
+  // Cloud Sync (bi-directional WebSocket replication)
+  cloudSyncNew(engine: Handle, mode: number, clientId: string | null, roomKey: string | null, authToken: string | null): Handle;
+  cloudSyncStart(cloudSync: Handle, address: string): number;
+  cloudSyncStatus(cloudSync: Handle): string | null;
+  cloudSyncStop(cloudSync: Handle): void;
+  cloudSyncFree(cloudSync: Handle): void;
 
   // v0.5.9
   createFtsIndex(engine: Handle, collection: string, field: string): number;
@@ -147,18 +183,27 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
 
   const symbols = dlopen(libPath, {
     fl_engine_open: { args: [FFIType.cstring], returns: FFIType.ptr },
+    fl_engine_is_indexes_ready: { args: [FFIType.ptr], returns: FFIType.bool },
     fl_engine_open_with_config: { args: [FFIType.cstring, FFIType.ptr], returns: FFIType.ptr },
     fl_engine_free: { args: [FFIType.ptr], returns: FFIType.void },
     fl_engine_backup: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.i32 },
+    fl_engine_compact: { args: [FFIType.ptr], returns: FFIType.i32 },
+    fl_engine_get_stats: { args: [FFIType.ptr], returns: FFIType.ptr },
+    fl_engine_get_audit_log: { args: [FFIType.ptr], returns: FFIType.ptr },
+    fl_engine_snapshot_indices: { args: [FFIType.ptr], returns: FFIType.i32 },
+    fl_engine_list_indexes: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.ptr },
 
     fl_config_new: { args: [], returns: FFIType.ptr },
     fl_config_free: { args: [FFIType.ptr], returns: FFIType.void },
     fl_config_set_durability: { args: [FFIType.ptr, FFIType.i32], returns: FFIType.void },
     fl_config_set_encryption_key: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.void },
+    fl_config_set_encrypted_collections: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.i32 },
     fl_config_set_audit_log: { args: [FFIType.ptr, FFIType.bool, FFIType.cstring], returns: FFIType.void },
     fl_config_set_query_workers: { args: [FFIType.ptr, FFIType.usize], returns: FFIType.void },
     fl_config_set_memory_limits: { args: [FFIType.ptr, FFIType.usize, FFIType.usize], returns: FFIType.void },
     fl_config_set_storage_tuning: { args: [FFIType.ptr, FFIType.usize, FFIType.usize, FFIType.usize], returns: FFIType.void },
+    fl_config_set_blob_threshold: { args: [FFIType.ptr, FFIType.usize], returns: FFIType.void },
+    fl_config_set_compression: { args: [FFIType.ptr, FFIType.bool, FFIType.i32], returns: FFIType.void },
 
     fl_engine_watch: { args: [FFIType.ptr, FFIType.cstring, FFIType.function, FFIType.ptr], returns: FFIType.ptr },
     fl_watch_free: { args: [FFIType.ptr], returns: FFIType.void },
@@ -178,12 +223,22 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     fl_engine_insert: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring, FFIType.ptr], returns: FFIType.i32 },
     fl_engine_get: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.ptr },
     fl_engine_delete: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
+    fl_engine_patch: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring, FFIType.ptr], returns: FFIType.i32 },
+    fl_engine_insert_subdoc: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring, FFIType.cstring, FFIType.cstring, FFIType.ptr], returns: FFIType.i32 },
+    fl_engine_get_by_ref: { args: [FFIType.ptr, FFIType.ptr, FFIType.cstring], returns: FFIType.ptr },
+    fl_engine_create_index: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.u32 },
 
     fl_batch_new: { args: [], returns: FFIType.ptr },
     fl_batch_free: { args: [FFIType.ptr], returns: FFIType.void },
     fl_batch_set: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring, FFIType.ptr], returns: FFIType.i32 },
     fl_batch_delete: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
     fl_batch_commit: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+
+    fl_transaction_begin: { args: [FFIType.ptr], returns: FFIType.ptr },
+    fl_transaction_get: { args: [FFIType.ptr, FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.ptr },
+    fl_transaction_set: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring, FFIType.ptr], returns: FFIType.i32 },
+    fl_transaction_commit: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+    fl_transaction_free: { args: [FFIType.ptr], returns: FFIType.void },
 
     fl_query_new: { args: [FFIType.cstring], returns: FFIType.ptr },
     fl_query_free: { args: [FFIType.ptr], returns: FFIType.void },
@@ -208,17 +263,19 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     fl_query_offset: { args: [FFIType.ptr, FFIType.usize], returns: FFIType.i32 },
     fl_query_select_field: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.i32 },
     fl_query_execute: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.ptr },
+    fl_query_delete: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+    fl_query_patch: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+    fl_query_execute_to_handles: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.ptr },
+    fl_result_set_count: { args: [FFIType.ptr], returns: FFIType.usize },
+    fl_result_set_get_doc: { args: [FFIType.ptr, FFIType.usize], returns: FFIType.ptr },
+    fl_result_set_free: { args: [FFIType.ptr], returns: FFIType.void },
 
     fl_query_aggregate_count: { args: [FFIType.ptr], returns: FFIType.i32 },
     fl_query_aggregate_sum: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.i32 },
     fl_query_aggregate_avg: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.i32 },
     fl_query_execute_aggregation: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.ptr },
-
-    fl_engine_list_collections: { args: [FFIType.ptr], returns: FFIType.ptr },
-    fl_net_syncer_new: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.ptr },
-    fl_net_syncer_start: { args: [FFIType.ptr, FFIType.u16], returns: FFIType.i32 },
-    fl_net_syncer_status: { args: [FFIType.ptr], returns: FFIType.ptr },
-    fl_net_syncer_free: { args: [FFIType.ptr], returns: FFIType.void },
+    fl_query_where_or_str: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
+    fl_query_where_or_int: { args: [FFIType.ptr, FFIType.cstring, FFIType.i64], returns: FFIType.i32 },
 
     // v0.5.9
     // Indexing
@@ -246,6 +303,14 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     fl_query_end_at: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
     fl_query_end_before: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
 
+    fl_doc_insert_reference: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
+
+    fl_cloud_sync_new: { args: [FFIType.ptr, FFIType.i32, FFIType.cstring, FFIType.cstring, FFIType.cstring], returns: FFIType.ptr },
+    fl_cloud_sync_start: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.i32 },
+    fl_cloud_sync_status: { args: [FFIType.ptr], returns: FFIType.ptr },
+    fl_cloud_sync_stop: { args: [FFIType.ptr], returns: FFIType.void },
+    fl_cloud_sync_free: { args: [FFIType.ptr], returns: FFIType.void },
+
     // ================= ERRORS =================
     fl_last_error: { args: [], returns: FFIType.ptr },
     fl_string_free: { args: [FFIType.ptr], returns: FFIType.void }
@@ -262,18 +327,27 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
 
   return {
     engineOpen: (path) => symbols.fl_engine_open(toC(path)),
+    engineIsIndexesReady: (engine) => symbols.fl_engine_is_indexes_ready(engine),
     engineOpenWithConfig: (path, config) => symbols.fl_engine_open_with_config(toC(path), config),
     engineFree: (engine) => symbols.fl_engine_free(engine),
     engineBackup: (e, p) => symbols.fl_engine_backup(e, toC(p)),
+    engineCompact: (e) => symbols.fl_engine_compact(e),
+    engineGetStats: (e) => ptrToStringAndFree(symbols.fl_engine_get_stats(e)),
+    engineGetAuditLog: (e) => ptrToStringAndFree(symbols.fl_engine_get_audit_log(e)),
+    engineSnapshotIndices: (e) => symbols.fl_engine_snapshot_indices(e),
+    engineListIndexes: (e, c) => ptrToStringAndFree(symbols.fl_engine_list_indexes(e, toC(c))),
 
     configNew: () => symbols.fl_config_new(),
     configFree: (c) => symbols.fl_config_free(c),
     configSetDurability: (c, m) => symbols.fl_config_set_durability(c, m),
     configSetEncryptionKey: (c, k) => symbols.fl_config_set_encryption_key(c, toC(k)),
+    configSetEncryptedCollections: (c, json) => symbols.fl_config_set_encrypted_collections(c, toC(json)),
     configSetAuditLog: (c, e, p) => symbols.fl_config_set_audit_log(c, e, toC(p)),
     configSetQueryWorkers: (c, count) => symbols.fl_config_set_query_workers(c, count),
     configSetMemoryLimits: (c, m, mi) => symbols.fl_config_set_memory_limits(c, m, mi),
     configSetStorageTuning: (c, ps, th, gc) => symbols.fl_config_set_storage_tuning(c, ps, th, gc),
+    configSetBlobThreshold: (c, t) => symbols.fl_config_set_blob_threshold(c, t),
+    configSetCompression: (c, e, l) => symbols.fl_config_set_compression(c, e, l),
 
     engineWatch: (engine, collection, callback) => {
       const cb = new JSCallback((c: any, p: any, kind: number) => {
@@ -293,17 +367,28 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     docInsertBin: (doc, key, bytes) => symbols.fl_doc_insert_bin(doc, toC(key), bytes, bytes.byteLength),
     docInsertTimestamp: (doc, key, micros) => symbols.fl_doc_insert_timestamp(doc, toC(key), micros),
     docInsertServerTimestamp: (doc, key) => symbols.fl_doc_insert_server_timestamp(doc, toC(key)),
+    docInsertReference: (doc, key, tc, tid) => symbols.fl_doc_insert_reference(doc, toC(key), toC(tc), toC(tid)),
     docToJson: (doc) => ptrToStringAndFree(symbols.fl_doc_to_json(doc)),
 
     engineInsert: (engine, collection, docId, doc) => symbols.fl_engine_insert(engine, toC(collection), toC(docId), doc),
     engineGet: (engine, collection, docId) => symbols.fl_engine_get(engine, toC(collection), toC(docId)),
     engineDelete: (engine, collection, docId) => symbols.fl_engine_delete(engine, toC(collection), toC(docId)),
+    enginePatch: (engine, collection, docId, updates) => symbols.fl_engine_patch(engine, toC(collection), toC(docId), updates),
+    engineInsertSubDoc: (engine, col, id, subCol, subId, doc) => symbols.fl_engine_insert_subdoc(engine, toC(col), toC(id), toC(subCol), toC(subId), doc),
+    engineGetByRef: (engine, doc, fieldKey) => symbols.fl_engine_get_by_ref(engine, doc, toC(fieldKey)),
+    engineCreateIndex: (engine, collection, fieldsJson) => symbols.fl_engine_create_index(engine, toC(collection), toC(fieldsJson)),
 
     batchNew: () => symbols.fl_batch_new(),
     batchFree: (batch) => symbols.fl_batch_free(batch),
     batchSet: (batch, collection, docId, doc) => symbols.fl_batch_set(batch, toC(collection), toC(docId), doc),
     batchDelete: (batch, collection, docId) => symbols.fl_batch_delete(batch, toC(collection), toC(docId)),
     batchCommit: (engine, batch) => symbols.fl_batch_commit(engine, batch),
+
+    transactionBegin: (engine) => symbols.fl_transaction_begin(engine),
+    transactionGet: (engine, tx, collection, docId) => symbols.fl_transaction_get(engine, tx, toC(collection), toC(docId)),
+    transactionSet: (tx, collection, docId, doc) => symbols.fl_transaction_set(tx, toC(collection), toC(docId), doc),
+    transactionCommit: (engine, tx) => symbols.fl_transaction_commit(engine, tx),
+    transactionFree: (tx) => symbols.fl_transaction_free(tx),
 
     queryNew: (collection) => symbols.fl_query_new(toC(collection)),
     queryFree: (query) => symbols.fl_query_free(query),
@@ -323,11 +408,19 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     queryWhereMatch: (query, field, value) => symbols.fl_query_where_match(query, toC(field), toC(value)),
     queryWhereContains: (query, field, value) => symbols.fl_query_where_contains(query, toC(field), toC(value)),
     queryWhereStartsWith: (query, field, value) => symbols.fl_query_where_starts_with(query, toC(field), toC(value)),
+    queryWhereOrStr: (query, field, value) => symbols.fl_query_where_or_str(query, toC(field), toC(value)),
+    queryWhereOrInt: (query, field, value) => symbols.fl_query_where_or_int(query, toC(field), BigInt(value)),
     queryOrderBy: (query, field, asc) => symbols.fl_query_order_by(query, toC(field), asc),
     queryLimit: (query, limit) => symbols.fl_query_limit(query, limit),
     queryOffset: (query, offset) => symbols.fl_query_offset(query, offset),
     querySelectField: (query, field) => symbols.fl_query_select_field(query, toC(field)),
     queryExecute: (engine, query) => ptrToStringAndFree(symbols.fl_query_execute(engine, query)),
+    queryDelete: (engine, query) => symbols.fl_query_delete(engine, query),
+    queryPatch: (engine, query, patchDoc) => symbols.fl_query_patch(engine, query, patchDoc),
+    queryExecuteToHandles: (engine, query) => symbols.fl_query_execute_to_handles(engine, query),
+    resultSetCount: (results) => symbols.fl_result_set_count(results),
+    resultSetGetDoc: (results, index) => symbols.fl_result_set_get_doc(results, index),
+    resultSetFree: (results) => symbols.fl_result_set_free(results),
 
     queryAggregateCount: (q) => symbols.fl_query_aggregate_count(q),
     queryAggregateSum: (q, f) => symbols.fl_query_aggregate_sum(q, toC(f)),
@@ -338,6 +431,12 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     netSyncerStart: (syncer, port) => symbols.fl_net_syncer_start(syncer, port),
     netSyncerStatus: (syncer) => ptrToStringAndFree(symbols.fl_net_syncer_status(syncer)),
     netSyncerFree: (syncer) => symbols.fl_net_syncer_free(syncer),
+
+    cloudSyncNew: (engine, mode, clientId, roomKey, authToken) => symbols.fl_cloud_sync_new(engine, mode, toC(clientId), toC(roomKey), toC(authToken)),
+    cloudSyncStart: (cs, address) => symbols.fl_cloud_sync_start(cs, toC(address)),
+    cloudSyncStatus: (cs) => ptrToStringAndFree(symbols.fl_cloud_sync_status(cs)),
+    cloudSyncStop: (cs) => symbols.fl_cloud_sync_stop(cs),
+    cloudSyncFree: (cs) => symbols.fl_cloud_sync_free(cs),
 
     // ================= v0.5.9 =================
 
@@ -383,18 +482,27 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
 
   const fn = {
     fl_engine_open: lib.func('FL_Engine* fl_engine_open(const char* path)'),
+    fl_engine_is_indexes_ready: lib.func('bool fl_engine_is_indexes_ready(FL_Engine* engine)'),
     fl_engine_open_with_config: lib.func('FL_Engine* fl_engine_open_with_config(const char* path, FL_Config* config)'),
     fl_engine_free: lib.func('void fl_engine_free(FL_Engine* engine)'),
     fl_engine_backup: lib.func('int fl_engine_backup(FL_Engine* engine, const char* path)'),
+    fl_engine_compact: lib.func('int fl_engine_compact(FL_Engine* engine)'),
+    fl_engine_get_stats: lib.func('char* fl_engine_get_stats(FL_Engine* engine)'),
+    fl_engine_get_audit_log: lib.func('char* fl_engine_get_audit_log(FL_Engine* engine)'),
+    fl_engine_snapshot_indices: lib.func('int fl_engine_snapshot_indices(FL_Engine* engine)'),
+    fl_engine_list_indexes: lib.func('char* fl_engine_list_indexes(FL_Engine* engine, const char* collection)'),
 
     fl_config_new: lib.func('FL_Config* fl_config_new()'),
     fl_config_free: lib.func('void fl_config_free(FL_Config* config)'),
     fl_config_set_durability: lib.func('void fl_config_set_durability(FL_Config* config, int32_t mode)'),
     fl_config_set_encryption_key: lib.func('void fl_config_set_encryption_key(FL_Config* config, const char* key)'),
+    fl_config_set_encrypted_collections: lib.func('int fl_config_set_encrypted_collections(FL_Config* config, const char* collections_json)'),
     fl_config_set_audit_log: lib.func('void fl_config_set_audit_log(FL_Config* config, bool enabled, const char* path)'),
     fl_config_set_query_workers: lib.func('void fl_config_set_query_workers(FL_Config* config, size_t count)'),
     fl_config_set_memory_limits: lib.func('void fl_config_set_memory_limits(FL_Config* config, size_t mmap_size, size_t max_inlined_bytes)'),
     fl_config_set_storage_tuning: lib.func('void fl_config_set_storage_tuning(FL_Config* config, size_t page_size, size_t compaction_threshold, size_t group_commit_max_ops)'),
+    fl_config_set_blob_threshold: lib.func('void fl_config_set_blob_threshold(FL_Config* config, size_t threshold_bytes)'),
+    fl_config_set_compression: lib.func('void fl_config_set_compression(FL_Config* config, bool enabled, int32_t level)'),
 
     fl_engine_watch: lib.func('FL_Watch* fl_engine_watch(FL_Engine* engine, const char* collection, OnSnapshotCB* callback, void* user_data)'),
     fl_watch_free: lib.func('void fl_watch_free(FL_Watch* watch)'),
@@ -414,12 +522,22 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_engine_insert: lib.func('int fl_engine_insert(FL_Engine* engine, const char* collection, const char* doc_id, const FL_Doc* doc)'),
     fl_engine_get: lib.func('FL_Doc* fl_engine_get(FL_Engine* engine, const char* collection, const char* doc_id)'),
     fl_engine_delete: lib.func('int fl_engine_delete(FL_Engine* engine, const char* collection, const char* doc_id)'),
+    fl_engine_patch: lib.func('int fl_engine_patch(FL_Engine* engine, const char* collection, const char* doc_id, const FL_Doc* updates)'),
+    fl_engine_insert_subdoc: lib.func('int fl_engine_insert_subdoc(FL_Engine* engine, const char* col, const char* id, const char* sub_col, const char* sub_id, const FL_Doc* doc)'),
+    fl_engine_get_by_ref: lib.func('FL_Doc* fl_engine_get_by_ref(FL_Engine* engine, const FL_Doc* doc, const char* field_key)'),
+    fl_engine_create_index: lib.func('uint32_t fl_engine_create_index(FL_Engine* engine, const char* collection, const char* fields_json)'),
 
     fl_batch_new: lib.func('FL_Batch* fl_batch_new()'),
     fl_batch_free: lib.func('void fl_batch_free(FL_Batch* batch)'),
     fl_batch_set: lib.func('int fl_batch_set(FL_Batch* batch, const char* collection, const char* doc_id, const FL_Doc* doc)'),
     fl_batch_delete: lib.func('int fl_batch_delete(FL_Batch* batch, const char* collection, const char* doc_id)'),
     fl_batch_commit: lib.func('int fl_batch_commit(FL_Engine* engine, FL_Batch* batch)'),
+
+    fl_transaction_begin: lib.func('FL_Transaction* fl_transaction_begin(FL_Engine* engine)'),
+    fl_transaction_get: lib.func('FL_Doc* fl_transaction_get(FL_Engine* engine, FL_Transaction* tx, const char* collection, const char* doc_id)'),
+    fl_transaction_set: lib.func('int fl_transaction_set(FL_Transaction* tx, const char* collection, const char* doc_id, const FL_Doc* doc)'),
+    fl_transaction_commit: lib.func('int fl_transaction_commit(FL_Engine* engine, FL_Transaction* tx)'),
+    fl_transaction_free: lib.func('void fl_transaction_free(FL_Transaction* tx)'),
 
     fl_query_new: lib.func('FL_Query* fl_query_new(const char* collection)'),
     fl_query_free: lib.func('void fl_query_free(FL_Query* query)'),
@@ -444,11 +562,19 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_query_offset: lib.func('int fl_query_offset(FL_Query* query, size_t offset)'),
     fl_query_select_field: lib.func('int fl_query_select_field(FL_Query* query, const char* field)'),
     fl_query_execute: lib.func('char* fl_query_execute(FL_Engine* engine, const FL_Query* query)'),
+    fl_query_delete: lib.func('int fl_query_delete(FL_Engine* engine, FL_Query* query)'),
+    fl_query_patch: lib.func('int fl_query_patch(FL_Engine* engine, FL_Query* query, const FL_Doc* patch_doc)'),
+    fl_query_execute_to_handles: lib.func('FL_ResultSet* fl_query_execute_to_handles(FL_Engine* engine, const FL_Query* query)'),
+    fl_result_set_count: lib.func('size_t fl_result_set_count(FL_ResultSet* results)'),
+    fl_result_set_get_doc: lib.func('FL_Doc* fl_result_set_get_doc(FL_ResultSet* results, size_t index)'),
+    fl_result_set_free: lib.func('void fl_result_set_free(FL_ResultSet* results)'),
 
     fl_query_aggregate_count: lib.func('int fl_query_aggregate_count(FL_Query* query)'),
     fl_query_aggregate_sum: lib.func('int fl_query_aggregate_sum(FL_Query* query, const char* field)'),
     fl_query_aggregate_avg: lib.func('int fl_query_aggregate_avg(FL_Query* query, const char* field)'),
     fl_query_execute_aggregation: lib.func('char* fl_query_execute_aggregation(FL_Engine* engine, const FL_Query* query)'),
+    fl_query_where_or_str: lib.func('int fl_query_where_or_str(FL_Query* query, const char* field, const char* value)'),
+    fl_query_where_or_int: lib.func('int fl_query_where_or_int(FL_Query* query, const char* field, int64_t value)'),
 
     fl_engine_list_collections: lib.func('char* fl_engine_list_collections(FL_Engine* engine)'),
     fl_net_syncer_new: lib.func('FL_NetSyncer* fl_net_syncer_new(FL_Engine* engine, const char* name, const char* room_key)'),
@@ -482,6 +608,14 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_query_end_at: lib.func('int fl_query_end_at(FL_Query* query, const FL_Doc* anchor)'),
     fl_query_end_before: lib.func('int fl_query_end_before(FL_Query* query, const FL_Doc* anchor)'),
 
+    fl_doc_insert_reference: lib.func('int fl_doc_insert_reference(FL_Doc* doc, const char* key, const char* target_collection, const char* target_id)'),
+
+    fl_cloud_sync_new: lib.func('FL_CloudSync* fl_cloud_sync_new(FL_Engine* engine, int32_t mode, const char* client_id, const char* room_key, const char* auth_token)'),
+    fl_cloud_sync_start: lib.func('int fl_cloud_sync_start(FL_CloudSync* cloud_sync, const char* address)'),
+    fl_cloud_sync_status: lib.func('char* fl_cloud_sync_status(FL_CloudSync* cloud_sync)'),
+    fl_cloud_sync_stop: lib.func('void fl_cloud_sync_stop(FL_CloudSync* cloud_sync)'),
+    fl_cloud_sync_free: lib.func('void fl_cloud_sync_free(FL_CloudSync* cloud_sync)'),
+
     fl_last_error: lib.func('const char* fl_last_error()'),
     fl_string_free: lib.func('void fl_string_free(char* value)')
   };
@@ -495,18 +629,27 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
 
   return {
     engineOpen: (path) => fn.fl_engine_open(path),
+    engineIsIndexesReady: (engine) => fn.fl_engine_is_indexes_ready(engine),
     engineOpenWithConfig: (path, config) => fn.fl_engine_open_with_config(path, config),
     engineFree: (engine) => fn.fl_engine_free(engine),
     engineBackup: (e, p) => fn.fl_engine_backup(e, p),
+    engineCompact: (e) => fn.fl_engine_compact(e),
+    engineGetStats: (e) => ptrToStringAndFree(fn.fl_engine_get_stats(e)),
+    engineGetAuditLog: (e) => ptrToStringAndFree(fn.fl_engine_get_audit_log(e)),
+    engineSnapshotIndices: (e) => fn.fl_engine_snapshot_indices(e),
+    engineListIndexes: (e, c) => ptrToStringAndFree(fn.fl_engine_list_indexes(e, c ?? null)),
 
     configNew: () => fn.fl_config_new(),
     configFree: (c) => fn.fl_config_free(c),
     configSetDurability: (c, m) => fn.fl_config_set_durability(c, m),
     configSetEncryptionKey: (c, k) => fn.fl_config_set_encryption_key(c, k),
+    configSetEncryptedCollections: (c, json) => fn.fl_config_set_encrypted_collections(c, json),
     configSetAuditLog: (c, e, p) => fn.fl_config_set_audit_log(c, e, p),
     configSetQueryWorkers: (c, count) => fn.fl_config_set_query_workers(c, count),
     configSetMemoryLimits: (c, m, mi) => fn.fl_config_set_memory_limits(c, m, mi),
     configSetStorageTuning: (c, ps, th, gc) => fn.fl_config_set_storage_tuning(c, ps, th, gc),
+    configSetBlobThreshold: (c, t) => fn.fl_config_set_blob_threshold(c, t),
+    configSetCompression: (c, e, l) => fn.fl_config_set_compression(c, e, l),
 
     engineWatch: (engine, collection, callback) => {
       const wrapper = (c: string, p: string, kind: number, _user: any) => callback(c, p, kind);
@@ -524,17 +667,28 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     docInsertBin: (doc, key, bytes) => fn.fl_doc_insert_bin(doc, key, Buffer.from(bytes), bytes.byteLength),
     docInsertTimestamp: (doc, key, micros) => fn.fl_doc_insert_timestamp(doc, key, micros),
     docInsertServerTimestamp: (doc, key) => fn.fl_doc_insert_server_timestamp(doc, key),
+    docInsertReference: (doc, key, tc, tid) => fn.fl_doc_insert_reference(doc, key, tc, tid),
     docToJson: (doc) => ptrToStringAndFree(fn.fl_doc_to_json(doc)),
 
     engineInsert: (engine, collection, docId, doc) => fn.fl_engine_insert(engine, collection, docId, doc),
     engineGet: (engine, collection, docId) => fn.fl_engine_get(engine, collection, docId),
     engineDelete: (engine, collection, docId) => fn.fl_engine_delete(engine, collection, docId),
+    enginePatch: (engine, collection, docId, updates) => fn.fl_engine_patch(engine, collection, docId, updates),
+    engineInsertSubDoc: (engine, col, id, subCol, subId, doc) => fn.fl_engine_insert_subdoc(engine, col, id, subCol, subId, doc),
+    engineGetByRef: (engine, doc, fieldKey) => fn.fl_engine_get_by_ref(engine, doc, fieldKey),
+    engineCreateIndex: (engine, collection, fieldsJson) => fn.fl_engine_create_index(engine, collection, fieldsJson),
 
     batchNew: () => fn.fl_batch_new(),
     batchFree: (batch) => fn.fl_batch_free(batch),
     batchSet: (batch, collection, docId, doc) => fn.fl_batch_set(batch, collection, docId, doc),
     batchDelete: (batch, collection, docId) => fn.fl_batch_delete(batch, collection, docId),
     batchCommit: (engine, batch) => fn.fl_batch_commit(engine, batch),
+
+    transactionBegin: (engine) => fn.fl_transaction_begin(engine),
+    transactionGet: (engine, tx, collection, docId) => fn.fl_transaction_get(engine, tx, collection, docId),
+    transactionSet: (tx, collection, docId, doc) => fn.fl_transaction_set(tx, collection, docId, doc),
+    transactionCommit: (engine, tx) => fn.fl_transaction_commit(engine, tx),
+    transactionFree: (tx) => fn.fl_transaction_free(tx),
 
     queryNew: (collection) => fn.fl_query_new(collection),
     queryFree: (query) => fn.fl_query_free(query),
@@ -554,11 +708,19 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     queryWhereMatch: (query, field, value) => fn.fl_query_where_match(query, field, value),
     queryWhereContains: (query, field, value) => fn.fl_query_where_contains(query, field, value),
     queryWhereStartsWith: (query, field, value) => fn.fl_query_where_starts_with(query, field, value),
+    queryWhereOrStr: (query, field, value) => fn.fl_query_where_or_str(query, field, value),
+    queryWhereOrInt: (query, field, value) => fn.fl_query_where_or_int(query, field, value),
     queryOrderBy: (query, field, asc) => fn.fl_query_order_by(query, field, asc),
     queryLimit: (query, limit) => fn.fl_query_limit(query, limit),
     queryOffset: (query, offset) => fn.fl_query_offset(query, offset),
     querySelectField: (query, field) => fn.fl_query_select_field(query, field),
     queryExecute: (engine, query) => ptrToStringAndFree(fn.fl_query_execute(engine, query)),
+    queryDelete: (engine, query) => fn.fl_query_delete(engine, query),
+    queryPatch: (engine, query, patchDoc) => fn.fl_query_patch(engine, query, patchDoc),
+    queryExecuteToHandles: (engine, query) => fn.fl_query_execute_to_handles(engine, query),
+    resultSetCount: (results) => fn.fl_result_set_count(results),
+    resultSetGetDoc: (results, index) => fn.fl_result_set_get_doc(results, index),
+    resultSetFree: (results) => fn.fl_result_set_free(results),
 
     queryAggregateCount: (q) => fn.fl_query_aggregate_count(q),
     queryAggregateSum: (q, f) => fn.fl_query_aggregate_sum(q, f),
@@ -569,6 +731,12 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     netSyncerStart: (syncer, port) => fn.fl_net_syncer_start(syncer, port),
     netSyncerStatus: (syncer) => ptrToStringAndFree(fn.fl_net_syncer_status(syncer)),
     netSyncerFree: (syncer) => fn.fl_net_syncer_free(syncer),
+
+    cloudSyncNew: (engine, mode, clientId, roomKey, authToken) => fn.fl_cloud_sync_new(engine, mode, clientId, roomKey, authToken),
+    cloudSyncStart: (cs, address) => fn.fl_cloud_sync_start(cs, address),
+    cloudSyncStatus: (cs) => ptrToStringAndFree(fn.fl_cloud_sync_status(cs)),
+    cloudSyncStop: (cs) => fn.fl_cloud_sync_stop(cs),
+    cloudSyncFree: (cs) => fn.fl_cloud_sync_free(cs),
 
     // ================= v0.5.9 =================
 

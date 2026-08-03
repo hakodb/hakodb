@@ -17,6 +17,8 @@ type
   PFL_NetSyncer = Pointer;
   PFL_Array = Pointer;       // Added in v0.5.9
   PFL_Transaction = Pointer; // Added in v0.5.9
+  PFL_ResultSet = Pointer;   // Added in v0.6.x
+  PFL_CloudSync = Pointer;   // Added in v0.6.65
 
   { Callback for real-time snapshots }
   TFL_OnSnapshotCallback = procedure(collection: PChar; path: PChar; kind: cint32; user_data: Pointer); cdecl;
@@ -25,9 +27,9 @@ const
   FL_CHANGE_PUT = 1;
   FL_CHANGE_DELETE = 2;
 
-{$ifdef Windows}
+{$if defined(Windows)}
 const FIRELITE_LIB = 'firelite.dll';
-{$elseif Darwin}
+{$elseif defined(Darwin)}
 const FIRELITE_LIB = 'libfirelite.dylib';
 {$else}
 const FIRELITE_LIB = 'libfirelite.so';
@@ -35,10 +37,13 @@ const FIRELITE_LIB = 'libfirelite.so';
 
 { Engine Management }
 function fl_engine_open(path: PChar): PFL_Engine; cdecl; external FIRELITE_LIB;
+function fl_engine_is_indexes_ready(engine: PFL_Engine): cbool; cdecl; external FIRELITE_LIB;
 function fl_engine_open_with_config(path: PChar; config: PFL_Config): PFL_Engine; cdecl; external FIRELITE_LIB;
 procedure fl_engine_free(engine: PFL_Engine); cdecl; external FIRELITE_LIB;
 function fl_engine_backup(engine: PFL_Engine; path: PChar): cint32; cdecl; external FIRELITE_LIB;
+function fl_engine_compact(engine: PFL_Engine): cint32; cdecl; external FIRELITE_LIB;
 function fl_engine_list_collections(engine: PFL_Engine): PChar; cdecl; external FIRELITE_LIB;
+function fl_engine_list_indexes(engine: PFL_Engine; collection: PChar): PChar; cdecl; external FIRELITE_LIB;
 function fl_engine_get_stats(engine: PFL_Engine): PChar; cdecl; external FIRELITE_LIB;
 function fl_engine_get_audit_log(engine: PFL_Engine): PChar; cdecl; external FIRELITE_LIB;
 function fl_engine_snapshot_indices(engine: PFL_Engine): cint32; cdecl; external FIRELITE_LIB;
@@ -48,10 +53,12 @@ function fl_config_new: PFL_Config; cdecl; external FIRELITE_LIB;
 procedure fl_config_free(config: PFL_Config); cdecl; external FIRELITE_LIB;
 procedure fl_config_set_durability(config: PFL_Config; mode: cint32); cdecl; external FIRELITE_LIB;
 procedure fl_config_set_encryption_key(config: PFL_Config; key: PChar); cdecl; external FIRELITE_LIB;
+function fl_config_set_encrypted_collections(config: PFL_Config; collections_json: PChar): cint32; cdecl; external FIRELITE_LIB;
 procedure fl_config_set_audit_log(config: PFL_Config; enabled: cbool; path: PChar); cdecl; external FIRELITE_LIB;
 procedure fl_config_set_query_workers(config: PFL_Config; count: SizeUInt); cdecl; external FIRELITE_LIB;
 procedure fl_config_set_memory_limits(config: PFL_Config; mmap_size, max_inlined_bytes: SizeUInt); cdecl; external FIRELITE_LIB;
 procedure fl_config_set_storage_tuning(config: PFL_Config; page_size, compaction_threshold, group_commit_max_ops: SizeUInt); cdecl; external FIRELITE_LIB;
+procedure fl_config_set_blob_threshold(config: PFL_Config; threshold_bytes: SizeUInt); cdecl; external FIRELITE_LIB;
 procedure fl_config_set_compression(config: PFL_Config; enabled: cbool; level: cint32); cdecl; external FIRELITE_LIB;
 
 { Real-time Snapshots }
@@ -87,6 +94,7 @@ function fl_engine_get(engine: PFL_Engine; col, doc_id: PChar): PFL_Doc; cdecl; 
 function fl_engine_delete(engine: PFL_Engine; col, doc_id: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_engine_patch(engine: PFL_Engine; col, doc_id: PChar; updates: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;
 function fl_engine_get_by_ref(engine: PFL_Engine; doc: PFL_Doc; field_key: PChar): PFL_Doc; cdecl; external FIRELITE_LIB;
+function fl_engine_insert_subdoc(engine: PFL_Engine; col, id, sub_col, sub_id: PChar; doc: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;
 
 { Atomic Batches }
 function fl_batch_new: PFL_Batch; cdecl; external FIRELITE_LIB;
@@ -129,6 +137,12 @@ function fl_query_limit(query: PFL_Query; limit: SizeUInt): cint32; cdecl; exter
 function fl_query_offset(query: PFL_Query; offset: SizeUInt): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_select_field(query: PFL_Query; field: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_execute(engine: PFL_Engine; query: PFL_Query): PChar; cdecl; external FIRELITE_LIB;
+function fl_query_delete(engine: PFL_Engine; query: PFL_Query): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_patch(engine: PFL_Engine; query: PFL_Query; patch_doc: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_execute_to_handles(engine: PFL_Engine; query: PFL_Query): PFL_ResultSet; cdecl; external FIRELITE_LIB;
+function fl_result_set_count(results: PFL_ResultSet): SizeUInt; cdecl; external FIRELITE_LIB;
+function fl_result_set_get_doc(results: PFL_ResultSet; index: SizeUInt): PFL_Doc; cdecl; external FIRELITE_LIB;
+procedure fl_result_set_free(results: PFL_ResultSet); cdecl; external FIRELITE_LIB;
 function fl_query_where_match(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_where_contains(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_where_starts_with(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
@@ -144,7 +158,7 @@ function fl_query_aggregate_avg(query: PFL_Query; field: PChar): cint32; cdecl; 
 function fl_query_execute_aggregation(engine: PFL_Engine; query: PFL_Query): PChar; cdecl; external FIRELITE_LIB;
 
 { Manual Indexing }
-function fl_engine_create_index(engine: PFL_Engine; col, json_def: PChar): cint32; cdecl; external FIRELITE_LIB;
+function fl_engine_create_index(engine: PFL_Engine; col, json_def: PChar): cuint32; cdecl; external FIRELITE_LIB;
 function fl_engine_create_simple_index(engine: PFL_Engine; col, field: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_engine_create_fts_index(engine: PFL_Engine; col, field: PChar): cint32; cdecl; external FIRELITE_LIB;
 
@@ -153,6 +167,13 @@ function fl_net_syncer_new(engine: PFL_Engine; name, room_key: PChar): PFL_NetSy
 function fl_net_syncer_start(syncer: PFL_NetSyncer; port: Word): cint32; cdecl; external FIRELITE_LIB;
 function fl_net_syncer_status(syncer: PFL_NetSyncer): PChar; cdecl; external FIRELITE_LIB;
 procedure fl_net_syncer_free(syncer: PFL_NetSyncer); cdecl; external FIRELITE_LIB;
+
+{ Cloud Sync }
+function fl_cloud_sync_new(engine: PFL_Engine; mode: cint32; client_id, room_key, auth_token: PChar): PFL_CloudSync; cdecl; external FIRELITE_LIB;
+function fl_cloud_sync_start(cloud_sync: PFL_CloudSync; address: PChar): cint32; cdecl; external FIRELITE_LIB;
+function fl_cloud_sync_status(cloud_sync: PFL_CloudSync): PChar; cdecl; external FIRELITE_LIB;
+procedure fl_cloud_sync_stop(cloud_sync: PFL_CloudSync); cdecl; external FIRELITE_LIB;
+procedure fl_cloud_sync_free(cloud_sync: PFL_CloudSync); cdecl; external FIRELITE_LIB;
 
 { Errors and Helpers }
 function fl_last_error: PChar; cdecl; external FIRELITE_LIB;

@@ -13,6 +13,8 @@ type
 
   TFLDurabilityMode = (dmAlways, dmInterval, dmManual, dmOnCommit);
 
+  TFLCloudSyncMode = (csmServer, csmClient);
+
   TOnSnapshotCallback = procedure(const JsonSnapshot: string) of object;
 
   IFLSubscription = interface
@@ -28,6 +30,7 @@ type
   TFLBatch = class;
   TFLTransaction = class;
   TFLDocumentRef = class;
+  TFLCloudSync = class;
 
   { TFLArray: Builder for List/Array types }
   TFLArray = class
@@ -53,9 +56,12 @@ type
     destructor Destroy; override;
     function SetDurability(Mode: TFLDurabilityMode): TFLConfig;
     function SetEncryptionKey(const Key: string): TFLConfig;
+    function SetEncryptedCollections(const Collections: array of string): TFLConfig;
     function SetAuditLog(Enabled: Boolean; const LogPath: string = ''): TFLConfig;
     function SetQueryWorkers(Count: NativeUInt): TFLConfig;
     function SetMemoryLimits(MMapSize, MaxInlinedBytes: NativeUInt): TFLConfig;
+    function SetStorageTuning(PageSize, CompactionThreshold, GroupCommitMaxOps: NativeUInt): TFLConfig;
+    function SetBlobThreshold(ThresholdBytes: NativeUInt): TFLConfig;
     function SetCompression(Enabled: Boolean; Level: Integer = 3): TFLConfig;
     property Handle: PFL_Config read FHandle;
   end;
@@ -76,6 +82,8 @@ type
     function InsertBool(const Key: string; Value: Boolean): TFLDocument;
     function InsertNull(const Key: string): TFLDocument;
     function InsertBin(const Key: string; Data: PByte; Len: NativeUInt): TFLDocument;
+    function InsertTimestamp(const Key: string; Micros: Int64): TFLDocument;
+    function InsertServerTimestamp(const Key: string): TFLDocument;
     function InsertDoc(const Key: string; ADoc: TFLDocument): TFLDocument;
     function InsertArray(const Key: string; AArray: TFLArray): TFLDocument;
     function InsertRef(const Key, TargetCol, TargetID: string): TFLDocument;
@@ -94,7 +102,7 @@ type
   public
     constructor Create(ADBHandle: PFL_Engine);
     destructor Destroy; override;
-    function Set(const Col, ID: string; Doc: TFLDocument): TFLBatch;
+    function SetDoc(const Col, ID: string; Doc: TFLDocument): TFLBatch;
     function Delete(const Col, ID: string): TFLBatch;
     procedure Commit;
   end;
@@ -108,7 +116,7 @@ type
     constructor Create(ADBHandle: PFL_Engine);
     destructor Destroy; override;
     function Get(const Col, ID: string): TFLDocument;
-    procedure Set(const Col, ID: string; Doc: TFLDocument);
+    procedure SetDoc(const Col, ID: string; Doc: TFLDocument);
     procedure Commit;
   end;
 
@@ -127,9 +135,10 @@ type
     FOrderByAsc: Boolean;
     FLimit, FOffset: NativeUInt;
     FHasLimit, FHasOffset: Boolean;
-    FStartAfter: PFL_Doc;
     FSelectFields: TStringList;
     FStartAt, FStartAfter, FEndAt, FEndBefore: PFL_Doc;
+    FWhereOrStr: array of record Field, Value: string; end;
+    FWhereOrInt: array of record Field: string; Value: Int64; end;
 
     function BuildNativeQuery: PFL_Query;
   public
@@ -160,18 +169,23 @@ type
     function OrderBy(const Field: string; Ascending: Boolean = True): TFLQuery;
     function Limit(ACount: NativeUInt): TFLQuery;
     function Offset(ACount: NativeUInt): TFLQuery;
-    function [Select](const Fields: array of string): TFLQuery;
+    function Select(const Fields: array of string): TFLQuery;
 
     function StartAt(ASnapshot: TFLDocument): TFLQuery;
     function StartAfter(ASnapshot: TFLDocument): TFLQuery;
     function EndAt(ASnapshot: TFLDocument): TFLQuery;
     function EndBefore(ASnapshot: TFLDocument): TFLQuery;
 
+    function WhereOrStr(const Field, Value: string): TFLQuery;
+    function WhereOrInt(const Field: string; Value: Int64): TFLQuery;
+
     function Count: Int64;
     function Sum(const Field: string): Double;
     function Avg(const Field: string): Double;
 
     function GetJSON: string;
+    function Delete: Int64;
+    function Patch(Doc: TFLDocument): Int64;
     function OnSnapshot(const Callback: TOnSnapshotCallback; QueueToMainThread: Boolean = True): IFLSubscription;
   end;
 
@@ -181,7 +195,7 @@ type
     FCollection, FDocID: string;
   public
     constructor Create(ADB: TFireLite; const ACollection, ADocID: string);
-    procedure [Set](const Doc: TFLDocument);
+    procedure SetDoc(const Doc: TFLDocument);
     function Get: TFLDocument;
     procedure Delete;
   end;
@@ -203,6 +217,8 @@ type
 
     procedure CreateIndex(const Field: string);
     procedure CreateFTSIndex(const Field: string);
+    procedure CreateCompositeIndex(const Fields: array of string);
+    function ListIndexes: string;
   end;
 
   TFLNetSyncer = class
@@ -215,6 +231,17 @@ type
     function StatusJSON: string;
   end;
 
+  TFLCloudSync = class
+  private
+    FHandle: PFL_CloudSync;
+  public
+    constructor Create(ADBHandle: PFL_Engine; Mode: TFLCloudSyncMode; const ClientID, RoomKey, AuthToken: string);
+    destructor Destroy; override;
+    procedure Start(const Address: string);
+    function StatusJSON: string;
+    procedure Stop;
+  end;
+
   TFireLite = class
   private
     FHandle: PFL_Engine;
@@ -224,10 +251,20 @@ type
     destructor Destroy; override;
     function Collection(const Name: string): TFLCollection;
     function ListCollections: TStringList;
+    function ListIndexes(const ACollection: string): string;
     function GetStats: string;
+    function GetAuditLog: string;
+    function Backup(const Path: string): Integer;
+    procedure Compact;
+    function IsIndexesReady: Boolean;
+    procedure SnapshotIndices;
+    function InsertSubDoc(const Col, ID, SubCol, SubID: string; Doc: TFLDocument): Integer;
+    function GetByRef(Doc: TFLDocument; const FieldKey: string): TFLDocument;
+    procedure CreateCompositeIndex(const ACollection: string; const Fields: array of string);
     function StartBatch: TFLBatch;
     function StartTransaction: TFLTransaction;
     function CreateNetSyncer(const Name, RoomKey: string): TFLNetSyncer;
+    function CreateCloudSyncer(Mode: TFLCloudSyncMode; const ClientID, RoomKey, AuthToken: string): TFLCloudSync;
     property Handle: PFL_Engine read FHandle;
   end;
 
@@ -318,6 +355,33 @@ begin
   Result := Self;
 end;
 
+function TFLConfig.SetEncryptedCollections(const Collections: array of string): TFLConfig;
+var
+  I: Integer;
+  S: string;
+begin
+  S := '[';
+  for I := Low(Collections) to High(Collections) do begin
+    if I > Low(Collections) then S := S + ',';
+    S := S + '"' + Collections[I] + '"';
+  end;
+  S := S + ']';
+  CheckStatus(fl_config_set_encrypted_collections(FHandle, PChar(S)), 'SetEncryptedCollections');
+  Result := Self;
+end;
+
+function TFLConfig.SetStorageTuning(PageSize, CompactionThreshold, GroupCommitMaxOps: NativeUInt): TFLConfig;
+begin
+  fl_config_set_storage_tuning(FHandle, PageSize, CompactionThreshold, GroupCommitMaxOps);
+  Result := Self;
+end;
+
+function TFLConfig.SetBlobThreshold(ThresholdBytes: NativeUInt): TFLConfig;
+begin
+  fl_config_set_blob_threshold(FHandle, ThresholdBytes);
+  Result := Self;
+end;
+
 function TFLConfig.SetCompression(Enabled: Boolean; Level: Integer): TFLConfig;
 begin
   fl_config_set_compression(FHandle, Enabled, Level);
@@ -352,6 +416,12 @@ begin fl_doc_insert_null(FHandle, PChar(Key)); Result := Self; end;
 
 function TFLDocument.InsertBin(const Key: string; Data: PByte; Len: NativeUInt): TFLDocument;
 begin fl_doc_insert_bin(FHandle, PChar(Key), Data, Len); Result := Self; end;
+
+function TFLDocument.InsertTimestamp(const Key: string; Micros: Int64): TFLDocument;
+begin fl_doc_insert_timestamp(FHandle, PChar(Key), Micros); Result := Self; end;
+
+function TFLDocument.InsertServerTimestamp(const Key: string): TFLDocument;
+begin fl_doc_insert_server_timestamp(FHandle, PChar(Key)); Result := Self; end;
 
 function TFLDocument.InsertDoc(const Key: string; ADoc: TFLDocument): TFLDocument;
 begin fl_doc_insert_doc(FHandle, PChar(Key), ADoc.Handle); Result := Self; end;
@@ -409,7 +479,7 @@ begin inherited Create; FDBHandle := ADBHandle; FHandle := fl_batch_new; end;
 destructor TFLBatch.Destroy;
 begin if (FHandle <> nil) and not FCommitted then fl_batch_free(FHandle); inherited; end;
 
-function TFLBatch.Set(const Col, ID: string; Doc: TFLDocument): TFLBatch;
+function TFLBatch.SetDoc(const Col, ID: string; Doc: TFLDocument): TFLBatch;
 begin CheckStatus(fl_batch_set(FHandle, PChar(Col), PChar(ID), Doc.Handle), 'BatchSet'); Result := Self; end;
 
 function TFLBatch.Delete(const Col, ID: string): TFLBatch;
@@ -434,7 +504,7 @@ begin
   Result := TFLDocument.CreateFromHandle(H, True);
 end;
 
-procedure TFLTransaction.Set(const Col, ID: string; Doc: TFLDocument);
+procedure TFLTransaction.SetDoc(const Col, ID: string; Doc: TFLDocument);
 begin CheckStatus(fl_transaction_set(FHandle, PChar(Col), PChar(ID), Doc.Handle), 'TxSet'); end;
 
 procedure TFLTransaction.Commit;
@@ -619,6 +689,12 @@ begin
     for I := Low(FWhereBool) to High(FWhereBool) do begin
       fl_query_where_eq_bool(Result, PChar(FWhereBool[I].Field), FWhereBool[I].Value);
     end;
+    for I := Low(FWhereOrStr) to High(FWhereOrStr) do begin
+      fl_query_where_or_str(Result, PChar(FWhereOrStr[I].Field), PChar(FWhereOrStr[I].Value));
+    end;
+    for I := Low(FWhereOrInt) to High(FWhereOrInt) do begin
+      fl_query_where_or_int(Result, PChar(FWhereOrInt[I].Field), FWhereOrInt[I].Value);
+    end;
     for I := Low(FWhereIn) to High(FWhereIn) do begin
       TmpArr := fl_array_new;
       for J := 0 to FWhereIn[I].Data.Count-1 do
@@ -677,6 +753,136 @@ end;
 function TFLQuery.GetJSON: string;
 var Q: PFL_Query; begin Q := BuildNativeQuery; try Result := ConsumeCString(fl_query_execute(FDB.Handle, Q)); finally fl_query_free(Q); end; end;
 
+function TFLQuery.WhereOrStr(const Field, Value: string): TFLQuery;
+begin
+  SetLength(FWhereOrStr, Length(FWhereOrStr) + 1);
+  FWhereOrStr[High(FWhereOrStr)].Field := Field;
+  FWhereOrStr[High(FWhereOrStr)].Value := Value;
+  Result := Self;
+end;
+
+function TFLQuery.WhereOrInt(const Field: string; Value: Int64): TFLQuery;
+begin
+  SetLength(FWhereOrInt, Length(FWhereOrInt) + 1);
+  FWhereOrInt[High(FWhereOrInt)].Field := Field;
+  FWhereOrInt[High(FWhereOrInt)].Value := Value;
+  Result := Self;
+end;
+
+function TFLQuery.Delete: Int64;
+var Q: PFL_Query;
+begin
+  Q := BuildNativeQuery; try
+    Result := fl_query_delete(FDB.Handle, Q);
+  finally fl_query_free(Q); end;
+end;
+
+function TFLQuery.Patch(Doc: TFLDocument): Int64;
+var Q: PFL_Query;
+begin
+  Q := BuildNativeQuery; try
+    Result := fl_query_patch(FDB.Handle, Q, Doc.Handle);
+  finally fl_query_free(Q); end;
+end;
+
+type
+  TFLPollingThread = class(TThread)
+  private
+    FQuery: TFLQuery;
+    FCallback: TOnSnapshotCallback;
+    FQueueToMain: Boolean;
+    FInterval: Cardinal;
+    procedure DoCallback;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AQuery: TFLQuery; ACallback: TOnSnapshotCallback; AQueueToMain: Boolean; AInterval: Cardinal);
+  end;
+
+  TFLPollingSubscription = class(TInterfacedObject, IFLSubscription)
+  private
+    FThread: TFLPollingThread;
+  public
+    constructor Create(AThread: TFLPollingThread);
+    procedure Stop;
+    destructor Destroy; override;
+  end;
+
+constructor TFLPollingThread.Create(AQuery: TFLQuery; ACallback: TOnSnapshotCallback; AQueueToMain: Boolean; AInterval: Cardinal);
+begin
+  inherited Create(False);
+  FQuery := AQuery; FCallback := ACallback; FQueueToMain := AQueueToMain; FInterval := AInterval;
+  FreeOnTerminate := False;
+end;
+
+procedure TFLPollingThread.DoCallback;
+begin
+  FCallback(FQuery.GetJSON);
+end;
+
+procedure TFLPollingThread.Execute;
+begin
+  while not Terminated do begin
+    try
+      if FQueueToMain then
+        Queue(@DoCallback)
+      else
+        DoCallback;
+    except end;
+    Sleep(FInterval);
+  end;
+end;
+
+constructor TFLPollingSubscription.Create(AThread: TFLPollingThread);
+begin
+  inherited Create;
+  FThread := AThread;
+end;
+
+procedure TFLPollingSubscription.Stop;
+begin
+  FThread.Terminate;
+end;
+
+destructor TFLPollingSubscription.Destroy;
+begin
+  FThread.Terminate;
+  FThread.WaitFor;
+  FThread.Free;
+  inherited;
+end;
+
+function TFLQuery.OnSnapshot(const Callback: TOnSnapshotCallback; QueueToMainThread: Boolean): IFLSubscription;
+begin
+  Result := TFLPollingSubscription.Create(TFLPollingThread.Create(Self, Callback, QueueToMainThread, 1000));
+end;
+
+{ TFLDocumentRef }
+
+constructor TFLDocumentRef.Create(ADB: TFireLite; const ACollection, ADocID: string);
+begin
+  inherited Create;
+  FDB := ADB; FCollection := ACollection; FDocID := ADocID;
+end;
+
+procedure TFLDocumentRef.SetDoc(const Doc: TFLDocument);
+begin
+  CheckStatus(fl_engine_insert(FDB.Handle, PChar(FCollection), PChar(FDocID), Doc.Handle), 'DocRefSet');
+end;
+
+function TFLDocumentRef.Get: TFLDocument;
+var H: PFL_Doc;
+begin
+  H := fl_engine_get(FDB.Handle, PChar(FCollection), PChar(FDocID));
+  if H = nil then Exit(nil);
+  Result := TFLDocument.CreateFromHandle(H, True);
+end;
+
+procedure TFLDocumentRef.Delete;
+begin
+  CheckStatus(fl_engine_delete(FDB.Handle, PChar(FCollection), PChar(FDocID)), 'DocRefDelete');
+end;
+
 { TFLCollection }
 
 constructor TFLCollection.Create(ADB: TFireLite; const AName: string); begin inherited Create; FDB := ADB; FName := AName; end;
@@ -712,8 +918,54 @@ function TFLNetSyncer.StatusJSON: string;
 begin
   Result := ConsumeCString(fl_net_syncer_status(FHandle));
 end;
+
+{ TFLCloudSync }
+
+constructor TFLCloudSync.Create(ADBHandle: PFL_Engine; Mode: TFLCloudSyncMode; const ClientID, RoomKey, AuthToken: string);
+begin
+  inherited Create;
+  FHandle := fl_cloud_sync_new(ADBHandle, Ord(Mode), PChar(ClientID), PChar(RoomKey), PChar(AuthToken));
+  if FHandle = nil then
+    raise Exception.Create('CreateCloudSyncer failed: ' + string(fl_last_error));
+end;
+
+destructor TFLCloudSync.Destroy;
+begin
+  if FHandle <> nil then fl_cloud_sync_free(FHandle);
+  inherited;
+end;
+
+procedure TFLCloudSync.Start(const Address: string);
+begin
+  CheckStatus(fl_cloud_sync_start(FHandle, PChar(Address)), 'CloudSyncStart');
+end;
+
+function TFLCloudSync.StatusJSON: string;
+begin
+  Result := ConsumeCString(fl_cloud_sync_status(FHandle));
+end;
+
+procedure TFLCloudSync.Stop;
+begin
+  fl_cloud_sync_stop(FHandle);
+end;
 procedure TFLCollection.CreateIndex(const Field: string); begin CheckStatus(fl_engine_create_simple_index(FDB.Handle, PChar(FName), PChar(Field)), 'CreateIndex'); end;
 procedure TFLCollection.CreateFTSIndex(const Field: string); begin CheckStatus(fl_engine_create_fts_index(FDB.Handle, PChar(FName), PChar(Field)), 'CreateFTSIndex'); end;
+
+procedure TFLCollection.CreateCompositeIndex(const Fields: array of string);
+var I: Integer; S: string;
+begin
+  S := '[';
+  for I := Low(Fields) to High(Fields) do begin
+    if I > Low(Fields) then S := S + ',';
+    S := S + '{"field":"' + Fields[I] + '","desc":false}';
+  end;
+  S := S + ']';
+  CheckStatus(fl_engine_create_index(FDB.Handle, PChar(FName), PChar(S)), 'CreateCompositeIndex');
+end;
+
+function TFLCollection.ListIndexes: string;
+begin Result := ConsumeCString(fl_engine_list_indexes(FDB.Handle, PChar(FName))); end;
 
 { TFireLite }
 
@@ -724,6 +976,33 @@ function TFireLite.Collection(const Name: string): TFLCollection; begin Result :
 function TFireLite.StartBatch: TFLBatch; begin Result := TFLBatch.Create(FHandle); end;
 function TFireLite.StartTransaction: TFLTransaction; begin Result := TFLTransaction.Create(FHandle); end;
 function TFireLite.CreateNetSyncer(const Name, RoomKey: string): TFLNetSyncer; begin Result := TFLNetSyncer.Create(FHandle, Name, RoomKey); end;
+function TFireLite.CreateCloudSyncer(Mode: TFLCloudSyncMode; const ClientID, RoomKey, AuthToken: string): TFLCloudSync; begin Result := TFLCloudSync.Create(FHandle, Mode, ClientID, RoomKey, AuthToken); end;
+function TFireLite.Backup(const Path: string): Integer; begin Result := fl_engine_backup(FHandle, PChar(Path)); end;
+procedure TFireLite.Compact; begin CheckStatus(fl_engine_compact(FHandle), 'Compact'); end;
+function TFireLite.IsIndexesReady: Boolean; begin Result := fl_engine_is_indexes_ready(FHandle); end;
+procedure TFireLite.SnapshotIndices; begin CheckStatus(fl_engine_snapshot_indices(FHandle), 'SnapshotIndices'); end;
+function TFireLite.ListIndexes(const ACollection: string): string; begin Result := ConsumeCString(fl_engine_list_indexes(FHandle, PChar(ACollection))); end;
+function TFireLite.GetAuditLog: string; begin Result := ConsumeCString(fl_engine_get_audit_log(FHandle)); end;
+function TFireLite.InsertSubDoc(const Col, ID, SubCol, SubID: string; Doc: TFLDocument): Integer;
+begin Result := fl_engine_insert_subdoc(FHandle, PChar(Col), PChar(ID), PChar(SubCol), PChar(SubID), Doc.Handle); end;
+function TFireLite.GetByRef(Doc: TFLDocument; const FieldKey: string): TFLDocument;
+var H: PFL_Doc;
+begin
+  H := fl_engine_get_by_ref(FHandle, Doc.Handle, PChar(FieldKey));
+  if H = nil then Exit(nil);
+  Result := TFLDocument.CreateFromHandle(H, True);
+end;
+procedure TFireLite.CreateCompositeIndex(const ACollection: string; const Fields: array of string);
+var I: Integer; S: string;
+begin
+  S := '[';
+  for I := Low(Fields) to High(Fields) do begin
+    if I > Low(Fields) then S := S + ',';
+    S := S + '{"field":"' + Fields[I] + '","desc":false}';
+  end;
+  S := S + ']';
+  CheckStatus(fl_engine_create_index(FHandle, PChar(ACollection), PChar(S)), 'CreateCompositeIndex');
+end;
 function TFireLite.ListCollections: TStringList; var S: string; P: TJSONParser; A: TJSONArray; I: Integer; begin Result := TStringList.Create; S := ConsumeCString(fl_engine_list_collections(FHandle)); if S = '' then Exit; P := TJSONParser.Create(S); try A := TJSONArray(P.Parse); for I := 0 to A.Count - 1 do Result.Add(A.Strings[I]); finally P.Free; end; end;
 function TFireLite.GetStats: string; begin Result := ConsumeCString(fl_engine_get_stats(FHandle)); end;
 

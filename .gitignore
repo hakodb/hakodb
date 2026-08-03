@@ -9,3 +9,7 @@ benchmark.obj
 */jniLibs
 /jniLibs
 /.vscode
+node_modules/
+pascal/*.ppu
+pascal/*.o
+pascal/*.a

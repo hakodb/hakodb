@@ -9,6 +9,7 @@ export type Primitive =
   | null
   | Uint8Array
   | Date
+  | FireLiteReference
   | { [key: string]: Primitive }
   | Primitive[];
 
@@ -17,11 +18,20 @@ export type FireLiteDocData = { [key: string]: Primitive };
 
 const SERVER_TIMESTAMP_SENTINEL = "__FL_SERVER_TIMESTAMP__";
 
+export class FireLiteReference {
+  constructor(public readonly collection: string, public readonly id: string) {}
+}
+
 export enum DurabilityMode {
   Always = 0,
   Interval = 1,
   Manual = 2,
   OnCommit = 3,
+}
+
+export enum CloudSyncMode {
+  Server = 0,
+  Client = 1,
 }
 
 export interface FireLiteClientOptions {
@@ -86,6 +96,21 @@ export class FireLiteConfig {
     return this;
   }
 
+  setEncryptedCollections(collections: string[]): this {
+    ensureOk(this._native.configSetEncryptedCollections(this._handle, JSON.stringify(collections)), this._native, 'setEncryptedCollections');
+    return this;
+  }
+
+  setBlobThreshold(thresholdBytes: number): this {
+    this._native.configSetBlobThreshold(this._handle, thresholdBytes);
+    return this;
+  }
+
+  setCompression(enabled: boolean, level: number = 3): this {
+    this._native.configSetCompression(this._handle, enabled, level);
+    return this;
+  }
+
   getHandle(): unknown {
     return this._handle;
   }
@@ -122,6 +147,10 @@ function insertField(native: NativeBindings, handle: unknown, key: string, value
   }
   if (value instanceof Uint8Array) {
     ensureOk(native.docInsertBin(handle, key, value), native, 'insertBin');
+    return;
+  }
+  if (value instanceof FireLiteReference) {
+    ensureOk(native.docInsertReference(handle, key, value.collection, value.id), native, 'insertReference');
     return;
   }
 
@@ -248,6 +277,102 @@ export class FireLiteClient {
     return new NetSyncer(this.native, handle);
   }
 
+  createCloudSync(
+    mode: CloudSyncMode,
+    clientId: string | null = null,
+    roomKey: string | null = null,
+    authToken: string | null = null
+  ): CloudSync {
+    this.assertOpen();
+    const handle = this.native.cloudSyncNew(this.engine, mode, clientId, roomKey, authToken);
+    if (!handle) {
+      throw new Error(`cloudSyncNew failed: ${this.native.lastError()}`);
+    }
+    return new CloudSync(this.native, handle);
+  }
+
+  isIndexesReady(): boolean {
+    this.assertOpen();
+    return this.native.engineIsIndexesReady(this.engine);
+  }
+
+  async compact(): Promise<void> {
+    this.assertOpen();
+    ensureOk(this.native.engineCompact(this.engine), this.native, 'engineCompact');
+  }
+
+  async getStats(): Promise<Record<string, unknown>> {
+    this.assertOpen();
+    const raw = this.native.engineGetStats(this.engine);
+    return raw ? JSON.parse(raw) : {};
+  }
+
+  async getAuditLog(): Promise<unknown[]> {
+    this.assertOpen();
+    const raw = this.native.engineGetAuditLog(this.engine);
+    return raw ? JSON.parse(raw) : [];
+  }
+
+  async snapshotIndices(): Promise<void> {
+    this.assertOpen();
+    ensureOk(this.native.engineSnapshotIndices(this.engine), this.native, 'engineSnapshotIndices');
+  }
+
+  async listIndexes(collection: string | null = null): Promise<unknown> {
+    this.assertOpen();
+    const raw = this.native.engineListIndexes(this.engine, collection);
+    return raw ? JSON.parse(raw) : null;
+  }
+
+  async patch(collection: string, docId: string, data: FireLiteDocData): Promise<void> {
+    this.assertOpen();
+    const updates = toNativeDoc(this.native, data);
+    try {
+      ensureOk(this.native.enginePatch(this.engine, collection, docId, updates), this.native, 'enginePatch');
+    } finally {
+      this.native.docFree(updates);
+    }
+  }
+
+  async insertSubDoc(col: string, id: string, subCol: string, subId: string, data: FireLiteDocData): Promise<void> {
+    this.assertOpen();
+    const doc = toNativeDoc(this.native, data);
+    try {
+      ensureOk(this.native.engineInsertSubDoc(this.engine, col, id, subCol, subId, doc), this.native, 'engineInsertSubDoc');
+    } finally {
+      this.native.docFree(doc);
+    }
+  }
+
+  async getByReference(doc: DocumentSnapshot, fieldKey: string): Promise<DocumentSnapshot | null> {
+    this.assertOpen();
+    if (!doc._nativeHandle) return null;
+    const target = this.native.engineGetByRef(this.engine, doc._nativeHandle, fieldKey);
+    if (!target) return null;
+    const json = this.native.docToJson(target);
+    this.native.docFree(target);
+    return new DocumentSnapshot(fieldKey, true, parseDocJson(json));
+  }
+
+  async createCompositeIndex(collection: string, fields: { field: string; desc?: boolean }[]): Promise<number> {
+    this.assertOpen();
+    const id = this.native.engineCreateIndex(this.engine, collection, JSON.stringify(fields.map(f => ({ field: f.field, desc: !!f.desc }))));
+    if (id === 0) throw new Error(`engineCreateIndex failed: ${this.native.lastError()}`);
+    return id;
+  }
+
+  async runTransaction<T>(fn: (tx: Transaction) => Promise<T>): Promise<T> {
+    this.assertOpen();
+    const tx = new Transaction(this.native, this.engine);
+    try {
+      const result = await fn(tx);
+      ensureOk(this.native.transactionCommit(this.engine, tx.handle), this.native, 'transactionCommit');
+      return result;
+    } finally {
+      tx.dispose();
+    }
+  }
+
   async backup(destinationPath: string): Promise<void> {
     this.assertOpen();
     ensureOk(this.native.engineBackup(this.engine, destinationPath), this.native, 'engineBackup');
@@ -314,6 +439,74 @@ export class NetSyncer {
   }
 }
 
+export class CloudSync {
+  private closed = false;
+
+  constructor(private readonly native: NativeBindings, private readonly handle: unknown) {}
+
+  async start(address: string): Promise<void> {
+    ensureOk(this.native.cloudSyncStart(this.handle, address), this.native, 'cloudSyncStart');
+  }
+
+  async status<T = unknown>(): Promise<T | null> {
+    const raw = this.native.cloudSyncStatus(this.handle);
+    return raw ? (JSON.parse(raw) as T) : null;
+  }
+
+  stop(): void {
+    if (this.closed) return;
+    this.native.cloudSyncStop(this.handle);
+  }
+
+  close(): void {
+    this.stop();
+    this.native.cloudSyncFree(this.handle);
+    this.closed = true;
+  }
+}
+
+export class Transaction {
+  private disposed = false;
+
+  constructor(
+    private readonly native: NativeBindings,
+    private readonly engine: unknown,
+    readonly handle: unknown = native.transactionBegin(engine)
+  ) {
+    if (!handle) throw new Error(`transactionBegin failed: ${native.lastError()}`);
+  }
+
+  async get(collection: string, docId: string): Promise<DocumentSnapshot> {
+    this.ensureActive();
+    const doc = this.native.transactionGet(this.engine, this.handle, collection, docId);
+    if (!doc) return new DocumentSnapshot(docId, false);
+    const json = this.native.docToJson(doc);
+    this.native.docFree(doc);
+    return new DocumentSnapshot(docId, true, parseDocJson(json));
+  }
+
+  set(collection: string, docId: string, data: FireLiteDocData): this {
+    this.ensureActive();
+    const doc = toNativeDoc(this.native, data);
+    try {
+      ensureOk(this.native.transactionSet(this.handle, collection, docId, doc), this.native, 'transactionSet');
+    } finally {
+      this.native.docFree(doc);
+    }
+    return this;
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.native.transactionFree(this.handle);
+    this.disposed = true;
+  }
+
+  private ensureActive(): void {
+    if (this.disposed) throw new Error('Transaction has already been committed/disposed');
+  }
+}
+
 export class CollectionReference {
   constructor(private readonly client: FireLiteClient, private readonly name: string) { }
 
@@ -357,6 +550,10 @@ export class CollectionReference {
   async createFtsIndex(field: string): Promise<void> {
     ensureOk(this.client.nativeBindings().createFtsIndex(this.client.engineHandle(), this.name, field), this.client.nativeBindings(), 'createFtsIndex');
   }
+
+  async createCompositeIndex(fields: { field: string; desc?: boolean }[]): Promise<number> {
+    return this.client.createCompositeIndex(this.name, fields);
+  }
 }
 
 export class DocumentReference {
@@ -366,12 +563,22 @@ export class DocumentReference {
     await this.client.set(this._collection, this._id, data);
   }
 
+  async update(data: FireLiteDocData): Promise<void> {
+    await this.client.patch(this._collection, this._id, data);
+  }
+
   async get(): Promise<DocumentSnapshot> {
     return this.client.get(this._collection, this._id);
   }
 
   async delete(): Promise<void> {
     await this.client.delete(this._collection, this._id);
+  }
+
+  async getByReference(fieldKey: string): Promise<DocumentSnapshot | null> {
+    const snap = await this.get();
+    if (!snap.exists) return null;
+    return this.client.getByReference(snap, fieldKey);
   }
 }
 
@@ -381,6 +588,7 @@ export class Query {
   private _endAtSnapshot?: DocumentSnapshot;
   private _endBeforeSnapshot?: DocumentSnapshot;
   private readonly filters: QueryConstraint[] = [];
+  private readonly orFilters: QueryConstraint[] = [];
   private order?: QueryOrder;
   private queryLimit?: number;
   private queryOffset?: number;
@@ -390,6 +598,11 @@ export class Query {
 
   where(field: string, op: '==' | '!=' | '>' | '>=' | '<' | '<=' | 'match' | 'contains' | 'startsWith' | 'in' | 'not-in' | 'array-contains' | 'array-contains-any', value: any): Query {
     this.filters.push({ field, op, value });
+    return this;
+  }
+
+  orWhere(field: string, op: '==' | '!=' | '>' | '>=' | '<' | '<=' | 'match' | 'contains' | 'startsWith', value: any): Query {
+    this.orFilters.push({ field, op, value });
     return this;
   }
 
@@ -497,6 +710,14 @@ export class Query {
         }
       }
 
+      for (const filter of this.orFilters) {
+        if (typeof filter.value === 'string') {
+          ensureOk(native.queryWhereOrStr(handle, filter.field, filter.value), native, 'queryWhereOrStr');
+        } else {
+          ensureOk(native.queryWhereOrInt(handle, filter.field, filter.value), native, 'queryWhereOrInt');
+        }
+      }
+
       if (this._startAtSnapshot?._nativeHandle) {
         ensureOk(native.queryStartAt(handle, this._startAtSnapshot._nativeHandle), native, 'queryStartAt');
       }
@@ -528,6 +749,32 @@ export class Query {
     try {
       return parseQueryRows(native.queryExecute(this.client.engineHandle(), handle));
     } finally {
+      native.queryFree(handle);
+    }
+  }
+
+  async delete(): Promise<number> {
+    const native = this.client.nativeBindings();
+    const handle = this.prepareNativeQuery();
+    try {
+      const n = native.queryDelete(this.client.engineHandle(), handle);
+      if (n < 0) throw new Error(`queryDelete failed: ${native.lastError()}`);
+      return n;
+    } finally {
+      native.queryFree(handle);
+    }
+  }
+
+  async patch(data: FireLiteDocData): Promise<number> {
+    const native = this.client.nativeBindings();
+    const handle = this.prepareNativeQuery();
+    const patchDoc = toNativeDoc(native, data);
+    try {
+      const n = native.queryPatch(this.client.engineHandle(), handle, patchDoc);
+      if (n < 0) throw new Error(`queryPatch failed: ${native.lastError()}`);
+      return n;
+    } finally {
+      native.docFree(patchDoc);
       native.queryFree(handle);
     }
   }

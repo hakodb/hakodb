@@ -11,17 +11,20 @@ extern "C" {
 
 typedef struct FL_Array FL_Array;
 typedef struct FL_Batch FL_Batch;
+typedef struct FL_CloudSync FL_CloudSync;
 typedef struct FL_Config FL_Config;
 typedef struct FL_Doc FL_Doc;
 typedef struct FL_Engine FL_Engine;
 typedef struct FL_NetSyncer FL_NetSyncer;
 typedef struct FL_Query FL_Query;
+typedef struct FL_ResultSet FL_ResultSet;
 typedef struct FL_Transaction FL_Transaction;
 typedef struct FL_Watch FL_Watch;
 
 typedef void (*FL_OnSnapshotCallback)(const char *collection, const char *path, int32_t kind, void *user_data);
 
 FL_Engine *fl_engine_open(const char *path);
+bool fl_engine_is_indexes_ready(FL_Engine *engine);
 FL_Engine *fl_engine_open_with_config(const char *path, FL_Config *config);
 void fl_engine_free(FL_Engine *engine);
 
@@ -29,10 +32,12 @@ FL_Config *fl_config_new(void);
 void fl_config_free(FL_Config *config);
 void fl_config_set_durability(FL_Config *config, int32_t mode);
 void fl_config_set_encryption_key(FL_Config *config, const char *key);
+int32_t fl_config_set_encrypted_collections(FL_Config *config, const char *collections_json);
 void fl_config_set_audit_log(FL_Config *config, bool enabled, const char *path);
 void fl_config_set_query_workers(FL_Config *config, uintptr_t count);
 void fl_config_set_memory_limits(FL_Config *config, uintptr_t mmap_size, uintptr_t max_inlined_bytes);
 void fl_config_set_storage_tuning(FL_Config *config, uintptr_t page_size, uintptr_t compaction_threshold, uintptr_t group_commit_max_ops);
+void fl_config_set_blob_threshold(FL_Config *config, uintptr_t threshold_bytes);
 void fl_config_set_compression(FL_Config *config, bool enabled, int32_t level);
 
 FL_Watch *fl_engine_watch(FL_Engine *engine, const char *collection, FL_OnSnapshotCallback callback, void *user_data_ptr);
@@ -104,6 +109,12 @@ int32_t fl_query_start_at(FL_Query *query, const FL_Doc *anchor_doc);
 int32_t fl_query_end_at(FL_Query *query, const FL_Doc *anchor_doc);
 int32_t fl_query_end_before(FL_Query *query, const FL_Doc *anchor_doc);
 char *fl_query_execute(FL_Engine *engine, const FL_Query *query);
+int32_t fl_query_delete(FL_Engine *engine, FL_Query *query);
+int32_t fl_query_patch(FL_Engine *engine, FL_Query *query, const FL_Doc *patch_doc);
+FL_ResultSet *fl_query_execute_to_handles(FL_Engine *engine, const FL_Query *query);
+uintptr_t fl_result_set_count(FL_ResultSet *results);
+FL_Doc *fl_result_set_get_doc(FL_ResultSet *results, uintptr_t index);
+void fl_result_set_free(FL_ResultSet *results);
 int32_t fl_query_aggregate_count(FL_Query *query);
 int32_t fl_query_aggregate_sum(FL_Query *query, const char *field);
 int32_t fl_query_aggregate_avg(FL_Query *query, const char *field);
@@ -112,6 +123,7 @@ char *fl_query_execute_aggregation(FL_Engine *engine, const FL_Query *query);
 uint32_t fl_engine_create_index(FL_Engine *engine, const char *collection, const char *fields_json);
 int32_t fl_engine_create_simple_index(FL_Engine *engine, const char *collection, const char *field);
 int32_t fl_engine_create_fts_index(FL_Engine *engine, const char *collection, const char *field);
+char *fl_engine_list_indexes(FL_Engine *engine, const char *collection);
 int32_t fl_engine_snapshot_indices(FL_Engine *engine);
 
 FL_Transaction *fl_transaction_begin(FL_Engine *engine);
@@ -131,6 +143,12 @@ FL_NetSyncer *fl_net_syncer_new(FL_Engine *engine, const char *name, const char 
 int32_t fl_net_syncer_start(FL_NetSyncer *syncer, uint16_t port);
 char *fl_net_syncer_status(FL_NetSyncer *syncer);
 void fl_net_syncer_free(FL_NetSyncer *syncer);
+
+FL_CloudSync *fl_cloud_sync_new(FL_Engine *engine, int32_t mode, const char *client_id, const char *room_key, const char *auth_token);
+int32_t fl_cloud_sync_start(FL_CloudSync *cloud_sync, const char *address);
+char *fl_cloud_sync_status(FL_CloudSync *cloud_sync);
+void fl_cloud_sync_stop(FL_CloudSync *cloud_sync);
+void fl_cloud_sync_free(FL_CloudSync *cloud_sync);
 
 const char *fl_last_error(void);
 void fl_string_free(char *value);

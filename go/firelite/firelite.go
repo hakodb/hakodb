@@ -34,6 +34,8 @@ type (
 	Batch       struct{ ptr *C.FL_Batch }
 	Transaction struct{ ptr *C.FL_Transaction }
 	NetSyncer   struct{ ptr *C.FL_NetSyncer }
+	ResultSet   struct{ ptr *C.FL_ResultSet }
+	CloudSync   struct{ ptr *C.FL_CloudSync }
 	Watch       struct {
 		ptr    *C.FL_Watch
 		handle cgo.Handle
@@ -47,6 +49,13 @@ const (
 	DurabilityInterval DurabilityMode = 1
 	DurabilityManual   DurabilityMode = 2
 	DurabilityOnCommit DurabilityMode = 3
+)
+
+type CloudSyncMode int32
+
+const (
+	CloudSyncServer CloudSyncMode = 0
+	CloudSyncClient CloudSyncMode = 1
 )
 
 type SnapshotKind int32
@@ -154,6 +163,21 @@ func (c *Config) SetMemoryLimits(mmapSize, maxInlined uintptr) {
 
 func (c *Config) SetStorageTuning(pageSize, compactionThreshold, groupCommitMaxOps uintptr) {
 	C.fl_config_set_storage_tuning(c.ptr, C.uintptr_t(pageSize), C.uintptr_t(compactionThreshold), C.uintptr_t(groupCommitMaxOps))
+}
+
+// SetEncryptedCollections marks specific collections for at-rest encryption.
+func (c *Config) SetEncryptedCollections(collections ...string) error {
+	payload, err := json.Marshal(collections)
+	if err != nil {
+		return err
+	}
+	cj, free := cString(string(payload))
+	defer free()
+	return checkStatus("fl_config_set_encrypted_collections", C.fl_config_set_encrypted_collections(c.ptr, cj))
+}
+
+func (c *Config) SetBlobThreshold(thresholdBytes uintptr) {
+	C.fl_config_set_blob_threshold(c.ptr, C.uintptr_t(thresholdBytes))
 }
 
 func NewDoc() *Doc { return &Doc{ptr: C.fl_doc_new()} }
@@ -321,6 +345,18 @@ func (e *Engine) Backup(path string) error {
 }
 func (e *Engine) Compact() error { return checkStatus("fl_engine_compact", C.fl_engine_compact(e.ptr)) }
 
+// IsIndexesReady reports whether background index construction has completed.
+func (e *Engine) IsIndexesReady() bool {
+	return bool(C.fl_engine_is_indexes_ready(e.ptr))
+}
+
+// ListIndexes returns the raw JSON index listing for a collection (or all collections when empty).
+func (e *Engine) ListIndexes(collection string) (string, error) {
+	cc, free := cString(collection)
+	defer free()
+	return ownedCStringJSON(func() *C.char { return C.fl_engine_list_indexes(e.ptr, cc) })
+}
+
 func (e *Engine) ListCollections() ([]string, error) {
 	s, err := ownedCStringJSON(func() *C.char { return C.fl_engine_list_collections(e.ptr) })
 	if err != nil {
@@ -363,6 +399,46 @@ func (n *NetSyncer) Free() {
 	if n != nil && n.ptr != nil {
 		C.fl_net_syncer_free(n.ptr)
 		n.ptr = nil
+	}
+}
+
+// NewCloudSync creates a bi-directional cloud sync handle.
+// mode: CloudSyncServer (0) or CloudSyncClient (1).
+func (e *Engine) NewCloudSync(mode CloudSyncMode, clientID, roomKey, authToken string) (*CloudSync, error) {
+	ci, fi := cString(clientID)
+	cr, fr := cString(roomKey)
+	ct, ft := cString(authToken)
+	defer fi()
+	defer fr()
+	defer ft()
+	ptr := C.fl_cloud_sync_new(e.ptr, C.int32_t(mode), ci, cr, ct)
+	if ptr == nil {
+		return nil, fmt.Errorf("fl_cloud_sync_new failed: %s", lastError())
+	}
+	return &CloudSync{ptr: ptr}, nil
+}
+
+// Start connects a cloud sync client (ws:// or wss://) or binds the cloud sync server (host:port).
+func (s *CloudSync) Start(address string) error {
+	ca, free := cString(address)
+	defer free()
+	return checkStatus("fl_cloud_sync_start", C.fl_cloud_sync_start(s.ptr, ca))
+}
+
+func (s *CloudSync) Status() (string, error) {
+	return ownedCStringJSON(func() *C.char { return C.fl_cloud_sync_status(s.ptr) })
+}
+
+func (s *CloudSync) Stop() {
+	if s != nil && s.ptr != nil {
+		C.fl_cloud_sync_stop(s.ptr)
+	}
+}
+
+func (s *CloudSync) Free() {
+	if s != nil && s.ptr != nil {
+		C.fl_cloud_sync_free(s.ptr)
+		s.ptr = nil
 	}
 }
 
@@ -664,6 +740,66 @@ func (e *Engine) ExecuteAggregation(q *Query) (string, error) {
 	return ownedCStringJSON(func() *C.char { return C.fl_query_execute_aggregation(e.ptr, q.ptr) })
 }
 
+// Delete executes the query and deletes all matching documents.
+// Returns the number of deleted documents.
+func (e *Engine) DeleteWhere(q *Query) (int32, error) {
+	n := C.fl_query_delete(e.ptr, q.ptr)
+	if n < 0 {
+		return 0, fmt.Errorf("fl_query_delete failed: %s", lastError())
+	}
+	return int32(n), nil
+}
+
+// PatchWhere executes the query and applies the updates from 'updates' to all matches.
+// Returns the number of updated documents.
+func (e *Engine) PatchWhere(q *Query, updates *Doc) (int32, error) {
+	if updates == nil || updates.ptr == nil {
+		return 0, errors.New("patch doc is nil")
+	}
+	n := C.fl_query_patch(e.ptr, q.ptr, updates.ptr)
+	if n < 0 {
+		return 0, fmt.Errorf("fl_query_patch failed: %s", lastError())
+	}
+	return int32(n), nil
+}
+
+// ExecuteQueryToHandles runs the query and returns the result as native doc handles,
+// avoiding the JSON serialization round-trip.
+func (e *Engine) ExecuteQueryToHandles(q *Query) (*ResultSet, error) {
+	ptr := C.fl_query_execute_to_handles(e.ptr, q.ptr)
+	if ptr == nil {
+		return nil, fmt.Errorf("fl_query_execute_to_handles failed: %s", lastError())
+	}
+	return &ResultSet{ptr: ptr}, nil
+}
+
+func (r *ResultSet) Count() uintptr {
+	if r == nil || r.ptr == nil {
+		return 0
+	}
+	return uintptr(C.fl_result_set_count(r.ptr))
+}
+
+// GetDoc returns the doc handle at the given index. The returned Doc is owned by the
+// ResultSet and must not be freed separately.
+func (r *ResultSet) GetDoc(index uintptr) (*Doc, error) {
+	if r == nil || r.ptr == nil {
+		return nil, errors.New("result set is nil")
+	}
+	ptr := C.fl_result_set_get_doc(r.ptr, C.uintptr_t(index))
+	if ptr == nil {
+		return nil, nil
+	}
+	return &Doc{ptr: ptr}, nil
+}
+
+func (r *ResultSet) Free() {
+	if r != nil && r.ptr != nil {
+		C.fl_result_set_free(r.ptr)
+		r.ptr = nil
+	}
+}
+
 func ownedCStringJSON(fn func() *C.char) (string, error) {
 	ptr := fn()
 	if ptr == nil {
@@ -736,6 +872,25 @@ func (c *Client) RunTransaction(fn func(tx *Tx) error) error {
 		return err
 	}
 	return c.engine.CommitTransaction(txHandle)
+}
+
+// Compact triggers storage compaction on the underlying engine.
+func (c *Client) Compact() error { return c.engine.Compact() }
+
+// IndexesReady reports whether background indexes have finished building.
+func (c *Client) IndexesReady() bool { return c.engine.IsIndexesReady() }
+
+// CloudSync creates a bi-directional cloud sync handle for this engine.
+func (c *Client) CloudSync(mode CloudSyncMode, clientID, roomKey, authToken string) (*CloudSync, error) {
+	return c.engine.NewCloudSync(mode, clientID, roomKey, authToken)
+}
+
+// SnapshotIndices forces a durable snapshot of the in-memory index metadata.
+func (c *Client) SnapshotIndices() error { return c.engine.SnapshotIndices() }
+
+// ListIndexes returns the raw JSON listing of indexes for the collection.
+func (c *Client) ListIndexes(collection string) (string, error) {
+	return c.engine.ListIndexes(collection)
 }
 
 type CollectionRef struct {
@@ -942,6 +1097,35 @@ func (q *QueryRef) Get() ([]map[string]any, error) {
 		return nil, err
 	}
 	return rows, nil
+}
+
+// Delete executes the query and removes every matching document. Returns the deleted count.
+func (q *QueryRef) Delete() (int32, error) {
+	raw := NewQuery(q.collection)
+	defer raw.Free()
+	for _, op := range q.ops {
+		if err := op(raw); err != nil {
+			return 0, err
+		}
+	}
+	return q.client.engine.DeleteWhere(raw)
+}
+
+// Patch applies the given field updates to every matching document. Returns the updated count.
+func (q *QueryRef) Patch(data map[string]any) (int32, error) {
+	raw := NewQuery(q.collection)
+	defer raw.Free()
+	for _, op := range q.ops {
+		if err := op(raw); err != nil {
+			return 0, err
+		}
+	}
+	updates, err := mapToDoc(data)
+	if err != nil {
+		return 0, err
+	}
+	defer updates.Free()
+	return q.client.engine.PatchWhere(raw, updates)
 }
 
 type WriteBatch struct {
