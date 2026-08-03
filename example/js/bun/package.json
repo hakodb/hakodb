@@ -1,0 +1,10 @@
+{
+  "name": "firelite-example-bun",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "FireLite Bun example using the TypeScript SDK (bun:ffi backend)",
+  "scripts": {
+    "start": "bun index.ts"
+  }
+}

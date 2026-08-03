@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CONFIG>
+  <Package Version="5.0">
+    <PathDelim Value="\"/>
+    <Name Value="FireLite"/>
+    <Author Value="FireLite contributors"/>
+    <CompilerOptions>
+      <Version Value="11"/>
+      <PathDelim Value="\"/>
+      <Target>
+        <Filename Value="FireLite"/>
+      </Target>
+      <SearchPaths>
+        <IncludeFiles Value="$(PkgOutDir)"/>
+        <UnitOutputDirectory Value="lib\$(TargetCPU)-$(TargetOS)"/>
+      </SearchPaths>
+    </CompilerOptions>
+    <Description Value="FireLite embedded document database bindings for Lazarus. Includes the raw C-FFI layer (FireLiteRaw), the high-level OO engine (FireLite), a drop-on-form TFireLiteComponent with NetSync / CloudSync configuration, and design-time registration (FireLitePkgReg). Requires the firelite shared library (firelite.dll / libfirelite.so / libfirelite.dylib)."/>
+    <Files Count="4">
+      <Item1>
+        <Filename Value="FireLiteRaw.pas"/>
+        <UnitName Value="FireLiteRaw"/>
+      </Item1>
+      <Item2>
+        <Filename Value="FireLite.pas"/>
+        <UnitName Value="FireLite"/>
+      </Item2>
+      <Item3>
+        <Filename Value="FireLiteComponent.pas"/>
+        <UnitName Value="FireLiteComponent"/>
+      </Item3>
+      <Item4>
+        <Filename Value="FireLitePkgReg.pas"/>
+        <UnitName Value="FireLitePkgReg"/>
+      </Item4>
+    </Files>
+    <RequiredPkg Count="1">
+      <Item1>
+        <PackageName Value="FCL"/>
+      </Item1>
+    </RequiredPkg>
+    <UsageOptions>
+      <UnitPath Value="$(PkgDir)"/>
+    </UsageOptions>
+    <PublishOptions>
+      <Version Value="2"/>
+      <UseFileFilters Value="True"/>
+    </PublishOptions>
+  </Package>
+</CONFIG>

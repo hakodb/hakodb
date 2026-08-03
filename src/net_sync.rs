@@ -446,9 +446,15 @@ impl NetSyncer {
         }
         // 4. clear peers (close sockets)
         let peers = self.peers.clone();
-        tokio::spawn(async move {
-            peers.lock().await.clear();
-        });
+        // Only spawn on a running Tokio runtime. FFI callers from other
+        // languages (Go / Node / Pascal / C) have no ambient runtime, so
+        // fall back to dropping the peer write halves inline - the sockets
+        // are closed anyway once the last Arc reference is dropped.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(async move {
+                peers.lock().await.clear();
+            });
+        }
     }
 
     pub fn status(&self) -> NetworkStatus {

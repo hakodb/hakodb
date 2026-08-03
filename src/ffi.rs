@@ -1956,9 +1956,11 @@ pub extern "C" fn fl_transaction_set(
 pub extern "C" fn fl_transaction_commit(engine: *mut FL_Engine, tx: *mut FL_Transaction) -> i32 {
     safety_shield!(-1, {
         let engine = unsafe { &*engine };
-        let tx_box = unsafe { Box::from_raw(tx) }; // Take ownership to free memory
+        // Borrow only: the caller still owns the handle and must release it
+        // with fl_transaction_free (matching the fl_batch_commit contract).
+        let tx = unsafe { &*tx };
 
-        match tx_box.tx.commit(&engine.db) {
+        match tx.tx.commit(&engine.db) {
             Ok(_) => 0,
             Err(e) => {
                 set_last_error(e.to_string());

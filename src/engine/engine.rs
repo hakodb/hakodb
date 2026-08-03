@@ -194,7 +194,7 @@ impl SerializableTransaction {
             doc_id: doc_id.to_string(),
         });
     }
-    pub fn commit(self, db: &FireLite) -> Result<Vec<String>> {
+    pub fn commit(&self, db: &FireLite) -> Result<Vec<String>> {
         Ok(db.commit_serializable(self.reads.clone(), self.mutations.clone())?)
     }
 }

@@ -1,0 +1,13 @@
+[package]
+name = "firelite-basic"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal FireLite Rust example: open, CRUD, query, batch, transaction, watch"
+
+[dependencies]
+firelite = { path = "../../.." }
+
+[profile.release]
+opt-level = 3
+
+[workspace]

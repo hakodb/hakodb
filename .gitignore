@@ -6,6 +6,7 @@ benchmark.obj
 *.zip
 /benches*
 /backup*
+bench_data_*
 */jniLibs
 /jniLibs
 /.vscode
@@ -13,3 +14,7 @@ node_modules/
 pascal/*.ppu
 pascal/*.o
 pascal/*.a
+example/rust/basic/target/
+example/**/demo.db/
+*.ppu
+*.o

@@ -10,5 +10,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run benches
-        run: cargo bench --bench engine_bench
+      - name: Build FireLite cdylib
+        run: cargo build --release
+      - name: Build C++ benchmark harness
+        run: g++ -O2 -std=c++17 -Iinclude benchmark.cpp -Ltarget/release -lfirelite -o benchmark
+      - name: Run official benchmark (benchmark.cpp)
+        run: LD_LIBRARY_PATH=target/release ./benchmark --docs=1000

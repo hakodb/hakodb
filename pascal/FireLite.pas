@@ -508,7 +508,7 @@ procedure TFLTransaction.SetDoc(const Col, ID: string; Doc: TFLDocument);
 begin CheckStatus(fl_transaction_set(FHandle, PChar(Col), PChar(ID), Doc.Handle), 'TxSet'); end;
 
 procedure TFLTransaction.Commit;
-begin CheckStatus(fl_transaction_commit(FDBHandle, FHandle), 'TxCommit'); FHandle := nil; end;
+begin CheckStatus(fl_transaction_commit(FDBHandle, FHandle), 'TxCommit'); end;
 
 { TFLQuery }
 
