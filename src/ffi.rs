@@ -2458,6 +2458,7 @@ pub extern "C" fn fl_cloud_sync_new(
     engine: *mut FL_Engine,
     mode: i32, // 0 = Server, 1 = Client
     client_id: *const c_char,
+    room_name: *const c_char,
     room_key: *const c_char,
     auth_token: *const c_char,
 ) -> *mut FL_CloudSync {
@@ -2469,6 +2470,7 @@ pub extern "C" fn fl_cloud_sync_new(
 
         let engine_ref = unsafe { &*engine };
         let cid_str = cstr_to_string(client_id).unwrap_or_else(|_| "node".into());
+        let room_name_str = cstr_to_string(room_name).unwrap_or_else(|_| "default".into());
         let room_str = cstr_to_string(room_key).unwrap_or_else(|_| "default".into());
         let token_str = cstr_to_string(auth_token).unwrap_or_default();
 
@@ -2482,6 +2484,7 @@ pub extern "C" fn fl_cloud_sync_new(
             engine_ref.db.clone(),
             sync_mode,
             &cid_str,
+            &room_name_str,
             &room_str,
             &token_str,
         );

@@ -116,7 +116,7 @@ func main() {
 	// ---- CloudSync ----
 	// Requires the DLL/so built with --features cloud-sync.
 	// A server/room must exist; this example only shows construction.
-	cloud, err := engine.NewCloudSync(firelite.CloudSyncServer, "", "demo-room", "")
+	cloud, err := engine.NewCloudSync(firelite.CloudSyncServer, "", "demo-room", "", "")
 	if err != nil {
 		log.Fatal(err)
 	}

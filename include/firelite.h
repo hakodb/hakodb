@@ -309,6 +309,7 @@ void fl_net_syncer_free(FL_NetSyncer *syncer);
 FL_CloudSync *fl_cloud_sync_new(FL_Engine *engine,
                                 int32_t mode,
                                 const char *client_id,
+                                const char *room_name,
                                 const char *room_key,
                                 const char *auth_token);
 

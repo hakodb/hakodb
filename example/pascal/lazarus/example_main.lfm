@@ -9,6 +9,8 @@ object Form1: TForm1
     DatabasePath = 'demo.db'
     NetSyncPort = 4456
     CloudSyncMode = csmClient
+    CloudSyncRoomName = 'demo-room'
+    CloudSyncRoomKey = 'secret-key'
     CloudSyncAddress = 'wss://your-firelite-server'
   end
   object btnRun: TButton

@@ -41,6 +41,7 @@ type
     FNetSyncPort: Word;
     FCloudSyncMode: TFLCloudSyncMode;
     FCloudSyncClientID: string;
+    FCloudSyncRoomName: string;
     FCloudSyncRoomKey: string;
     FCloudSyncAuthToken: string;
     FCloudSyncAddress: string;
@@ -74,7 +75,7 @@ type
     { Create a standalone NetSyncer (not tied to the published properties). }
     function CreateNetSyncer(const AName, ARoomKey: string): TFLNetSyncer;
     { Create a standalone CloudSyncer (not tied to the published properties). }
-    function CreateCloudSyncer(AMode: TFLCloudSyncMode; const AClientID, ARoomKey, AAuthToken: string): TFLCloudSync;
+    function CreateCloudSyncer(AMode: TFLCloudSyncMode; const AClientID, ARoomName, ARoomKey, AAuthToken: string): TFLCloudSync;
 
     function Collection(const AName: string): TFLCollection;
     function ListCollections: TStringList;
@@ -92,6 +93,7 @@ type
     { --- CloudSync configuration --- }
     property CloudSyncMode: TFLCloudSyncMode read FCloudSyncMode write FCloudSyncMode default csmClient;
     property CloudSyncClientID: string read FCloudSyncClientID write FCloudSyncClientID;
+    property CloudSyncRoomName: string read FCloudSyncRoomName write FCloudSyncRoomName;
     property CloudSyncRoomKey: string read FCloudSyncRoomKey write FCloudSyncRoomKey;
     property CloudSyncAuthToken: string read FCloudSyncAuthToken write FCloudSyncAuthToken;
     property CloudSyncAddress: string read FCloudSyncAddress write FCloudSyncAddress;
@@ -162,7 +164,7 @@ begin
   EnsureOpen;
   FCloudSyncer.Free;
   FCloudSyncer := FLite.CreateCloudSyncer(FCloudSyncMode, FCloudSyncClientID,
-    FCloudSyncRoomKey, FCloudSyncAuthToken);
+    FCloudSyncRoomName, FCloudSyncRoomKey, FCloudSyncAuthToken);
   FCloudSyncer.Start(FCloudSyncAddress);
 end;
 
@@ -179,10 +181,10 @@ begin
 end;
 
 function TFireLiteComponent.CreateCloudSyncer(AMode: TFLCloudSyncMode;
-  const AClientID, ARoomKey, AAuthToken: string): TFLCloudSync;
+  const AClientID, ARoomName, ARoomKey, AAuthToken: string): TFLCloudSync;
 begin
   EnsureOpen;
-  Result := FLite.CreateCloudSyncer(AMode, AClientID, ARoomKey, AAuthToken);
+  Result := FLite.CreateCloudSyncer(AMode, AClientID, ARoomName, ARoomKey, AAuthToken);
 end;
 
 function TFireLiteComponent.Collection(const AName: string): TFLCollection;

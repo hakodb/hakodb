@@ -239,6 +239,11 @@ enum Commands {
         #[arg(long)]
         server: Option<String>,
 
+        /// Room name for Cloud Sync (used by the client to join a room).
+        /// The server stores room collections as <room_name>_<collection>.
+        #[arg(long)]
+        room_name: Option<String>,
+
         /// Auth Token for Cloud Sync
         #[arg(long, default_value = "default_token")]
         token: String,
@@ -290,8 +295,9 @@ fn main() -> Result<()> {
         key,         
         bind,
         server,
+        room_name,
         token, } = &cli.command {
-        return run_server(&cli, Some(*port), node_id, key, bind.as_deref(), server.as_deref(), token);
+        return run_server(&cli, Some(*port), node_id, key, bind.as_deref(), server.as_deref(), room_name.as_deref(), token);
     }
 
     let db = open_db(&cli)?;
@@ -1333,6 +1339,7 @@ fn run_server(
     key: &str,
     bind_addr: Option<&str>,
     server_url: Option<&str>,
+    room_name: Option<&str>,
     token: &str,
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
@@ -1353,30 +1360,35 @@ fn run_server(
         // 2. Initialize Cloud Sync (if --bind or --server provided)
         #[cfg(feature = "cloud-sync")]
         let cloud_syncer = if let Some(b) = bind_addr {
+            // Server mode is room-agnostic: it hosts any room. The room name is
+            // only meaningful for clients, so it is ignored here.
             let cs = CloudSync::new(
                 db.clone(),
                 CloudSyncMode::Server,
                 node_id,
+                "",
                 key,
                 token,
             );
             cs.start(b).await.map_err(|e| anyhow!(e.to_string()))?;
             Some((cs, format!("Server ({})", b)))
         } else if let Some(s) = server_url {
+            let room = room_name.unwrap_or("default");
             let cs = CloudSync::new(
                 db.clone(),
                 CloudSyncMode::Client,
                 node_id,
+                room,
                 key,
                 token,
             );
             cs.start(s).await.map_err(|e| anyhow!(e.to_string()))?;
-            Some((cs, format!("Client -> {}", s)))
+            Some((cs, format!("Client -> {} (room: {})", s, room)))
         } else {
             None
         };
 
-        println!("🔥 FireLite v0.6.64 Server Active");
+        println!("🔥 FireLite v0.7.0 Server Active");
         println!("🆔 Node ID: {}", node_id);
 
         #[cfg(feature = "net-sync")]

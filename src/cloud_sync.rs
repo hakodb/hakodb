@@ -1,9 +1,9 @@
 #[cfg(feature = "cloud-sync")]
-use std::collections::HashMap;
-#[cfg(feature = "cloud-sync")]
-use std::sync::{Arc, Mutex as StdMutex};
+use std::collections::{HashMap, HashSet};
 #[cfg(feature = "cloud-sync")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "cloud-sync")]
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 #[cfg(feature = "cloud-sync")]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -12,9 +12,15 @@ use crate::document::firelite_doc::FireLiteDoc;
 #[cfg(feature = "cloud-sync")]
 use crate::document::value::Value;
 #[cfg(feature = "cloud-sync")]
-use crate::engine::{BatchMutation, FireLite};
+use crate::engine::engine::IndexOp;
+#[cfg(feature = "cloud-sync")]
+use crate::engine::{BatchMutation, ChangeEvent, ChangeKind, FireLite};
 #[cfg(feature = "cloud-sync")]
 use crate::error::{FireLiteError, Result as FLResult};
+#[cfg(feature = "cloud-sync")]
+use crate::query::query::Query;
+#[cfg(feature = "cloud-sync")]
+use crate::storage::engine::Pointer;
 #[cfg(feature = "cloud-sync")]
 use crate::storage::wal::WalOp;
 
@@ -38,6 +44,12 @@ fn init_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Server-internal collection that stores the room registry. It is
+/// `_`-prefixed so it stays hidden from `list_collections()`, the WAL
+/// tailers and the version maps, exactly like `__firelite_security`.
+#[cfg(feature = "cloud-sync")]
+pub const INTERNAL_ROOMS_COLLECTION: &str = "__firelite_rooms";
+
 #[cfg(feature = "cloud-sync")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +66,7 @@ pub enum CloudPacket {
     Authenticate {
         token: String,
         client_id: String,
+        room_name: String,
         room_key: String,
     },
     /// Server -> Client: Handshake Response
@@ -84,9 +97,265 @@ pub enum CloudPacket {
 pub struct CloudStatus {
     pub mode: CloudSyncMode,
     pub connected: bool,
+    pub room_name: String,
     pub room_key: String,
     pub active_clients: usize,
     pub queued_writes: usize,
+}
+
+// ============================================================================
+// ROOM REGISTRY
+// ============================================================================
+//
+// A "room" is uniquely identified by the pair (room_name, room_key). Clients
+// that share a room name but use a different security key are considered to be
+// in different groups/rooms. On the server, every room owns a storage prefix:
+//   - first distinct (name, key) for a name  -> "roomname"
+//   - each additional distinct key           -> "roomname_1", "roomname_2", ...
+// Client collections are stored server-side as "<prefix>_<collection>" and are
+// presented back to clients as just "<collection>", so data never mixes across
+// rooms even when clients use the same collection names.
+//
+// The registry is persisted in the internal collection and mirrored into an
+// in-memory cache. The disk is only consulted on cache misses (first connect
+// after start / cache cold), and a periodic re-read keeps the cache realtime.
+
+#[cfg(feature = "cloud-sync")]
+#[derive(Debug, Clone)]
+struct RoomEntry {
+    room_id: String,
+    room_name: String,
+    prefix: String,
+}
+
+#[cfg(feature = "cloud-sync")]
+#[derive(Default)]
+struct RoomRegistryState {
+    cache: HashMap<String, RoomEntry>,
+    prefixes: HashSet<String>,
+}
+
+#[cfg(feature = "cloud-sync")]
+pub struct RoomRegistry {
+    db: Arc<FireLite>,
+    state: StdRwLock<RoomRegistryState>,
+    alloc_lock: StdMutex<()>,
+    loaded: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "cloud-sync")]
+fn hash_room_id(room_name: &str, room_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(room_name.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(room_key.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        hex.push_str(&format!("{:02x}", b));
+    }
+    hex
+}
+
+#[cfg(feature = "cloud-sync")]
+fn sanitize_room_name(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            out.push(c);
+        } else if !out.is_empty() && !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "room".to_string()
+    } else {
+        out.chars().take(40).collect()
+    }
+}
+#[cfg(feature = "cloud-sync")]
+fn value_to_string(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Client-facing collections are stored server-side as "<prefix>_<collection>".
+/// When the prefix is empty (client-local ingest), the collection keeps its
+/// plain name instead of gaining a leading "_".
+#[cfg(feature = "cloud-sync")]
+fn storage_col_name(prefix: &str, plain_col: &str) -> String {
+    if prefix.is_empty() {
+        plain_col.to_string()
+    } else {
+        format!("{}_{}", prefix, plain_col)
+    }
+}
+
+/// Uniform key used by the outbound tailers and the ingest flusher to suppress
+/// echoes (writes that originated locally and were only re-applied on arrival).
+#[cfg(feature = "cloud-sync")]
+fn echo_key(prefix: &str, plain_col: &str, key: &str) -> String {
+    format!("{}:{}:{}", prefix, plain_col, key)
+}
+
+#[cfg(feature = "cloud-sync")]
+impl RoomRegistry {
+    pub fn new(db: Arc<FireLite>) -> Self {
+        Self {
+            db,
+            state: StdRwLock::new(RoomRegistryState::default()),
+            alloc_lock: StdMutex::new(()),
+            loaded: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn load_all(&self) {
+        let mut state = self.state.write().unwrap();
+        state.cache.clear();
+        state.prefixes.clear();
+        if let Ok(hits) = self.db.query(Query::new(INTERNAL_ROOMS_COLLECTION)) {
+            for (id, doc) in hits {
+                let room_name = doc
+                    .get("room_name")
+                    .and_then(value_to_string)
+                    .unwrap_or_default();
+                let prefix = doc
+                    .get("prefix")
+                    .and_then(value_to_string)
+                    .unwrap_or_default();
+                if prefix.is_empty() {
+                    continue;
+                }
+                state.cache.insert(
+                    id.clone(),
+                    RoomEntry {
+                        room_id: id.clone(),
+                        room_name,
+                        prefix: prefix.clone(),
+                    },
+                );
+                state.prefixes.insert(prefix);
+            }
+        }
+        self.loaded.store(true, Ordering::SeqCst);
+    }
+
+    /// Resolves a room to its storage prefix, allocating + persisting a new
+    /// prefix when the room is seen for the first time. This is the ONLY path
+    /// that touches the internal collection on the hot path, and only on a
+    /// cache miss.
+    pub fn resolve(&self, room_name: &str, room_key: &str) -> FLResult<(String, String)> {
+        let room_id = hash_room_id(room_name, room_key);
+        let _guard = self.alloc_lock.lock().unwrap();
+
+        if !self.loaded.load(Ordering::SeqCst) {
+            self.load_all();
+        }
+
+        // 1. In-memory cache hit.
+        if let Some(entry) = self.state.read().unwrap().cache.get(&room_id) {
+            return Ok((entry.room_id.clone(), entry.prefix.clone()));
+        }
+
+        // 2. Durable registry hit (single-doc read).
+        if let Ok(Some(doc)) = self.db.get(INTERNAL_ROOMS_COLLECTION, &room_id) {
+            if let Some(prefix) = doc.get("prefix").and_then(value_to_string) {
+                let mut state = self.state.write().unwrap();
+                state.cache.insert(
+                    room_id.clone(),
+                    RoomEntry {
+                        room_id: room_id.clone(),
+                        room_name: room_name.to_string(),
+                        prefix: prefix.clone(),
+                    },
+                );
+                state.prefixes.insert(prefix.clone());
+                return Ok((room_id, prefix));
+            }
+        }
+
+        // 3. Allocate a globally unique prefix.
+        let base = sanitize_room_name(room_name);
+        let prefix = {
+            let prefixes = self.state.read().unwrap();
+            if !prefixes.prefixes.contains(&base) {
+                base.clone()
+            } else {
+                let mut n = 1;
+                loop {
+                    let candidate = format!("{}_{}", base, n);
+                    if !prefixes.prefixes.contains(&candidate) {
+                        break candidate;
+                    }
+                    n += 1;
+                }
+            }
+        };
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mut doc = FireLiteDoc::default();
+        doc.insert("room_name", Value::String(room_name.to_string()));
+        doc.insert("key_hash", Value::String(hash_room_id(room_name, room_key)));
+        doc.insert("prefix", Value::String(prefix.clone()));
+        doc.insert("created_at", Value::Int(now));
+        doc.insert("last_seen", Value::Int(now));
+        self.db.write_batch(vec![BatchMutation::Put {
+            collection: INTERNAL_ROOMS_COLLECTION.to_string(),
+            doc_id: room_id.clone(),
+            doc,
+        }])?;
+
+        let mut state = self.state.write().unwrap();
+        state.cache.insert(
+            room_id.clone(),
+            RoomEntry {
+                room_id: room_id.clone(),
+                room_name: room_name.to_string(),
+                prefix: prefix.clone(),
+            },
+        );
+        state.prefixes.insert(prefix.clone());
+
+        Ok((room_id, prefix))
+    }
+
+    /// All currently-known storage prefixes.
+    pub fn prefixes(&self) -> Vec<String> {
+        self.state.read().unwrap().prefixes.iter().cloned().collect()
+    }
+
+    /// Longest-prefix match: maps a server-side storage collection name back to
+    /// `(room_prefix, client_collection_name)`. Returns `None` when the
+    /// collection does not belong to any registered room.
+    pub fn prefix_of(&self, storage_col: &str) -> Option<(String, String)> {
+        let prefixes = self.state.read().unwrap();
+        let mut best: Option<(&String, &str)> = None;
+        for p in prefixes.prefixes.iter() {
+            let marker = format!("{}_", p);
+            if let Some(rest) = storage_col.strip_prefix(&marker) {
+                if rest.is_empty() {
+                    continue;
+                }
+                if best.map_or(true, |(bp, _)| p.len() > bp.len()) {
+                    best = Some((p, rest));
+                }
+            }
+        }
+        best.map(|(p, c)| (p.clone(), c.to_string()))
+    }
+
+    /// Re-reads the durable registry so the cache stays realtime.
+    pub fn refresh(&self) {
+        self.load_all();
+    }
 }
 
 // ============================================================================
@@ -97,7 +366,7 @@ pub struct CloudStatus {
 pub struct CloudSync {
     db: Arc<FireLite>,
     mode: CloudSyncMode,
-    room_hash: [u8; 32],
+    room_name: String,
     room_key: String,
     client_id: String,
     auth_token: String,
@@ -107,7 +376,7 @@ pub struct CloudSync {
     // Ingress Buffer for High-Throughput Batch Coalescing
     ingest_tx: mpsc::Sender<IngestItem>,
     ingest_rx: Arc<AsyncMutex<Option<mpsc::Receiver<IngestItem>>>>,
-    active_peers: Arc<AsyncRwLock<HashMap<String, mpsc::Sender<Message>>>>,
+    active_peers: Arc<AsyncRwLock<HashMap<String, PeerInfo>>>,
     // Outbound client queue (Client mode -> Server)
     outbound_tx: Arc<AsyncMutex<Option<mpsc::Sender<CloudPacket>>>>,
 }
@@ -115,8 +384,15 @@ pub struct CloudSync {
 #[cfg(feature = "cloud-sync")]
 struct IngestItem {
     collection: String,
+    prefix: String,
     op: WalOp,
     sender_client_id: Option<String>,
+}
+
+#[cfg(feature = "cloud-sync")]
+struct PeerInfo {
+    tx: mpsc::Sender<Message>,
+    prefix: String,
 }
 
 #[cfg(feature = "cloud-sync")]
@@ -125,19 +401,16 @@ impl CloudSync {
         db: Arc<FireLite>,
         mode: CloudSyncMode,
         client_id: &str,
+        room_name: &str,
         room_key: &str,
         auth_token: &str,
     ) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(room_key.as_bytes());
-        let room_hash: [u8; 32] = hasher.finalize().into();
-
         let (tx, rx) = mpsc::channel(100_000);
 
         Self {
             db,
             mode,
-            room_hash,
+            room_name: room_name.to_string(),
             room_key: room_key.to_string(),
             client_id: client_id.to_string(),
             auth_token: auth_token.to_string(),
@@ -186,6 +459,7 @@ impl CloudSync {
         CloudStatus {
             mode: self.mode,
             connected: self.running.load(Ordering::Relaxed),
+            room_name: self.room_name.clone(),
             room_key: self.room_key.clone(),
             active_clients,
             queued_writes: 0,
@@ -209,7 +483,7 @@ impl CloudSync {
                 None => return,
             };
 
-            let mut batch_buffer: HashMap<String, Vec<(WalOp, Option<String>)>> = HashMap::new();
+            let mut batch_buffer: HashMap<String, Vec<IngestItem>> = HashMap::new();
             let mut interval = tokio::time::interval(Duration::from_millis(5));
 
             while running.load(Ordering::Relaxed) {
@@ -220,9 +494,10 @@ impl CloudSync {
                     item = rx.recv() => {
                         match item {
                             Some(item) => {
-                                batch_buffer.entry(item.collection)
+                                let storage_col = storage_col_name(&item.prefix, &item.collection);
+                                batch_buffer.entry(storage_col)
                                     .or_default()
-                                    .push((item.op, item.sender_client_id));
+                                    .push(item);
 
                                 let total_pending: usize = batch_buffer.values().map(|v| v.len()).sum();
                                 if total_pending >= 512 {
@@ -239,9 +514,9 @@ impl CloudSync {
 
     async fn flush_ingest_buffer(
         db: &Arc<FireLite>,
-        buffer: &mut HashMap<String, Vec<(WalOp, Option<String>)>>,
+        buffer: &mut HashMap<String, Vec<IngestItem>>,
         echo_cache: &Arc<StdMutex<HashMap<String, i64>>>,
-        peers: &Arc<AsyncRwLock<HashMap<String, mpsc::Sender<Message>>>>,
+        peers: &Arc<AsyncRwLock<HashMap<String, PeerInfo>>>,
     ) {
         if buffer.is_empty() {
             return;
@@ -256,66 +531,85 @@ impl CloudSync {
             }
         }
 
-        for (col, items) in buffer.drain() {
+        for (storage_col, items) in buffer.drain() {
             if items.is_empty() {
                 continue;
             }
 
-            let mut mutations = Vec::with_capacity(items.len());
+            // Every item in the same batch key shares (prefix, plain collection).
+            let prefix = items[0].prefix.clone();
+            let plain_col = items[0].collection.clone();
+
+            let mut apply_ops: Vec<WalOp> = Vec::with_capacity(items.len());
+            let mut index_puts: Vec<(String, Arc<FireLiteDoc>)> = Vec::new();
             let mut sender_relays: HashMap<Option<String>, Vec<WalOp>> = HashMap::new();
 
-            for (op, sender_id) in &items {
-                match op {
+            for item in &items {
+                match &item.op {
                     WalOp::PutInlined { key, value } => {
-                        if let Some(doc) = FireLiteDoc::decode(value) {
-                            let ts = doc.get_logical_time();
-
-                            // LWW Check
-                            if let Ok(Some(existing_doc)) = db.get(&col, key) {
-                                if existing_doc.get_logical_time() >= ts {
-                                    continue;
-                                }
-                            }
-
-                            {
-                                let mut cache = echo_cache.lock().unwrap();
-                                cache.insert(key.clone(), ts);
-                            }
-                            mutations.push(BatchMutation::Put {
-                                collection: col.clone(),
-                                doc_id: key.clone(),
-                                doc,
-                            });
-                            sender_relays
-                                .entry(sender_id.clone())
-                                .or_default()
-                                .push(op.clone());
+                        let ts = FireLiteDoc::decode(value)
+                            .map(|d| d.get_logical_time())
+                            .unwrap_or(0);
+                        if ts == 0 {
+                            continue;
                         }
+
+                        // LWW Check
+                        if let Ok(Some(existing_doc)) = db.get(&storage_col, key) {
+                            if existing_doc.get_logical_time() >= ts {
+                                continue;
+                            }
+                        }
+
+                        {
+                            let mut cache = echo_cache.lock().unwrap();
+                            cache.insert(echo_key(&prefix, &plain_col, key), ts);
+                        }
+                        apply_ops.push(WalOp::PutInlined {
+                            key: key.clone(),
+                            value: value.clone(),
+                        });
+                        if let Some(doc) = FireLiteDoc::decode(value) {
+                            index_puts.push((key.clone(), Arc::new(doc)));
+                        }
+                        sender_relays
+                            .entry(item.sender_client_id.clone())
+                            .or_default()
+                            .push(item.op.clone());
                     }
                     WalOp::Delete { key, timestamp } => {
                         {
                             let mut cache = echo_cache.lock().unwrap();
-                            cache.insert(key.clone(), *timestamp);
+                            cache.insert(echo_key(&prefix, &plain_col, key), *timestamp);
                         }
-                        mutations.push(BatchMutation::Delete {
-                            collection: col.clone(),
-                            doc_id: key.clone(),
+                        apply_ops.push(WalOp::Delete {
+                            key: key.clone(),
+                            timestamp: *timestamp,
                         });
                         sender_relays
-                            .entry(sender_id.clone())
+                            .entry(item.sender_client_id.clone())
                             .or_default()
-                            .push(op.clone());
+                            .push(item.op.clone());
                     }
                     _ => {}
                 }
             }
 
-            if !mutations.is_empty() {
+            if !apply_ops.is_empty() {
                 let db_clone = db.clone();
-                let _ = tokio::task::spawn_blocking(move || db_clone.write_batch(mutations)).await;
+                let col = storage_col.clone();
+                let keys: Vec<Arc<str>> = apply_ops
+                    .iter()
+                    .map(|op| Arc::from(op.get_key().to_string()))
+                    .collect();
+                let _ = tokio::task::spawn_blocking(move || {
+                    Self::apply_timestamped(&db_clone, &col, apply_ops, index_puts, keys);
+                })
+                .await;
             }
 
-            // Relay packet to all connected room members EXCEPT origin sender
+            // Relay packet to connected members of the SAME room (except origin).
+            // The collection name is translated back to the client-facing name.
             for (origin_sender, ops) in sender_relays {
                 if ops.is_empty() {
                     continue;
@@ -326,7 +620,7 @@ impl CloudSync {
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_micros(),
-                    collection: col.clone(),
+                    collection: plain_col.clone(),
                     ops,
                 };
 
@@ -334,13 +628,76 @@ impl CloudSync {
                     let msg = Message::Binary(bytes.into());
                     let peers_guard = peers.read().await;
 
-                    for (client_id, tx) in peers_guard.iter() {
-                        if Some(client_id) != origin_sender.as_ref() {
-                            let _ = tx.try_send(msg.clone());
+                    for (peer_id, info) in peers_guard.iter() {
+                        if info.prefix == prefix && Some(peer_id) != origin_sender.as_ref() {
+                            let _ = info.tx.try_send(msg.clone());
                         }
                     }
                 }
             }
+        }
+    }
+
+    /// Applies replicated ops to a local shard while PRESERVING each document's
+    /// original logical timestamp. This is the counterpart to net_sync's remote
+    /// apply: `write_batch` would re-stamp `_time` to the wall clock, which both
+    /// defeats LWW conflict resolution and breaks the echo cache used by the
+    /// outbound tailers (causing replication amplification loops).
+    fn apply_timestamped(
+        db: &Arc<FireLite>,
+        collection: &str,
+        ops: Vec<WalOp>,
+        index_puts: Vec<(String, Arc<FireLiteDoc>)>,
+        keys: Vec<Arc<str>>,
+    ) {
+        let shard_arc = match db.get_shard(collection) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        {
+            let mut shard = shard_arc.write().unwrap();
+            let tx_id = shard.next_tx_id;
+            shard.next_tx_id += 1;
+            if shard.wal.append_batch_fast(tx_id, &ops, true).is_err() {
+                return;
+            }
+            for op in &ops {
+                match op {
+                    WalOp::PutInlined { key, value } => {
+                        shard.update_index_entry(key.clone(), Some(Pointer::Inlined(value.clone())));
+                    }
+                    WalOp::Delete { key, timestamp } => {
+                        shard.update_index_entry(key.clone(), Some(Pointer::Deleted { timestamp: *timestamp }));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        db.bump_versions_by_keys(keys);
+
+        if !index_puts.is_empty() {
+            let _ = db.index_tx.send(IndexOp::Update {
+                collection: collection.to_string(),
+                puts: Arc::new(index_puts),
+                deletes: vec![],
+            });
+        }
+
+        for op in &ops {
+            let kind = match op {
+                WalOp::PutInlined { .. } => ChangeKind::Put,
+                WalOp::Delete { .. } => ChangeKind::Delete,
+                _ => continue,
+            };
+            db.notify_watchers(
+                collection,
+                ChangeEvent {
+                    path: op.get_key().to_string(),
+                    kind,
+                },
+            );
         }
     }
 
@@ -355,14 +712,32 @@ impl CloudSync {
 
         let ingest_tx = self.ingest_tx.clone();
         let db = self.db.clone();
-        let room_hash = self.room_hash;
         let active_peers = self.active_peers.clone();
         let running = self.running.clone();
         let seen_messages = self.seen_messages.clone();
         let echo_cache = self.echo_cache.clone();
+        let rooms = Arc::new(RoomRegistry::new(self.db.clone()));
 
-        // 1. Spawn Server Local WAL Tailer (Broadcasts server-side writes to all connected clients)
-        self.spawn_server_outbound_tailer(echo_cache);
+        // 0. Keep the in-memory room registry realtime by re-reading the
+        //    durable internal collection periodically.
+        {
+            let rooms_refresh = rooms.clone();
+            let running_refresh = running.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(20));
+                while running_refresh.load(Ordering::Relaxed) {
+                    ticker.tick().await;
+                    let rooms = rooms_refresh.clone();
+                    tokio::task::spawn_blocking(move || rooms.refresh())
+                        .await
+                        .ok();
+                }
+            });
+        }
+
+        // 1. Spawn Server Local WAL Tailer (Broadcasts server-side writes to all
+        //    connected clients of the owning room)
+        self.spawn_server_outbound_tailer(echo_cache, rooms.clone());
 
         // 2. Accept Incoming WebSocket Clients
         tokio::spawn(async move {
@@ -372,6 +747,7 @@ impl CloudSync {
                     let db = db.clone();
                     let active_peers = active_peers.clone();
                     let seen_messages = seen_messages.clone();
+                    let rooms = rooms.clone();
 
                     tokio::spawn(async move {
                         if let Ok(ws_stream) = tokio_tungstenite::accept_async(stream).await {
@@ -379,7 +755,7 @@ impl CloudSync {
                                 ws_stream,
                                 ingest_tx,
                                 db,
-                                room_hash,
+                                rooms,
                                 active_peers,
                                 seen_messages,
                             )
@@ -393,12 +769,31 @@ impl CloudSync {
         Ok(())
     }
 
+    /// Server-side version map restricted to one room, keyed by the
+    /// client-facing (unprefixed) collection names.
+    fn server_room_version_map(db: &Arc<FireLite>, prefix: &str) -> HashMap<String, i64> {
+        let mut map = HashMap::new();
+        if let Ok(cols) = db.list_collections() {
+            let marker = format!("{}_", prefix);
+            for col in cols {
+                if let Some(plain) = col.strip_prefix(&marker) {
+                    if !plain.is_empty() {
+                        if let Ok(version) = db.get_collection_version(&col) {
+                            map.insert(plain.to_string(), version);
+                        }
+                    }
+                }
+            }
+        }
+        map
+    }
+
     async fn handle_server_client<S>(
         ws_stream: tokio_tungstenite::WebSocketStream<S>,
         ingest_tx: mpsc::Sender<IngestItem>,
         db: Arc<FireLite>,
-        expected_room_hash: [u8; 32],
-        peers: Arc<AsyncRwLock<HashMap<String, mpsc::Sender<Message>>>>,
+        rooms: Arc<RoomRegistry>,
+        peers: Arc<AsyncRwLock<HashMap<String, PeerInfo>>>,
         seen_messages: Arc<AsyncMutex<Vec<u128>>>,
     ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -407,31 +802,66 @@ impl CloudSync {
         let (client_tx, mut client_rx) = mpsc::channel::<Message>(2000);
 
         let mut client_id = String::new();
+        let mut room_prefix = String::new();
         let mut authenticated = false;
 
         if let Some(Ok(Message::Binary(bytes))) = ws_rx.next().await {
             if let Ok(CloudPacket::Authenticate {
                 token: _,
                 client_id: cid,
+                room_name,
                 room_key,
             }) = rmp_serde::from_slice(&bytes)
             {
-                let mut hasher = Sha256::new();
-                hasher.update(room_key.as_bytes());
-                let h: [u8; 32] = hasher.finalize().into();
+                // Resolve the room -> storage prefix (register it if needed).
+                let resolve = {
+                    let rooms = rooms.clone();
+                    let rn = room_name.clone();
+                    let rk = room_key.clone();
+                    tokio::task::spawn_blocking(move || rooms.resolve(&rn, &rk)).await
+                };
 
-                if h == expected_room_hash {
-                    authenticated = true;
-                    client_id = cid.clone();
+                match resolve {
+                    Ok(Ok((_room_id, prefix))) => {
+                        authenticated = true;
+                        client_id = cid.clone();
+                        room_prefix = prefix.clone();
 
-                    peers.write().await.insert(client_id.clone(), client_tx);
+                        peers.write().await.insert(
+                            client_id.clone(),
+                            PeerInfo {
+                                tx: client_tx,
+                                prefix,
+                            },
+                        );
 
-                    let ack = CloudPacket::AuthResult {
-                        success: true,
-                        error: None,
-                    };
-                    let ack_bytes = rmp_serde::to_vec_named(&ack).unwrap();
-                    let _ = ws_tx.send(Message::Binary(ack_bytes.into())).await;
+                        let ack = CloudPacket::AuthResult {
+                            success: true,
+                            error: None,
+                        };
+                        let ack_bytes = rmp_serde::to_vec_named(&ack).unwrap();
+                        let _ = ws_tx.send(Message::Binary(ack_bytes.into())).await;
+                    }
+                    Ok(Err(e)) => {
+                        let nack = CloudPacket::AuthResult {
+                            success: false,
+                            error: Some(format!("Room registration failed: {}", e)),
+                        };
+                        if let Ok(bytes) = rmp_serde::to_vec_named(&nack) {
+                            let _ = ws_tx.send(Message::Binary(bytes.into())).await;
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        let nack = CloudPacket::AuthResult {
+                            success: false,
+                            error: Some(format!("Room registration failed: {}", e)),
+                        };
+                        if let Ok(bytes) = rmp_serde::to_vec_named(&nack) {
+                            let _ = ws_tx.send(Message::Binary(bytes.into())).await;
+                        }
+                        return;
+                    }
                 }
             }
         }
@@ -476,10 +906,13 @@ impl CloudSync {
                                     }
                                 }
 
+                                // Translate client collection -> room-scoped storage.
+                                let prefix = room_prefix.clone();
                                 for op in ops {
                                     let _ = ingest_tx
                                         .send(IngestItem {
                                             collection: collection.clone(),
+                                            prefix: prefix.clone(),
                                             op,
                                             sender_client_id: Some(client_id.clone()),
                                         })
@@ -487,31 +920,40 @@ impl CloudSync {
                                 }
                             }
                             CloudPacket::VersionPing { versions: client_versions } => {
-                                // 1. SYMMETRICAL REPLY: Send Server's VersionMap back to Client
-                                let server_versions = db.get_version_map();
+                                let prefix = room_prefix.clone();
+
+                                // 1. SYMMETRICAL REPLY: Send the Server's room-scoped
+                                //    VersionMap (plain collection names) back to Client
+                                let server_versions = Self::server_room_version_map(&db, &prefix);
                                 let reply = CloudPacket::VersionPing {
                                     versions: server_versions.clone(),
                                 };
                                 if let Ok(reply_bytes) = rmp_serde::to_vec_named(&reply) {
                                     let peers_guard = peers.read().await;
                                     if let Some(tx) = peers_guard.get(&client_id) {
-                                        let _ = tx.try_send(Message::Binary(reply_bytes.into()));
+                                        let _ = tx.tx.try_send(Message::Binary(reply_bytes.into()));
                                     }
                                 }
 
-                                // 2. Send Deltas for collections where Server is ahead of Client
-                                for (col, remote_ts) in client_versions {
-                                    if let Ok(local_version) = db.get_collection_version(&col) {
-                                        if local_version > remote_ts {
-                                            Self::send_catchup_deltas(
-                                                &db,
-                                                &col,
-                                                remote_ts,
-                                                &client_id,
-                                                &peers,
-                                            )
-                                            .await;
-                                        }
+                                // 2. Pull catch-up: send deltas for every room collection
+                                //    where the Server is ahead of the Client (including
+                                //    collections the client has never seen).
+                                for (plain_col, server_ts) in server_versions {
+                                    let client_ts = client_versions
+                                        .get(&plain_col)
+                                        .copied()
+                                        .unwrap_or(0);
+                                    if server_ts > client_ts {
+                                        let storage_col = format!("{}_{}", prefix, plain_col);
+                                        Self::send_catchup_deltas(
+                                            &db,
+                                            &storage_col,
+                                            &plain_col,
+                                            client_ts,
+                                            &client_id,
+                                            &peers,
+                                        )
+                                        .await;
                                     }
                                 }
                             }
@@ -531,12 +973,13 @@ impl CloudSync {
 
     async fn send_catchup_deltas(
         db: &Arc<FireLite>,
-        collection: &str,
+        storage_col: &str,
+        plain_col: &str,
         since_ts: i64,
         client_id: &str,
-        peers: &Arc<AsyncRwLock<HashMap<String, mpsc::Sender<Message>>>>,
+        peers: &Arc<AsyncRwLock<HashMap<String, PeerInfo>>>,
     ) {
-        if let Ok(shard_arc) = db.get_shard(collection) {
+        if let Ok(shard_arc) = db.get_shard(storage_col) {
             let changed_items: Vec<(String, crate::storage::engine::Pointer)> = {
                 let guard = shard_arc.read().unwrap();
                 guard
@@ -572,21 +1015,26 @@ impl CloudSync {
             if !ops.is_empty() {
                 let packet = CloudPacket::Replication {
                     msg_id: 0,
-                    collection: collection.to_string(),
+                    collection: plain_col.to_string(),
                     ops,
                 };
                 if let Ok(bytes) = rmp_serde::to_vec_named(&packet) {
                     let peers_guard = peers.read().await;
                     if let Some(tx) = peers_guard.get(client_id) {
-                        let _ = tx.try_send(Message::Binary(bytes.into()));
+                        let _ = tx.tx.try_send(Message::Binary(bytes.into()));
                     }
                 }
             }
         }
     }
 
-    /// Tails local WAL changes on the SERVER and broadcasts server-side writes to all connected clients.
-    fn spawn_server_outbound_tailer(&self, echo_cache: Arc<StdMutex<HashMap<String, i64>>>) {
+    /// Tails local WAL changes on the SERVER and broadcasts server-side writes to
+    /// the connected clients of the room that owns each collection.
+    fn spawn_server_outbound_tailer(
+        &self,
+        echo_cache: Arc<StdMutex<HashMap<String, i64>>>,
+        rooms: Arc<RoomRegistry>,
+    ) {
         let db = self.db.clone();
         let active_peers = self.active_peers.clone();
         let running = self.running.clone();
@@ -598,6 +1046,11 @@ impl CloudSync {
                 let cols = db.list_collections().unwrap_or_default();
 
                 for col in cols {
+                    // Skip collections that don't belong to any registered room.
+                    let Some((prefix, plain_col)) = rooms.prefix_of(&col) else {
+                        continue;
+                    };
+
                     if let Ok(shard_arc) = db.get_shard(&col) {
                         let last_pos = *offsets.get(&col).unwrap_or(&0);
                         let tail_res = {
@@ -610,6 +1063,9 @@ impl CloudSync {
                                 let mut to_send = Vec::new();
 
                                 for op in ops {
+                                    if !matches!(op, WalOp::PutInlined { .. } | WalOp::Delete { .. }) {
+                                        continue;
+                                    }
                                     let key = op.get_key();
                                     let wal_ts = match &op {
                                         WalOp::PutInlined { value, .. } => {
@@ -620,11 +1076,12 @@ impl CloudSync {
                                     };
 
                                     // Skip writes originating from client WebSockets (already handled)
+                                    let ek = echo_key(&prefix, &plain_col, &key);
                                     let is_echo = {
                                         let mut cache = echo_cache.lock().unwrap();
-                                        if let Some(&cached_ts) = cache.get(key) {
+                                        if let Some(&cached_ts) = cache.get(&ek) {
                                             if cached_ts == wal_ts {
-                                                cache.remove(key);
+                                                cache.remove(&ek);
                                                 true
                                             } else {
                                                 false
@@ -666,7 +1123,7 @@ impl CloudSync {
                                             .duration_since(UNIX_EPOCH)
                                             .unwrap()
                                             .as_micros(),
-                                        collection: col.clone(),
+                                        collection: plain_col.clone(),
                                         ops: to_send,
                                     };
 
@@ -674,10 +1131,13 @@ impl CloudSync {
                                         let msg = Message::Binary(bytes.into());
                                         let rt = tokio::runtime::Handle::current();
                                         let peers_ptr = active_peers.clone();
+                                        let target_prefix = prefix.clone();
                                         rt.block_on(async move {
                                             let peers_guard = peers_ptr.read().await;
-                                            for tx in peers_guard.values() {
-                                                let _ = tx.try_send(msg.clone());
+                                            for (_, info) in peers_guard.iter() {
+                                                if info.prefix == target_prefix {
+                                                    let _ = info.tx.try_send(msg.clone());
+                                                }
                                             }
                                         });
                                     }
@@ -712,6 +1172,7 @@ impl CloudSync {
         let db = self.db.clone();
         let client_id = self.client_id.clone();
         let auth_token = self.auth_token.clone();
+        let room_name = self.room_name.clone();
         let room_key_str = self.room_key.clone();
         let running = self.running.clone();
         let ingest_tx = self.ingest_tx.clone();
@@ -733,6 +1194,7 @@ impl CloudSync {
                     let auth_packet = CloudPacket::Authenticate {
                         token: auth_token.clone(),
                         client_id: client_id.clone(),
+                        room_name: room_name.clone(),
                         room_key: room_key_str.clone(),
                     };
                     let auth_bytes = rmp_serde::to_vec_named(&auth_packet).unwrap();
@@ -789,6 +1251,7 @@ impl CloudSync {
                                                             let _ = ingest_tx
                                                                 .send(IngestItem {
                                                                     collection: collection.clone(),
+                                                                    prefix: String::new(),
                                                                     op,
                                                                     sender_client_id: None,
                                                                 })
@@ -878,6 +1341,7 @@ impl CloudSync {
             while running.load(Ordering::Relaxed) {
                 let outbound_guard = outbound_tx_option.blocking_lock();
                 let Some(ref tx) = *outbound_guard else {
+                    drop(outbound_guard);
                     std::thread::sleep(Duration::from_millis(500));
                     continue;
                 };
@@ -897,6 +1361,9 @@ impl CloudSync {
                                 let mut to_send = Vec::new();
 
                                 for op in ops {
+                                    if !matches!(op, WalOp::PutInlined { .. } | WalOp::Delete { .. }) {
+                                        continue;
+                                    }
                                     let key = op.get_key();
                                     let wal_ts = match &op {
                                         WalOp::PutInlined { value, .. } => {
@@ -906,11 +1373,12 @@ impl CloudSync {
                                         _ => 0,
                                     };
 
+                                    let echo_key = echo_key("", &col, &key);
                                     let is_echo = {
                                         let mut cache = echo_cache.lock().unwrap();
-                                        if let Some(&cached_ts) = cache.get(key) {
+                                        if let Some(&cached_ts) = cache.get(&echo_key) {
                                             if cached_ts == wal_ts {
-                                                cache.remove(key);
+                                                cache.remove(&echo_key);
                                                 true
                                             } else {
                                                 false
@@ -967,5 +1435,105 @@ impl CloudSync {
                 std::thread::sleep(Duration::from_millis(150));
             }
         });
+    }
+}
+
+#[cfg(all(test, feature = "cloud-sync"))]
+mod tests {
+    use super::*;
+    use crate::config::{DurabilityMode, FireLiteConfig};
+
+    fn temp_db(tag: &str) -> (Arc<FireLite>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "firelite-rooms-{}-{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = FireLiteConfig::default();
+        cfg.durability_mode = DurabilityMode::Manual;
+        let db = Arc::new(FireLite::open(&dir, cfg).unwrap());
+        (db, dir)
+    }
+
+    #[test]
+    fn same_room_key_pair_reuses_prefix() {
+        let (db, _dir) = temp_db("samepair");
+        let reg = RoomRegistry::new(db.clone());
+        let (id1, p1) = reg.resolve("alpha", "k1").unwrap();
+        let (id2, p2) = reg.resolve("alpha", "k1").unwrap();
+        assert_eq!(id1, id2);
+        assert_eq!(p1, p2);
+        assert_eq!(p1, "alpha");
+    }
+
+    #[test]
+    fn same_name_different_key_gets_suffix() {
+        let (db, _dir) = temp_db("suffix");
+        let reg = RoomRegistry::new(db.clone());
+        let (_, p1) = reg.resolve("alpha", "k1").unwrap();
+        let (_, p2) = reg.resolve("alpha", "k2").unwrap();
+        let (_, p3) = reg.resolve("alpha", "k3").unwrap();
+        assert_eq!(p1, "alpha");
+        assert_eq!(p2, "alpha_1");
+        assert_eq!(p3, "alpha_2");
+    }
+
+    #[test]
+    fn different_names_are_independent() {
+        let (db, _dir) = temp_db("names");
+        let reg = RoomRegistry::new(db.clone());
+        let (_, p1) = reg.resolve("alpha", "k1").unwrap();
+        let (_, p2) = reg.resolve("beta", "k1").unwrap();
+        assert_eq!(p1, "alpha");
+        assert_eq!(p2, "beta");
+    }
+
+    #[test]
+    fn prefix_persists_across_registry_restart() {
+        let (db, dir) = temp_db("persist");
+        {
+            let reg = RoomRegistry::new(db.clone());
+            let (_, p1) = reg.resolve("alpha", "k1").unwrap();
+            let (_, p2) = reg.resolve("alpha", "k2").unwrap();
+            assert_eq!(p1, "alpha");
+            assert_eq!(p2, "alpha_1");
+        }
+        // A fresh registry on the same db reloads prefixes from the internal collection.
+        let reg = RoomRegistry::new(db.clone());
+        let (_, p1) = reg.resolve("alpha", "k1").unwrap();
+        let (_, p2) = reg.resolve("alpha", "k2").unwrap();
+        assert_eq!(p1, "alpha");
+        assert_eq!(p2, "alpha_1");
+        // A new distinct key after restart gets the next free suffix.
+        let (_, p3) = reg.resolve("alpha", "k3").unwrap();
+        assert_eq!(p3, "alpha_2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefix_of_maps_storage_back_to_plain() {
+        let (db, _dir) = temp_db("prefixof");
+        let reg = RoomRegistry::new(db.clone());
+        reg.resolve("alpha", "k1").unwrap();
+        reg.resolve("alpha", "k2").unwrap();
+        assert_eq!(
+            reg.prefix_of("alpha_users").unwrap(),
+            ("alpha".to_string(), "users".to_string())
+        );
+        assert_eq!(
+            reg.prefix_of("alpha_1_users").unwrap(),
+            ("alpha_1".to_string(), "users".to_string())
+        );
+        assert!(reg.prefix_of("orphan_users").is_none());
+    }
+
+    #[test]
+    fn sanitize_handles_weird_names() {
+        assert_eq!(sanitize_room_name("my room!"), "my_room");
+        assert_eq!(sanitize_room_name("a/b\\c"), "a_b_c");
+        assert_eq!(sanitize_room_name(""), "room");
+        assert_eq!(sanitize_room_name("___"), "room");
     }
 }

@@ -6,7 +6,7 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 FireLite speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.6.65 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.7.0 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
@@ -212,7 +212,7 @@ firelite-cli --db ./cloud.db serve \
 
 # 4) Cloud Sync CLIENT (connects to the central server, offline-first)
 firelite-cli --db ./local.db serve \
-  --node-id device-1 --key room-key \
+  --node-id device-1 --key room-key --room-name game \
   --server ws://cloud-host:8080 --token s3cret-token
 ```
 
@@ -233,6 +233,7 @@ firelite(node-1 | LAN:Online (Peers:2)) > exit
 | `--key <key>` | Room key (SHA-256 hashed for room isolation) |
 | `--bind <addr>` | Enable **Cloud Sync server** on this bind address (e.g. `0.0.0.0:8080`) |
 | `--server <url>` | Enable **Cloud Sync client**; connect to this server (`ws://`, `wss://`, or `https://`) |
+| `--room-name <name>` | Room name for Cloud Sync clients (defaults to `default`); the server hosts any room |
 | `--token <token>` | Auth token shared with the cloud server |
 
 ---
@@ -364,7 +365,7 @@ batch
 await batch.commit();
 
 // cloud sync + real-time snapshots
-const cs = await db.createCloudSync("client", "device-1", "room-key", "token");
+const cs = await db.createCloudSync("client", "device-1", "game", "room-key", "token");
 await cs.start("ws://host:8080");
 
 const stop = await db.collection("users").onSnapshot((rows) => {
@@ -424,8 +425,8 @@ The wrapper also ships as a ready-to-use **Lazarus package**:
 - `pascal/FireLiteComponent.pas` — the drop-on-form component. NetSync and
   CloudSync are fully exposed as Object Inspector properties:
   `NetSyncName`, `NetSyncRoomKey`, `NetSyncPort`,
-  `CloudSyncMode`, `CloudSyncClientID`, `CloudSyncRoomKey`, `CloudSyncAuthToken`,
-  `CloudSyncAddress`, with one-call `StartNetSync` / `StartCloudSync` methods.
+  `CloudSyncMode`, `CloudSyncClientID`, `CloudSyncRoomName`, `CloudSyncRoomKey`,
+  `CloudSyncAuthToken`, `CloudSyncAddress`, with one-call `StartNetSync` / `StartCloudSync` methods.
 - `pascal/FireLitePkgReg.pas` — design-time registration unit.
 
 > Run it: [`example/pascal/console`](example/pascal/console) is a plain FPC
@@ -502,7 +503,7 @@ Core FFI functions: `fl_net_syncer_new`, `fl_net_syncer_start`, `fl_net_syncer_s
 
 ```toml
 [dependencies]
-firelite = { version = "0.6.65", features = ["net-sync"] }
+firelite = { version = "0.7.0", features = ["net-sync"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -518,7 +519,7 @@ The `cloud-sync` feature provides cloud-level, **bi-directional synchronization*
 
 ```toml
 [dependencies]
-firelite = { version = "0.6.65", features = ["cloud-sync"] }
+firelite = { version = "0.7.0", features = ["cloud-sync"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -530,6 +531,27 @@ tokio = { version = "1", features = ["full"] }
 - **TLS-friendly URLs** — `https://`/`wss://` connect seamlessly through cloud proxies (GitHub Codespaces, Cloudflare Tunnels, AWS ALB, Heroku).
 - **High-throughput flusher** — drains and coalesces incoming client mutations every 5ms or 512 ops, reducing FireLite write-lock acquisitions by ~500x.
 - **Anti-echo & deduplication** — self-pruning echo cache plus `msg_id` deduplication prevents infinite loopbacks and stale re-transmissions.
+
+### Rooms and storage layout
+
+A **room** is uniquely identified by the pair `(room_name, room_key)`. Clients
+that share a room name but use a different security key are treated as being in
+different rooms, so their data is fully isolated on the server.
+
+- `CloudSync::new(db, mode, client_id, room_name, room_key, auth_token)` — the
+  `room_name` argument was added in **v0.7.0** (inserted before `room_key`).
+- The server is **multi-room and room-agnostic**: it accepts any `(room_name,
+  room_key)` pair and hosts all of them in one database.
+- On the server, every room owns a **storage prefix**:
+  - first distinct `(name, key)` for a name → `roomname`
+  - each additional distinct key → `roomname_1`, `roomname_2`, …
+- Client collections are stored server-side as `<prefix>_<collection>` (e.g. a
+  client's `users` collection lands in `game_users`) and are presented back to
+  clients as plain `<collection>`, so data never mixes across rooms even when
+  clients use identical collection names.
+- The room→prefix mapping is kept in the internal, hidden
+  `__firelite_rooms` collection and is re-read periodically by the server, so
+  new rooms are picked up without a restart.
 
 ### Cloud Sync server example (Rust)
 
@@ -547,6 +569,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db.clone(),
         CloudSyncMode::Server,
         "server_node_01",        // Server Node ID
+        "game",                  // Room name (server hosts any room)
         "secret_game_room_key",  // Room Key (SHA-256 hashed for room isolation)
         "master_jwt_secret",     // Authentication Secret
     );
@@ -578,7 +601,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db.clone(),
         CloudSyncMode::Client,
         "user_client_42",          // Client ID
-        "secret_game_room_key",    // Must match the server room key
+        "game",                    // Room name (must match other clients of the room)
+        "secret_game_room_key",    // Must match the room key
         "user_jwt_token_123",      // Authentication Token
     );
 

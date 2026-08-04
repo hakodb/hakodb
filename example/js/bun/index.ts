@@ -68,7 +68,7 @@ async function main(): Promise<void> {
     await syncer.close();
   }
 
-  const cloud = db.createCloudSync(CloudSyncMode.Client, "c1", "room", "token");
+  const cloud = db.createCloudSync(CloudSyncMode.Client, "c1", "room", "secret-key", "token");
   cloud.close();
 
   await db.close();

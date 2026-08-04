@@ -106,8 +106,9 @@ has a `TFireLiteComponent` dropped on it (from the FireLite package's
 component palette tab) and demonstrates document writes, reads and stats.
 NetSync/CloudSync settings are exposed as Object Inspector properties on the
 component (`NetSyncName`, `NetSyncRoomKey`, `NetSyncPort`, `CloudSyncMode`,
-`CloudSyncClientID`, `CloudSyncRoomKey`, `CloudSyncAuthToken`,
-`CloudSyncAddress`) and started with `StartNetSync` / `StartCloudSync`.
+`CloudSyncClientID`, `CloudSyncRoomName`, `CloudSyncRoomKey`,
+`CloudSyncAuthToken`, `CloudSyncAddress`) and started with `StartNetSync` /
+`StartCloudSync`.
 
 ### Installing the FireLite package into Lazarus (optional)
 

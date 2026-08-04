@@ -280,11 +280,12 @@ export class FireLiteClient {
   createCloudSync(
     mode: CloudSyncMode,
     clientId: string | null = null,
+    roomName: string | null = null,
     roomKey: string | null = null,
     authToken: string | null = null
   ): CloudSync {
     this.assertOpen();
-    const handle = this.native.cloudSyncNew(this.engine, mode, clientId, roomKey, authToken);
+    const handle = this.native.cloudSyncNew(this.engine, mode, clientId, roomName, roomKey, authToken);
     if (!handle) {
       throw new Error(`cloudSyncNew failed: ${this.native.lastError()}`);
     }

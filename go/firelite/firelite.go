@@ -404,14 +404,18 @@ func (n *NetSyncer) Free() {
 
 // NewCloudSync creates a bi-directional cloud sync handle.
 // mode: CloudSyncServer (0) or CloudSyncClient (1).
-func (e *Engine) NewCloudSync(mode CloudSyncMode, clientID, roomKey, authToken string) (*CloudSync, error) {
+// roomName identifies the room; roomKey is the room's security key. On the
+// server, room collections are stored as <roomName>_<collection>.
+func (e *Engine) NewCloudSync(mode CloudSyncMode, clientID, roomName, roomKey, authToken string) (*CloudSync, error) {
 	ci, fi := cString(clientID)
+	rn, frn := cString(roomName)
 	cr, fr := cString(roomKey)
 	ct, ft := cString(authToken)
 	defer fi()
+	defer frn()
 	defer fr()
 	defer ft()
-	ptr := C.fl_cloud_sync_new(e.ptr, C.int32_t(mode), ci, cr, ct)
+	ptr := C.fl_cloud_sync_new(e.ptr, C.int32_t(mode), ci, rn, cr, ct)
 	if ptr == nil {
 		return nil, fmt.Errorf("fl_cloud_sync_new failed: %s", lastError())
 	}
@@ -881,8 +885,8 @@ func (c *Client) Compact() error { return c.engine.Compact() }
 func (c *Client) IndexesReady() bool { return c.engine.IsIndexesReady() }
 
 // CloudSync creates a bi-directional cloud sync handle for this engine.
-func (c *Client) CloudSync(mode CloudSyncMode, clientID, roomKey, authToken string) (*CloudSync, error) {
-	return c.engine.NewCloudSync(mode, clientID, roomKey, authToken)
+func (c *Client) CloudSync(mode CloudSyncMode, clientID, roomName, roomKey, authToken string) (*CloudSync, error) {
+	return c.engine.NewCloudSync(mode, clientID, roomName, roomKey, authToken)
 }
 
 // SnapshotIndices forces a durable snapshot of the in-memory index metadata.
