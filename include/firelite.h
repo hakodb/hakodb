@@ -313,6 +313,22 @@ FL_CloudSync *fl_cloud_sync_new(FL_Engine *engine,
                                 const char *room_key,
                                 const char *auth_token);
 
+/// Creates a room-agnostic cloud SERVER. Not bound to any room: the server
+/// accepts and persists any (room_name, room_key) pair its clients ask for and
+/// routes sync to the matching room group.
+FL_CloudSync *fl_cloud_sync_server_new(FL_Engine *engine,
+                                       const char *server_id,
+                                       const char *auth_token);
+
+/// Creates an offline-first cloud CLIENT bound to a room of the caller's
+/// choosing. The client picks the room (room_name + room_key) and later picks
+/// the server via `fl_cloud_sync_start`.
+FL_CloudSync *fl_cloud_sync_client_new(FL_Engine *engine,
+                                       const char *client_id,
+                                       const char *room_name,
+                                       const char *room_key,
+                                       const char *auth_token);
+
 int32_t fl_cloud_sync_start(FL_CloudSync *cloud_sync, const char *address);
 
 char *fl_cloud_sync_status(FL_CloudSync *cloud_sync);

@@ -422,6 +422,41 @@ func (e *Engine) NewCloudSync(mode CloudSyncMode, clientID, roomName, roomKey, a
 	return &CloudSync{ptr: ptr}, nil
 }
 
+// NewCloudSyncServer creates a room-agnostic cloud SERVER ("big cloud server
+// storage"). It is not bound to any room: it accepts and persists any
+// (roomName, roomKey) pair its clients ask for, stores each room's collections
+// under its own storage prefix and relays sync only to the members of that room.
+func (e *Engine) NewCloudSyncServer(serverID, authToken string) (*CloudSync, error) {
+	si, fsi := cString(serverID)
+	ct, ft := cString(authToken)
+	defer fsi()
+	defer ft()
+	ptr := C.fl_cloud_sync_server_new(e.ptr, si, ct)
+	if ptr == nil {
+		return nil, fmt.Errorf("fl_cloud_sync_server_new failed: %s", lastError())
+	}
+	return &CloudSync{ptr: ptr}, nil
+}
+
+// NewCloudSyncClient creates an offline-first cloud CLIENT bound to a room of
+// the caller's choosing. The client picks the room (roomName + roomKey) and
+// later picks the server via Start.
+func (e *Engine) NewCloudSyncClient(clientID, roomName, roomKey, authToken string) (*CloudSync, error) {
+	ci, fi := cString(clientID)
+	rn, frn := cString(roomName)
+	cr, fr := cString(roomKey)
+	ct, ft := cString(authToken)
+	defer fi()
+	defer frn()
+	defer fr()
+	defer ft()
+	ptr := C.fl_cloud_sync_client_new(e.ptr, ci, rn, cr, ct)
+	if ptr == nil {
+		return nil, fmt.Errorf("fl_cloud_sync_client_new failed: %s", lastError())
+	}
+	return &CloudSync{ptr: ptr}, nil
+}
+
 // Start connects a cloud sync client (ws:// or wss://) or binds the cloud sync server (host:port).
 func (s *CloudSync) Start(address string) error {
 	ca, free := cString(address)
@@ -887,6 +922,16 @@ func (c *Client) IndexesReady() bool { return c.engine.IsIndexesReady() }
 // CloudSync creates a bi-directional cloud sync handle for this engine.
 func (c *Client) CloudSync(mode CloudSyncMode, clientID, roomName, roomKey, authToken string) (*CloudSync, error) {
 	return c.engine.NewCloudSync(mode, clientID, roomName, roomKey, authToken)
+}
+
+// CloudSyncServer creates a room-agnostic cloud SERVER for this engine.
+func (c *Client) CloudSyncServer(serverID, authToken string) (*CloudSync, error) {
+	return c.engine.NewCloudSyncServer(serverID, authToken)
+}
+
+// CloudSyncClient creates an offline-first cloud CLIENT bound to a room.
+func (c *Client) CloudSyncClient(clientID, roomName, roomKey, authToken string) (*CloudSync, error) {
+	return c.engine.NewCloudSyncClient(clientID, roomName, roomKey, authToken)
 }
 
 // SnapshotIndices forces a durable snapshot of the in-memory index metadata.

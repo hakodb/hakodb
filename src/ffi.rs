@@ -2496,6 +2496,75 @@ pub extern "C" fn fl_cloud_sync_new(
     })
 }
 
+/// Creates a room-agnostic cloud SERVER. Not bound to any room: the server
+/// accepts and persists any (room_name, room_key) pair its clients ask for and
+/// routes sync to the matching room group.
+#[cfg(feature = "cloud-sync")]
+#[no_mangle]
+pub extern "C" fn fl_cloud_sync_server_new(
+    engine: *mut FL_Engine,
+    server_id: *const c_char,
+    auth_token: *const c_char,
+) -> *mut FL_CloudSync {
+    safety_shield!(ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error("Null engine handle");
+            return ptr::null_mut();
+        }
+
+        let engine_ref = unsafe { &*engine };
+        let sid_str = cstr_to_string(server_id).unwrap_or_else(|_| "server".into());
+        let token_str = cstr_to_string(auth_token).unwrap_or_default();
+
+        let cloud_sync =
+            crate::cloud_sync::CloudSync::server(engine_ref.db.clone(), &sid_str, &token_str);
+
+        clear_last_error();
+        Box::into_raw(Box::new(FL_CloudSync {
+            inner: std::sync::Arc::new(cloud_sync),
+        }))
+    })
+}
+
+/// Creates an offline-first cloud CLIENT bound to a room of the caller's
+/// choosing. The client picks the room (room_name + room_key) and later picks
+/// the server via `fl_cloud_sync_start`.
+#[cfg(feature = "cloud-sync")]
+#[no_mangle]
+pub extern "C" fn fl_cloud_sync_client_new(
+    engine: *mut FL_Engine,
+    client_id: *const c_char,
+    room_name: *const c_char,
+    room_key: *const c_char,
+    auth_token: *const c_char,
+) -> *mut FL_CloudSync {
+    safety_shield!(ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error("Null engine handle");
+            return ptr::null_mut();
+        }
+
+        let engine_ref = unsafe { &*engine };
+        let cid_str = cstr_to_string(client_id).unwrap_or_else(|_| "node".into());
+        let room_name_str = cstr_to_string(room_name).unwrap_or_else(|_| "default".into());
+        let room_str = cstr_to_string(room_key).unwrap_or_else(|_| "default".into());
+        let token_str = cstr_to_string(auth_token).unwrap_or_default();
+
+        let cloud_sync = crate::cloud_sync::CloudSync::client(
+            engine_ref.db.clone(),
+            &cid_str,
+            &room_name_str,
+            &room_str,
+            &token_str,
+        );
+
+        clear_last_error();
+        Box::into_raw(Box::new(FL_CloudSync {
+            inner: std::sync::Arc::new(cloud_sync),
+        }))
+    })
+}
+
 #[cfg(feature = "cloud-sync")]
 #[no_mangle]
 pub extern "C" fn fl_cloud_sync_start(cloud_sync: *mut FL_CloudSync, address: *const c_char) -> i32 {

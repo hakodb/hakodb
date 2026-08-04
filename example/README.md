@@ -108,7 +108,9 @@ NetSync/CloudSync settings are exposed as Object Inspector properties on the
 component (`NetSyncName`, `NetSyncRoomKey`, `NetSyncPort`, `CloudSyncMode`,
 `CloudSyncClientID`, `CloudSyncRoomName`, `CloudSyncRoomKey`,
 `CloudSyncAuthToken`, `CloudSyncAddress`) and started with `StartNetSync` /
-`StartCloudSync`.
+`StartCloudSync`. For the room-agnostic big-cloud-server shape, use
+`CreateCloudServerSyncer(ServerID, AuthToken)`; for a client that picks its own
+room, use `CreateCloudClientSyncer(ClientID, RoomName, RoomKey, AuthToken)`.
 
 ### Installing the FireLite package into Lazarus (optional)
 

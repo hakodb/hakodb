@@ -76,6 +76,10 @@ type
     function CreateNetSyncer(const AName, ARoomKey: string): TFLNetSyncer;
     { Create a standalone CloudSyncer (not tied to the published properties). }
     function CreateCloudSyncer(AMode: TFLCloudSyncMode; const AClientID, ARoomName, ARoomKey, AAuthToken: string): TFLCloudSync;
+    { Create a room-agnostic cloud SERVER (not tied to the published properties). }
+    function CreateCloudServerSyncer(const AServerID, AAuthToken: string): TFLCloudSync;
+    { Create an offline-first cloud CLIENT for a room (not tied to the published properties). }
+    function CreateCloudClientSyncer(const AClientID, ARoomName, ARoomKey, AAuthToken: string): TFLCloudSync;
 
     function Collection(const AName: string): TFLCollection;
     function ListCollections: TStringList;
@@ -185,6 +189,18 @@ function TFireLiteComponent.CreateCloudSyncer(AMode: TFLCloudSyncMode;
 begin
   EnsureOpen;
   Result := FLite.CreateCloudSyncer(AMode, AClientID, ARoomName, ARoomKey, AAuthToken);
+end;
+
+function TFireLiteComponent.CreateCloudServerSyncer(const AServerID, AAuthToken: string): TFLCloudSync;
+begin
+  EnsureOpen;
+  Result := FLite.CreateCloudServerSyncer(AServerID, AAuthToken);
+end;
+
+function TFireLiteComponent.CreateCloudClientSyncer(const AClientID, ARoomName, ARoomKey, AAuthToken: string): TFLCloudSync;
+begin
+  EnsureOpen;
+  Result := FLite.CreateCloudClientSyncer(AClientID, ARoomName, ARoomKey, AAuthToken);
 end;
 
 function TFireLiteComponent.Collection(const AName: string): TFLCollection;

@@ -129,6 +129,8 @@ export interface NativeBindings {
 
   // Cloud Sync (bi-directional WebSocket replication)
   cloudSyncNew(engine: Handle, mode: number, clientId: string | null, roomName: string | null, roomKey: string | null, authToken: string | null): Handle;
+  cloudSyncServerNew(engine: Handle, serverId: string | null, authToken: string | null): Handle;
+  cloudSyncClientNew(engine: Handle, clientId: string | null, roomName: string | null, roomKey: string | null, authToken: string | null): Handle;
   cloudSyncStart(cloudSync: Handle, address: string): number;
   cloudSyncStatus(cloudSync: Handle): string | null;
   cloudSyncStop(cloudSync: Handle): void;
@@ -306,6 +308,8 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     fl_doc_insert_reference: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
 
     fl_cloud_sync_new: { args: [FFIType.ptr, FFIType.i32, FFIType.cstring, FFIType.cstring, FFIType.cstring], returns: FFIType.ptr },
+    fl_cloud_sync_server_new: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.ptr },
+    fl_cloud_sync_client_new: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring, FFIType.cstring, FFIType.cstring], returns: FFIType.ptr },
     fl_cloud_sync_start: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.i32 },
     fl_cloud_sync_status: { args: [FFIType.ptr], returns: FFIType.ptr },
     fl_cloud_sync_stop: { args: [FFIType.ptr], returns: FFIType.void },
@@ -433,6 +437,8 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     netSyncerFree: (syncer) => symbols.fl_net_syncer_free(syncer),
 
     cloudSyncNew: (engine, mode, clientId, roomName, roomKey, authToken) => symbols.fl_cloud_sync_new(engine, mode, toC(clientId), toC(roomName), toC(roomKey), toC(authToken)),
+    cloudSyncServerNew: (engine, serverId, authToken) => symbols.fl_cloud_sync_server_new(engine, toC(serverId), toC(authToken)),
+    cloudSyncClientNew: (engine, clientId, roomName, roomKey, authToken) => symbols.fl_cloud_sync_client_new(engine, toC(clientId), toC(roomName), toC(roomKey), toC(authToken)),
     cloudSyncStart: (cs, address) => symbols.fl_cloud_sync_start(cs, toC(address)),
     cloudSyncStatus: (cs) => ptrToStringAndFree(symbols.fl_cloud_sync_status(cs)),
     cloudSyncStop: (cs) => symbols.fl_cloud_sync_stop(cs),
@@ -611,6 +617,8 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_doc_insert_reference: lib.func('int fl_doc_insert_reference(FL_Doc* doc, const char* key, const char* target_collection, const char* target_id)'),
 
     fl_cloud_sync_new: lib.func('FL_CloudSync* fl_cloud_sync_new(FL_Engine* engine, int32_t mode, const char* client_id, const char* room_name, const char* room_key, const char* auth_token)'),
+    fl_cloud_sync_server_new: lib.func('FL_CloudSync* fl_cloud_sync_server_new(FL_Engine* engine, const char* server_id, const char* auth_token)'),
+    fl_cloud_sync_client_new: lib.func('FL_CloudSync* fl_cloud_sync_client_new(FL_Engine* engine, const char* client_id, const char* room_name, const char* room_key, const char* auth_token)'),
     fl_cloud_sync_start: lib.func('int fl_cloud_sync_start(FL_CloudSync* cloud_sync, const char* address)'),
     fl_cloud_sync_status: lib.func('char* fl_cloud_sync_status(FL_CloudSync* cloud_sync)'),
     fl_cloud_sync_stop: lib.func('void fl_cloud_sync_stop(FL_CloudSync* cloud_sync)'),
@@ -733,6 +741,8 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     netSyncerFree: (syncer) => fn.fl_net_syncer_free(syncer),
 
     cloudSyncNew: (engine, mode, clientId, roomName, roomKey, authToken) => fn.fl_cloud_sync_new(engine, mode, clientId, roomName, roomKey, authToken),
+    cloudSyncServerNew: (engine, serverId, authToken) => fn.fl_cloud_sync_server_new(engine, serverId, authToken),
+    cloudSyncClientNew: (engine, clientId, roomName, roomKey, authToken) => fn.fl_cloud_sync_client_new(engine, clientId, roomName, roomKey, authToken),
     cloudSyncStart: (cs, address) => fn.fl_cloud_sync_start(cs, address),
     cloudSyncStatus: (cs) => ptrToStringAndFree(fn.fl_cloud_sync_status(cs)),
     cloudSyncStop: (cs) => fn.fl_cloud_sync_stop(cs),

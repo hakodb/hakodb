@@ -11,7 +11,6 @@
  */
 import path from "node:path";
 import {
-  CloudSyncMode,
   DurabilityMode,
   FireLiteClient,
 } from "../../../js/src/index.ts";
@@ -68,7 +67,12 @@ async function main(): Promise<void> {
     await syncer.close();
   }
 
-  const cloud = db.createCloudSync(CloudSyncMode.Client, "c1", "room", "secret-key", "token");
+  // Room-agnostic cloud SERVER: not bound to any room, hosts any (room, key).
+  const server = db.createCloudSyncServer("bun-server", "server-token");
+  server.close();
+
+  // Offline-first cloud CLIENT: picks its own room + server.
+  const cloud = db.createCloudSyncClient("c1", "room", "secret-key", "token");
   cloud.close();
 
   await db.close();

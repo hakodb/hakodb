@@ -3,7 +3,9 @@
 //! Verifies that the server stores collections as `<room>_<collection>`, that
 //! clients of the same (room_name, room_key) pair share data, that a client
 //! using the same room name with a different security key is isolated into a
-//! separate room (`<room>_1`), and that the internal room registry persists.
+//! separate room (`<room>_1`), that the internal room registry persists, that
+//! two clients sharing a client_id in different rooms never clobber each other,
+//! and that a client's data stays on the server it chose to sync with.
 //!
 //! Run with: cargo test --features cloud-sync --test cloud_sync_rooms
 
@@ -152,6 +154,154 @@ async fn rooms_are_isolated_and_prefixed_on_server() {
     cc.stop();
 
     for d in [srv_dir, dir_a, dir_b, dir_c] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+#[tokio::test]
+async fn same_client_id_different_rooms_stay_isolated() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{}", port);
+
+    let (srv_db, srv_dir) = temp_db("server_dup");
+    let server = CloudSync::server(srv_db.clone(), "srv", "tok");
+    server.start(&addr).await.unwrap();
+
+    // Two clients share the SAME client_id but join different rooms. The server
+    // must route sync per-room: the second connection must never clobber the
+    // first one's peer entry.
+    let (db_dup1, dir_dup1) = temp_db("dup1");
+    let c1 = CloudSync::client(db_dup1.clone(), "dup", "alpha", "k1", "tok");
+    c1.start(&format!("ws://{}", addr)).await.unwrap();
+
+    let (db_dup2, dir_dup2) = temp_db("dup2");
+    let c2 = CloudSync::client(db_dup2.clone(), "dup", "alpha", "k2", "tok");
+    c2.start(&format!("ws://{}", addr)).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Each client writes into its own room.
+    db_dup1.put("users", "doc1", &make_doc("one", "alpha-k1"))
+        .unwrap();
+    db_dup2.put("users", "doc2", &make_doc("two", "alpha-k2"))
+        .unwrap();
+    wait_until(
+        "server alpha_users/doc1",
+        || srv_db.get("alpha_users", "doc1").unwrap().is_some(),
+        6000,
+    )
+    .await;
+    wait_until(
+        "server alpha_1_users/doc2",
+        || srv_db.get("alpha_1_users", "doc2").unwrap().is_some(),
+        6000,
+    )
+    .await;
+
+    // Server-side writes must reach the CORRECT room member even though both
+    // clients share client_id "dup".
+    srv_db.put("alpha_users", "srv1", &make_doc("s1", "server"))
+        .unwrap();
+    srv_db.put("alpha_1_users", "srv2", &make_doc("s2", "server"))
+        .unwrap();
+
+    wait_until(
+        "dup1 receives srv1",
+        || db_dup1.get("users", "srv1").unwrap().is_some(),
+        8000,
+    )
+    .await;
+    wait_until(
+        "dup2 receives srv2",
+        || db_dup2.get("users", "srv2").unwrap().is_some(),
+        8000,
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(
+        db_dup1.get("users", "srv2").unwrap().is_none(),
+        "dup1 must not receive room alpha/k2 server writes"
+    );
+    assert!(
+        db_dup2.get("users", "srv1").unwrap().is_none(),
+        "dup2 must not receive room alpha/k1 server writes"
+    );
+    assert!(
+        db_dup1.get("users", "doc2").unwrap().is_none(),
+        "dup1 must not receive room alpha/k2 client writes"
+    );
+    assert!(
+        db_dup2.get("users", "doc1").unwrap().is_none(),
+        "dup2 must not receive room alpha/k1 client writes"
+    );
+
+    server.stop();
+    c1.stop();
+    c2.stop();
+
+    for d in [srv_dir, dir_dup1, dir_dup2] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+#[tokio::test]
+async fn clients_choose_which_server_to_sync_to() {
+    let port1 = free_port();
+    let port2 = free_port();
+    let addr1 = format!("127.0.0.1:{}", port1);
+    let addr2 = format!("127.0.0.1:{}", port2);
+
+    let (db1, dir1) = temp_db("server_a");
+    let s1 = CloudSync::server(db1.clone(), "srvA", "tok");
+    s1.start(&addr1).await.unwrap();
+
+    let (db2, dir2) = temp_db("server_b");
+    let s2 = CloudSync::server(db2.clone(), "srvB", "tok");
+    s2.start(&addr2).await.unwrap();
+
+    // The client decides BOTH the room and the server it syncs with.
+    let (c_db, c_dir) = temp_db("client_x");
+    let cx = CloudSync::client(c_db.clone(), "x", "gamma", "k1", "tok");
+    cx.start(&format!("ws://{}", addr1)).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    c_db.put("users", "doc1", &make_doc("xavier", "gamma"))
+        .unwrap();
+    wait_until(
+        "server A gamma_users/doc1",
+        || db1.get("gamma_users", "doc1").unwrap().is_some(),
+        6000,
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    // The OTHER server never saw the data.
+    let cols2 = db2.list_collections().unwrap();
+    assert!(
+        !cols2.contains(&"gamma_users".to_string()),
+        "server B must not receive room gamma data: {:?}",
+        cols2
+    );
+
+    // A client on server B, same room, receives nothing from server A.
+    let (d_db, d_dir) = temp_db("client_y");
+    let cy = CloudSync::client(d_db.clone(), "y", "gamma", "k1", "tok");
+    cy.start(&format!("ws://{}", addr2)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        d_db.get("users", "doc1").unwrap().is_none(),
+        "client on server B must not see data synced to server A"
+    );
+
+    s1.stop();
+    s2.stop();
+    cx.stop();
+    cy.stop();
+
+    for d in [dir1, dir2, c_dir, d_dir] {
         let _ = std::fs::remove_dir_all(d);
     }
 }

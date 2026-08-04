@@ -170,6 +170,8 @@ procedure fl_net_syncer_free(syncer: PFL_NetSyncer); cdecl; external FIRELITE_LI
 
 { Cloud Sync }
 function fl_cloud_sync_new(engine: PFL_Engine; mode: cint32; client_id, room_name, room_key, auth_token: PChar): PFL_CloudSync; cdecl; external FIRELITE_LIB;
+function fl_cloud_sync_server_new(engine: PFL_Engine; server_id, auth_token: PChar): PFL_CloudSync; cdecl; external FIRELITE_LIB;
+function fl_cloud_sync_client_new(engine: PFL_Engine; client_id, room_name, room_key, auth_token: PChar): PFL_CloudSync; cdecl; external FIRELITE_LIB;
 function fl_cloud_sync_start(cloud_sync: PFL_CloudSync; address: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_cloud_sync_status(cloud_sync: PFL_CloudSync): PChar; cdecl; external FIRELITE_LIB;
 procedure fl_cloud_sync_stop(cloud_sync: PFL_CloudSync); cdecl; external FIRELITE_LIB;

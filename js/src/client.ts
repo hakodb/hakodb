@@ -292,6 +292,41 @@ export class FireLiteClient {
     return new CloudSync(this.native, handle);
   }
 
+  /**
+   * Creates a room-agnostic cloud SERVER ("big cloud server storage"). It is
+   * not bound to any room: clients choose their room (and this server) and the
+   * server accepts and persists any (roomName, roomKey) pair, storing each
+   * room's collections under its own storage prefix and relaying sync only to
+   * the members of that room.
+   */
+  createCloudSyncServer(serverId: string | null = null, authToken: string | null = null): CloudSync {
+    this.assertOpen();
+    const handle = this.native.cloudSyncServerNew(this.engine, serverId, authToken);
+    if (!handle) {
+      throw new Error(`cloudSyncServerNew failed: ${this.native.lastError()}`);
+    }
+    return new CloudSync(this.native, handle);
+  }
+
+  /**
+   * Creates an offline-first cloud CLIENT bound to a room of the caller's
+   * choosing. The client picks the room (roomName + roomKey) and later picks
+   * the server via `CloudSync.start()`.
+   */
+  createCloudSyncClient(
+    clientId: string | null = null,
+    roomName: string | null = null,
+    roomKey: string | null = null,
+    authToken: string | null = null
+  ): CloudSync {
+    this.assertOpen();
+    const handle = this.native.cloudSyncClientNew(this.engine, clientId, roomName, roomKey, authToken);
+    if (!handle) {
+      throw new Error(`cloudSyncClientNew failed: ${this.native.lastError()}`);
+    }
+    return new CloudSync(this.native, handle);
+  }
+
   isIndexesReady(): boolean {
     this.assertOpen();
     return this.native.engineIsIndexesReady(this.engine);

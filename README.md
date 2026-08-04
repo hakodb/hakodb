@@ -365,7 +365,11 @@ batch
 await batch.commit();
 
 // cloud sync + real-time snapshots
-const cs = await db.createCloudSync("client", "device-1", "game", "room-key", "token");
+// room-agnostic server (not bound to any room):
+const server = db.createCloudSyncServer("server-1", "master-token");
+await server.start("0.0.0.0:8080");
+// offline-first client that picks its room + server:
+const cs = db.createCloudSyncClient("device-1", "game", "room-key", "token");
 await cs.start("ws://host:8080");
 
 const stop = await db.collection("users").onSnapshot((rows) => {
@@ -481,7 +485,7 @@ Platform outputs:
 - **Result sets:** `fl_result_set_count/get_doc/free`.
 - **Indexing:** `fl_engine_create_index` (composite JSON), `fl_engine_create_simple_index`, `fl_engine_create_fts_index`.
 - **Net Sync:** `fl_net_syncer_new/start/status/free`.
-- **Cloud Sync:** `fl_cloud_sync_new/start/status/stop/free`.
+- **Cloud Sync:** `fl_cloud_sync_new/start/status/stop/free`, plus the room-agnostic `fl_cloud_sync_server_new` and the room-bound `fl_cloud_sync_client_new`.
 
 All FFI gateways (Go / JS-TS / Pascal) wrap these APIs.
 
@@ -540,6 +544,14 @@ different rooms, so their data is fully isolated on the server.
 
 - `CloudSync::new(db, mode, client_id, room_name, room_key, auth_token)` — the
   `room_name` argument was added in **v0.7.0** (inserted before `room_key`).
+  Prefer the dedicated constructors:
+  - `CloudSync::server(db, server_id, auth_token)` — a **room-agnostic cloud
+    server** ("big cloud server storage"). It is *not* bound to any room: it
+    accepts and persists any `(room_name, room_key)` pair its clients ask for.
+  - `CloudSync::client(db, client_id, room_name, room_key, auth_token)` — an
+    offline-first client that decides which room (and, via `start(server_url)`,
+    which server) to sync with. Every client using the same `(room_name,
+    room_key)` on the same server forms one sync group.
 - The server is **multi-room and room-agnostic**: it accepts any `(room_name,
   room_key)` pair and hosts all of them in one database.
 - On the server, every room owns a **storage prefix**:
@@ -552,6 +564,9 @@ different rooms, so their data is fully isolated on the server.
 - The room→prefix mapping is kept in the internal, hidden
   `__firelite_rooms` collection and is re-read periodically by the server, so
   new rooms are picked up without a restart.
+- Peer routing on the server is keyed by `(room, client_id)`, so two clients in
+  different rooms may safely reuse the same `client_id` without clobbering each
+  other's connections.
 
 ### Cloud Sync server example (Rust)
 
@@ -559,20 +574,14 @@ different rooms, so their data is fully isolated on the server.
 use std::sync::Arc;
 use firelite::config::FireLiteConfig;
 use firelite::engine::FireLite;
-use firelite::cloud_sync::{CloudSync, CloudSyncMode};
+use firelite::cloud_sync::CloudSync;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Arc::new(FireLite::open("./data/cloud_server_db", FireLiteConfig::default())?);
 
-    let cloud_server = CloudSync::new(
-        db.clone(),
-        CloudSyncMode::Server,
-        "server_node_01",        // Server Node ID
-        "game",                  // Room name (server hosts any room)
-        "secret_game_room_key",  // Room Key (SHA-256 hashed for room isolation)
-        "master_jwt_secret",     // Authentication Secret
-    );
+    // Room-agnostic server: not bound to any room, hosts any (room, key).
+    let cloud_server = CloudSync::server(db.clone(), "server_node_01", "master_jwt_secret");
 
     cloud_server.start("0.0.0.0:8080").await?;
     println!("FireLite Cloud Sync Server listening on ws://0.0.0.0:8080");
@@ -591,15 +600,15 @@ use firelite::config::FireLiteConfig;
 use firelite::document::firelite_doc::FireLiteDoc;
 use firelite::document::value::Value;
 use firelite::engine::FireLite;
-use firelite::cloud_sync::{CloudSync, CloudSyncMode};
+use firelite::cloud_sync::CloudSync;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Arc::new(FireLite::open("./data/client_db", FireLiteConfig::default())?);
 
-    let cloud_client = CloudSync::new(
+    // The client picks its room (room_name + room_key) and the server URL.
+    let cloud_client = CloudSync::client(
         db.clone(),
-        CloudSyncMode::Client,
         "user_client_42",          // Client ID
         "game",                    // Room name (must match other clients of the room)
         "secret_game_room_key",    // Must match the room key

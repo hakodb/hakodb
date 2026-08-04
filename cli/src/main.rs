@@ -20,7 +20,7 @@ use serde_json::{json, Map, Value as JsonValue};
 use firelite::net_sync::{NetSyncer, SyncStatus};
 
 #[cfg(feature = "cloud-sync")]
-use firelite::cloud_sync::{CloudSync, CloudSyncMode};
+use firelite::cloud_sync::CloudSync;
 
 #[derive(Parser, Debug)]
 #[command(name = "firelite")]
@@ -1360,28 +1360,15 @@ fn run_server(
         // 2. Initialize Cloud Sync (if --bind or --server provided)
         #[cfg(feature = "cloud-sync")]
         let cloud_syncer = if let Some(b) = bind_addr {
-            // Server mode is room-agnostic: it hosts any room. The room name is
-            // only meaningful for clients, so it is ignored here.
-            let cs = CloudSync::new(
-                db.clone(),
-                CloudSyncMode::Server,
-                node_id,
-                "",
-                key,
-                token,
-            );
+            // Server mode is room-agnostic: it hosts any room. Clients pick the
+            // room (and this server); the server stores each room under its own
+            // storage prefix. Room name/key are not needed here.
+            let cs = CloudSync::server(db.clone(), node_id, token);
             cs.start(b).await.map_err(|e| anyhow!(e.to_string()))?;
             Some((cs, format!("Server ({})", b)))
         } else if let Some(s) = server_url {
             let room = room_name.unwrap_or("default");
-            let cs = CloudSync::new(
-                db.clone(),
-                CloudSyncMode::Client,
-                node_id,
-                room,
-                key,
-                token,
-            );
+            let cs = CloudSync::client(db.clone(), node_id, room, key, token);
             cs.start(s).await.map_err(|e| anyhow!(e.to_string()))?;
             Some((cs, format!("Client -> {} (room: {})", s, room)))
         } else {

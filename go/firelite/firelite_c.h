@@ -145,6 +145,8 @@ char *fl_net_syncer_status(FL_NetSyncer *syncer);
 void fl_net_syncer_free(FL_NetSyncer *syncer);
 
 FL_CloudSync *fl_cloud_sync_new(FL_Engine *engine, int32_t mode, const char *client_id, const char *room_name, const char *room_key, const char *auth_token);
+FL_CloudSync *fl_cloud_sync_server_new(FL_Engine *engine, const char *server_id, const char *auth_token);
+FL_CloudSync *fl_cloud_sync_client_new(FL_Engine *engine, const char *client_id, const char *room_name, const char *room_key, const char *auth_token);
 int32_t fl_cloud_sync_start(FL_CloudSync *cloud_sync, const char *address);
 char *fl_cloud_sync_status(FL_CloudSync *cloud_sync);
 void fl_cloud_sync_stop(FL_CloudSync *cloud_sync);

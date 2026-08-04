@@ -236,6 +236,8 @@ type
     FHandle: PFL_CloudSync;
   public
     constructor Create(ADBHandle: PFL_Engine; Mode: TFLCloudSyncMode; const ClientID, RoomName, RoomKey, AuthToken: string);
+    constructor CreateServer(ADBHandle: PFL_Engine; const ServerID, AuthToken: string);
+    constructor CreateClient(ADBHandle: PFL_Engine; const ClientID, RoomName, RoomKey, AuthToken: string);
     destructor Destroy; override;
     procedure Start(const Address: string);
     function StatusJSON: string;
@@ -265,6 +267,8 @@ type
     function StartTransaction: TFLTransaction;
     function CreateNetSyncer(const Name, RoomKey: string): TFLNetSyncer;
     function CreateCloudSyncer(Mode: TFLCloudSyncMode; const ClientID, RoomName, RoomKey, AuthToken: string): TFLCloudSync;
+    function CreateCloudServerSyncer(const ServerID, AuthToken: string): TFLCloudSync;
+    function CreateCloudClientSyncer(const ClientID, RoomName, RoomKey, AuthToken: string): TFLCloudSync;
     property Handle: PFL_Engine read FHandle;
   end;
 
@@ -929,6 +933,22 @@ begin
     raise Exception.Create('CreateCloudSyncer failed: ' + string(fl_last_error));
 end;
 
+constructor TFLCloudSync.CreateServer(ADBHandle: PFL_Engine; const ServerID, AuthToken: string);
+begin
+  inherited Create;
+  FHandle := fl_cloud_sync_server_new(ADBHandle, PChar(ServerID), PChar(AuthToken));
+  if FHandle = nil then
+    raise Exception.Create('CreateCloudServerSyncer failed: ' + string(fl_last_error));
+end;
+
+constructor TFLCloudSync.CreateClient(ADBHandle: PFL_Engine; const ClientID, RoomName, RoomKey, AuthToken: string);
+begin
+  inherited Create;
+  FHandle := fl_cloud_sync_client_new(ADBHandle, PChar(ClientID), PChar(RoomName), PChar(RoomKey), PChar(AuthToken));
+  if FHandle = nil then
+    raise Exception.Create('CreateCloudClientSyncer failed: ' + string(fl_last_error));
+end;
+
 destructor TFLCloudSync.Destroy;
 begin
   if FHandle <> nil then fl_cloud_sync_free(FHandle);
@@ -977,6 +997,8 @@ function TFireLite.StartBatch: TFLBatch; begin Result := TFLBatch.Create(FHandle
 function TFireLite.StartTransaction: TFLTransaction; begin Result := TFLTransaction.Create(FHandle); end;
 function TFireLite.CreateNetSyncer(const Name, RoomKey: string): TFLNetSyncer; begin Result := TFLNetSyncer.Create(FHandle, Name, RoomKey); end;
 function TFireLite.CreateCloudSyncer(Mode: TFLCloudSyncMode; const ClientID, RoomName, RoomKey, AuthToken: string): TFLCloudSync; begin Result := TFLCloudSync.Create(FHandle, Mode, ClientID, RoomName, RoomKey, AuthToken); end;
+function TFireLite.CreateCloudServerSyncer(const ServerID, AuthToken: string): TFLCloudSync; begin Result := TFLCloudSync.CreateServer(FHandle, ServerID, AuthToken); end;
+function TFireLite.CreateCloudClientSyncer(const ClientID, RoomName, RoomKey, AuthToken: string): TFLCloudSync; begin Result := TFLCloudSync.CreateClient(FHandle, ClientID, RoomName, RoomKey, AuthToken); end;
 function TFireLite.Backup(const Path: string): Integer; begin Result := fl_engine_backup(FHandle, PChar(Path)); end;
 procedure TFireLite.Compact; begin CheckStatus(fl_engine_compact(FHandle), 'Compact'); end;
 function TFireLite.IsIndexesReady: Boolean; begin Result := fl_engine_is_indexes_ready(FHandle); end;

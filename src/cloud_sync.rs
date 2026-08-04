@@ -101,6 +101,8 @@ pub struct CloudStatus {
     pub room_key: String,
     pub active_clients: usize,
     pub queued_writes: usize,
+    /// Server mode only: number of distinct rooms currently hosted.
+    pub hosted_rooms: usize,
 }
 
 // ============================================================================
@@ -379,6 +381,8 @@ pub struct CloudSync {
     active_peers: Arc<AsyncRwLock<HashMap<String, PeerInfo>>>,
     // Outbound client queue (Client mode -> Server)
     outbound_tx: Arc<AsyncMutex<Option<mpsc::Sender<CloudPacket>>>>,
+    // Server mode: room registry so `status()` can report hosted rooms.
+    room_registry: Option<Arc<RoomRegistry>>,
 }
 
 #[cfg(feature = "cloud-sync")]
@@ -397,9 +401,57 @@ struct PeerInfo {
 
 #[cfg(feature = "cloud-sync")]
 impl CloudSync {
+    /// Creates a Cloud Sync controller. In **server** mode the room parameters
+    /// are ignored: the server is room-agnostic and hosts any room its clients
+    /// ask for. Prefer the dedicated [`CloudSync::server`] / [`CloudSync::client`]
+    /// constructors for clarity.
     pub fn new(
         db: Arc<FireLite>,
         mode: CloudSyncMode,
+        client_id: &str,
+        room_name: &str,
+        room_key: &str,
+        auth_token: &str,
+    ) -> Self {
+        match mode {
+            CloudSyncMode::Server => Self::server(db, client_id, auth_token),
+            CloudSyncMode::Client => Self::client(db, client_id, room_name, room_key, auth_token),
+        }
+    }
+
+    /// Creates a room-agnostic cloud server ("big cloud server storage"). It is
+    /// not bound to any room: clients choose the room (and the server) and the
+    /// server accepts and persists any (room_name, room_key) pair, storing each
+    /// room's collections under its own storage prefix and relaying sync only to
+    /// the members of that room.
+    pub fn server(db: Arc<FireLite>, server_id: &str, auth_token: &str) -> Self {
+        let (tx, rx) = mpsc::channel(100_000);
+        let registry = Arc::new(RoomRegistry::new(db.clone()));
+
+        Self {
+            db,
+            mode: CloudSyncMode::Server,
+            room_name: String::new(),
+            room_key: String::new(),
+            client_id: server_id.to_string(),
+            auth_token: auth_token.to_string(),
+            running: Arc::new(AtomicBool::new(false)),
+            echo_cache: Arc::new(StdMutex::new(HashMap::new())),
+            seen_messages: Arc::new(AsyncMutex::new(Vec::with_capacity(1000))),
+            ingest_tx: tx,
+            ingest_rx: Arc::new(AsyncMutex::new(Some(rx))),
+            active_peers: Arc::new(AsyncRwLock::new(HashMap::new())),
+            outbound_tx: Arc::new(AsyncMutex::new(None)),
+            room_registry: Some(registry),
+        }
+    }
+
+    /// Creates an offline-first cloud client bound to a single room. The client
+    /// decides which room to join (room_name + room_key) and which server to
+    /// sync with via [`CloudSync::start`]; every other client/peer using the
+    /// same (room_name, room_key) on the same server forms the sync group.
+    pub fn client(
+        db: Arc<FireLite>,
         client_id: &str,
         room_name: &str,
         room_key: &str,
@@ -409,7 +461,7 @@ impl CloudSync {
 
         Self {
             db,
-            mode,
+            mode: CloudSyncMode::Client,
             room_name: room_name.to_string(),
             room_key: room_key.to_string(),
             client_id: client_id.to_string(),
@@ -421,6 +473,7 @@ impl CloudSync {
             ingest_rx: Arc::new(AsyncMutex::new(Some(rx))),
             active_peers: Arc::new(AsyncRwLock::new(HashMap::new())),
             outbound_tx: Arc::new(AsyncMutex::new(None)),
+            room_registry: None,
         }
     }
 
@@ -456,13 +509,26 @@ impl CloudSync {
             0
         };
 
+        let (room_name, room_key, hosted_rooms) = match &self.room_registry {
+            Some(reg) => {
+                let hosted = reg.prefixes().len();
+                ("(multi-room)".to_string(), String::new(), hosted)
+            }
+            None => (
+                self.room_name.clone(),
+                self.room_key.clone(),
+                0,
+            ),
+        };
+
         CloudStatus {
             mode: self.mode,
             connected: self.running.load(Ordering::Relaxed),
-            room_name: self.room_name.clone(),
-            room_key: self.room_key.clone(),
+            room_name,
+            room_key,
             active_clients,
             queued_writes: 0,
+            hosted_rooms,
         }
     }
 
@@ -716,7 +782,12 @@ impl CloudSync {
         let running = self.running.clone();
         let seen_messages = self.seen_messages.clone();
         let echo_cache = self.echo_cache.clone();
-        let rooms = Arc::new(RoomRegistry::new(self.db.clone()));
+        // The room registry is created once (server constructor) and reused so
+        // `status()` can report the number of hosted rooms.
+        let rooms = self
+            .room_registry
+            .clone()
+            .expect("server mode always has a room registry");
 
         // 0. Keep the in-memory room registry realtime by re-reading the
         //    durable internal collection periodically.
@@ -801,7 +872,7 @@ impl CloudSync {
         let (mut ws_tx, mut ws_rx) = ws_stream.split();
         let (client_tx, mut client_rx) = mpsc::channel::<Message>(2000);
 
-        let mut client_id = String::new();
+        let mut peer_key = String::new();
         let mut room_prefix = String::new();
         let mut authenticated = false;
 
@@ -822,13 +893,16 @@ impl CloudSync {
                 };
 
                 match resolve {
-                    Ok(Ok((_room_id, prefix))) => {
+                    Ok(Ok((room_id, prefix))) => {
                         authenticated = true;
-                        client_id = cid.clone();
                         room_prefix = prefix.clone();
+                        // Peers are keyed by room+client so the same client_id
+                        // used in different rooms can never clobber each other
+                        // on a multi-room server.
+                        peer_key = format!("{}:{}", room_id, cid);
 
                         peers.write().await.insert(
-                            client_id.clone(),
+                            peer_key.clone(),
                             PeerInfo {
                                 tx: client_tx,
                                 prefix,
@@ -914,7 +988,7 @@ impl CloudSync {
                                             collection: collection.clone(),
                                             prefix: prefix.clone(),
                                             op,
-                                            sender_client_id: Some(client_id.clone()),
+                                            sender_client_id: Some(peer_key.clone()),
                                         })
                                         .await;
                                 }
@@ -930,7 +1004,7 @@ impl CloudSync {
                                 };
                                 if let Ok(reply_bytes) = rmp_serde::to_vec_named(&reply) {
                                     let peers_guard = peers.read().await;
-                                    if let Some(tx) = peers_guard.get(&client_id) {
+                                    if let Some(tx) = peers_guard.get(&peer_key) {
                                         let _ = tx.tx.try_send(Message::Binary(reply_bytes.into()));
                                     }
                                 }
@@ -950,7 +1024,7 @@ impl CloudSync {
                                             &storage_col,
                                             &plain_col,
                                             client_ts,
-                                            &client_id,
+                                            &peer_key,
                                             &peers,
                                         )
                                         .await;
@@ -968,7 +1042,7 @@ impl CloudSync {
         }
 
         send_task.abort();
-        peers.write().await.remove(&client_id);
+        peers.write().await.remove(&peer_key);
     }
 
     async fn send_catchup_deltas(
@@ -976,7 +1050,7 @@ impl CloudSync {
         storage_col: &str,
         plain_col: &str,
         since_ts: i64,
-        client_id: &str,
+        peer_key: &str,
         peers: &Arc<AsyncRwLock<HashMap<String, PeerInfo>>>,
     ) {
         if let Ok(shard_arc) = db.get_shard(storage_col) {
@@ -1020,7 +1094,7 @@ impl CloudSync {
                 };
                 if let Ok(bytes) = rmp_serde::to_vec_named(&packet) {
                     let peers_guard = peers.read().await;
-                    if let Some(tx) = peers_guard.get(client_id) {
+                    if let Some(tx) = peers_guard.get(peer_key) {
                         let _ = tx.tx.try_send(Message::Binary(bytes.into()));
                     }
                 }
