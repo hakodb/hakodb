@@ -126,7 +126,6 @@ pub struct CloudStatus {
 #[derive(Debug, Clone)]
 struct RoomEntry {
     room_id: String,
-    room_name: String,
     prefix: String,
 }
 
@@ -222,10 +221,6 @@ impl RoomRegistry {
         state.prefixes.clear();
         if let Ok(hits) = self.db.query(Query::new(INTERNAL_ROOMS_COLLECTION)) {
             for (id, doc) in hits {
-                let room_name = doc
-                    .get("room_name")
-                    .and_then(value_to_string)
-                    .unwrap_or_default();
                 let prefix = doc
                     .get("prefix")
                     .and_then(value_to_string)
@@ -237,7 +232,6 @@ impl RoomRegistry {
                     id.clone(),
                     RoomEntry {
                         room_id: id.clone(),
-                        room_name,
                         prefix: prefix.clone(),
                     },
                 );
@@ -272,7 +266,6 @@ impl RoomRegistry {
                     room_id.clone(),
                     RoomEntry {
                         room_id: room_id.clone(),
-                        room_name: room_name.to_string(),
                         prefix: prefix.clone(),
                     },
                 );
@@ -320,7 +313,6 @@ impl RoomRegistry {
             room_id.clone(),
             RoomEntry {
                 room_id: room_id.clone(),
-                room_name: room_name.to_string(),
                 prefix: prefix.clone(),
             },
         );
