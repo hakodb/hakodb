@@ -817,11 +817,16 @@ impl ParallelQueryExecutor {
                 Ok(out)
             }
 
-            ScanType::InvertedIndex { field, query } => {
+            ScanType::InvertedIndex { field, query, prefix } => {
                 let mut out = Vec::new();
                 if let Some(fts_map) = indexes.fts.get(collection) {
                     if let Some(index) = fts_map.get(field) {
-                        if let Some(doc_ids) = index.search(query) {
+                        let doc_ids = if *prefix {
+                            index.search_prefix(query)
+                        } else {
+                            index.search(query)
+                        };
+                        if let Some(doc_ids) = doc_ids {
                             for doc_id in doc_ids.iter().take(max_ids) {
                                 let key = Self::make_key(collection, doc_id);
                                 if let Some(ptr) = storage.index.get(&key) {

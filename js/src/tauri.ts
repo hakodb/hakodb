@@ -16,7 +16,7 @@ export type FireLiteRecord = { [key: string]: FireLitePrimitive };
 // v0.5.9 operators exposed by the Tauri gateway
 export type FilterOperator = 
   | 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' 
-  | 'match' | 'contains' | 'startsWith' | 'in' | 'notIn' | 'arrayContains' | 'arrayContainsAny';
+  | 'match' | 'matchPrefix' | 'contains' | 'startsWith' | 'in' | 'notIn' | 'arrayContains' | 'arrayContainsAny';
 
 type FireLiteOp =
   | { op: 'get'; collection: string; docId: string }

@@ -35,6 +35,7 @@ pub enum ScanType {
     InvertedIndex {
         field: String,
         query: String,
+        prefix: bool,
     },
     // UPDATED: CursorIndex now defines a strict range
     CursorIndex {

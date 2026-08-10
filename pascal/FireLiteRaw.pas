@@ -144,6 +144,7 @@ function fl_result_set_count(results: PFL_ResultSet): SizeUInt; cdecl; external 
 function fl_result_set_get_doc(results: PFL_ResultSet; index: SizeUInt): PFL_Doc; cdecl; external FIRELITE_LIB;
 procedure fl_result_set_free(results: PFL_ResultSet); cdecl; external FIRELITE_LIB;
 function fl_query_where_match(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_where_match_prefix(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_where_contains(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_where_starts_with(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_start_at(query: PFL_Query; anchor: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;

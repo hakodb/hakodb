@@ -163,6 +163,7 @@ type
     function ArrayContains(const Field, Value: string): TFLQuery;
     function ArrayContainsAny(const Field: string; const Values: array of const): TFLQuery;
     function Match(const Field, Value: string): TFLQuery;
+    function MatchPrefix(const Field, Value: string): TFLQuery;
     function Contains(const Field, Value: string): TFLQuery;
     function StartsWith(const Field, Value: string): TFLQuery;
     
@@ -570,6 +571,9 @@ var L: Integer; begin L := Length(FWhereInt); SetLength(FWhereInt, L + 1); FWher
 function TFLQuery.Match(const Field, Value: string): TFLQuery;
 var L: Integer; begin L := Length(FWhereStr); SetLength(FWhereStr, L + 1); FWhereStr[L].Field := Field; FWhereStr[L].Value := Value; FWhereStr[L].Op := 'match'; Result := Self; end;
 
+function TFLQuery.MatchPrefix(const Field, Value: string): TFLQuery;
+var L: Integer; begin L := Length(FWhereStr); SetLength(FWhereStr, L + 1); FWhereStr[L].Field := Field; FWhereStr[L].Value := Value; FWhereStr[L].Op := 'match_prefix'; Result := Self; end;
+
 function TFLQuery.Contains(const Field, Value: string): TFLQuery;
 var L: Integer; begin L := Length(FWhereStr); SetLength(FWhereStr, L + 1); FWhereStr[L].Field := Field; FWhereStr[L].Value := Value; FWhereStr[L].Op := 'contains'; Result := Self; end;
 
@@ -672,6 +676,7 @@ begin
   try
     for I := Low(FWhereStr) to High(FWhereStr) do begin
       if FWhereStr[I].Op = 'match' then fl_query_where_match(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value))
+      else if FWhereStr[I].Op = 'match_prefix' then fl_query_where_match_prefix(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value))
       else if FWhereStr[I].Op = 'contains' then fl_query_where_contains(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value))
       else if FWhereStr[I].Op = 'starts_with' then fl_query_where_starts_with(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value))
       else if FWhereStr[I].Op = 'ne' then fl_query_where_ne_str(Result, PChar(FWhereStr[I].Field), PChar(FWhereStr[I].Value))

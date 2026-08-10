@@ -153,7 +153,7 @@ pub enum BatchMutationKind { Set, Patch, Delete }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FilterOperator {
-    Eq, Ne, Gt, Gte, Lt, Lte, Match, Contains, StartsWith, In, NotIn, ArrayContains, ArrayContainsAny,
+    Eq, Ne, Gt, Gte, Lt, Lte, Match, MatchPrefix, Contains, StartsWith, In, NotIn, ArrayContains, ArrayContainsAny,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -695,6 +695,7 @@ fn map_operator(op: &FilterOperator) -> Operator {
         FilterOperator::Lt => Operator::Lt,
         FilterOperator::Lte => Operator::Lte,
         FilterOperator::Match => Operator::Match,
+        FilterOperator::MatchPrefix => Operator::MatchPrefix,
         FilterOperator::Contains => Operator::Contains,
         FilterOperator::StartsWith => Operator::StartsWith,
         FilterOperator::In => Operator::In,

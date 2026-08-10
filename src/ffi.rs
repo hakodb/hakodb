@@ -1554,6 +1554,15 @@ pub extern "C" fn fl_query_where_match(
 }
 
 #[no_mangle]
+pub extern "C" fn fl_query_where_match_prefix(
+    query: *mut FL_Query,
+    field: *const c_char,
+    value: *const c_char,
+) -> i32 {
+    apply_string_filter(query, field, value, Operator::MatchPrefix)
+}
+
+#[no_mangle]
 pub extern "C" fn fl_query_where_contains(
     query: *mut FL_Query,
     field: *const c_char,

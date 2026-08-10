@@ -43,7 +43,7 @@ export interface FireLiteClientOptions {
 // 2. FIXED: Added 'in' to the interface to match the Query class
 export interface QueryConstraint {
   field: string;
-  op: '==' | '!=' | '>' | '>=' | '<' | '<=' | 'match' | 'contains' | 'startsWith' | 'in' | 'not-in' | 'array-contains' | 'array-contains-any';
+  op: '==' | '!=' | '>' | '>=' | '<' | '<=' | 'match' | 'matchPrefix' | 'contains' | 'startsWith' | 'in' | 'not-in' | 'array-contains' | 'array-contains-any';
   value: any; // Use any because 'in' takes an array
 }
 
@@ -555,7 +555,7 @@ export class CollectionReference {
   }
 
   // 3. FIXED: Updated 'op' signature to include 'in'
-  where(field: string, op: '==' | '!=' | '>' | '>=' | '<' | '<=' | 'match' | 'contains' | 'startsWith' | 'in' | 'not-in' | 'array-contains' | 'array-contains-any', value: any): Query {
+  where(field: string, op: '==' | '!=' | '>' | '>=' | '<' | '<=' | 'match' | 'matchPrefix' | 'contains' | 'startsWith' | 'in' | 'not-in' | 'array-contains' | 'array-contains-any', value: any): Query {
     return new Query(this.client, this.name).where(field, op, value);
   }
 
@@ -632,12 +632,12 @@ export class Query {
 
   constructor(private readonly client: FireLiteClient, private readonly collection: string) { }
 
-  where(field: string, op: '==' | '!=' | '>' | '>=' | '<' | '<=' | 'match' | 'contains' | 'startsWith' | 'in' | 'not-in' | 'array-contains' | 'array-contains-any', value: any): Query {
+  where(field: string, op: '==' | '!=' | '>' | '>=' | '<' | '<=' | 'match' | 'matchPrefix' | 'contains' | 'startsWith' | 'in' | 'not-in' | 'array-contains' | 'array-contains-any', value: any): Query {
     this.filters.push({ field, op, value });
     return this;
   }
 
-  orWhere(field: string, op: '==' | '!=' | '>' | '>=' | '<' | '<=' | 'match' | 'contains' | 'startsWith', value: any): Query {
+  orWhere(field: string, op: '==' | '!=' | '>' | '>=' | '<' | '<=' | 'match' | 'matchPrefix' | 'contains' | 'startsWith', value: any): Query {
     this.orFilters.push({ field, op, value });
     return this;
   }
@@ -720,6 +720,9 @@ export class Query {
             break;
           case 'match':
             ensureOk(native.queryWhereMatch(handle, filter.field, String(filter.value)), native, 'queryWhereMatch');
+            break;
+          case 'matchPrefix':
+            ensureOk(native.queryWhereMatchPrefix(handle, filter.field, String(filter.value)), native, 'queryWhereMatchPrefix');
             break;
           case 'contains':
             ensureOk(native.queryWhereContains(handle, filter.field, String(filter.value)), native, 'queryWhereContains');

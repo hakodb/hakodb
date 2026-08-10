@@ -98,6 +98,7 @@ int32_t fl_query_where_not_in(FL_Query *query, const char *field, FL_Array *arra
 int32_t fl_query_where_array_contains_any(FL_Query *query, const char *field, FL_Array *array);
 int32_t fl_query_where_array_contains(FL_Query *query, const char *field, const char *value);
 int32_t fl_query_where_match(FL_Query *query, const char *field, const char *value);
+int32_t fl_query_where_match_prefix(FL_Query *query, const char *field, const char *value);
 int32_t fl_query_where_contains(FL_Query *query, const char *field, const char *value);
 int32_t fl_query_where_starts_with(FL_Query *query, const char *field, const char *value);
 int32_t fl_query_order_by(FL_Query *query, const char *field, bool ascending);

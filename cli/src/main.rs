@@ -1012,6 +1012,7 @@ fn parse_operator(input: &str) -> Result<Operator> {
         "lt" | "<" => Ok(Operator::Lt),
         "lte" | "<=" => Ok(Operator::Lte),
         "match" => Ok(Operator::Match),
+        "matchprefix" | "match_prefix" => Ok(Operator::MatchPrefix),
         "contains" => Ok(Operator::Contains),
         "startswith" | "starts_with" => Ok(Operator::StartsWith),
         "in" => Ok(Operator::In),
@@ -1375,7 +1376,7 @@ fn run_server(
             None
         };
 
-        println!("🔥 FireLite v0.7.0 Server Active");
+        println!("🔥 FireLite v0.7.1 Server Active");
         println!("🆔 Node ID: {}", node_id);
 
         #[cfg(feature = "net-sync")]

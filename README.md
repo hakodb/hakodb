@@ -6,7 +6,7 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 FireLite speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.7.0 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.7.1 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
@@ -160,6 +160,8 @@ firelite-cli --db ./demo.db query users --or status:eq:active --or status:eq:pen
 
 # full-text search (match) and projections
 firelite-cli --db ./demo.db query users --fts description:seeded
+# prefix / autocomplete search (matches "seeded" from "seed")
+firelite-cli --db ./demo.db query users --where description:matchPrefix:seed
 firelite-cli --db ./demo.db query users --select name,age
 
 # aggregates
@@ -190,7 +192,7 @@ firelite-cli --db ./demo.db rest GET users/alice
 firelite-cli --db ./demo.db rest PATCH users/alice --data '{"age":32}'
 ```
 
-Query filter syntax is `field:op:value` where `op` is one of `eq, ne, gt, gte, lt, lte, in, notIn, match, contains, startsWith, arrayContains, arrayContainsAny`. Array values use JSON, e.g. `tags:in:["a","b"]`. Ordering uses `field:asc` / `field:desc`.
+Query filter syntax is `field:op:value` where `op` is one of `eq, ne, gt, gte, lt, lte, in, notIn, match, matchPrefix, contains, startsWith, arrayContains, arrayContainsAny`. Array values use JSON, e.g. `tags:in:["a","b"]`. Ordering uses `field:asc` / `field:desc`. `match` runs a full-text (inverted-index) word search; `matchPrefix` is autocomplete-style prefix search over the same index (e.g. `"indom"` matches `"indomie"`).
 
 > **Windows PowerShell note:** when passing inline JSON to `--data`, use `--fromfile payload.json` (or `cmd.exe`) instead of `'{"key":"value"}'` — PowerShell 5.1 strips the inner double quotes when invoking native executables.
 
@@ -507,7 +509,7 @@ Core FFI functions: `fl_net_syncer_new`, `fl_net_syncer_start`, `fl_net_syncer_s
 
 ```toml
 [dependencies]
-firelite = { version = "0.7.0", features = ["net-sync"] }
+firelite = { version = "0.7.1", features = ["net-sync"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -523,7 +525,7 @@ The `cloud-sync` feature provides cloud-level, **bi-directional synchronization*
 
 ```toml
 [dependencies]
-firelite = { version = "0.7.0", features = ["cloud-sync"] }
+firelite = { version = "0.7.1", features = ["cloud-sync"] }
 tokio = { version = "1", features = ["full"] }
 ```
 

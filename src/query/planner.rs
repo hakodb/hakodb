@@ -30,18 +30,19 @@ impl QueryPlanner {
         // 1. PRIORITY 1: Full-Text Search
         // SAFEGUARD: Skip FTS for 'id' and '_time' as they are never tokenized as text.
         for filter in &query.filters {
-            if matches!(filter.op, Operator::Match) && filter.field != "_time" {
+            if matches!(filter.op, Operator::Match | Operator::MatchPrefix) && filter.field != "_time" {
                 if let Value::String(q_text) = &filter.value {
                     if indexes.fts.get(&query.collection).map_or(false, |m| m.contains_key(&filter.field)) {
                         return Self::make_plan(
-                            query, 
-                            ScanType::InvertedIndex { 
-                                field: filter.field.clone(), 
-                                query: q_text.clone() 
-                            }, 
-                            query.limit, 
-                            false, 
-                            false
+                            query,
+                            ScanType::InvertedIndex {
+                                field: filter.field.clone(),
+                                query: q_text.clone(),
+                                prefix: filter.op == Operator::MatchPrefix,
+                            },
+                            query.limit,
+                            false,
+                            false,
                         );
                     }
                 }

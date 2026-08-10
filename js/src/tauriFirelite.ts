@@ -12,7 +12,7 @@ export type FireLiteRecord = Record<string, any>;
 
 export type FilterOperator = 
   | 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' 
-  | 'match' | 'contains' | 'startsWith' | 'in' | 'notIn' 
+  | 'match' | 'matchPrefix' | 'contains' | 'startsWith' | 'in' | 'notIn' 
   | 'arrayContains' | 'arrayContainsAny';
 
 export interface SetOptions {

@@ -717,6 +717,13 @@ func (q *Query) WhereMatch(field, value string) error {
 	defer fv()
 	return checkStatus("fl_query_where_match", C.fl_query_where_match(q.ptr, cf, cv))
 }
+func (q *Query) WhereMatchPrefix(field, value string) error {
+	cf, ff := cString(field)
+	cv, fv := cString(value)
+	defer ff()
+	defer fv()
+	return checkStatus("fl_query_where_match_prefix", C.fl_query_where_match_prefix(q.ptr, cf, cv))
+}
 func (q *Query) WhereContains(field, value string) error {
 	cf, ff := cString(field)
 	cv, fv := cString(value)

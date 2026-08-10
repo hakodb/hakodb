@@ -202,6 +202,8 @@ int32_t fl_engine_backup(FL_Engine *engine, const char *path);
 
 int32_t fl_query_where_match(FL_Query *query, const char *field, const char *value);
 
+int32_t fl_query_where_match_prefix(FL_Query *query, const char *field, const char *value);
+
 int32_t fl_query_where_contains(FL_Query *query, const char *field, const char *value);
 
 int32_t fl_query_where_starts_with(FL_Query *query, const char *field, const char *value);

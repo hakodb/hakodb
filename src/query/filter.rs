@@ -11,6 +11,7 @@ pub enum Operator {
     Lt,
     Lte,
     Match,      // Full word matching
+    MatchPrefix, // Word-prefix matching (autocomplete; works on the FTS index)
     Contains,   // Substring matching
     StartsWith, // Prefix matching
     In,
@@ -129,6 +130,17 @@ pub fn compare_values(a: &Value, op: &Operator, b: &Value) -> bool {
                 // Return true if every word in the filter exists in the document
                 f_lower.split_whitespace().all(|w| doc_words.contains(w))
             }
+            Operator::MatchPrefix => {
+                // Word-prefix matching: every query word must be a prefix of some
+                // word in the document (mirrors the FTS-index prefix scan).
+                let d_lower = d.to_lowercase();
+                let f_lower = f.to_lowercase();
+                let doc_words: HashSet<&str> = d_lower.split_whitespace().collect();
+
+                f_lower
+                    .split_whitespace()
+                    .all(|w| doc_words.iter().any(|doc_word| doc_word.starts_with(w)))
+            }
             // Fallback for standard string sorting (Eq, Gt, etc.)
             _ => eval_ordering(d.cmp(f), op),
         },
@@ -213,6 +225,7 @@ fn eval_ordering(ord: Ordering, op: &Operator) -> bool {
         Operator::Lte => ord == Ordering::Less || ord == Ordering::Equal,
         // String-only operators return false if used on non-string types
         Operator::Match
+        | Operator::MatchPrefix
         | Operator::Contains
         | Operator::StartsWith
         | Operator::In
