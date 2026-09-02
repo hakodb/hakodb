@@ -589,6 +589,9 @@ fn decode(payload: &[u8]) -> Result<WalOp> {
                     .map_err(|_| FireLiteError::Corrupt("bad wal key len".into()))?,
             ) as usize;
             pos += 2;
+            if pos + key_len > payload.len() {
+                return Err(FireLiteError::Corrupt("wal put key overruns record".into()));
+            }
             let key = String::from_utf8(payload[pos..pos + key_len].to_vec())
                 .map_err(|_| FireLiteError::Corrupt("bad wal key".into()))?;
             pos += key_len;
@@ -623,9 +626,19 @@ fn decode(payload: &[u8]) -> Result<WalOp> {
                     .map_err(|_| FireLiteError::Corrupt("bad wal key len".into()))?,
             ) as usize;
             pos += 2;
+            if pos + key_len > payload.len() {
+                return Err(FireLiteError::Corrupt("wal delete key overruns record".into()));
+            }
             let key = String::from_utf8(payload[pos..pos + key_len].to_vec())
                 .map_err(|_| FireLiteError::Corrupt("bad wal key".into()))?;
-            let timestamp = i64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+            pos += key_len;
+            // FIX: was reading timestamp from key bytes (missing pos += key_len);
+            // would silently misread timestamps for any key >= 8 bytes.
+            let timestamp = i64::from_le_bytes(
+                payload[pos..pos + 8]
+                    .try_into()
+                    .map_err(|_| FireLiteError::Corrupt("bad wal delete timestamp".into()))?,
+            );
             Ok(WalOp::Delete { key, timestamp })
         }
         3 => {
@@ -636,24 +649,55 @@ fn decode(payload: &[u8]) -> Result<WalOp> {
             );
             Ok(WalOp::CommitTx { tx_id })
         }
-        4 => { // NEW
-            let key_len = u16::from_le_bytes(payload[pos..pos+2].try_into().unwrap()) as usize;
+        4 => {
+            let key_len = u16::from_le_bytes(
+                payload[pos..pos + 2]
+                    .try_into()
+                    .map_err(|_| FireLiteError::Corrupt("bad wal key len".into()))?,
+            ) as usize;
             pos += 2;
-            let key = String::from_utf8(payload[pos..pos+key_len].to_vec()).map_err(|_| FireLiteError::Corrupt("bad key".into()))?;
+            if pos + key_len > payload.len() {
+                return Err(FireLiteError::Corrupt("wal putinlined key overruns record".into()));
+            }
+            let key = String::from_utf8(payload[pos..pos + key_len].to_vec())
+                .map_err(|_| FireLiteError::Corrupt("bad key".into()))?;
             pos += key_len;
-            let val_len = u32::from_le_bytes(payload[pos..pos+4].try_into().unwrap()) as usize;
+            let val_len = u32::from_le_bytes(
+                payload[pos..pos + 4]
+                    .try_into()
+                    .map_err(|_| FireLiteError::Corrupt("bad wal putinlined val len".into()))?,
+            ) as usize;
             pos += 4;
-            let value = payload[pos..pos+val_len].to_vec();
+            if pos + val_len > payload.len() {
+                return Err(FireLiteError::Corrupt("wal putinlined val overruns record".into()));
+            }
+            let value = payload[pos..pos + val_len].to_vec();
             Ok(WalOp::PutInlined { key, value })
         }
-        5 => { // FIX: Error E0004
-            let key_len = u16::from_le_bytes(payload[pos..pos+2].try_into().unwrap()) as usize;
+        5 => {
+            let key_len = u16::from_le_bytes(
+                payload[pos..pos + 2]
+                    .try_into()
+                    .map_err(|_| FireLiteError::Corrupt("bad wal key len".into()))?,
+            ) as usize;
             pos += 2;
-            let key = String::from_utf8(payload[pos..pos+key_len].to_vec()).map_err(|_| FireLiteError::Corrupt("bad key".into()))?;
+            if pos + key_len > payload.len() {
+                return Err(FireLiteError::Corrupt("wal putblob key overruns record".into()));
+            }
+            let key = String::from_utf8(payload[pos..pos + key_len].to_vec())
+                .map_err(|_| FireLiteError::Corrupt("bad key".into()))?;
             pos += key_len;
-            let offset = u64::from_le_bytes(payload[pos..pos+8].try_into().unwrap());
+            let offset = u64::from_le_bytes(
+                payload[pos..pos + 8]
+                    .try_into()
+                    .map_err(|_| FireLiteError::Corrupt("bad wal putblob offset".into()))?,
+            );
             pos += 8;
-            let len = u32::from_le_bytes(payload[pos..pos+4].try_into().unwrap());
+            let len = u32::from_le_bytes(
+                payload[pos..pos + 4]
+                    .try_into()
+                    .map_err(|_| FireLiteError::Corrupt("bad wal putblob len".into()))?,
+            );
             Ok(WalOp::PutBlob { key, offset, len })
         }
         _ => Err(FireLiteError::Corrupt("unknown wal op".into())),
@@ -694,6 +738,53 @@ mod tests {
         wal.append(&WalOp::CommitTx { tx_id: 1 }, false).expect("commit");
         let replayed = wal.replay().expect("replay2");
         assert_eq!(replayed.len(), 1);
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn roundtrip_delete_via_replay() {
+        // Regression test for the wal decode() bug: tag 2 (Delete) was missing
+        // `pos += key_len` and silently misread the timestamp. We can't poke
+        // private decode() directly, but we can replay a Delete through the
+        // public Wal API and check the recovered timestamp matches what we
+        // wrote.
+        let path = std::env::temp_dir().join(format!(
+            "firelite-wal-rt-{}.log",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+
+        let ts: i64 = 1_700_000_123;
+
+        let mut wal = Wal::open(&path, DurabilityMode::Always, 2, None).expect("open");
+        wal.append(&WalOp::BeginTx { tx_id: 9 }, false)
+            .expect("begin");
+        wal.append(
+            &WalOp::Delete {
+                key: "doc-with-long-key".into(),
+                timestamp: ts,
+            },
+            false,
+        )
+        .expect("delete");
+        wal.append(&WalOp::CommitTx { tx_id: 9 }, false)
+            .expect("commit");
+
+        let replayed = wal.replay().expect("replay");
+        assert_eq!(replayed.len(), 1, "expected the Delete op back");
+        match &replayed[0] {
+            WalOp::Delete { key, timestamp } => {
+                assert_eq!(key, "doc-with-long-key");
+                assert_eq!(
+                    *timestamp, ts,
+                    "timestamp round-trip (regression test for pos += key_len bug)"
+                );
+            }
+            other => panic!("expected Delete, got {:?}", other),
+        }
 
         fs::remove_file(path).expect("cleanup");
     }
