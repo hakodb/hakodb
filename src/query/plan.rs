@@ -8,6 +8,15 @@ use super::order::OrderBy;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScanType {
     FullCollection,
+    /// Direct slice over the storage engine's sorted_keys vec. Used when the
+    /// planner can determine that the query's natural key order matches the
+    /// requested order (or no order is requested) — i.e. the executor would
+    /// otherwise materialise the entire index and skip N entries by hand.
+    /// `start_key` is the inclusive start; combined with the plan's
+    /// `offset` and `limit` to derive the actual slice.
+    SortedKeys {
+        start_key: Option<String>,
+    },
     CompositeIndex {
         index_id: u32,
         fields: Vec<String>,

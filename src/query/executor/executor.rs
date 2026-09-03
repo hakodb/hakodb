@@ -38,7 +38,7 @@ impl ParallelQueryExecutor {
     ) -> Result<Vec<(String, FireLiteDoc)>> {
         // 1. PHASE 1: INDEX SCAN
         // Fetch physical pointers from the RAM Index
-        let mut keys_from_index = {
+        let keys_from_index = {
             let storage = storage_arc.read().unwrap();
             self.execute_single_scan(
                 &storage,
@@ -46,6 +46,7 @@ impl ParallelQueryExecutor {
                 &plan.scan,
                 &plan.collection,
                 plan.scan_limit,
+                plan.offset,
             )?
         };
 
@@ -53,22 +54,12 @@ impl ParallelQueryExecutor {
             return Ok(Vec::new());
         }
 
-        // 2. PHASE 2: RAM-LEVEL OPTIMIZATION (Limit/Offset)
-        let mut offset_to_apply_later = plan.offset.unwrap_or(0);
-
-        // If the index already provides the correct sort order,
-        // we can discard pointers in RAM before touching the disk.
-        if plan.order_by_satisfied && offset_to_apply_later > 0 {
-            let skip_count = offset_to_apply_later.min(keys_from_index.len());
-            keys_from_index.drain(0..skip_count);
-            offset_to_apply_later = 0;
-        }
-
-        if plan.order_by_satisfied && plan.filters_satisfied_by_index {
-            if let Some(limit) = plan.limit {
-                keys_from_index.truncate(limit);
-            }
-        }
+        // 2. PHASE 2: Limit / Offset
+        // `execute_single_scan` now handles both via the plan's offset+limit
+        // for ScanType::SortedKeys (direct slice over sorted_keys) and via
+        // scan_limit for the other scan types. Nothing to drain or truncate
+        // here — the result vec is already the final shape.
+        let offset_to_apply_later = 0usize;
 
         let doc_count = keys_from_index.len();
 
@@ -350,6 +341,7 @@ impl ParallelQueryExecutor {
                 &plan.scan,
                 &plan.collection,
                 plan.scan_limit,
+                None,
             )?
         };
 
@@ -478,6 +470,7 @@ impl ParallelQueryExecutor {
                 &plan.scan,
                 &plan.collection,
                 plan.scan_limit,
+                plan.offset,
             )?
         };
 
@@ -597,6 +590,7 @@ impl ParallelQueryExecutor {
         scan: &ScanType,
         collection: &str,
         limit: Option<usize>,
+        offset: Option<usize>,
     ) -> Result<Vec<(String, Pointer)>> {
         // Change from Vec<u8> to Pointer
         let max_ids = limit.unwrap_or(usize::MAX);
@@ -611,6 +605,30 @@ impl ParallelQueryExecutor {
                     .take(max_ids)
                     .map(|(k, p)| (k.clone(), p.clone()))
                     .collect())
+            }
+
+            // Direct slice over sorted_keys. Used by the planner for queries
+            // that order by `id` (or no order at all) and have no usable
+            // filter index — turns offset-of-N from O(N) into O(log N + limit).
+            ScanType::SortedKeys { start_key: _ } => {
+                let (start_pos, end_pos) = match storage.sorted_key_range(
+                    None,
+                    offset,
+                    limit,
+                ) {
+                    Some(r) => r,
+                    None => return Ok(Vec::new()),
+                };
+                let mut out = Vec::with_capacity(end_pos.saturating_sub(start_pos));
+                for key in &storage.sorted_keys[start_pos..end_pos] {
+                    if let Some(ptr) = storage.index.get(key) {
+                        if !matches!(ptr, Pointer::Deleted { .. }) {
+                            out.push((key.clone(), ptr.clone()));
+                            if out.len() >= max_ids { break; }
+                        }
+                    }
+                }
+                Ok(out)
             }
 
             ScanType::SecondaryIndex { field, value } => {
@@ -849,7 +867,7 @@ impl ParallelQueryExecutor {
                 let mut unique_results = HashMap::new();
                 for sub_scan in scans {
                     // Recursively execute sub-scans (Eq lookups for each item in the "IN" array)
-                    let results = self.execute_single_scan(storage, indexes, sub_scan, collection, None)?;
+                    let results = self.execute_single_scan(storage, indexes, sub_scan, collection, None, None)?;
                     for (id, ptr) in results {
                         unique_results.insert(id, ptr); 
                     }

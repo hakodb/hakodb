@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{FireLiteConfig, DurabilityMode};
 use crate::error::{FireLiteError, Result};
-use std::sync::{Arc, Mutex}; 
+use std::sync::{Arc, Mutex};
 // use std::sync::atomic::Ordering;
 use std::time::UNIX_EPOCH;
-use crate::memory::page_cache::PageCache; 
+use crate::memory::page_cache::PageCache;
 
 use super::blob::{BlobManager, BlobWork};
 use super::compaction::compact_segment;
@@ -66,8 +66,15 @@ pub struct StorageEngine {
     pub(crate) use_compression: bool, 
     pub(crate) collection_counts: HashMap<String, usize>,
     pub cache: Arc<Mutex<PageCache>>,
-    pub mmap_size: usize, 
+    pub mmap_size: usize,
+    // Primary index: O(1) hash lookup. Ordered by insertion only when iterated
+    // explicitly via `index.iter()`; reads use `get(key)` which is hash-based.
     pub index: HashMap<String, Pointer>,
+    // Sorted key view for offset/cursor. Maintained on every index write under
+    // the same exclusive lock that owns `index` (caller holds &mut StorageEngine
+    // when calling update_index_entry), so no extra synchronisation needed.
+    // Read by the executor via `sorted_key_range` and direct slice.
+    pub(crate) sorted_keys: Vec<String>,
     pub blob_manager: Option<Arc<BlobManager>>,
     pub(crate) blob_tx: Option<CrossbeamSender<BlobWork>>,
     pub logical_name: String,
@@ -165,12 +172,13 @@ impl StorageEngine {
             compaction_threshold_bytes: cfg.auto_compaction_threshold_bytes,
             encryption: encryption.clone(),
             use_compression: cfg.use_compression,
-            inlined_bytes: 0, 
+            inlined_bytes: 0,
             blob_threshold: cfg.value_blob_threshold_bytes,
             max_inlined_bytes: cfg.max_inlined_memory_bytes,
             collection_counts: HashMap::new(),
-            cache, 
+            cache,
             mmap_size: cfg.mmap_size,
+            sorted_keys: Vec::new(),
             blob_manager: Some(Arc::new(BlobManager::new(
                 blob_file,
                 initial_size,
@@ -190,10 +198,10 @@ impl StorageEngine {
         for op in self.wal.replay()? {
             match op {
                 WalOp::Put { key, segment_id, segment_offset, len } => {
-                    let pointer = Pointer::Segment { 
-                        segment_id, 
-                        offset: segment_offset, 
-                        len 
+                    let pointer = Pointer::Segment {
+                        segment_id,
+                        offset: segment_offset,
+                        len
                     };
                     self.update_index_entry(key, Some(pointer));
                 }
@@ -210,6 +218,16 @@ impl StorageEngine {
                 }
             }
         }
+        // Rebuild sorted_keys from the recovered index. We pay the O(N log N)
+        // sort once here instead of N x O(N) Vec::insert shifts during replay.
+        let mut keys: Vec<String> = self
+            .index
+            .iter()
+            .filter(|(_, p)| !matches!(p, Pointer::Deleted { .. }))
+            .map(|(k, _)| k.clone())
+            .collect();
+        keys.sort();
+        self.sorted_keys = keys;
         Ok(())
     }
 
@@ -223,10 +241,28 @@ impl StorageEngine {
                 Pointer::BlobPendingData { skeleton, .. } => { self.inlined_bytes += skeleton.len(); }
                 _ => {}
             }
-            self.index.insert(key, p.clone())
+            self.index.insert(key.clone(), p.clone())
         } else {
             self.index.remove(&key)
         };
+
+        // 1b. Maintain the sorted_keys view in lockstep with `index`.
+        // Only LIVE pointers go in sorted_keys — tombstones are excluded so the
+        // sorted view is a clean offset/cursor index.
+        // Insert: binary_search + insert (O(n) worst case but keys arrive in WAL
+        //   replay order which is mostly sorted, so amortised O(log n)).
+        // Remove: binary_search + remove (O(n) worst case but deletes are rare
+        //   relative to inserts in steady state).
+        // The caller holds &mut StorageEngine so no extra synchronisation needed.
+        let new_is_live = matches!(new_pointer, Some(ref p) if !matches!(p, Pointer::Deleted { .. }));
+        if new_is_live {
+            match self.sorted_keys.binary_search(&key) {
+                Ok(_) => {} // already present — overwrite kept key
+                Err(pos) => self.sorted_keys.insert(pos, key.clone()),
+            }
+        } else if let Ok(pos) = self.sorted_keys.binary_search(&key) {
+            self.sorted_keys.remove(pos);
+        }
 
         // 2. Adjust stats based on the OLD pointer
         if let Some(old_val) = old_p {
@@ -241,7 +277,6 @@ impl StorageEngine {
             // If we are replacing a LIVE doc with a DELETED doc: decrement
             // If we are replacing a LIVE doc with a LIVE doc: no change
             let old_was_live = !matches!(old_val, Pointer::Deleted { .. });
-            let new_is_live = matches!(new_pointer, Some(p) if !matches!(p, Pointer::Deleted { .. }));
 
             if old_was_live && !new_is_live {
                 if let Some(count) = self.collection_counts.get_mut(&self.logical_name) {
@@ -255,14 +290,39 @@ impl StorageEngine {
             }
         } else {
             // Brand new entry (old_p was None)
-            // Increment count only if the new entry is not a tombstone
-            let new_is_live = matches!(new_pointer, Some(p) if !matches!(p, Pointer::Deleted { .. }));
             if new_is_live {
                 if let Some(count) = self.collection_counts.get_mut(&self.logical_name) {
                     *count += 1;
                 }
             }
         }
+    }
+
+    /// Returns a half-open range `[start_pos, end_pos)` over the sorted key list,
+    /// or `None` if the start key isn't found. The caller can then slice
+    /// `self.sorted_keys[start_pos..end_pos]` and look up pointers via `self.index`.
+    pub(crate) fn sorted_key_range(
+        &self,
+        start: Option<&str>,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Option<(usize, usize)> {
+        let total = self.sorted_keys.len();
+        if total == 0 { return Some((0, 0)); }
+
+        let start_pos = match start {
+            Some(s) => match self.sorted_keys.binary_search(&s.to_string()) {
+                Ok(p) => p + offset.unwrap_or(0),
+                Err(_) => return None,
+            },
+            None => offset.unwrap_or(0),
+        };
+        let end_pos = match limit {
+            Some(l) => (start_pos + l).min(total),
+            None => total,
+        };
+        if start_pos >= total { return Some((total, total)); }
+        Some((start_pos, end_pos))
     }
 
     pub fn checkpoint_inlined_data(&mut self) -> Result<bool> {
@@ -295,7 +355,7 @@ impl StorageEngine {
         )?;
 
         // RENAME TO MATCH THE LOOP BELOW
-        let mut new_pointers = HashMap::new(); 
+        let mut new_pointers = HashMap::new();
         
         crate::storage::compaction::compact_segment(
             &mut target_segment, 

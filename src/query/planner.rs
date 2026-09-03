@@ -63,6 +63,30 @@ impl QueryPlanner {
 
         // 3. PRIORITY 3: Range / Cursor / Pure Pagination Detection
         if let Some(first_order) = query.order_by.first() {
+            // PONYTAIL: special-case the `id` field. When the user orders by
+            // `id` with no cursor bounds and no filters, the storage
+            // sorted_keys vec is already sorted by id. We can slice it
+            // directly (O(log N + limit)) instead of walking any index.
+            // fl_engine_create_index("id") registers `id` as a composite
+            // index with one field, so this short-circuit has to live
+            // BEFORE the composite-index loop below or it never fires.
+            if first_order.field == "id"
+                && query.start_at.is_none() && query.start_after.is_none()
+                && query.end_at.is_none() && query.end_before.is_none()
+            {
+                let order_satisfied = query.order_by.len() == 1;
+                let filters_empty = query.filters.is_empty() && query.or_groups.is_empty();
+                let safe_limit = if order_satisfied && filters_empty {
+                    query.limit
+                } else { None };
+                return Self::make_plan(
+                    query,
+                    ScanType::SortedKeys { start_key: None },
+                    safe_limit,
+                    order_satisfied,
+                    filters_empty,
+                );
+            }
             // Check Composite Indices for both Cursors AND pure OrderBy Pagination
             for idx in indexes.indexes_for_collection(&query.collection) {
                 if !idx.definition.fields.is_empty() && idx.definition.fields[0].field == first_order.field {
@@ -129,10 +153,10 @@ impl QueryPlanner {
                     } else { None };
 
                     return Self::make_plan(
-                        query, 
-                        ScanType::SecondaryIndexRange { field: first_order.field.clone(), start, end, reverse: !first_order.ascending }, 
-                        safe_limit, 
-                        order_satisfied, 
+                        query,
+                        ScanType::SecondaryIndexRange { field: first_order.field.clone(), start, end, reverse: !first_order.ascending },
+                        safe_limit,
+                        order_satisfied,
                         filters_empty
                     );
                 }
@@ -143,10 +167,10 @@ impl QueryPlanner {
         if use_index_heuristic {
             if let Some(range_scan) = Self::try_plan_composite_range(query, indexes) {
                 return Self::make_plan(
-                    query, 
-                    range_scan, 
-                    None, 
-                    false, 
+                    query,
+                    range_scan,
+                    None,
+                    false,
                     false
                 );
             }
@@ -156,10 +180,10 @@ impl QueryPlanner {
         if !query.or_groups.is_empty() || query.filters.iter().any(|f| matches!(f.op, Operator::In)) {
             if let Some(union_scan) = Self::try_plan_union(query, indexes) {
                 return Self::make_plan(
-                    query, 
-                    union_scan, 
-                    None, 
-                    false, 
+                    query,
+                    union_scan,
+                    None,
+                    false,
                     false
                 );
             }
@@ -200,7 +224,7 @@ impl QueryPlanner {
         }
 
         // 7. DEFAULT FALLBACK: Full Collection Scan
-        // This is the "Safety Net". If no index was found for 'id:eq', 
+        // This is the "Safety Net". If no index was found for 'id:eq',
         // it lands here and the Worker checks the storage keys manually.
         let no_filters = query.filters.is_empty() && query.or_groups.is_empty();
         Self::make_plan(query, ScanType::FullCollection, None, false, no_filters)

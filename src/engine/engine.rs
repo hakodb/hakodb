@@ -17,7 +17,7 @@ use crate::index::manager::IndexManager;
 use crate::index::service::IndexingService;
 use crate::index::storage::index_storage::IndexStorage;
 use crate::query::executor::executor::ParallelQueryExecutor;
-use crate::query::planner::QueryPlanner;
+use crate::query::plan_cache::PlanCache;
 use crate::query::query::Query;
 use crate::query::builder::Collection;
 use crate::storage::wal::WalOp;
@@ -233,6 +233,7 @@ pub struct FireLite {
     pub(crate) trigger_blob_flush: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) id_sequence: std::sync::atomic::AtomicU16,
     pub(crate) indexes_ready: Arc<std::sync::atomic::AtomicBool>,
+    plan_cache: PlanCache,
 }
 
 impl FireLite {
@@ -459,7 +460,8 @@ impl FireLite {
             blob_stop_tx: Mutex::new(Some(stop_tx)),
             blob_worker_handle: Mutex::new(Some(blob_worker_handle)),
             id_sequence: std::sync::atomic::AtomicU16::new(0),
-            indexes_ready
+            indexes_ready,
+            plan_cache: PlanCache::default(),
         };
 
         let _ = db.restore_index_defs();
@@ -901,10 +903,10 @@ impl FireLite {
 
         let is_ready = self.indexes_ready.load(std::sync::atomic::Ordering::Acquire);
 
-        let plan = QueryPlanner::plan(&query, &indexes, rows, self.config.query_workers, is_ready);
+        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
 
         // SIMPLE CALL: No blob_file or encryption passed here!
-        let results = self.executor.execute(shard_arc, &indexes, plan)?;
+        let results = self.executor.execute(shard_arc, &indexes, (*plan).clone())?;
 
         // AUDIT RESULT
         self.record_audit(AuditEntry {
@@ -941,10 +943,10 @@ impl FireLite {
         let rows = shard_arc.read().unwrap().count_prefix("");
 
         let is_ready = self.indexes_ready.load(std::sync::atomic::Ordering::Acquire);
-        let plan = QueryPlanner::plan(&q, &indexes, rows, self.config.query_workers, is_ready);
+        let plan = self.plan_cache.get_or_compute(&q, &indexes, rows, self.config.query_workers, is_ready);
 
         // SIMPLE CALL: Worker handles blob resolution internally
-        let results = self.executor.execute_projected(shard_arc, &indexes, plan)?;
+        let results = self.executor.execute_projected(shard_arc, &indexes, (*plan).clone())?;
 
         // 5. Audit & Return
         self.record_audit(AuditEntry {
@@ -1170,11 +1172,11 @@ impl FireLite {
 
         let is_ready = self.indexes_ready.load(std::sync::atomic::Ordering::Acquire);
         // FIX: Add self.config.query_workers as the 4th argument
-        let plan = QueryPlanner::plan(&query, &indexes, rows, self.config.query_workers, is_ready);
+        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
 
         let res = self
             .executor
-            .execute_aggregation(shard_arc, &indexes, plan, &query.aggregations);
+            .execute_aggregation(shard_arc, &indexes, (*plan).clone(), &query.aggregations);
 
         self.record_audit(AuditEntry {
             op: AccessOp::Query,
@@ -1398,22 +1400,23 @@ impl FireLite {
                         decoded_docs.push((full_key, doc));
                     }
                 }
-                IndexingService::backfill_secondary(
-                    &mut mgr,
-                    &col_name,
-                    decoded_docs
-                        .iter()
-                        .map(|(doc_id, doc)| (doc_id.as_str(), doc))
-                        .filter(|(_, doc)| doc.get(&f_name).is_some()),
-                        // .filter(|(id, doc)| {
-                        //     f_name == "id" || f_name == "_time" || doc.get(&f_name).is_some()
-                        // }),
-                );
-                thread::yield_now();
-            }
-        });
+            IndexingService::backfill_secondary(
+                &mut mgr,
+                &col_name,
+                decoded_docs
+                    .iter()
+                    .map(|(doc_id, doc)| (doc_id.as_str(), doc))
+                    .filter(|(_, doc)| doc.get(&f_name).is_some()),
+                    // .filter(|(id, doc)| {
+                    //     f_name == "id" || f_name == "_time" || doc.get(&f_name).is_some()
+                    // }),
+            );
+            thread::yield_now();
+        }
+    });
 
         let _ = self.persist_index_defs();
+        self.plan_cache.invalidate();
         Ok(())
     }
 
@@ -1477,6 +1480,7 @@ impl FireLite {
         });
 
         let _ = self.persist_index_defs();
+        self.plan_cache.invalidate();
         Ok(())
     }
 
@@ -1558,6 +1562,7 @@ impl FireLite {
         });
 
         let _ = self.persist_index_defs();
+        self.plan_cache.invalidate();
         Ok(index_id)
     }
 
