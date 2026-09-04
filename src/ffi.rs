@@ -301,6 +301,16 @@ pub extern "C" fn fl_config_set_blob_threshold(config: *mut FL_Config, threshold
     }
 }
 
+/// WAL headroom reservation in bytes (0 = off, default 4MB). Preallocated
+/// ahead of the write position so steady-state appends never extend the
+/// file. Sparse: consumes no disk until written. Ignored for Manual.
+#[no_mangle]
+pub extern "C" fn fl_config_set_wal_reserve_bytes(config: *mut FL_Config, bytes: u64) {
+    if let Some(cfg) = unsafe { config.as_mut() } {
+        cfg.inner.wal_reserve_bytes = bytes;
+    }
+}
+
 /// Opens the engine using a custom config.
 /// Note: This function takes ownership of the config and will free it automatically.
 #[no_mangle]
@@ -582,6 +592,39 @@ pub extern "C" fn fl_engine_insert(
         let engine = unsafe { &mut *engine };
         let doc = unsafe { &*doc };
         match engine.db.put(&collection, &doc_id, &doc.doc) {
+            Ok(_) => 0,
+            Err(e) => set_last_error(format!("{}", e)),
+        }
+    })
+}
+
+/// Owned-doc insert: takes over the FL_Doc handle (no deep clone).
+/// The handle is ALWAYS consumed — success or failure — do not use or free
+/// `doc` after the call.
+#[no_mangle]
+pub extern "C" fn fl_engine_insert_take(
+    engine: *mut FL_Engine,
+    collection: *const c_char,
+    doc_id: *const c_char,
+    doc: *mut FL_Doc,
+) -> i32 {
+    safety_shield!(-1, {
+        if engine.is_null() || doc.is_null() {
+            return set_last_error("null engine/doc handle");
+        }
+        let collection = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => return set_last_error(e),
+        };
+        let doc_id = match cstr_to_string(doc_id) {
+            Ok(v) => v,
+            Err(e) => return set_last_error(e),
+        };
+
+        let engine = unsafe { &mut *engine };
+        // Move the document out of its Box without cloning every field.
+        let owned = unsafe { *Box::from_raw(doc) };
+        match engine.db.put_owned(&collection, &doc_id, owned.doc) {
             Ok(_) => 0,
             Err(e) => set_last_error(format!("{}", e)),
         }

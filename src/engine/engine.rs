@@ -234,6 +234,14 @@ pub struct FireLite {
     pub(crate) id_sequence: std::sync::atomic::AtomicU16,
     pub(crate) indexes_ready: Arc<std::sync::atomic::AtomicBool>,
     plan_cache: PlanCache,
+    /// ponytail: hot decoded-doc cache. Key is `collection\0doc_id` (ids are
+    /// NUL-free by FFI construction). Value is the global doc version at
+    /// decode time plus the post-`resolve_doc` document: repeat `get()`s of
+    /// the same doc (tx read-modify-write loops, tight polling) skip storage
+    /// lookup + full decode for one Arc clone. Versions only increase and
+    /// every write bumps, so a version match is exact; writes also remove
+    /// the key outright so stale entries can't linger.
+    pub(crate) doc_cache: RwLock<HashMap<String, (u64, Arc<FireLiteDoc>)>>,
 }
 
 impl FireLite {
@@ -416,7 +424,7 @@ impl FireLite {
                                     if active_doc.get_logical_time() == timestamp {
                                         // Transition: Pending (Arc) -> Inlined (Bytes)
                                         // We use the skeleton bytes already calculated by main thread
-                                        shard.update_index_entry(key, Some(Pointer::Inlined(skeleton)));
+                                        shard.update_index_entry(key, Some(Pointer::Inlined(Arc::new(skeleton))));
                                         // NOTE: We DO NOT write to WAL here. Main thread already did it.
                                     }
                                 }
@@ -462,6 +470,7 @@ impl FireLite {
             id_sequence: std::sync::atomic::AtomicU16::new(0),
             indexes_ready,
             plan_cache: PlanCache::default(),
+            doc_cache: RwLock::new(HashMap::new()),
         };
 
         let _ = db.restore_index_defs();
@@ -799,6 +808,20 @@ impl FireLite {
             }
             
             self.trigger_blob_flush.store(true, Ordering::Release);
+
+            // ponytail: drop hot-cache entries for written keys. The version
+            // bump alone would invalidate them; this reclaims memory eagerly.
+            {
+                let mut cache = self.doc_cache.write().unwrap();
+                for (doc_id, _) in &work.index_puts {
+                    cache.remove(&format!("{col_name}\0{doc_id}"));
+                }
+                for op in &work.ops {
+                    if let WalOp::Delete { key, .. } = op {
+                        cache.remove(&format!("{col_name}\0{key}"));
+                    }
+                }
+            }
             
             // Notify Indexer (Worker 1)
             if !work.index_puts.is_empty() || !work.index_deletes.is_empty() {
@@ -849,6 +872,20 @@ impl FireLite {
             return Err(FireLiteError::Corrupt("Denied".into()));
         }
 
+        // ponytail: hot-cache probe. Hit skips storage lookup, full decode
+        // and blob resolve for one deep clone (field Arcs are shared via
+        // interning, so the clone is mostly the value Strings). Ordering is
+        // linearizable: a hit linearizes at the version check, same as a
+        // storage read racing a write today.
+        let cache_key = format!("{collection}\0{doc_id}");
+        if let Some(ver) = self.current_version(doc_id) {
+            if let Some((v, cached)) = self.doc_cache.read().unwrap().get(&cache_key) {
+                if *v == ver {
+                    return Ok(Some((**cached).clone()));
+                }
+            }
+        }
+
         let shard = self.get_shard(collection)?;
         let storage = shard.safe_read()?;
         let res = storage
@@ -865,6 +902,15 @@ impl FireLite {
         
         if let Some(mut doc) = res {
             self.resolve_doc(&mut doc, collection)?;
+            // ponytail: populate post-resolve. Bounded at 8192 with single
+            // arbitrary eviction when full.
+            if let Some(ver) = self.current_version(doc_id) {
+                let mut cache = self.doc_cache.write().unwrap();
+                if cache.len() >= 8192 {
+                    if let Some(k) = cache.keys().next().cloned() { cache.remove(&k); }
+                }
+                cache.insert(cache_key, (ver, Arc::new(doc.clone())));
+            }
             return Ok(Some(doc));
         }
 
@@ -872,10 +918,17 @@ impl FireLite {
     }
 
     pub fn put(&self, col: &str, id: &str, doc: &FireLiteDoc) -> Result<String> {
+        self.put_owned(col, id, doc.clone())
+    }
+
+    /// ponytail: owned-doc variant — skips the full deep clone that `put`
+    /// pays (every String field). Use whenever the caller already owns the
+    /// doc (FFI take-handles, Tauri JSON builds, subdocument assembly).
+    pub fn put_owned(&self, col: &str, id: &str, doc: FireLiteDoc) -> Result<String> {
         let res = self.write_batch(vec![BatchMutation::Put {
             collection: col.into(),
             doc_id: id.into(),
-            doc: doc.clone(),
+            doc,
         }])?;
         Ok(res.into_iter().next().unwrap_or_default())
     }

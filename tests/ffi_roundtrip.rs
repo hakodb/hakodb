@@ -42,7 +42,6 @@ extern "C" {
     fn fl_query_offset(query: *mut FL_Query, offset: usize) -> c_int;
     fn fl_query_where_eq_str(query: *mut FL_Query, field: *const c_char, value: *const c_char) -> c_int;
     fn fl_query_where_eq_int(query: *mut FL_Query, field: *const c_char, value: i64) -> c_int;
-
     fn fl_query_execute_to_handles(engine: *mut FL_Engine, query: *const FL_Query) -> *mut FL_ResultSet;
     fn fl_query_start_at(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> c_int;
     fn fl_query_start_after(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> c_int;
@@ -326,6 +325,49 @@ fn where_eq_returns_subset() {
     let count = unsafe { fl_result_set_count(rs) };
     // cat=2 matches i=2,6,10,14,18 → 5 rows
     assert_eq!(count, 5, "where cat=2 should yield 5 rows");
+
+    unsafe {
+        fl_result_set_free(rs);
+        fl_query_free(q);
+        fl_engine_free(engine);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn multi_filter_conjunction_matches_one() {
+    // No indexes on this collection => full scan with per-doc filter verify,
+    // exercising the byte-compare fast path (19 rejections must not decode).
+    let dir = temp_dir("where2");
+    let path = cs(dir.to_str().unwrap());
+    let engine = unsafe { fl_engine_open(path.as_ptr()) };
+
+    let coll = cs("bench");
+    unsafe {
+        let batch = fl_batch_new();
+        for i in 0..20 {
+            let id = cs(format!("d_{i}").as_str());
+            let doc = fl_doc_new();
+            fl_doc_insert_int(doc, cs("cat").as_ptr(), (i % 4) as i64);
+            fl_doc_insert_str(doc, cs("name").as_ptr(), cs(format!("n_{i}").as_str()).as_ptr());
+            fl_batch_set(batch, coll.as_ptr(), id.as_ptr(), doc);
+        }
+        assert_eq!(fl_batch_commit(engine, batch), 0);
+    }
+
+    wait_for_indexes(engine);
+
+    // cat=2 AND name=n_6 → only i=6
+    let q = unsafe { fl_query_new(coll.as_ptr()) };
+    unsafe {
+        fl_query_where_eq_int(q, cs("cat").as_ptr(), 2);
+        fl_query_where_eq_str(q, cs("name").as_ptr(), cs("n_6").as_ptr());
+    }
+    let rs = unsafe { fl_query_execute_to_handles(engine, q) };
+    assert_eq!(unsafe { fl_result_set_count(rs) }, 1, "conjunction should yield 1 row");
+    let d = unsafe { fl_result_set_get_doc(rs, 0) };
+    let j = read_cstr(unsafe { fl_doc_to_json(d) });
+    assert!(j.contains("n_6"), "row should be n_6, got {j}");
 
     unsafe {
         fl_result_set_free(rs);

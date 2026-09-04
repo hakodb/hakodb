@@ -48,6 +48,16 @@ pub struct Wal {
     write_buffer: Vec<u8>,
     last_sync: Instant,
     group_commit_interval: Duration,
+    reserve_bytes: u64,
+}
+
+/// ponytail: every encoded op is >= 1 byte, so an all-zero 8-byte header can
+/// only be unwritten preallocation padding (see open()). Readers treat it as
+/// clean end-of-records: stop WITHOUT truncating (the reservation must
+/// survive recovery) and WITHOUT erroring (tail() callers progress normally).
+#[inline]
+fn is_zero_header(header: &[u8; 8]) -> bool {
+    header.iter().all(|&b| b == 0)
 }
 
 impl Wal {
@@ -56,14 +66,32 @@ impl Wal {
         mode: DurabilityMode,
         group_commit_max_ops: usize,
         encryption: Option<EncryptionContext>,
+        reserve_bytes: u64,
     ) -> Result<Self> {
         let mut file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .open(path)?;
-   
-        file.seek(SeekFrom::End(0))?;
+
+        // ponytail: keep `reserve_bytes` of headroom ahead of the write
+        // position so steady-state appends never extend the file. Thousands
+        // of 1KB extensions fragment the file and inflate every fsync (which
+        // must flush file metadata too). One reservation per open amortizes
+        // it. 0 disables. The config default also skips Manual (never
+        // syncs mid-session — reserving there only inflates apparent size).
+        // The zero padding is replay-safe: record headers are never
+        // all-zero (every op encodes to >= 1 byte), so readers treat an
+        // all-zero header as clean end-of-records and never truncate the
+        // reservation (see replay()/tail()).
+        // Writer position stays at the end of REAL data, never inside the
+        // padding — otherwise replay would stop early and lose records.
+        let end = file.seek(SeekFrom::End(0))?;
+        // Skipped for Manual regardless of the knob (never fsyncs).
+        if mode != DurabilityMode::Manual && reserve_bytes > 0 && file.metadata()?.len() < end.saturating_add(reserve_bytes) {
+            let _ = file.set_len(end.saturating_add(reserve_bytes));
+        }
+        file.seek(SeekFrom::Start(end))?;
 
         Ok(Self {
             file,
@@ -74,6 +102,7 @@ impl Wal {
             write_buffer: Vec::with_capacity(1024 * 1024), // 1MB WAL buffer
             last_sync: Instant::now(),
             group_commit_interval: Duration::from_millis(5),
+            reserve_bytes,
         })
     }
 
@@ -276,6 +305,7 @@ impl Wal {
         
         // Scratchpad to avoid re-allocating memory for every record
         let mut payload_scratch = Vec::with_capacity(8192);
+        let mut stopped_on_padding = false;
 
         loop {
             // A. Read Header (8 bytes: 4 for Len, 4 for CRC)
@@ -288,6 +318,12 @@ impl Wal {
 
             let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
             let expected_crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
+
+            // Preallocation padding (see open()): clean stop, keep reservation.
+            if is_zero_header(&header) {
+                stopped_on_padding = true;
+                break;
+            }
 
             // B. Read Payload into scratchpad
             payload_scratch.resize(len, 0);
@@ -321,13 +357,16 @@ impl Wal {
 
         // 3. AUTO-REPAIR: If we stopped early due to corruption or partial write, 
         // truncate the file so future runs don't get stuck on the same bad data.
-        if last_valid_pos < self.file.metadata()?.len() {
+        // ponytail: never truncate preallocation padding — file length beyond
+        // the last record is reservation, not junk (replay() below shares it).
+        if last_valid_pos < self.file.metadata()?.len() && !stopped_on_padding {
             crate::util::log::info(&format!("WAL repair: truncating at {} bytes", last_valid_pos));
             self.file.set_len(last_valid_pos)?;
         }
 
-        // 4. Seek to end so future appends happen correctly
-        self.file.seek(SeekFrom::End(0))?;
+        // 4. Seek so future appends continue exactly at end-of-records.
+        // (NOT End(0): with preallocation those differ — see replay().)
+        self.file.seek(SeekFrom::Start(last_valid_pos))?;
 
         // 5. Apply Transaction Logic (Only return ops from committed TXs)
         Ok(filter_committed_ops(raw_ops))
@@ -339,6 +378,7 @@ impl Wal {
         let mut raw_ops = Vec::new();
         let mut last_valid_pos = 0;
         let mut payload_scratch = Vec::with_capacity(8192);
+        let mut stopped_on_padding = false;
 
         loop {
             let mut header = [0u8; 8];
@@ -346,6 +386,12 @@ impl Wal {
 
             let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
             let expected_crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
+
+            // Preallocation padding (see open()): clean stop, keep reservation.
+            if is_zero_header(&header) {
+                stopped_on_padding = true;
+                break;
+            }
 
             if len == 0 { break; } 
 
@@ -395,15 +441,19 @@ impl Wal {
 
         // ONLY TRUNCATE if we actually hit a CRC failure or partial write.
         // If we stopped because of a logical Err above, we return before this line.
+        // ponytail: never truncate preallocation padding (see open()).
         let current_file_len = self.file.metadata()?.len();
-        if last_valid_pos < current_file_len {
+        if last_valid_pos < current_file_len && !stopped_on_padding {
             // Double check: if the next byte is valid, don't truncate, just error.
             // For now, let's just log it.
             crate::util::log::info(&format!("WAL repair: truncating {} bytes of tail junk", current_file_len - last_valid_pos));
             let _ = self.file.set_len(last_valid_pos);
         }
 
-        self.file.seek(SeekFrom::End(0))?;
+        // ponytail: resume exactly at end-of-records, NOT End(0) — with a
+        // preallocated file those differ, and appending past the padding
+        // would strand records replay can no longer reach.
+        self.file.seek(SeekFrom::Start(last_valid_pos))?;
         Ok(filter_committed_ops(raw_ops))
     }
 
@@ -416,6 +466,13 @@ impl Wal {
         // snapshot ends up double-written to disk.
         self.write_buffer.clear();
         self.file.set_len(0)?;
+        // ponytail: re-reserve headroom after the wipe (see open()) —
+        // metadata-only, so post-checkpoint appends don't regrow 1KB at a
+        // time. Skipped for Manual (never fsyncs; reservation would only
+        // inflate apparent DB size). Position stays at 0 where records begin.
+        if self.mode != DurabilityMode::Manual && self.reserve_bytes > 0 {
+            let _ = self.file.set_len(self.reserve_bytes);
+        }
         self.file.seek(SeekFrom::Start(0))?;
         self.pending_ops_since_sync = 0;
         Ok(())
@@ -449,6 +506,10 @@ impl Wal {
             let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
             let expected_crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
 
+            // Preallocation padding (see open()): clean end, not an error —
+            // callers use the returned position to keep tailing.
+            if is_zero_header(&header) { break; }
+
             let mut payload = vec![0u8; len];
             if reader.read_exact(&mut payload).is_err() { break; }
 
@@ -473,8 +534,7 @@ impl Wal {
 impl WalOp {
     /// Returns the document key associated with this operation.
     /// Returns an empty string for transaction markers (Begin/Commit).
-    pub fn get_key(&self) -> &str {
-        match self {
+    pub fn get_key(&self) -> &str {        match self {
             WalOp::Put { key, .. } => key,
             WalOp::Delete { key, .. } => key,
             WalOp::PutInlined { key, .. } => key,
@@ -729,7 +789,7 @@ mod tests {
                 .as_nanos()
         ));
 
-        let mut wal = Wal::open(&path, DurabilityMode::Always, 2, None).expect("open");
+        let mut wal = Wal::open(&path, DurabilityMode::Always, 2, None, 0).expect("open");
         wal.append(&WalOp::BeginTx { tx_id: 1 }, false).expect("begin");
         wal.append(&WalOp::Put {
             key: "users:1".into(),
@@ -766,7 +826,7 @@ mod tests {
 
         let ts: i64 = 1_700_000_123;
 
-        let mut wal = Wal::open(&path, DurabilityMode::Always, 2, None).expect("open");
+        let mut wal = Wal::open(&path, DurabilityMode::Always, 2, None, 0).expect("open");
         wal.append(&WalOp::BeginTx { tx_id: 9 }, false)
             .expect("begin");
         wal.append(
@@ -792,6 +852,54 @@ mod tests {
             }
             other => panic!("expected Delete, got {:?}", other),
         }
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn preallocation_survives_replay_and_appends() {
+        // The 4MB reservation must be invisible to recovery: records written
+        // into it replay fully, the padding is never truncated, and appends
+        // after a reopen continue exactly at end-of-records (not EOF).
+        let path = std::env::temp_dir().join(format!(
+            "firelite-wal-prealloc-{}.log",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+
+        let mut wal = Wal::open(&path, DurabilityMode::OnCommit, 100, None, 4 * 1024 * 1024).expect("open");
+        assert!(fs::metadata(&path).expect("meta").len() >= 4 * 1024 * 1024 - 1);
+
+        for tx in 1..=3u64 {
+            wal.append(&WalOp::BeginTx { tx_id: tx }, false).expect("begin");
+            wal.append(&WalOp::PutInlined {
+                key: format!("k{tx}"),
+                value: vec![tx as u8; 64],
+            }, false).expect("put");
+            wal.append(&WalOp::CommitTx { tx_id: tx }, false).expect("commit");
+        }
+        drop(wal);
+
+        // Reopen: reservation intact, all 3 puts recover, no truncation.
+        let mut wal2 = Wal::open(&path, DurabilityMode::OnCommit, 100, None, 4 * 1024 * 1024).expect("reopen");
+        let replayed = wal2.replay().expect("replay");
+        assert_eq!(replayed.len(), 3, "all puts must survive, got {replayed:?}");
+        assert!(fs::metadata(&path).expect("meta2").len() >= 4 * 1024 * 1024 - 1);
+
+        // Append after reopen lands right after the records (position check:
+        // file length must NOT jump — the reservation absorbs it).
+        let len_before = fs::metadata(&path).expect("meta3").len();
+        wal2.append(&WalOp::BeginTx { tx_id: 4 }, false).expect("begin2");
+        wal2.append(&WalOp::PutInlined { key: "k4".into(), value: vec![4u8; 64] }, false).expect("put2");
+        wal2.append(&WalOp::CommitTx { tx_id: 4 }, false).expect("commit2");
+        assert_eq!(fs::metadata(&path).expect("meta4").len(), len_before);
+        drop(wal2);
+
+        let mut wal3 = Wal::open(&path, DurabilityMode::OnCommit, 100, None, 4 * 1024 * 1024).expect("reopen2");
+        let replayed = wal3.replay().expect("replay2");
+        assert_eq!(replayed.len(), 4, "post-reopen append must be reachable, got {replayed:?}");
 
         fs::remove_file(path).expect("cleanup");
     }

@@ -1,58 +1,68 @@
 use crate::document::value::Value;
+use std::cell::RefCell;
+
+thread_local! {
+    /// Reused encode buffer for index maintenance (`index_document` encodes
+    /// every indexed field per write). Borrowed per field, never escapes.
+    pub static ENC_SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(128));
+}
 
 pub fn encode_scalar(value: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_scalar_into(value, &mut out);
+    out
+}
+
+/// ponytail: borrow-friendly form — encode into a caller-provided buffer
+/// (e.g. a reused thread-local scratch) instead of allocating per call.
+/// Byte-identical output to `encode_scalar`.
+pub fn encode_scalar_into(value: &Value, out: &mut Vec<u8>) {
     match value {
-        Value::Null => vec![0],
-        Value::Bool(v) => vec![1, *v as u8],
+        Value::Null => out.push(0),
+        Value::Bool(v) => { out.push(1); out.push(*v as u8); }
         Value::Int(v) => {
-            let mut out = vec![2];
+            out.push(2);
             out.extend(v.to_be_bytes());
-            out
         }
         Value::Float(v) => {
-            let mut out = vec![3];
+            out.push(3);
             out.extend(v.to_bits().to_be_bytes());
-            out
         }
-        Value::String(v) => {
-            let mut out = vec![4];
-            out.extend((v.len() as u32).to_be_bytes());
-            out.extend(v.as_bytes());
-            out
-        }
+        Value::String(v) => encode_str_scalar_into(v, out),
         Value::Binary(v) => {
-            let mut out = vec![5];
+            out.push(5);
             out.extend((v.len() as u32).to_be_bytes());
             out.extend(v);
-            out
         }
         Value::Timestamp(v) => {
-            let mut out = vec![6];
+            out.push(6);
             out.extend(v.to_be_bytes());
-            out
         }
-        Value::ServerTimestamp => vec![0], // Fallback to Null
-        Value::Map(_) => vec![8],
-        Value::Array(_) => vec![9],
+        Value::ServerTimestamp => out.push(0), // Fallback to Null
+        Value::Map(_) => out.push(8),
+        Value::Array(_) => out.push(9),
         Value::Reference { collection, doc_id } => {
-            let mut b = Vec::with_capacity(1 + 1 + collection.len() + 1 + doc_id.len());
-            b.push(10); // Tag 10
-            
-            // MATCHING THE firelite_doc.rs ENCODING:
-            b.push(collection.len() as u8);
-            b.extend_from_slice(collection.as_bytes());
-            b.push(doc_id.len() as u8);
-            b.extend_from_slice(doc_id.as_bytes());
-            b
-        },
-        // ADD THIS ARM:
+            out.reserve(1 + 1 + collection.len() + 1 + doc_id.len());
+            out.push(10); // Tag 10
+            out.push(collection.len() as u8);
+            out.extend_from_slice(collection.as_bytes());
+            out.push(doc_id.len() as u8);
+            out.extend_from_slice(doc_id.as_bytes());
+        }
         Value::BlobLink { offset, len } => {
-            let mut b = vec![11]; // Tag 11
-            b.extend_from_slice(&offset.to_be_bytes());
-            b.extend_from_slice(&len.to_be_bytes());
-            b
+            out.push(11); // Tag 11
+            out.extend_from_slice(&offset.to_be_bytes());
+            out.extend_from_slice(&len.to_be_bytes());
         }
     }
+}
+
+/// String scalar encoding shared by `encode_scalar_into` and the id fast
+/// path in index maintenance (avoids building a temp `Value::String`).
+pub fn encode_str_scalar_into(s: &str, out: &mut Vec<u8>) {
+    out.push(4);
+    out.extend((s.len() as u32).to_be_bytes());
+    out.extend(s.as_bytes());
 }
 
 pub fn decode_scalar_as_f64(bytes: &[u8]) -> Option<f64> {

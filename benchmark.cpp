@@ -201,7 +201,8 @@ Report run_benchmark(BenchConfig cfg) {
         auto d = make_complex_doc(i, payload);
         char key_buf[16];
         snprintf(key_buf, sizeof(key_buf), "s_%d", i);
-        fl_engine_insert(db, "bench", key_buf, d.get());
+        // Move semantics: the freshly built doc is consumed, no deep clone.
+        fl_engine_insert_take(db, "bench", key_buf, d.release());
     }
     res.single_wps = to_throughput(s_write_count, diff_ms(t_start));
     // cout << fixed << setprecision(0) << res.single_wps << " wps";
@@ -389,8 +390,11 @@ Report run_benchmark(BenchConfig cfg) {
 
 int main(int argc, char** argv) {
     int g_docs = 1000;
-    if (argc > 1 && string(argv[1]).find("--docs=") == 0) {
-        g_docs = stoi(string(argv[1]).substr(7));
+    string only_profile;
+    for (int i = 1; i < argc; i++) {
+        string a = argv[i];
+        if (a.find("--docs=") == 0) g_docs = stoi(a.substr(7));
+        if (a.find("--profile=") == 0) only_profile = a.substr(10);
     }
 
     vector<BenchConfig> suite = {
@@ -408,6 +412,7 @@ int main(int argc, char** argv) {
 
     vector<Report> results;
     for (const auto& cfg : suite) {
+        if (!only_profile.empty() && cfg.name != only_profile) continue;
         cout << "\n>> PROFILE: " << setw(12) <<  cfg.name << flush;
         results.push_back(run_benchmark(cfg));
         this_thread::sleep_for(chrono::milliseconds(200));

@@ -105,4 +105,32 @@ impl CompositeIndex {
             .map(|(_, doc_id)| doc_id.clone())
             .collect()
     }
+
+    /// ponytail: limit-aware walk — stops the BTree iteration after `limit`
+    /// entries instead of materializing the whole prefix range first. For
+    /// reverse scans this takes the LAST `limit` entries (via rev().take),
+    /// which the old materialize-then-rev also did but only after cloning
+    /// every key in the range.
+    pub fn range_scan_limit(
+        &self,
+        start: &SmallVec<[u8; 32]>,
+        end: &SmallVec<[u8; 32]>,
+        limit: usize,
+        reverse: bool,
+    ) -> Vec<Arc<str>> {
+        if reverse {
+            self.tree
+                .range::<SmallVec<[u8; 32]>, _>(start..=end)
+                .rev()
+                .take(limit)
+                .map(|(_, doc_id)| doc_id.clone())
+                .collect()
+        } else {
+            self.tree
+                .range::<SmallVec<[u8; 32]>, _>(start..=end)
+                .take(limit)
+                .map(|(_, doc_id)| doc_id.clone())
+                .collect()
+        }
+    }
 }

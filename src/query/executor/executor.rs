@@ -74,21 +74,32 @@ impl ParallelQueryExecutor {
             let optimized_plan = crate::query::executor::worker::prepare_optimized_plan(&plan);
             let mut results = Vec::with_capacity(doc_count);
 
-            for (id, ptr) in keys_from_index {
-                if let Ok(Some(bytes)) = storage_guard.read_pointer(&ptr) {
-                    if plan.filters_satisfied_by_index {
-                        if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
-                            if let Some(bm) = blob_manager {
-                                let _ = crate::query::executor::worker::inflate_blobs(&mut doc, bm);
-                            }
-                            results.push((id, doc));
+            // ponytail: shared decode helper for both byte sources below.
+            let push_row = |id: String, bytes: &[u8], results: &mut Vec<(String, FireLiteDoc)>| {
+                if plan.filters_satisfied_by_index {
+                    if let Some(mut doc) = FireLiteDoc::decode(bytes) {
+                        if let Some(bm) = blob_manager {
+                            let _ = crate::query::executor::worker::inflate_blobs(&mut doc, bm);
                         }
-                    } else {
-                        if let Some(mut doc) = crate::query::executor::worker::unified_match_decode(&id, &bytes, &optimized_plan) {
-                            if let Some(bm) = blob_manager {
-                                let _ = crate::query::executor::worker::inflate_blobs(&mut doc, bm);
-                            }
-                            results.push((id, doc));
+                        results.push((id, doc));
+                    }
+                } else if let Some(mut doc) = crate::query::executor::worker::unified_match_decode(&id, bytes, &optimized_plan) {
+                    if let Some(bm) = blob_manager {
+                        let _ = crate::query::executor::worker::inflate_blobs(&mut doc, bm);
+                    }
+                    results.push((id, doc));
+                }
+            };
+
+            for (id, ptr) in keys_from_index {
+                // ponytail: Inlined bytes are Arc-shared — decode borrows the
+                // shared buffer instead of cloning ~1KB per row. The owned Arc
+                // keeps the buffer alive, so no guard lifetime is involved.
+                match ptr {
+                    Pointer::Inlined(shared) => push_row(id, &shared, &mut results),
+                    other => {
+                        if let Ok(Some(bytes)) = storage_guard.read_pointer(&other) {
+                            push_row(id, &bytes, &mut results);
                         }
                     }
                 }
@@ -244,7 +255,7 @@ impl ParallelQueryExecutor {
             let op = &ops[0];
 
             // Determine if the operation is eligible for RAM-only execution
-            let mut filter_ids: Option<hashbrown::HashSet<String>> = None;
+            let mut filter_ids: Option<hashbrown::HashSet<std::sync::Arc<str>>> = None;
             let mut can_use_fast_path = true;
 
             // Step A: Attempt to resolve matching Document IDs using RAM indexes
@@ -711,15 +722,16 @@ impl ParallelQueryExecutor {
                 let mut out = Vec::new();
                 if let Some(idx) = indexes.composite.get(*index_id) {
                     let range = crate::index::composite::range_builder::build_prefix_range(&idx.definition, values);
-                    let doc_ids = idx.range_scan(&range.start, &range.end);
-                    
-                    let iter: Box<dyn Iterator<Item = _>> = if *reverse {
-                        Box::new(doc_ids.iter().rev())
-                    } else {
-                        Box::new(doc_ids.iter())
-                    };
+                    // ponytail: bounded walk — the old code materialized the
+                    // ENTIRE prefix (e.g. 666 keys for a hot value) and only
+                    // then truncated via max_ids below.
+                    let doc_ids = idx.range_scan_limit(&range.start, &range.end, max_ids, *reverse);
 
-                    for doc_id in iter {
+                    // ponytail: range_scan_limit already yields rows in scan
+                    // order (ascending, or descending when reverse), so no
+                    // re-reversal — the old code rev'd because it always
+                    // materialized ascending first.
+                    for doc_id in doc_ids.iter() {
                         if let Some(ptr) = storage.index.get(doc_id.as_ref()) {
                             if !matches!(ptr, Pointer::Deleted { .. }) {
                                 out.push((doc_id.to_string(), ptr.clone()));
@@ -808,9 +820,9 @@ impl ParallelQueryExecutor {
                         if *reverse {
                             for (_, ids) in range_iter.rev() {
                                 for doc_id in ids.iter().rev() { 
-                                    if let Some(ptr) = storage.index.get(doc_id) {
+                                    if let Some(ptr) = storage.index.get(doc_id.as_ref()) {
                                         if !matches!(ptr, Pointer::Deleted { .. }) {
-                                            out.push((doc_id.clone(), ptr.clone()));
+                                            out.push((doc_id.to_string(), ptr.clone()));
                                             if out.len() >= max_ids { break; }
                                         }
                                     }
@@ -820,9 +832,9 @@ impl ParallelQueryExecutor {
                         } else {
                             for (_, ids) in range_iter {
                                 for doc_id in ids {
-                                    if let Some(ptr) = storage.index.get(doc_id) {
+                                    if let Some(ptr) = storage.index.get(doc_id.as_ref()) {
                                         if !matches!(ptr, Pointer::Deleted { .. }) {
-                                            out.push((doc_id.clone(), ptr.clone()));
+                                            out.push((doc_id.to_string(), ptr.clone()));
                                             if out.len() >= max_ids { break; }
                                         }
                                     }

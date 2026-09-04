@@ -86,21 +86,29 @@ impl IndexManager {
         }
 
         // 3. ADD THIS: Update Secondary Indexes automatically
+        // ponytail: one shared id Arc across every field of this doc (was a
+        // String clone per field), keys encoded into a reused scratch buffer
+        // with zero-alloc hits for hot values via `insert_borrowed`, and no
+        // deep Value clone — `encode_scalar_into` borrows straight from the
+        // doc (the old code cloned every indexed String value per write).
         if let Some(sec_map) = self.secondary.get_mut(collection) {
-            for (field_name, index) in sec_map.iter_mut() {
-                let val_opt = match field_name.as_str() {
-                    "id" => Some(Value::String(doc_id.to_string())),
-                    "_time" => Some(Value::Int(doc._time)),
-                    _ => doc.get(field_name).cloned(),
-                };
-                
-                if let Some(val) = val_opt {
-                    index.insert(
-                        crate::index::index_key::encode_scalar(&val),
-                        doc_id.to_string(),
-                    );
+            let id_shared: Arc<str> = Arc::from(doc_id);
+            crate::index::index_key::ENC_SCRATCH.with(|scratch| {
+                let mut enc = scratch.borrow_mut();
+                for (field_name, index) in sec_map.iter_mut() {
+                    enc.clear();
+                    if field_name.as_str() == "id" {
+                        crate::index::index_key::encode_str_scalar_into(doc_id, &mut enc);
+                    } else if field_name.as_str() == "_time" {
+                        crate::index::index_key::encode_scalar_into(&Value::Int(doc._time), &mut enc);
+                    } else if let Some(val) = doc.get(field_name) {
+                        crate::index::index_key::encode_scalar_into(val, &mut enc);
+                    } else {
+                        continue;
+                    }
+                    index.insert_borrowed(&enc, id_shared.clone());
                 }
-            }
+            });
         }
     }
 
@@ -156,7 +164,7 @@ impl IndexManager {
         collection: &str,
         field: &str,
         value: &[u8],
-    ) -> Option<Vec<String>> {
+    ) -> Option<Vec<Arc<str>>> {
         self.secondary
             .get(collection)?
             .get(field)?

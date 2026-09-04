@@ -2,7 +2,21 @@ use crate::document::firelite_doc::{FireLiteDoc, FireLiteDocView};
 use crate::document::value::Value;
 use super::task::QueryTask;
 use crate::query::filter::Operator;
+use std::cell::RefCell;
 use std::sync::Arc;
+
+thread_local! {
+    /// Scratch buffer for encoding filter values during byte-compare matching.
+    /// Reused across rows so the fast match pass allocates nothing.
+    static ENC_SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(256));
+}
+
+/// Value types with canonical byte encoding: same value <=> same bytes.
+/// Float excluded (-0.0 == 0.0 but different bits); Map/Array excluded
+/// (field order not canonical). Everything else memcmps exactly.
+fn byte_safe(v: &Value) -> bool {
+    !matches!(v, Value::Float(_) | Value::Map(_) | Value::Array(_))
+}
 
 pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
     let mut out = Vec::new();
@@ -12,28 +26,48 @@ pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
     let optimized_plan = prepare_optimized_plan(&task.plan);
 
     for (id, pointer) in task.docs {
-        if let Ok(Some(bytes)) = storage_guard.read_pointer(&pointer) {
-            
-            // CRITICAL FIX: If index handled everything, bypass `unified_match_decode` completely
-            if task.plan.filters_satisfied_by_index {
-                if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
-                    if let Some(bm) = blob_manager {
-                        let _ = inflate_blobs(&mut doc, bm);
-                    }
-                    out.push((id, doc));
-                }
-            } else {
-                // Slower Path: Query contains filters that the index couldn't verify
-                if let Some(mut doc) = unified_match_decode(&id, &bytes, &optimized_plan) {
-                    if let Some(bm) = blob_manager {
-                        let _ = inflate_blobs(&mut doc, bm);
-                    }
-                    out.push((id, doc));
+        // ponytail: same borrowed-Inlined fast path as execute() — decode
+        // borrows the Arc-shared buffer, zero copy per row.
+        match pointer {
+            crate::storage::engine::Pointer::Inlined(shared) => {
+                decode_row(&id, &shared, &task.plan, &optimized_plan, blob_manager, &mut out);
+            }
+            other => {
+                if let Ok(Some(bytes)) = storage_guard.read_pointer(&other) {
+                    decode_row(&id, &bytes, &task.plan, &optimized_plan, blob_manager, &mut out);
                 }
             }
         }
     }
     out
+}
+
+/// Shared decode+inflate+push helper for run_task's borrowed/owned sources.
+fn decode_row(
+    id: &str,
+    bytes: &[u8],
+    plan: &crate::query::plan::QueryPlan,
+    optimized_plan: &crate::query::plan::QueryPlan,
+    blob_manager: Option<&Arc<crate::storage::blob::BlobManager>>,
+    out: &mut Vec<(String, FireLiteDoc)>,
+) {
+    // CRITICAL FIX: If index handled everything, bypass `unified_match_decode` completely
+    if plan.filters_satisfied_by_index {
+        if let Some(mut doc) = FireLiteDoc::decode(bytes) {
+            if let Some(bm) = blob_manager {
+                let _ = inflate_blobs(&mut doc, bm);
+            }
+            out.push((id.to_string(), doc));
+        }
+    } else {
+        // Slower Path: Query contains filters that the index couldn't verify
+        if let Some(mut doc) = unified_match_decode(id, bytes, optimized_plan) {
+            if let Some(bm) = blob_manager {
+                let _ = inflate_blobs(&mut doc, bm);
+            }
+            out.push((id.to_string(), doc));
+        }
+    }
 }
 
 pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)> {
@@ -84,6 +118,12 @@ pub(crate) fn prepare_optimized_plan(plan: &crate::query::plan::QueryPlan) -> cr
 }
 
 /// Unified decoder for full documents. Combines filter checking with object construction.
+///
+/// ponytail: two-pass shape. When every undecided filter is a byte-comparable
+/// Eq/Ne on a body field (no OR groups), pass 1 memcmps the row's encoded
+/// bytes against the filter's encoding — zero allocation — and only rows
+/// that match pay for pass 2 (full decode). Non-matching rows previously paid
+/// a full decode (~15 allocs) just to be discarded.
 pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::query::plan::QueryPlan) -> Option<FireLiteDoc> {
     let view = FireLiteDocView::new(bytes)?;
     
@@ -95,16 +135,53 @@ pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::que
         return None; 
     }
 
-    // 2. Body Field Scanning (Decodes every field for the final object)
+    // 2. Fast path eligibility: no ORs, every undecided filter byte-checkable.
+    let mut fast = plan.or_groups.is_empty();
+    if fast {
+        for (i, f) in plan.filters.iter().enumerate() {
+            if and_matches[i] || f.field == "id" || f.field == "_time" { continue; }
+            if !(matches!(f.op, Operator::Eq | Operator::Ne) && byte_safe(&f.value)) {
+                fast = false;
+                break;
+            }
+        }
+    }
+
+    if fast {
+        // PASS 1: match on encoded bytes, no decode, no allocation.
+        ENC_SCRATCH.with(|scratch| {
+            let mut enc = scratch.borrow_mut();
+            for (key, tag, data) in view.iter() {
+                for (i, f) in plan.filters.iter().enumerate() {
+                    if and_matches[i] || key != f.field { continue; }
+                    enc.clear();
+                    FireLiteDoc::encode_value_to(&f.value, &mut enc);
+                    let hit = enc.first().copied() == Some(tag) && &enc[1..] == data;
+                    if (hit && f.op == Operator::Eq) || (!hit && f.op == Operator::Ne) {
+                        and_matches[i] = true;
+                    }
+                }
+            }
+        });
+        // Missing field => stays false => rejected, same as the old path.
+        if !validate_final_match(plan, &and_matches, &or_group_results) {
+            return None;
+        }
+    }
+
+    // 2/3. Body Field Scanning (Decodes every field for the final object).
+    // Slow path reaches here directly; fast path only for proven winners.
     let mut fields = Vec::with_capacity(view.iter().count()); 
     for (key, tag, data) in view.iter() {
         let val = crate::document::firelite_doc::decode_value(tag, data)?;
 
-        apply_filter_logic(key, &val, plan, &mut and_matches, &mut or_group_results);
-        fields.push((Arc::from(key), val));
+        if !fast {
+            apply_filter_logic(key, &val, plan, &mut and_matches, &mut or_group_results);
+        }
+        fields.push((crate::document::firelite_doc::intern_field(key), val));
     }
 
-    if validate_final_match(plan, &and_matches, &or_group_results) {
+    if fast || validate_final_match(plan, &and_matches, &or_group_results) {
         Some(FireLiteDoc { fields, _time: view._time })
     } else {
         None

@@ -68,6 +68,11 @@ void fl_config_set_storage_tuning(FL_Config *config,
 
 void fl_config_set_blob_threshold(FL_Config *config, uintptr_t threshold_bytes);
 
+/// WAL headroom reservation in bytes (0 = off, default 4MB). Preallocated
+/// ahead of the write position so steady-state appends never extend the
+/// file. Sparse: consumes no disk until written. Ignored for Manual.
+void fl_config_set_wal_reserve_bytes(FL_Config *config, uint64_t bytes);
+
 /// Opens the engine using a custom config.
 /// Note: This function takes ownership of the config and will free it automatically.
 FL_Engine *fl_engine_open_with_config(const char *path, FL_Config *config);
@@ -101,6 +106,14 @@ int32_t fl_engine_insert(FL_Engine *engine,
                          const char *collection,
                          const char *doc_id,
                          const FL_Doc *doc);
+
+/// Owned-doc insert: takes over the FL_Doc handle (no deep clone).
+/// The handle is ALWAYS consumed — success or failure — do not use or free
+/// `doc` after the call.
+int32_t fl_engine_insert_take(FL_Engine *engine,
+                              const char *collection,
+                              const char *doc_id,
+                              FL_Doc *doc);
 
 FL_Doc *fl_engine_get(FL_Engine *engine, const char *collection, const char *doc_id);
 

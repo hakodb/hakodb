@@ -431,7 +431,9 @@ pub async fn firelite_exec<R: Runtime>(
             }
             FireLiteOp::Set { collection, doc_id, data } => {
                 let doc = json_to_doc(&data)?;
-                gateway.db.put(&collection, &doc_id, &doc).map_err(|e| e.to_string())?;
+                // ponytail: `doc` is freshly built from JSON — move it in
+                // instead of deep-cloning every field via `put`.
+                gateway.db.put_owned(&collection, &doc_id, doc).map_err(|e| e.to_string())?;
                 Ok(FireLiteResponse::Ok)
             }
             FireLiteOp::Patch { collection, doc_id, data } => {

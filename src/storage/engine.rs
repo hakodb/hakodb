@@ -26,7 +26,7 @@ pub enum Pointer {
         offset: u64,
         len: u32,
     },
-    Inlined(Vec<u8>),
+    Inlined(Arc<Vec<u8>>),
     Blob {
         offset: u64,
         len: u32,
@@ -107,6 +107,7 @@ impl StorageEngine {
             cfg.durability_mode,
             cfg.group_commit_max_ops,
             encryption.clone(),
+            cfg.wal_reserve_bytes,
         )?;
 
         let mut segments = HashMap::new();
@@ -210,7 +211,7 @@ impl StorageEngine {
                 }
                 WalOp::BeginTx { .. } | WalOp::CommitTx { .. } => {}
                 WalOp::PutInlined { key, value } => {
-                    let pointer = Pointer::Inlined(value);
+                    let pointer = Pointer::Inlined(Arc::new(value));
                     self.update_index_entry(key, Some(pointer));
                 }
                 WalOp::PutBlob { key, offset, len } => {
@@ -343,7 +344,7 @@ impl StorageEngine {
         let mut to_flush = Vec::new();
         for (key, pointer) in &self.index {
             if let Pointer::Inlined(data) = pointer {
-                to_flush.push((key.clone(), data.clone()));
+                to_flush.push((key.clone(), (**data).clone()));
             }
         }
 
@@ -432,11 +433,11 @@ impl StorageEngine {
                     
                     if len < 4096 { // Path 1: Tiny (Inline)
                         wal_ops.push(WalOp::PutInlined { key: key.clone(), value: value.clone() });
-                        index_updates.push((key.clone(), Some(Pointer::Inlined(value.clone()))));
+                        index_updates.push((key.clone(), Some(Pointer::Inlined(Arc::new(value.clone())))));
                     } else if len > self.blob_threshold { // Path 2: Large (Side-load to Blob File)
                         let arc_data = Arc::new(value.clone());
                         // FIX: Use Pointer::Inlined for raw byte batches
-                        index_updates.push((key.clone(), Some(Pointer::Inlined(value.clone()))));
+                        index_updates.push((key.clone(), Some(Pointer::Inlined(Arc::new(value.clone())))));
                         
                         blob_work_todo.push(BlobWork::Put {
                             collection: self.logical_name.clone(),
@@ -508,7 +509,7 @@ impl StorageEngine {
                 if !skeleton.is_empty() {
                     if let Some(Pointer::BlobPending(current_doc)) = self.index.get(&key) {
                         if current_doc.get_logical_time() == timestamp {
-                            self.update_index_entry(key, Some(Pointer::Inlined(skeleton)));
+                            self.update_index_entry(key, Some(Pointer::Inlined(Arc::new(skeleton))));
                         }
                     }
                 }
@@ -649,7 +650,7 @@ impl StorageEngine {
                 Pointer::Inlined(value) => {
                     ops.push(WalOp::PutInlined {
                         key: key.clone(),
-                        value: value.clone(),
+                        value: (**value).clone(),
                     });
                 }
                 // v0.8.0 Recovery variants
@@ -683,8 +684,11 @@ impl StorageEngine {
             // PENDING: Serve directly from the Arc in memory (Fastest)
             Pointer::BlobPending(doc) => Ok(Some(doc.encode())),
             
-            // Standard small documents stored directly in RAM
-            Pointer::Inlined(data) => Ok(Some(data.clone())),
+            // Standard small documents stored directly in RAM.
+            // ponytail: shared buffer — the query fast paths decode straight
+            // from the Arc (no clone); this owned copy remains for callers
+            // that must own their bytes (disk-spill paths, FFI snapshots).
+            Pointer::Inlined(data) => Ok(Some((**data).clone())),
             
             // FINAL DISK STATE: Standard File/Mmap Read
             Pointer::Blob { offset, len } => {
@@ -959,7 +963,7 @@ impl StorageEngine {
                     });
                 }
                 crate::storage::wal::WalOp::PutInlined { key, value } => {
-                    self.update_index_entry(key.clone(), Some(Pointer::Inlined(value.clone())));
+                    self.update_index_entry(key.clone(), Some(Pointer::Inlined(Arc::new(value.clone()))));
                 }
                 crate::storage::wal::WalOp::Delete { key, timestamp } => {
                     self.update_index_entry(key.clone(), Some(Pointer::Deleted { timestamp: *timestamp }));

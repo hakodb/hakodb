@@ -24,8 +24,14 @@ pub struct FireLiteConfig {
     pub max_inlined_memory_bytes: usize,
     pub use_compression: bool,
     pub compression_level: i32,
-    pub value_blob_threshold_bytes: usize,
-    pub replication_collections: Option<Vec<String>>,
+pub value_blob_threshold_bytes: usize,
+pub replication_collections: Option<Vec<String>>,
+/// WAL headroom reservation in bytes (0 = off). Preallocated ahead of the
+/// write position so steady-state appends never extend the file (fewer
+/// tiny extensions => less fragmentation => cheaper per-commit fsync on
+/// durable modes). Sparse: consumes no disk until written. Ignored for
+/// Manual (never fsyncs mid-session).
+pub wal_reserve_bytes: u64,
 }
 
 impl Default for FireLiteConfig {
@@ -45,8 +51,9 @@ impl Default for FireLiteConfig {
             max_inlined_memory_bytes: 64 * 1024 * 1024, // 64MB Default
             use_compression: false, // Disabled by default
             compression_level: 3,
-            value_blob_threshold_bytes: 16 * 1024,
-            replication_collections: None,
+value_blob_threshold_bytes: 16 * 1024,
+replication_collections: None,
+wal_reserve_bytes: 4 * 1024 * 1024,
         }
     }
 }

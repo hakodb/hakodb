@@ -1,5 +1,6 @@
 use crate::document::value::Value;
 use crate::util::varint::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::cell::RefCell;
 
@@ -8,6 +9,28 @@ const VERSION: u8 = 5;
 
 thread_local! {
     static ENCODE_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(128 * 1024));
+    static FIELD_NAMES: RefCell<HashMap<String, Arc<str>>> = RefCell::new(HashMap::new());
+}
+
+/// ponytail: field names repeat across every document ("tenant", "score",
+/// ...) but `Arc::from` allocated per field per decode. Intern them in a
+/// thread-local pool: hits are a hash + refcount bump, zero alloc. Capped so
+/// pathological schemas (unbounded distinct keys) degrade to plain Arc
+/// instead of growing a leak vector.
+pub(crate) fn intern_field(key: &str) -> Arc<str> {
+    FIELD_NAMES.with(|pool| {
+        let mut p = pool.borrow_mut();
+        if let Some(a) = p.get(key) {
+            return a.clone();
+        }
+        if p.len() < 4096 {
+            let a: Arc<str> = Arc::from(key);
+            p.insert(key.to_string(), a.clone());
+            a
+        } else {
+            Arc::from(key)
+        }
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
@@ -64,7 +87,7 @@ impl FireLiteDoc {
         let mut doc = FireLiteDoc::default();
         doc._time = view._time;
         for (key, tag, data) in view.iter() {
-            doc.fields.push((Arc::from(key), decode_value(tag, data)?));
+            doc.fields.push((intern_field(key), decode_value(tag, data)?));
         }
         Some(doc)
     }
@@ -75,7 +98,7 @@ impl FireLiteDoc {
         doc._time = view._time;
         for (key, tag, data) in view.iter() {
             if projection.is_empty() || projection.iter().any(|p| p == key) {
-                doc.fields.push((Arc::from(key), decode_value(tag, data)?));
+                doc.fields.push((intern_field(key), decode_value(tag, data)?));
             }
         }
         Some(doc)
@@ -100,7 +123,7 @@ impl FireLiteDoc {
         json
     }
 
-    fn encode_value_to(v: &Value, out: &mut Vec<u8>) {
+    pub(crate) fn encode_value_to(v: &Value, out: &mut Vec<u8>) {
         match v {
             // --- SUPER TAGS (1 Byte Total) ---
             Value::Null => out.push(0xC0),
@@ -326,7 +349,7 @@ pub(crate) fn decode_value(tag: u8, bytes: &[u8]) -> Option<Value> {
                 p += 1;
                 let start = p;
                 skip_value(inner_tag, bytes, &mut p)?;
-                fields.push((Arc::from(key), decode_value(inner_tag, &bytes[start..p])?));
+                fields.push((intern_field(key), decode_value(inner_tag, &bytes[start..p])?));
             }
             Some(Value::Map(fields))
         }

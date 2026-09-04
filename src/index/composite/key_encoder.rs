@@ -53,22 +53,26 @@ pub(crate) fn encode_value(
         }
 
         Value::String(v) => {
+            // ponytail: encode in place and flip the tail directly instead
+            // of cloning the bytes to a temp Vec first.
             out.push(4);
-            let mut bytes = v.as_bytes().to_vec();
-            maybe_flip(direction, &mut bytes);
-
-            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-            out.extend_from_slice(&bytes);
+            out.extend_from_slice(&(v.len() as u32).to_be_bytes());
+            let body_pos = out.len();
+            out.extend_from_slice(v.as_bytes());
+            if matches!(direction, SortDirection::Desc) {
+                maybe_flip(direction, &mut out[body_pos..]);
+            }
         }
 
         Value::Binary(v) => {
+            // ponytail: same — no temp clone.
             out.push(5);
-
-            let mut bytes = v.clone();
-            maybe_flip(direction, &mut bytes);
-
-            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-            out.extend_from_slice(&bytes);
+            out.extend_from_slice(&(v.len() as u32).to_be_bytes());
+            let body_pos = out.len();
+            out.extend_from_slice(v);
+            if matches!(direction, SortDirection::Desc) {
+                maybe_flip(direction, &mut out[body_pos..]);
+            }
         }
 
         Value::Timestamp(v) => {
