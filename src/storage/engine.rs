@@ -298,9 +298,14 @@ impl StorageEngine {
         }
     }
 
-    /// Returns a half-open range `[start_pos, end_pos)` over the sorted key list,
+    /// Returns a half-half-open range `[start_pos, end_pos)` over the sorted key list,
     /// or `None` if the start key isn't found. The caller can then slice
     /// `self.sorted_keys[start_pos..end_pos]` and look up pointers via `self.index`.
+    // Kept around for cursor / start_at use cases the executor doesn't cover
+    // yet. Marked allow(dead_code) so the executor's inline slice doesn't
+    // leave it as a dangling warning — remove if it stays unused for another
+    // release.
+    #[allow(dead_code)]
     pub(crate) fn sorted_key_range(
         &self,
         start: Option<&str>,

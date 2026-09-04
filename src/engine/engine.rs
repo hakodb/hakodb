@@ -410,7 +410,7 @@ impl FireLite {
                         if let Ok(mut shard) = shard_arc.write() {
                             for (key, skeleton, timestamp, len) in completed_keys {
                                 shard.total_pending_blob_bytes.fetch_sub(len, Ordering::Relaxed);
-                                
+
                                 // Check if this is still the active version of the doc
                                 if let Some(Pointer::BlobPending(active_doc)) = shard.index.get(&key) {
                                     if active_doc.get_logical_time() == timestamp {
@@ -534,7 +534,13 @@ impl FireLite {
                     }
 
                     if let Ok(mut shards) = shards_ptr.write() {
-                        shards.insert(col_name.clone(), Arc::new(RwLock::new(storage)));
+                        // ponytail: only adopt the recovered shard if the user
+                        // hasn't already created one for this collection.
+                        // Unconditional insert lost in-memory writes that the
+                        // user made between open() and recovery completion
+                        // (recovery is async, so this race was always possible
+                        // under Manual durability where writes never fsync).
+                        shards.entry(col_name.clone()).or_insert_with(|| Arc::new(RwLock::new(storage)));
                     }
                 }
             }

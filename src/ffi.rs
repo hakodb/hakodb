@@ -88,7 +88,7 @@ pub struct FL_Transaction {
 
 #[allow(non_camel_case_types)]
 pub struct FL_ResultSet {
-    pub docs: Vec<*mut FL_Doc>,
+    pub docs: Vec<FL_Doc>,
 }
 
 #[cfg(feature = "net-sync")]
@@ -613,9 +613,11 @@ pub extern "C" fn fl_engine_get(
                 return ptr::null_mut();
             }
         };
-        let engine = unsafe { &mut *engine };
+        let engine = unsafe { &*engine };
         match engine.db.get(&collection, &doc_id) {
-            Ok(Some(doc)) => Box::into_raw(Box::new(FL_Doc { id: doc_id.clone(), doc })),
+            // PONYTAIL: move doc_id into FL_Doc instead of clone — doc_id is
+            // already a freshly-allocated String and we don't reuse it.
+            Ok(Some(doc)) => Box::into_raw(Box::new(FL_Doc { id: doc_id, doc })),
             _ => std::ptr::null_mut(),
         }
     })
@@ -1299,12 +1301,19 @@ pub extern "C" fn fl_query_execute_to_handles(
         let query_obj = unsafe { &*query };
         let results = engine.db.query(query_obj.query.clone()).unwrap_or_default();
 
-        let doc_handles: Vec<*mut FL_Doc> = results
+        // PONYTAIL: store FL_Doc values directly in the ResultSet slab
+        // (one allocation) instead of N individual Box::new(FL_Doc) per
+        // result. fl_result_set_get_doc returns a borrowed pointer into
+        // the slab; fl_result_set_free drops the whole Vec in one shot.
+        // The C++ side already treats returned handles as borrowed (it
+        // calls fl_doc_to_json or reads fields, never frees them itself),
+        // so this is safe as long as fl_result_set_free is called before
+        // the handles go out of scope.
+        let docs: Vec<FL_Doc> = results
             .into_iter()
-            .map(|(id, doc)| Box::into_raw(Box::new(FL_Doc { id, doc })))
+            .map(|(id, doc)| FL_Doc { id, doc })
             .collect();
-
-        Box::into_raw(Box::new(FL_ResultSet { docs: doc_handles }))
+        Box::into_raw(Box::new(FL_ResultSet { docs }))
     })
 }
 
@@ -1321,11 +1330,14 @@ pub extern "C" fn fl_result_set_count(results: *mut FL_ResultSet) -> usize {
 pub extern "C" fn fl_result_set_get_doc(results: *mut FL_ResultSet, index: usize) -> *mut FL_Doc {
     if results.is_null() { return std::ptr::null_mut(); }
     unsafe {
-        // 1. Convert raw pointer to a reference
+        // Borrowed pointer into the FL_ResultSet's docs slab. The caller
+        // MUST not free this handle and MUST call fl_result_set_free
+        // before the handle goes out of scope. C++ code already follows
+        // this contract (it reads fields or passes the handle to
+        // fl_doc_to_json without calling fl_doc_free).
         if let Some(rs) = results.as_ref() {
-            // 2. Access the vector and the element at the index
             rs.docs.get(index)
-                .cloned() // Copy the raw pointer (*mut FL_Doc) out of the Option
+                .map(|d| d as *const FL_Doc as *mut FL_Doc)
                 .unwrap_or(std::ptr::null_mut())
         } else {
             std::ptr::null_mut()
@@ -1336,19 +1348,10 @@ pub extern "C" fn fl_result_set_get_doc(results: *mut FL_ResultSet, index: usize
 #[no_mangle]
 pub extern "C" fn fl_result_set_free(results: *mut FL_ResultSet) {
     if !results.is_null() {
-        unsafe {
-            // Take ownership back from C++
-            let rs = Box::from_raw(results);
-            
-            // Crucial: The ResultSet owns these docs. We must free each one.
-            for doc_ptr in rs.docs {
-                if !doc_ptr.is_null() {
-                    // This triggers the Rust destructor for each FireLiteDoc
-                    let _ = Box::from_raw(doc_ptr);
-                }
-            }
-            // rs goes out of scope here and the Vec itself is freed
-        }
+        // PONYTAIL: docs is now Vec<FL_Doc> (owned values), not Vec<*mut
+        // FL_Doc>. Dropping the Box<Vec<FL_Doc>> drops every FL_Doc in
+        // one shot — no per-doc Box::from_raw walk needed.
+        unsafe { drop(Box::from_raw(results)); }
     }
 }
 
@@ -1380,6 +1383,18 @@ pub extern "C" fn fl_last_error() -> *const c_char {
             .map(|s| s.as_ptr())
             .unwrap_or(ptr::null())
     })
+}
+
+/// Enable library diagnostic logging to stderr. Default OFF. Idempotent.
+#[no_mangle]
+pub extern "C" fn fl_log_enable_stderr() {
+    crate::util::log::enable_stderr();
+}
+
+/// Disable library diagnostic logging to stderr. Default OFF. Idempotent.
+#[no_mangle]
+pub extern "C" fn fl_log_disable_stderr() {
+    crate::util::log::disable_stderr();
 }
 
 #[no_mangle]

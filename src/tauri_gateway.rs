@@ -326,8 +326,8 @@ impl FireLiteGateway {
                                         Err(e) => {
                                             // This is a serious error: we received data but cannot write it
                                             // because the local shard is locked/unreadable.
-                                            eprintln!("[Put] CRITICAL: Cannot put data {}. Shard error: {}", &query_template.collection, e);
-                                            return; 
+                                            crate::util::log::info(&format!("[Put] CRITICAL: Cannot put data {}. Shard error: {}", &query_template.collection, e));
+                                            return;
                                         }
                                     };
                                     let bytes_res = {

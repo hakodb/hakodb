@@ -14,4 +14,21 @@ fn main() {
         .generate()
         .expect("Unable to generate C header")
         .write_to_file(output);
+
+    // ponytail: cdylib on Windows MSVC produces `firelite.dll.lib` as the
+    // import library, but `#[link(name = "firelite")]` looks for `firelite.lib`.
+    // The FFI round-trip test in tests/ffi_roundtrip.rs needs that file to
+    // exist. Copy if absent — best-effort, no-op once present.
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "release".to_string());
+    let target_dir = std::path::Path::new("target").join(&profile);
+    #[cfg(windows)]
+    {
+        let src = target_dir.join("firelite.dll.lib");
+        let dst = target_dir.join("firelite.lib");
+        if src.exists() && !dst.exists() {
+            let _ = std::fs::copy(&src, &dst);
+        }
+    }
+    // Allow integration tests to find firelite.dll when invoked from anywhere.
+    println!("cargo:rustc-link-search=native={}", target_dir.display());
 }

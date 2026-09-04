@@ -565,7 +565,7 @@ async fn handle_peer(
                             }
                         } else {
                             // Log that we couldn't check this collection due to an error
-                            eprintln!("[sync] Skipping collection {}: Shard could not be opened.", col);
+                            crate::util::log::info(&format!("[sync] Skipping collection {}: Shard could not be opened.", col));
                         }
                     }
                 }

@@ -70,6 +70,10 @@ impl QueryPlanner {
             // fl_engine_create_index("id") registers `id` as a composite
             // index with one field, so this short-circuit has to live
             // BEFORE the composite-index loop below or it never fires.
+            //
+            // Descending case: pass a `start_key` hint of "" so the executor
+            // knows to slice from the END (descending == take-last-N). The
+            // arm in executor.rs reads this and walks `sorted_keys.iter().rev()`.
             if first_order.field == "id"
                 && query.start_at.is_none() && query.start_after.is_none()
                 && query.end_at.is_none() && query.end_before.is_none()
@@ -79,9 +83,11 @@ impl QueryPlanner {
                 let safe_limit = if order_satisfied && filters_empty {
                     query.limit
                 } else { None };
+                let descending = !first_order.ascending;
+                let start_key = if descending { Some(String::new()) } else { None };
                 return Self::make_plan(
                     query,
-                    ScanType::SortedKeys { start_key: None },
+                    ScanType::SortedKeys { start_key },
                     safe_limit,
                     order_satisfied,
                     filters_empty,

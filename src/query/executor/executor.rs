@@ -55,11 +55,14 @@ impl ParallelQueryExecutor {
         }
 
         // 2. PHASE 2: Limit / Offset
-        // `execute_single_scan` now handles both via the plan's offset+limit
-        // for ScanType::SortedKeys (direct slice over sorted_keys) and via
-        // scan_limit for the other scan types. Nothing to drain or truncate
-        // here — the result vec is already the final shape.
-        let offset_to_apply_later = 0usize;
+        // ponytail: v0.7.2 hard-coded this to 0 which silently dropped the
+        // user's offset for FullCollection and every other scan that didn't
+        // apply it internally. SortedKeys above already applied offset via
+        // sorted_key_range, so its skip path is a no-op (`0`).
+        let offset_to_apply_later = match plan.scan {
+            ScanType::SortedKeys { .. } => 0,
+            _ => plan.offset.unwrap_or(0),
+        };
 
         let doc_count = keys_from_index.len();
 
@@ -610,7 +613,33 @@ impl ParallelQueryExecutor {
             // Direct slice over sorted_keys. Used by the planner for queries
             // that order by `id` (or no order at all) and have no usable
             // filter index — turns offset-of-N from O(N) into O(log N + limit).
-            ScanType::SortedKeys { start_key: _ } => {
+            ScanType::SortedKeys { start_key } => {
+                // ponytail: planner encodes descending as `start_key = Some("")`
+                // so the executor can slice the LAST `offset + limit` keys in
+                // reverse without a separate sort pass. The ascending path is
+                // unchanged from the v0.7.2 implementation.
+                if start_key.is_some() {
+                    let total = storage.sorted_keys.len();
+                    if total == 0 {
+                        return Ok(Vec::new());
+                    }
+                    let off = offset.unwrap_or(0);
+                    let lim = limit.unwrap_or(total);
+                    let end = total.saturating_sub(off);
+                    let start = end.saturating_sub(lim);
+                    let mut out = Vec::with_capacity(end - start);
+                    for key in storage.sorted_keys[start..end].iter().rev() {
+                        if let Some(ptr) = storage.index.get(key) {
+                            if !matches!(ptr, Pointer::Deleted { .. }) {
+                                out.push((key.clone(), ptr.clone()));
+                                if out.len() >= max_ids { break; }
+                            }
+                        }
+                    }
+                    return Ok(out);
+                }
+
+                // Ascending: same as v0.7.2.
                 let (start_pos, end_pos) = match storage.sorted_key_range(
                     None,
                     offset,

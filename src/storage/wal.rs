@@ -408,6 +408,13 @@ impl Wal {
     }
 
     pub fn reset(&mut self) -> Result<()> {
+        // ponytail: clear the in-memory buffer too — otherwise the next
+        // append_batch keeps the old WAL data in self.write_buffer and
+        // flush() writes BOTH the historical ops and whatever was appended
+        // after reset. Manual mode never flushes during a session, so the
+        // buffer grows unbounded; on shutdown the rewrite_wal_snapshot
+        // snapshot ends up double-written to disk.
+        self.write_buffer.clear();
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
         self.pending_ops_since_sync = 0;

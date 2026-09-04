@@ -4,6 +4,7 @@ pub mod executor;
 pub mod filter;
 pub mod order;
 pub mod plan;
+pub mod plan_cache;
 pub mod planner;
 pub mod query;
 pub mod builder;

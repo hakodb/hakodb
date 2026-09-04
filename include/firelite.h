@@ -8,8 +8,6 @@ constexpr static const uint8_t INSERT = 1;
 
 constexpr static const uint8_t DELETE = 2;
 
-constexpr static const uintptr_t DEFAULT_PAGE_SIZE = 4096;
-
 struct FL_Array;
 
 struct FL_Batch;
@@ -183,6 +181,12 @@ void fl_result_set_free(FL_ResultSet *results);
 char *fl_doc_to_json(const FL_Doc *doc);
 
 const char *fl_last_error();
+
+/// Enable library diagnostic logging to stderr. Default OFF. Idempotent.
+void fl_log_enable_stderr();
+
+/// Disable library diagnostic logging to stderr. Default OFF. Idempotent.
+void fl_log_disable_stderr();
 
 void fl_string_free(char *value);
 
