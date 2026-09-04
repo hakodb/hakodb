@@ -50,8 +50,34 @@ impl QueryPlanner {
         }
 
         // 2. PRIORITY 2: Composite Index (Now correctly handles id/_time via updated IndexManager)
+        //
+        // ponytail: unordered single-Eq lookups are cheaper via the simple
+        // secondary index (exact-key BTreeMap get + early break at the scan
+        // limit) than a composite prefix walk (prefix-range build + FULL
+        // materialization of every matching tuple key before truncation).
+        // So yield to P6 whenever it would accept this filter. The conditions
+        // below mirror P6's acceptance exactly — Eq op, secondary present,
+        // no numeric-string ambiguity, size heuristic on — so we can never
+        // fall through to a full scan by yielding.
+        // Multi-filter and ordered queries keep the composite: conjunction
+        // narrowing and pre-sorted output are worth more than the cheaper
+        // point lookup there.
+        let yield_to_secondary = query.order_by.is_empty()
+            && query.or_groups.is_empty()
+            && query.filters.len() == 1
+            && use_index_heuristic
+            && matches!(query.filters[0].op, Operator::Eq)
+            && indexes.secondary.get(&query.collection)
+                .map_or(false, |m| m.contains_key(&query.filters[0].field))
+            && !matches!(&query.filters[0].value, Value::String(s) if s.parse::<i64>().is_ok());
+        if !yield_to_secondary {
         if let Some((eq_scan, satisfied, filters_done)) = Self::try_plan_composite_eq(query, indexes) {
-            let safe_limit = if satisfied { query.limit } else { None };
+            // ponytail: include offset like every P3/P6 path does — bare
+            // `limit` under-collected when offset > 0 (scan grabs `limit`,
+            // executor then skips `offset`).
+            let safe_limit = if satisfied {
+                query.limit.map(|l| l + query.offset.unwrap_or(0))
+            } else { None };
             return Self::make_plan(
                 query, 
                 eq_scan, 
@@ -60,38 +86,57 @@ impl QueryPlanner {
                 filters_done
             );
         }
+        }
 
         // 3. PRIORITY 3: Range / Cursor / Pure Pagination Detection
         if let Some(first_order) = query.order_by.first() {
             // PONYTAIL: special-case the `id` field. When the user orders by
-            // `id` with no cursor bounds and no filters, the storage
-            // sorted_keys vec is already sorted by id. We can slice it
-            // directly (O(log N + limit)) instead of walking any index.
-            // fl_engine_create_index("id") registers `id` as a composite
-            // index with one field, so this short-circuit has to live
-            // BEFORE the composite-index loop below or it never fires.
-            //
-            // Descending case: pass a `start_key` hint of "" so the executor
-            // knows to slice from the END (descending == take-last-N). The
-            // arm in executor.rs reads this and walks `sorted_keys.iter().rev()`.
+            // `id` with no filters, the storage sorted_keys vec is already
+            // sorted by id. We can slice it directly (O(log N + limit))
+            // instead of walking any index — including for cursor queries
+            // (`start_at`/`start_after` resolve to a binary search + slice
+            // in the executor). fl_engine_create_index("id") registers `id`
+            // as a composite index with one field, so this short-circuit has
+            // to live BEFORE the composite-index loop below or it never
+            // fires. Shapes we can't express here (end bounds, descending
+            // + bounds) fall through to the composite path below.
             if first_order.field == "id"
-                && query.start_at.is_none() && query.start_after.is_none()
                 && query.end_at.is_none() && query.end_before.is_none()
+                && query.filters.is_empty() && query.or_groups.is_empty()
+                && query.order_by.len() == 1
             {
-                let order_satisfied = query.order_by.len() == 1;
-                let filters_empty = query.filters.is_empty() && query.or_groups.is_empty();
-                let safe_limit = if order_satisfied && filters_empty {
-                    query.limit
-                } else { None };
-                let descending = !first_order.ascending;
-                let start_key = if descending { Some(String::new()) } else { None };
-                return Self::make_plan(
-                    query,
-                    ScanType::SortedKeys { start_key },
-                    safe_limit,
-                    order_satisfied,
-                    filters_empty,
-                );
+                // Resolve the cursor anchor (order by id => anchor is a doc id).
+                // None = supported shape with no bound; outer None =
+                // unsupported anchor type => fall through.
+                let anchor: Option<(Option<String>, bool)> =
+                    match (&query.start_at, &query.start_after) {
+                        (Some(v), _) if !v.is_empty() => Self::anchor_id(&v[0]).map(|s| (Some(s), false)),
+                        (_, Some(v)) if !v.is_empty() => Self::anchor_id(&v[0]).map(|s| (Some(s), true)),
+                        (None, None) => Some((None, false)),
+                        _ => Some((None, false)),
+                    };
+                if first_order.ascending {
+                    if let Some((start_key, start_exclusive)) = anchor {
+                        let safe_limit = query.limit;
+                        return Self::make_plan(
+                            query,
+                            ScanType::SortedKeys { start_key, start_exclusive, reverse: false },
+                            safe_limit,
+                            true,
+                            true,
+                        );
+                    }
+                } else if anchor == Some((None, false)) {
+                    // Descending without bounds: tail slice (see executor).
+                    let safe_limit = query.limit;
+                    return Self::make_plan(
+                        query,
+                        ScanType::SortedKeys { start_key: None, start_exclusive: false, reverse: true },
+                        safe_limit,
+                        true,
+                        true,
+                    );
+                }
             }
             // Check Composite Indices for both Cursors AND pure OrderBy Pagination
             for idx in indexes.indexes_for_collection(&query.collection) {
@@ -170,7 +215,11 @@ impl QueryPlanner {
         }
 
         // 4. PRIORITY 4: Composite Range (e.g. WHERE price > 100)
-        if use_index_heuristic {
+        // ponytail: also gated on !yield_to_secondary — P4 accepts all-Eq
+        // filters too, and would otherwise recapture the queries we just
+        // yielded with a WORSE plan (full prefix materialization, no limit
+        // pushdown, per-doc filter re-verify). P6 takes them instead.
+        if use_index_heuristic && !yield_to_secondary {
             if let Some(range_scan) = Self::try_plan_composite_range(query, indexes) {
                 return Self::make_plan(
                     query,
@@ -263,8 +312,18 @@ impl QueryPlanner {
         }
     }
 
-    fn try_plan_union(query: &Query, indexes: &IndexManager) -> Option<ScanType> {
-        let mut scans = Vec::new();
+    /// Cursor anchor for `order by id`: the anchor value is a doc id, which
+    /// is exactly what `sorted_keys` holds. Returns None for non-id-like
+    /// values so the caller falls through to the composite-index path.
+    fn anchor_id(v: &Value) -> Option<String> {
+        match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Int(i) => Some(i.to_string()),
+            _ => None,
+        }
+    }
+
+    fn try_plan_union(query: &Query, indexes: &IndexManager) -> Option<ScanType> {        let mut scans = Vec::new();
         for filter in &query.filters {
             if matches!(filter.op, Operator::In) {
                 if let Value::Array(vals) = &filter.value {
@@ -526,7 +585,11 @@ impl QueryPlanner {
 
                 // If this index covers ALL our filters
                 if matched_fields.len() == query.filters.len() {
-                    let mut order_satisfied = false;
+                    // ponytail: no ORDER BY means any subset is correctly
+                    // ordered, so limit pushdown is safe — treat as
+                    // satisfied. (make_plan already does this for the plan
+                    // flag; the raw bool here gates safe_limit below.)
+                    let mut order_satisfied = query.order_by.is_empty();
                     let mut reverse_scan = false;
 
                     // 3. Sorting Logic: Does the index cover the ORDER BY clause?
@@ -587,6 +650,61 @@ impl QueryPlanner {
             let scans = sub_scans.into_iter().map(|(s, _)| s).collect();
             Some((ScanType::UnionIndex { scans }, false, false))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::composite::definition::{CompositeIndexDefinition, SortDirection};
+
+    fn bench_manager() -> IndexManager {
+        let mut m = IndexManager::default();
+        m.create_secondary_index("bench", "tenant");
+        m.create_index(
+            CompositeIndexDefinition::new("bench").with_fields(vec![
+                ("tenant".to_string(), SortDirection::Asc),
+                ("score".to_string(), SortDirection::Desc),
+            ]),
+        );
+        m
+    }
+
+    #[test]
+    fn unordered_single_eq_yields_to_secondary() {
+        // No ORDER BY + single Eq + secondary present => P6 SecondaryIndex
+        // (exact-key get), NOT a composite prefix walk. Also pins the
+        // limit+offset pushdown P6 applies.
+        let m = bench_manager();
+        let q = Query::new("bench")
+            .where_eq("tenant", Value::String("tenant-2".into()))
+            .limit(20);
+        let plan = QueryPlanner::plan(&q, &m, 1000, 8, true);
+        assert!(
+            matches!(plan.scan, ScanType::SecondaryIndex { .. }),
+            "unordered point lookup should use secondary, got {:?}",
+            plan.scan
+        );
+        assert_eq!(plan.scan_limit, Some(20));
+        assert!(plan.filters_satisfied_by_index);
+    }
+
+    #[test]
+    fn ordered_single_eq_keeps_composite() {
+        // ORDER BY score => composite (tenant, score) keeps the query so
+        // rows come back pre-sorted; the yield must not fire.
+        let m = bench_manager();
+        let q = Query::new("bench")
+            .where_eq("tenant", Value::String("tenant-2".into()))
+            .order_by("score", false)
+            .limit(20);
+        let plan = QueryPlanner::plan(&q, &m, 1000, 8, true);
+        assert!(
+            matches!(plan.scan, ScanType::CompositeIndex { .. }),
+            "ordered query should keep composite, got {:?}",
+            plan.scan
+        );
+        assert_eq!(plan.scan_limit, Some(20));
     }
 }
 

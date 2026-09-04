@@ -613,16 +613,15 @@ impl ParallelQueryExecutor {
             // Direct slice over sorted_keys. Used by the planner for queries
             // that order by `id` (or no order at all) and have no usable
             // filter index — turns offset-of-N from O(N) into O(log N + limit).
-            ScanType::SortedKeys { start_key } => {
-                // ponytail: planner encodes descending as `start_key = Some("")`
-                // so the executor can slice the LAST `offset + limit` keys in
-                // reverse without a separate sort pass. The ascending path is
-                // unchanged from the v0.7.2 implementation.
-                if start_key.is_some() {
-                    let total = storage.sorted_keys.len();
-                    if total == 0 {
-                        return Ok(Vec::new());
-                    }
+            ScanType::SortedKeys { start_key, start_exclusive, reverse } => {
+                let total = storage.sorted_keys.len();
+                if total == 0 {
+                    return Ok(Vec::new());
+                }
+                // Descending without bounds (planner guarantee): slice the
+                // LAST `offset + limit` keys and walk them in reverse —
+                // no sort pass needed.
+                if *reverse {
                     let off = offset.unwrap_or(0);
                     let lim = limit.unwrap_or(total);
                     let end = total.saturating_sub(off);
@@ -639,9 +638,10 @@ impl ParallelQueryExecutor {
                     return Ok(out);
                 }
 
-                // Ascending: same as v0.7.2.
+                // Ascending, optional cursor bound: binary search + slice.
                 let (start_pos, end_pos) = match storage.sorted_key_range(
-                    None,
+                    start_key.as_deref(),
+                    *start_exclusive,
                     offset,
                     limit,
                 ) {

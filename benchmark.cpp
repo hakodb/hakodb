@@ -289,22 +289,22 @@ Report run_benchmark(BenchConfig cfg) {
     UniqueQuery q_off(fl_query_new("bench"));
     fl_query_order_by(q_off.get(), "id", true); 
     fl_query_offset(q_off.get(), mid); 
-    fl_query_limit(q_off.get(), 5);
+    fl_query_limit(q_off.get(), 20);
     
     t_start = now(); 
-    for(int i=0; i<20; i++) UniqueResultSet qo(fl_query_execute_to_handles(db, q_off.get())); 
-    res.offset_qps = to_throughput(20, diff_ms(t_start));
+    for(int i=0; i<300; i++) UniqueResultSet qo(fl_query_execute_to_handles(db, q_off.get())); 
+    res.offset_qps = to_throughput(300, diff_ms(t_start));
 
     char mid_buf[16]; snprintf(mid_buf, sizeof(mid_buf), "b_%d", mid);
     UniqueDoc start_doc(fl_engine_get(db, "bench", mid_buf));
     UniqueQuery q_cur(fl_query_new("bench"));
     fl_query_order_by(q_cur.get(), "id", true);
     fl_query_start_at(q_cur.get(), start_doc.get());
-    fl_query_limit(q_cur.get(), 5);
+    fl_query_limit(q_cur.get(), 20);
     
     t_start = now(); 
-    for(int i=0; i<20; i++) UniqueResultSet qc(fl_query_execute_to_handles(db, q_cur.get())); 
-    res.cursor_qps = to_throughput(20, diff_ms(t_start));
+    for(int i=0; i<300; i++) UniqueResultSet qc(fl_query_execute_to_handles(db, q_cur.get())); 
+    res.cursor_qps = to_throughput(300, diff_ms(t_start));
     // cout << (int)res.cursor_qps << " qps";
 
     // 5. QUERY STRESS TEST
@@ -322,11 +322,16 @@ Report run_benchmark(BenchConfig cfg) {
     // cout << (int)res.stress_get_rps << " rps";
 
     // stage("Query Stress QPS");
+    // Fair-test pair for Cmp below: SAME filter (tenant-2, ~31 docs) and
+    // SAME limit(20). Only difference is the index path: no ORDER BY + a
+    // simple secondary on `tenant` exists, so the planner yields P2 and
+    // this exercises the true simple-secondary path (exact-key get, early
+    // termination at 20, no sort).
     t_start = now();
     for(int i=0; i<stress_loops; i++) {
         UniqueQuery q(fl_query_new("bench"));
-        fl_query_where_eq_bool(q.get(), "active", true);
-        fl_query_limit(q.get(), 50);
+        fl_query_where_eq_str(q.get(), "tenant", "tenant-2");
+        fl_query_limit(q.get(), 20);
         UniqueResultSet rs(fl_query_execute_to_handles(db, q.get()));
     }
     res.stress_query_qps = to_throughput(stress_loops, diff_ms(t_start));

@@ -309,6 +309,7 @@ impl StorageEngine {
     pub(crate) fn sorted_key_range(
         &self,
         start: Option<&str>,
+        start_exclusive: bool,
         offset: Option<usize>,
         limit: Option<usize>,
     ) -> Option<(usize, usize)> {
@@ -316,9 +317,11 @@ impl StorageEngine {
         if total == 0 { return Some((0, 0)); }
 
         let start_pos = match start {
-            Some(s) => match self.sorted_keys.binary_search(&s.to_string()) {
-                Ok(p) => p + offset.unwrap_or(0),
-                Err(_) => return None,
+            // ponytail: mirror BTree range semantics — a missing anchor
+            // starts at the next-greater key (insertion point), not empty.
+            Some(s) => match self.sorted_keys.binary_search_by(|k| k.as_str().cmp(s)) {
+                Ok(p) => p + (start_exclusive as usize) + offset.unwrap_or(0),
+                Err(pos) => pos + offset.unwrap_or(0),
             },
             None => offset.unwrap_or(0),
         };

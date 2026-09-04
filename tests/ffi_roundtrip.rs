@@ -44,6 +44,8 @@ extern "C" {
     fn fl_query_where_eq_int(query: *mut FL_Query, field: *const c_char, value: i64) -> c_int;
 
     fn fl_query_execute_to_handles(engine: *mut FL_Engine, query: *const FL_Query) -> *mut FL_ResultSet;
+    fn fl_query_start_at(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> c_int;
+    fn fl_query_start_after(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> c_int;
     fn fl_result_set_count(rs: *mut FL_ResultSet) -> usize;
     fn fl_result_set_get_doc(rs: *mut FL_ResultSet, index: usize) -> *mut FL_Doc;
     fn fl_result_set_free(rs: *mut FL_ResultSet);
@@ -226,6 +228,71 @@ fn result_set_offset_and_limit() {
         fl_query_free(q);
         fl_engine_free(engine);
     }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn cursor_start_at_and_after_on_id() {
+    // Guards the SortedKeys cursor path: order by id + start_at/start_after
+    // must slice the sorted-keys vec at the anchor (inclusive/exclusive),
+    // not fall back to a different index or return the wrong window.
+    let dir = temp_dir("rs_cur");
+    let path = cs(dir.to_str().unwrap());
+    let engine = unsafe { fl_engine_open(path.as_ptr()) };
+
+    let coll = cs("bench");
+    unsafe {
+        let batch = fl_batch_new();
+        for i in 0..10 {
+            let id = cs(format!("k_{i:02}").as_str());
+            let doc = fl_doc_new();
+            fl_doc_insert_int(doc, cs("v").as_ptr(), i as i64);
+            fl_batch_set(batch, coll.as_ptr(), id.as_ptr(), doc);
+        }
+        assert_eq!(fl_batch_commit(engine, batch), 0);
+    }
+
+    wait_for_indexes(engine);
+
+    // start_at k_04 (inclusive), limit 3 → v=4,5,6
+    let anchor = unsafe { fl_engine_get(engine, coll.as_ptr(), cs("k_04").as_ptr()) };
+    assert!(!anchor.is_null(), "anchor get null");
+    let q = unsafe { fl_query_new(coll.as_ptr()) };
+    unsafe {
+        fl_query_order_by(q, cs("id").as_ptr(), true);
+        assert_eq!(fl_query_start_at(q, anchor), 0, "start_at rc");
+        fl_doc_free(anchor); // values are cloned into the query
+        fl_query_limit(q, 3);
+    }
+    let rs = unsafe { fl_query_execute_to_handles(engine, q) };
+    assert_eq!(unsafe { fl_result_set_count(rs) }, 3, "start_at limit 3 → 3 rows");
+    for (i, expect) in [4, 5, 6].iter().enumerate() {
+        let d = unsafe { fl_result_set_get_doc(rs, i) };
+        let j = read_cstr(unsafe { fl_doc_to_json(d) });
+        assert!(j.contains(&format!("\"v\":{expect}")), "row {i} should have v={expect}, got {j}");
+    }
+    unsafe { fl_result_set_free(rs) };
+    unsafe { fl_query_free(q) };
+
+    // start_after k_04 (exclusive), limit 3 → v=5,6,7
+    let anchor2 = unsafe { fl_engine_get(engine, coll.as_ptr(), cs("k_04").as_ptr()) };
+    assert!(!anchor2.is_null(), "anchor2 get null");
+    let q2 = unsafe { fl_query_new(coll.as_ptr()) };
+    unsafe {
+        fl_query_order_by(q2, cs("id").as_ptr(), true);
+        assert_eq!(fl_query_start_after(q2, anchor2), 0, "start_after rc");
+        fl_doc_free(anchor2);
+        fl_query_limit(q2, 3);
+    }
+    let rs2 = unsafe { fl_query_execute_to_handles(engine, q2) };
+    assert_eq!(unsafe { fl_result_set_count(rs2) }, 3, "start_after limit 3 → 3 rows");
+    let first2 = unsafe { fl_result_set_get_doc(rs2, 0) };
+    let first2_json = read_cstr(unsafe { fl_doc_to_json(first2) });
+    assert!(first2_json.contains("\"v\":5"), "start_after first should be v=5, got {first2_json}");
+    unsafe { fl_result_set_free(rs2) };
+    unsafe { fl_query_free(q2) };
+
+    unsafe { fl_engine_free(engine) };
     std::fs::remove_dir_all(&dir).ok();
 }
 

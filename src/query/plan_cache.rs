@@ -113,10 +113,13 @@ fn hash_query(q: &Query) -> u64 {
     for a in &q.aggregations { hash_agg(a, &mut h); }
 
     // Cursor bounds — these change the index range and must invalidate.
-    if let Some(v) = &q.start_at { for x in v { hash_value(x, &mut h); } }
-    if let Some(v) = &q.start_after { for x in v { hash_value(x, &mut h); } }
-    if let Some(v) = &q.end_at { for x in v { hash_value(x, &mut h); } }
-    if let Some(v) = &q.end_before { for x in v { hash_value(x, &mut h); } }
+    // ponytail: tag WHICH bound is set, not just its value — start_at=[k]
+    // and start_after=[k] hash identically otherwise and share a plan
+    // (inclusive vs exclusive), returning wrong rows.
+    if let Some(v) = &q.start_at { 0u8.hash(&mut h); for x in v { hash_value(x, &mut h); } }
+    if let Some(v) = &q.start_after { 1u8.hash(&mut h); for x in v { hash_value(x, &mut h); } }
+    if let Some(v) = &q.end_at { 2u8.hash(&mut h); for x in v { hash_value(x, &mut h); } }
+    if let Some(v) = &q.end_before { 3u8.hash(&mut h); for x in v { hash_value(x, &mut h); } }
 
     h.finish()
 }

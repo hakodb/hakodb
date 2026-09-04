@@ -16,6 +16,13 @@ pub enum ScanType {
     /// `offset` and `limit` to derive the actual slice.
     SortedKeys {
         start_key: Option<String>,
+        /// true = `start_after` (exclusive bound), false = `start_at`
+        /// (inclusive) or no bound. Only meaningful when `start_key`
+        /// is Some and `reverse` is false.
+        start_exclusive: bool,
+        /// true = descending tail slice. The planner only sends this
+        /// with `start_key == None` (no cursor bounds).
+        reverse: bool,
     },
     CompositeIndex {
         index_id: u32,
