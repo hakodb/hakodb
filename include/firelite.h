@@ -73,6 +73,10 @@ void fl_config_set_blob_threshold(FL_Config *config, uintptr_t threshold_bytes);
 /// file. Sparse: consumes no disk until written. Ignored for Manual.
 void fl_config_set_wal_reserve_bytes(FL_Config *config, uint64_t bytes);
 
+/// Write-path phase breakdown (see engine::write_stats_report). Returns a
+/// fresh C string the caller frees with fl_string_free. Counters reset.
+char *fl_debug_write_stats();
+
 /// Opens the engine using a custom config.
 /// Note: This function takes ownership of the config and will free it automatically.
 FL_Engine *fl_engine_open_with_config(const char *path, FL_Config *config);

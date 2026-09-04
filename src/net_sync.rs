@@ -1002,10 +1002,10 @@ async fn apply_replication_batch(db: Arc<FireLite>, collection: String, ops: Vec
             _ => continue,
         };
 
-        let event = crate::engine::ChangeEvent {
-            path: op.get_key().to_string(),
-            kind,
-        };
+let event = crate::engine::ChangeEvent {
+path: Arc::from(op.get_key()),
+kind,
+};
 
         // Notify local watchers (Tauri frontend, etc.)
         // This triggers the UI but the 'Tailer' will skip re-broadcasting 

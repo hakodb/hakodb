@@ -40,6 +40,74 @@ thread_local! {
     static KEY_BUFFER: RefCell<String> = RefCell::new(String::with_capacity(128));
 }
 
+// --- Write-path phase accounting (ponytail) ---
+// Always-on accumulators: a handful of Instant reads + Relaxed adds per
+// batch (~0.1µs against 20µs+ batches). Read via `write_stats_report()`
+// (resets), e.g. from the `fl_debug_write_stats` FFI hook or a test.
+pub(crate) struct WritePhaseStats {
+    pub batches: AtomicU64,
+    pub mutations: AtomicU64,
+    pub total_ns: AtomicU64,
+    pub encode_ns: AtomicU64,
+    pub wal_ns: AtomicU64,
+    pub apply_ns: AtomicU64,
+    pub index_send_ns: AtomicU64,
+    pub versions_ns: AtomicU64,
+    pub watchers_ns: AtomicU64,
+    pub cache_ns: AtomicU64,
+    pub blob_ns: AtomicU64,
+    pub encdoc_ns: AtomicU64,
+}
+pub(crate) static WRITE_STATS: WritePhaseStats = WritePhaseStats {
+    batches: AtomicU64::new(0),
+    mutations: AtomicU64::new(0),
+    total_ns: AtomicU64::new(0),
+    encode_ns: AtomicU64::new(0),
+    wal_ns: AtomicU64::new(0),
+    apply_ns: AtomicU64::new(0),
+    index_send_ns: AtomicU64::new(0),
+    versions_ns: AtomicU64::new(0),
+    watchers_ns: AtomicU64::new(0),
+    cache_ns: AtomicU64::new(0),
+    blob_ns: AtomicU64::new(0),
+    encdoc_ns: AtomicU64::new(0),
+};
+
+/// Human-readable phase table + reset. All figures per batch unless noted.
+pub fn write_stats_report() -> String {
+    let b = WRITE_STATS.batches.load(Ordering::Relaxed).max(1);
+    let m = WRITE_STATS.mutations.load(Ordering::Relaxed).max(1);
+    let g = |v: &AtomicU64| v.load(Ordering::Relaxed);
+    let mut s = format!(
+        "write profile: {} batches, {} mutations ({:.1}/batch)\n",
+        b, m, m as f64 / b as f64
+    );
+    for (name, ns) in [
+        ("total  ", g(&WRITE_STATS.total_ns)),
+        ("encode ", g(&WRITE_STATS.encode_ns)),
+        ("wal    ", g(&WRITE_STATS.wal_ns)),
+        // apply wall time nests the WAL call; net isolates index+lock work.
+        ("apply* ", g(&WRITE_STATS.apply_ns).saturating_sub(g(&WRITE_STATS.wal_ns))),
+        ("idxsend", g(&WRITE_STATS.index_send_ns)),
+        ("version", g(&WRITE_STATS.versions_ns)),
+        ("watch  ", g(&WRITE_STATS.watchers_ns)),
+        ("cache  ", g(&WRITE_STATS.cache_ns)),
+        ("blobex ", g(&WRITE_STATS.blob_ns)),
+        ("encdoc ", g(&WRITE_STATS.encdoc_ns)),
+    ] {
+        s.push_str(&format!("  {} {:>10.1}us/batch {:>8.1}us/mutation\n",
+            name, ns as f64 / 1000.0 / b as f64, ns as f64 / 1000.0 / m as f64));
+    }
+    for v in [&WRITE_STATS.batches, &WRITE_STATS.mutations, &WRITE_STATS.total_ns,
+        &WRITE_STATS.encode_ns, &WRITE_STATS.wal_ns, &WRITE_STATS.apply_ns,
+        &WRITE_STATS.index_send_ns, &WRITE_STATS.versions_ns,
+        &WRITE_STATS.watchers_ns, &WRITE_STATS.cache_ns,
+        &WRITE_STATS.blob_ns, &WRITE_STATS.encdoc_ns] {
+        v.store(0, Ordering::Relaxed);
+    }
+    s
+}
+
 // --- Data Types ---
 
 #[derive(Debug, Clone)]
@@ -68,7 +136,10 @@ pub enum ChangeKind {
 
 #[derive(Debug, Clone)]
 pub struct ChangeEvent {
-    pub path: String,
+    // ponytail: shared id — every write fans out one event per mutation and
+    // the old String clone per event was pure tax; subscribers bump or copy
+    // out only what they forward.
+    pub path: Arc<str>,
     pub kind: ChangeKind,
 }
 
@@ -678,6 +749,9 @@ impl FireLite {
     }
 
     fn write_batch_internal(&self, mutations: Vec<BatchMutation>) -> Result<Vec<String>> {
+        let t_total = Instant::now();
+        WRITE_STATS.batches.fetch_add(1, Ordering::Relaxed);
+        WRITE_STATS.mutations.fetch_add(mutations.len() as u64, Ordering::Relaxed);
         let now_nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64;
         let now_micros = now_nanos / 1000; 
 
@@ -688,6 +762,11 @@ impl FireLite {
         // Simple local tracker to avoid changing ShardWork
         // let mut deletes_for_indexer: Vec<(String, String, FireLiteDoc)> = Vec::new();
 
+        let t_encode = Instant::now();
+        // ponytail: last-collection cache — consecutive mutations usually hit
+        // the same shard, so reuse its handle + blob manager instead of a map
+        // lookup and two lock acquisitions per mutation.
+        let mut last_shard: Option<(String, Arc<RwLock<StorageEngine>>, Option<Arc<BlobManager>>)> = None;
         for m in mutations {
             // 1. Resolve basic info immediately
             let (col, mut doc_id, mut doc, is_delete) = match m {
@@ -726,44 +805,57 @@ impl FireLite {
             let key_arc: Arc<str> = Arc::from(doc_id.as_str());
             
             if is_delete {
-                work.ops.push(WalOp::Delete { key: doc_id.clone(), timestamp: now_micros });
-                work.keys.push(key_arc);
-                work.events.push((col, ChangeEvent { path: doc_id, kind: ChangeKind::Delete }));
+                // ponytail: doc_id moves into the WAL op (zero copy);
+                // keys/events share the Arc (bumps, no String allocs).
+                work.ops.push(WalOp::Delete { key: doc_id, timestamp: now_micros });
+                work.keys.push(key_arc.clone());
+                work.events.push((col, ChangeEvent { path: key_arc, kind: ChangeKind::Delete }));
                 continue;
             }
 
             doc._time = now_micros;
             
-            // 3. REUSE KEY for Blobs
-            let blob_work = {
-                let shard = self.get_shard(&col)?;
-                let guard = shard.read().unwrap();
-                guard.blob_manager.as_ref()
-                    .map(|bm| bm.extract_blobs_raw(&col, &key_arc, &mut doc, threshold))
-                    .unwrap_or_default()
-            };
+            // 3. REUSE KEY for Blobs (shard handle cached per collection above)
+            let t_blob = Instant::now();
+            let same_col = matches!(&last_shard, Some((c, _, _)) if *c == col);
+            if !same_col {
+                let shard_arc = self.get_shard(&col)?;
+                let bm = shard_arc.read().unwrap().blob_manager.clone();
+                last_shard = Some((col.clone(), shard_arc, bm));
+            }
+            let (_, _, blob_mgr) = last_shard.as_ref().unwrap();
+            let blob_work = blob_mgr.as_ref()
+                .map(|bm| bm.extract_blobs_raw(&col, &key_arc, &mut doc, threshold))
+                .unwrap_or_default();
+            WRITE_STATS.blob_ns.fetch_add(t_blob.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
             // 4. USE BUFFERED ENCODING
+            let t_enc = Instant::now();
             let skeleton_bytes = doc.encode_buffered();
+            WRITE_STATS.encdoc_ns.fetch_add(t_enc.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let doc_arc = Arc::new(doc);
             
             // REUSE KEY for WAL and Index
             work.ops.push(WalOp::PutInlined { key: key_arc.to_string(), value: skeleton_bytes });
             work.index_puts.push((doc_id, Arc::clone(&doc_arc))); 
-            work.keys.push(key_arc); // Reuses the same String allocation
-            work.events.push((col, ChangeEvent { 
-                path: work.keys.last().unwrap().to_string(), 
-                kind: ChangeKind::Put 
+            work.keys.push(key_arc.clone());
+            // ponytail: event path bumps the same Arc instead of a fresh
+            // String allocation per mutation.
+            work.events.push((col, ChangeEvent {
+                path: key_arc,
+                kind: ChangeKind::Put
             }));
             
             for b in blob_work { work.blob_queue_items.push(b); }
         }
+        WRITE_STATS.encode_ns.fetch_add(t_encode.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         // --- APPLY SHARD CHANGES ---
         for (col_name, mut work) in shard_map {
             let shard_arc = self.get_shard(&col_name)?;
             // let index_entries = work.index_puts; 
 
+            let t_apply = Instant::now();
             {
                 let mut shard = shard_arc.write().unwrap();
             
@@ -786,7 +878,9 @@ impl FireLite {
                 if !work.ops.is_empty() {
                     let tx_id = shard.next_tx_id;
                     shard.next_tx_id += 1;
+                    let t_wal = Instant::now();
                     shard.wal.append_batch_fast(tx_id, &work.ops, false)?;
+                    WRITE_STATS.wal_ns.fetch_add(t_wal.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 }
 
                 // Apply storage index changes
@@ -806,11 +900,14 @@ impl FireLite {
                 }
                 shard.total_pending_blob_bytes.fetch_add(b_bytes, Ordering::Relaxed);
             }
+            // apply wall time includes the WAL call above; report net below.
+            WRITE_STATS.apply_ns.fetch_add(t_apply.elapsed().as_nanos() as u64, Ordering::Relaxed);
             
             self.trigger_blob_flush.store(true, Ordering::Release);
 
             // ponytail: drop hot-cache entries for written keys. The version
             // bump alone would invalidate them; this reclaims memory eagerly.
+            let t_cache = Instant::now();
             {
                 let mut cache = self.doc_cache.write().unwrap();
                 for (doc_id, _) in &work.index_puts {
@@ -822,8 +919,10 @@ impl FireLite {
                     }
                 }
             }
+            WRITE_STATS.cache_ns.fetch_add(t_cache.elapsed().as_nanos() as u64, Ordering::Relaxed);
             
             // Notify Indexer (Worker 1)
+            let t_idx = Instant::now();
             if !work.index_puts.is_empty() || !work.index_deletes.is_empty() {
                 let _ = self.index_tx.send(IndexOp::Update { 
                     collection: col_name, 
@@ -831,10 +930,17 @@ impl FireLite {
                     deletes: work.index_deletes
                 });
             }
+            WRITE_STATS.index_send_ns.fetch_add(t_idx.elapsed().as_nanos() as u64, Ordering::Relaxed);
             
+            let t_ver = Instant::now();
             self.bump_versions_by_keys(work.keys);
+            WRITE_STATS.versions_ns.fetch_add(t_ver.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let t_watch = Instant::now();
             for (c, e) in work.events { self.notify_watchers(&c, e); }
+            WRITE_STATS.watchers_ns.fetch_add(t_watch.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
+
+        WRITE_STATS.total_ns.fetch_add(t_total.elapsed().as_nanos() as u64, Ordering::Relaxed);
         
         // 5. CONDITIONAL AUDIT (Zero overhead if disabled)
         if self.config.enable_audit_log {
@@ -1963,5 +2069,97 @@ pub(crate) fn resolve_doc_static(
 }
 
 fn subcollection_prefix(_collection: &str, doc_id: &str, subcollection: &str) -> String {
-    format!("{}/{}", doc_id, subcollection)
+format!("{}/{}", doc_id, subcollection)
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use crate::config::DurabilityMode;
+
+    fn test_doc(i: usize) -> FireLiteDoc {
+        let mut d = FireLiteDoc::default();
+        d.insert("tenant", Value::String(format!("tenant-{}", i % 32)));
+        d.insert("age", Value::Int(18 + (i % 70) as i64));
+        d.insert("active", Value::Bool(i % 3 != 0));
+        d.insert("score", Value::Float((i % 10000) as f64 / 7.0 + 0.5));
+        d.insert("description", Value::String(format!("payload {i}")));
+        d.insert("extra", Value::String("X".repeat(1024)));
+        d
+    }
+
+    fn profile_puts(mode: DurabilityMode, n: usize) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("fl-wprof-{nanos}"));
+        let mut cfg = FireLiteConfig::default();
+        cfg.durability_mode = mode;
+        let db = FireLite::open(&dir, cfg).expect("open");
+        // Reset first: open() itself writes (recovery/index setup paths).
+        write_stats_report();
+        // Warmup outside measurement: cold start (page faults, allocator,
+        // background indexer/blob threads spinning up) dwarfs steady state.
+        for i in 0..50 {
+            db.put_owned("bench", &format!("w_{i}"), test_doc(i)).expect("put");
+        }
+        write_stats_report();
+        for i in 0..n {
+            db.put_owned("bench", &format!("p_{i}"), test_doc(i)).expect("put");
+        }
+        let rep = write_stats_report();
+        std::fs::remove_dir_all(&dir).ok();
+        rep
+    }
+
+    #[test]
+    fn profile_write_phases_manual() {
+        // Run single-threaded: counters are process-global.
+        let rep = profile_puts(DurabilityMode::Manual, 200);
+        eprintln!("\n[Manual 200x put_owned]\n{rep}");
+    }
+
+    #[test]
+    fn profile_blob_extract_alone() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("fl-wprof-blob-{nanos}"));
+        let db = FireLite::open(&dir, FireLiteConfig::default()).expect("open");
+        // Warm up everything (locks, allocator, code pages).
+        for i in 0..50 {
+            db.put_owned("bench", &format!("w_{i}"), test_doc(i)).expect("put");
+        }
+        // (a) shard fetch + read lock alone.
+        let t = Instant::now();
+        for _ in 0..2000 {
+            let shard = db.get_shard("bench").expect("shard");
+            let guard = shard.read().unwrap();
+            std::hint::black_box(guard.blob_manager.is_some());
+        }
+        let lock_us = t.elapsed().as_micros() as f64 / 2000.0;
+        // (b) full blob block as in write_batch_internal.
+        let mut doc = test_doc(999);
+        let key_arc: Arc<str> = Arc::from("p_999");
+        let t = Instant::now();
+        for _ in 0..2000 {
+            let shard = db.get_shard("bench").expect("shard");
+            let guard = shard.read().unwrap();
+            let work = guard.blob_manager.as_ref()
+                .map(|bm| bm.extract_blobs_raw("bench", &key_arc, &mut doc, 16 * 1024))
+                .unwrap_or_default();
+            std::hint::black_box(work.len());
+        }
+        let full_us = t.elapsed().as_micros() as f64 / 2000.0;
+        eprintln!("\nblob micro: lock+fetch {lock_us:.2}us/iter, full block {full_us:.2}us/iter");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn profile_write_phases_always() {
+        let rep = profile_puts(DurabilityMode::Always, 50);
+        eprintln!("\n[Always 50x put_owned]\n{rep}");
+    }
 }

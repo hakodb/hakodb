@@ -751,10 +751,10 @@ impl CloudSync {
             };
             db.notify_watchers(
                 collection,
-                ChangeEvent {
-                    path: op.get_key().to_string(),
-                    kind,
-                },
+ChangeEvent {
+path: Arc::from(op.get_key()),
+kind,
+},
             );
         }
     }

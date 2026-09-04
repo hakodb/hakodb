@@ -304,7 +304,7 @@ impl FireLiteGateway {
                             
                             // ID Filtering (Optimization: check before reading disk)
                             if let Some(ref target_id) = query_template.doc_id_filter {
-                                if &doc_id != target_id { continue; }
+                                if target_id.as_str() != &doc_id[..] { continue; }
                             }
 
                             match event.kind {
@@ -350,7 +350,7 @@ impl FireLiteGateway {
                                                 let _ = db.resolve_document_blobs(&mut d, &query_template.collection);
                                                 changes.push(DocumentChange { 
                                                     kind: DeltaKind::Update, 
-                                                    doc_id: doc_id.clone(), 
+                                                    doc_id: doc_id.to_string(), 
                                                     data: doc_to_json_value(&doc_id,&d).ok() 
                                                 });
                                             }
@@ -361,7 +361,7 @@ impl FireLiteGateway {
                                             meta.insert("_time".to_string(), serde_json::json!(doc_time));
                                             changes.push(DocumentChange { 
                                                 kind: DeltaKind::Delete, 
-                                                doc_id, 
+                                                doc_id: doc_id.to_string(), 
                                                 data: Some(serde_json::Value::Object(meta)) 
                                             });
                                         }

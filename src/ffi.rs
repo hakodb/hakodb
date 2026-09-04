@@ -311,6 +311,16 @@ pub extern "C" fn fl_config_set_wal_reserve_bytes(config: *mut FL_Config, bytes:
     }
 }
 
+/// Write-path phase breakdown (see engine::write_stats_report). Returns a
+/// fresh C string the caller frees with fl_string_free. Counters reset.
+#[no_mangle]
+pub extern "C" fn fl_debug_write_stats() -> *mut c_char {
+    match std::ffi::CString::new(crate::engine::engine::write_stats_report()) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// Opens the engine using a custom config.
 /// Note: This function takes ownership of the config and will free it automatically.
 #[no_mangle]
@@ -389,7 +399,7 @@ pub extern "C" fn fl_engine_watch(
 
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(event) => {
-                    let c_path = CString::new(event.path).unwrap();
+                    let c_path = CString::new(&*event.path).unwrap();
                     let kind = match event.kind {
                         crate::engine::ChangeKind::Put => 1,
                         crate::engine::ChangeKind::Delete => 2,
