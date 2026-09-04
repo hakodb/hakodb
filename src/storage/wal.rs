@@ -162,7 +162,14 @@ impl Wal {
         self.file.write_all(&self.write_buffer)?;
         
         if self.mode == DurabilityMode::Always {
-            self.file.sync_all()?;
+            // ponytail: fdatasync, not fsync (restores pre-0.7 behavior).
+            // POSIX requires fdatasync to persist whatever metadata is
+            // needed to access the data (i.e. file size on growth), which is
+            // all a WAL reader needs — mtime/atime lag is irrelevant, and
+            // our preallocated size barely changes anyway. Same guarantee
+            // SQLite/LMDB rely on; ~2-3x cheaper per commit on Linux.
+            // (On Windows both map to FlushFileBuffers: no-op difference.)
+            self.file.sync_data()?;
         }
         
         Ok(())
@@ -245,9 +252,10 @@ impl Wal {
         // ONE Syscall to write multiple operations
         self.file.write_all(&self.write_buffer)?;
         
-        // Physically flip the bits on the disk
-        self.file.sync_all()?;
-        // self.file.sync_data()?;
+        // ponytail: fdatasync (see append() above for why). The torn-tail
+        // crash window this theoretically widens is exactly what replay's
+        // partial-record repair already handles.
+        self.file.sync_data()?;
 
         // NOW we clear, after the data is safe on the platter
         self.write_buffer.clear();
