@@ -723,7 +723,7 @@ impl CloudSync {
             for op in &ops {
                 match op {
                     WalOp::PutInlined { key, value } => {
-                        shard.update_index_entry(key.clone(), Some(Pointer::Inlined(value.clone())));
+                        shard.update_index_entry(key.clone(), Some(Pointer::Inlined(Arc::new(value.clone()))));
                     }
                     WalOp::Delete { key, timestamp } => {
                         shard.update_index_entry(key.clone(), Some(Pointer::Deleted { timestamp: *timestamp }));

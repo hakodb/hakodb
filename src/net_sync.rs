@@ -939,7 +939,7 @@ async fn apply_replication_batch(db: Arc<FireLite>, collection: String, ops: Vec
                 if has_blob {
                     shard.update_index_entry(key, Some(Pointer::BlobPending(Arc::new(doc))));
                 } else {
-                    shard.update_index_entry(key, Some(Pointer::Inlined(doc.encode())));
+                    shard.update_index_entry(key, Some(Pointer::Inlined(Arc::new(doc.encode()))));
                 }
             } else {
                 // It was a delete
