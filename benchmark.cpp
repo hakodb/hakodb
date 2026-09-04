@@ -88,6 +88,14 @@ struct Report {
 };
 
 std::atomic<size_t> g_snapshot_received{0};
+static bool g_wstats_enabled = false;
+
+// Print + reset the engine's write-phase counters (fl_debug_write_stats).
+static void dump_wstats(const char* tag) {
+    if (!g_wstats_enabled) return;
+    UniqueString s(fl_debug_write_stats());
+    if (s) printf("\n[WSTATS %s]\n%s", tag, s.get());
+}
 
 extern "C" void bench_on_snapshot(const char* col, const char* path, int kind, void* user_data) {
     g_snapshot_received.fetch_add(1, std::memory_order_relaxed);
@@ -206,6 +214,7 @@ Report run_benchmark(BenchConfig cfg) {
     }
     res.single_wps = to_throughput(s_write_count, diff_ms(t_start));
     // cout << fixed << setprecision(0) << res.single_wps << " wps";
+    dump_wstats("single-writes");
 
     // stage("Batch Write WPS");
     t_start = now();
@@ -223,6 +232,7 @@ Report run_benchmark(BenchConfig cfg) {
     }
     res.batch_wps = to_throughput(b_total, diff_ms(t_start));
     // cout << res.batch_wps << " wps";
+    dump_wstats("batch-writes");
 
     // stage("Waiting for indexes..");
     this_thread::sleep_for(chrono::milliseconds(1500));
@@ -391,11 +401,14 @@ Report run_benchmark(BenchConfig cfg) {
 int main(int argc, char** argv) {
     int g_docs = 1000;
     string only_profile;
+    bool wstats = false;
     for (int i = 1; i < argc; i++) {
         string a = argv[i];
         if (a.find("--docs=") == 0) g_docs = stoi(a.substr(7));
         if (a.find("--profile=") == 0) only_profile = a.substr(10);
+        if (a == "--wstats") wstats = true;
     }
+    g_wstats_enabled = wstats;
 
     vector<BenchConfig> suite = {
         {"Always",      g_docs, 10,  0, 4, false, false, 4,  false},
