@@ -598,6 +598,13 @@ impl CloudSync {
             let prefix = items[0].prefix.clone();
             let plain_col = items[0].collection.clone();
 
+            // Local-only signal (inbound): a locally-scoped collection
+            // refuses everything the room offers. Per-key marks do NOT
+            // filter inbound — a genuinely newer remote put resurrects.
+            if db.is_collection_local(&plain_col) {
+                continue;
+            }
+
             let mut apply_ops: Vec<WalOp> = Vec::with_capacity(items.len());
             let mut index_puts: Vec<(String, Arc<FireLiteDoc>)> = Vec::new();
             let mut sender_relays: HashMap<Option<String>, Vec<WalOp>> = HashMap::new();
@@ -636,6 +643,12 @@ impl CloudSync {
                             .push(item.op.clone());
                     }
                     WalOp::Delete { key, timestamp } => {
+                        // LWW check (mirrors the put arm): a stale tombstone —
+                        // e.g. replayed by handshake catch-up — must not beat
+                        // a newer local put.
+                        if Self::is_stale_remote_delete(&db, &storage_col, key, *timestamp) {
+                            continue;
+                        }
                         {
                             let mut cache = echo_cache.lock().unwrap();
                             cache.insert(echo_key(&prefix, &plain_col, key), *timestamp);
@@ -1037,6 +1050,90 @@ kind,
         peers.write().await.remove(&peer_key);
     }
 
+    /// LWW guard for inbound deletes: a tombstone older than (or equal
+    /// to) the local doc loses. `db.get` treats local tombstones as
+    /// non-existent, so re-applying the same delete is a harmless no-op.
+    #[cfg(feature = "cloud-sync")]
+    fn is_stale_remote_delete(
+        db: &Arc<FireLite>,
+        storage_col: &str,
+        key: &str,
+        timestamp: i64,
+    ) -> bool {
+        match db.get(storage_col, key) {
+            Ok(Some(existing)) => existing.get_logical_time() >= timestamp,
+            _ => false,
+        }
+    }
+
+    /// Shared handshake catch-up builder (server→client and client→server).
+    /// Every index entry newer than `since_ts` — puts AND tombstones.
+    /// Tombstones replay as `WalOp::Delete`, which is safe because deletes
+    /// carry timestamps and both ingest paths enforce LWW (a stale
+    /// tombstone loses to a newer local put). Previously catch-up was
+    /// put-only, so a peer offline during a delete never learned of it.
+    /// `filter_col` is the app-level collection name for the local-only
+    /// check — the handshake must not leak what the tailers withhold.
+    #[cfg(feature = "cloud-sync")]
+    fn collect_catchup_ops(
+        db: &Arc<FireLite>,
+        storage_col: &str,
+        filter_col: &str,
+        since_ts: i64,
+    ) -> Vec<WalOp> {
+        let Ok(shard_arc) = db.get_shard(storage_col) else {
+            return Vec::new();
+        };
+        let changed: Vec<(String, crate::storage::engine::Pointer)> = {
+            let guard = shard_arc.read().unwrap();
+            guard
+                .index
+                .iter()
+                .filter_map(|(k, ptr)| {
+                    let ts = match ptr {
+                        crate::storage::engine::Pointer::Deleted { timestamp } => *timestamp,
+                        crate::storage::engine::Pointer::Inlined(bytes) => {
+                            i64::from_le_bytes(bytes[2..10].try_into().unwrap_or([0; 8]))
+                        }
+                        // ponytail: pending docs carry their time on the doc;
+                        // the old scan dropped them (ts=0) — same staleness
+                        // class as the tombstone bug.
+                        crate::storage::engine::Pointer::BlobPending(doc) => {
+                            doc.get_logical_time()
+                        }
+                        _ => 0,
+                    };
+                    if ts > since_ts {
+                        Some((k.clone(), ptr.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        let mut ops = Vec::new();
+        {
+            let guard = shard_arc.read().unwrap();
+            for (key, ptr) in changed {
+                if db.is_local_only(filter_col, &key) {
+                    continue;
+                }
+                if let crate::storage::engine::Pointer::Deleted { timestamp } = ptr {
+                    ops.push(WalOp::Delete { key, timestamp });
+                    continue;
+                }
+                if let crate::storage::engine::Pointer::BlobPending(doc) = ptr {
+                    ops.push(WalOp::PutInlined { key, value: doc.encode_buffered() });
+                    continue;
+                }
+                if let Ok(Some(bytes)) = guard.read_pointer_internal(&ptr, false) {
+                    ops.push(WalOp::PutInlined { key, value: bytes });
+                }
+            }
+        }
+        ops
+    }
+
     async fn send_catchup_deltas(
         db: &Arc<FireLite>,
         storage_col: &str,
@@ -1045,50 +1142,18 @@ kind,
         peer_key: &str,
         peers: &Arc<AsyncRwLock<HashMap<String, PeerInfo>>>,
     ) {
-        if let Ok(shard_arc) = db.get_shard(storage_col) {
-            let changed_items: Vec<(String, crate::storage::engine::Pointer)> = {
-                let guard = shard_arc.read().unwrap();
-                guard
-                    .index
-                    .iter()
-                    .filter_map(|(k, ptr)| {
-                        let ts = match ptr {
-                            crate::storage::engine::Pointer::Deleted { timestamp } => *timestamp,
-                            crate::storage::engine::Pointer::Inlined(bytes) => {
-                                i64::from_le_bytes(bytes[2..10].try_into().unwrap_or([0; 8]))
-                            }
-                            _ => 0,
-                        };
-                        if ts > since_ts {
-                            Some((k.clone(), ptr.clone()))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
+        let ops = Self::collect_catchup_ops(db, storage_col, plain_col, since_ts);
+
+        if !ops.is_empty() {
+            let packet = CloudPacket::Replication {
+                msg_id: 0,
+                collection: plain_col.to_string(),
+                ops,
             };
-
-            let mut ops = Vec::new();
-            {
-                let guard = shard_arc.read().unwrap();
-                for (key, ptr) in changed_items {
-                    if let Ok(Some(bytes)) = guard.read_pointer_internal(&ptr, false) {
-                        ops.push(WalOp::PutInlined { key, value: bytes });
-                    }
-                }
-            }
-
-            if !ops.is_empty() {
-                let packet = CloudPacket::Replication {
-                    msg_id: 0,
-                    collection: plain_col.to_string(),
-                    ops,
-                };
-                if let Ok(bytes) = rmp_serde::to_vec_named(&packet) {
-                    let peers_guard = peers.read().await;
-                    if let Some(tx) = peers_guard.get(peer_key) {
-                        let _ = tx.tx.try_send(Message::Binary(bytes.into()));
-                    }
+            if let Ok(bytes) = rmp_serde::to_vec_named(&packet) {
+                let peers_guard = peers.read().await;
+                if let Some(tx) = peers_guard.get(peer_key) {
+                    let _ = tx.tx.try_send(Message::Binary(bytes.into()));
                 }
             }
         }
@@ -1158,6 +1223,10 @@ kind,
                                     };
 
                                     if !is_echo {
+                                        // Local-only signal: server never fans marked ops out.
+                                        if db.is_local_only(&plain_col, key) {
+                                            continue;
+                                        }
                                         let final_op = match op {
                                             WalOp::PutInlined { ref key, ref value } => {
                                                 if let Some(mut doc) = FireLiteDoc::decode(value) {
@@ -1349,50 +1418,18 @@ kind,
         server_ts: i64,
         outbound_tx: &mpsc::Sender<CloudPacket>,
     ) {
-        if let Ok(shard_arc) = db.get_shard(collection) {
-            let changed_items: Vec<(String, crate::storage::engine::Pointer)> = {
-                let guard = shard_arc.read().unwrap();
-                guard
-                    .index
-                    .iter()
-                    .filter_map(|(k, ptr)| {
-                        let ts = match ptr {
-                            crate::storage::engine::Pointer::Deleted { timestamp } => *timestamp,
-                            crate::storage::engine::Pointer::Inlined(bytes) => {
-                                i64::from_le_bytes(bytes[2..10].try_into().unwrap_or([0; 8]))
-                            }
-                            _ => 0,
-                        };
-                        if ts > server_ts {
-                            Some((k.clone(), ptr.clone()))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
+        let ops = Self::collect_catchup_ops(db, collection, collection, server_ts);
+
+        if !ops.is_empty() {
+            let packet = CloudPacket::Replication {
+                msg_id: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros(),
+                collection: collection.to_string(),
+                ops,
             };
-
-            let mut ops = Vec::new();
-            {
-                let guard = shard_arc.read().unwrap();
-                for (key, ptr) in changed_items {
-                    if let Ok(Some(bytes)) = guard.read_pointer_internal(&ptr, false) {
-                        ops.push(WalOp::PutInlined { key, value: bytes });
-                    }
-                }
-            }
-
-            if !ops.is_empty() {
-                let packet = CloudPacket::Replication {
-                    msg_id: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_micros(),
-                    collection: collection.to_string(),
-                    ops,
-                };
-                let _ = outbound_tx.send(packet).await;
-            }
+            let _ = outbound_tx.send(packet).await;
         }
     }
 
@@ -1415,6 +1452,11 @@ kind,
                 let cols = db.list_collections().unwrap_or_default();
 
                 for col in cols {
+                    // Sync-state + scope markers never leave the device.
+                    // (`__firelite_security` keeps flowing — policies replicate.)
+                    if col == "__firelite_system" || col == INTERNAL_ROOMS_COLLECTION {
+                        continue;
+                    }
                     if let Ok(shard_arc) = db.get_shard(&col) {
                         let last_pos = *offsets.get(&col).unwrap_or(&0);
                         let tail_res = {
@@ -1455,6 +1497,10 @@ kind,
                                     };
 
                                     if !is_echo {
+                                        // Local-only signal: client never pushes marked ops upstream.
+                                        if db.is_local_only(&col, key) {
+                                            continue;
+                                        }
                                         let final_op = match op {
                                             WalOp::PutInlined { ref key, ref value } => {
                                                 if let Some(mut doc) = FireLiteDoc::decode(value) {
@@ -1601,5 +1647,65 @@ mod tests {
         assert_eq!(sanitize_room_name("a/b\\c"), "a_b_c");
         assert_eq!(sanitize_room_name(""), "room");
         assert_eq!(sanitize_room_name("___"), "room");
+    }
+
+    fn put_simple(db: &Arc<FireLite>, col: &str, id: &str) {
+        let mut doc = FireLiteDoc::default();
+        doc.insert("v", Value::Int(1));
+        db.put(col, id, &doc).unwrap();
+    }
+
+    #[test]
+    fn catchup_emits_puts_and_tombstones() {
+        let (db, _dir) = temp_db("catchup");
+        put_simple(&db, "c", "keep");
+        put_simple(&db, "c", "gone");
+        db.delete("c", "gone").unwrap();
+
+        let ops = CloudSync::collect_catchup_ops(&db, "c", "c", 0);
+        let mut puts = 0;
+        let mut dels = Vec::new();
+        for op in &ops {
+            match op {
+                WalOp::PutInlined { .. } => puts += 1,
+                WalOp::Delete { key, .. } => dels.push(key.clone()),
+                _ => {}
+            }
+        }
+        assert_eq!(puts, 1, "expected only the live doc, got {ops:?}");
+        assert_eq!(dels, vec!["gone".to_string()]);
+    }
+
+    #[test]
+    fn catchup_withholds_local_only_marks() {
+        let (db, _dir) = temp_db("catchup-local");
+        put_simple(&db, "c", "keep");
+        put_simple(&db, "c", "gone");
+        db.delete_local("c", "gone").unwrap();
+
+        // Key-level mark: the tombstone never enters catch-up...
+        let ops = CloudSync::collect_catchup_ops(&db, "c", "c", 0);
+        assert_eq!(ops.len(), 1, "local-only tombstone leaked: {ops:?}");
+
+        // ...and the clock still advanced past it (deleter looks ahead).
+        let v = db.get_collection_version("c").unwrap();
+        assert!(v > 0);
+
+        // Collection-level mark: nothing leaves at all.
+        db.set_collection_local("c", true);
+        let ops = CloudSync::collect_catchup_ops(&db, "c", "c", 0);
+        assert!(ops.is_empty(), "local-only collection leaked: {ops:?}");
+    }
+
+    #[test]
+    fn stale_remote_delete_loses_to_newer_put() {
+        let (db, _dir) = temp_db("stale-del");
+        put_simple(&db, "c", "a");
+        let ts = db.get("c", "a").unwrap().unwrap().get_logical_time();
+
+        assert!(CloudSync::is_stale_remote_delete(&db, "c", "a", ts));
+        assert!(CloudSync::is_stale_remote_delete(&db, "c", "a", ts - 1));
+        assert!(!CloudSync::is_stale_remote_delete(&db, "c", "a", ts + 1_000_000));
+        assert!(!CloudSync::is_stale_remote_delete(&db, "c", "missing", ts));
     }
 }

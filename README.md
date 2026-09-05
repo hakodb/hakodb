@@ -6,11 +6,31 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 FireLite speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.7.5 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.7.6 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.7.5)
+## What's new (0.7.2 → 0.7.6)
+
+### v0.7.6 — local-only deletes + tombstone catch-up fix
+- **Local-only signal.** `delete_local` / `delete_where_local` / `delete_ids_local`
+  (FFI `fl_engine_delete_local`, `fl_query_delete_local`, CLI `--local`) mark keys
+  so no sync tailer or handshake ever transmits them — the app owns the deletion.
+  `set_collection_local` scopes whole collections (CLI `collection-local`, shown in
+  `collections`); `replicate_key` opts a key back in. Marks persist in
+  `__firelite_system/local_only` across restarts.
+- **Handshake-stability rule.** Local-only ops keep fresh tombstone timestamps, so
+  the deleter's version clock advances and no ping/catch-up can push the doc back.
+  Resurrect rule: a genuinely *newer* remote put still applies (LWW); stale
+  replays are rejected.
+- **Tombstone catch-up fix.** Handshake catch-up (`send_catchup_deltas`,
+  `push_client_deltas_upstream`) now replays tombstones as timestamped deletes —
+  previously put-only, so a peer offline during a delete never learned of it.
+  The cloud ingest Delete arm gained the missing LWW check; `BlobPending` docs
+  (previously also skipped) are included too.
+- SDKs: Go `DeleteLocal`/`DeleteWhereLocal`/`SetCollectionLocal`/`ReplicateKey`,
+  JS `deleteLocal`/`deleteWhereLocal`/`setCollectionLocal`, Tauri
+  `local_only` op flag + `localOnly()` constraint, Pascal `DeleteLocal`.
 
 ### v0.7.5 — deferred blobs, parallel inflation, bulk JSON
 - **`defer_blobs` query flag** — queries can skip blob inflation and return a `{"__blob__": {"len", "offset"}}` placeholder per blob field instead of the bytes. A 20-doc query over 50 KB images drops from ~1.2 ms to ~240 µs (~5×; more for larger blobs).
@@ -46,7 +66,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.7.5)](#whats-new-072--075)
+- [What's new (0.7.2 → 0.7.6)](#whats-new-072--076)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)

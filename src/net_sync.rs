@@ -357,6 +357,11 @@ impl NetSyncer {
                                     continue; // Skip this one, it was a remote write
                                 }
 
+                                // Local-only signal: never broadcast marked ops.
+                                if db_tail.is_local_only(&col, key) {
+                                    continue;
+                                }
+
                                 if let Some(bytes) = resolve_op_to_bytes(&shard, &db_tail, &op) {
                                     logical_ops.push(WalOp::PutInlined { key: op.get_key().to_string(), value: bytes });
                                 } else if matches!(op, WalOp::Delete { .. }) {
@@ -831,6 +836,12 @@ async fn send_replication_packet(
 
 #[cfg(feature = "net-sync")]
 async fn apply_replication_batch(db: Arc<FireLite>, collection: String, ops: Vec<WalOp>, echo_cache: Arc<Mutex<HashMap<String, i64>>>,) {
+    // Local-only signal (inbound): a locally-scoped collection refuses
+    // everything the mesh offers. Per-key marks do NOT filter inbound —
+    // a genuinely newer remote put still resurrects (documented rule).
+    if db.is_collection_local(&collection) {
+        return;
+    }
     // let shard_arc = db.get_shard(&collection);
     let shard_arc = match db.get_shard(&collection) {
         Ok(s) => s,

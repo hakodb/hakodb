@@ -189,6 +189,7 @@ function DeferBlobs(Defer: Boolean = True): TFLQuery;
 
     function GetJSON: string;
     function Delete: Int64;
+    function DeleteLocal: Int64;
     function Patch(Doc: TFLDocument): Int64;
     function OnSnapshot(const Callback: TOnSnapshotCallback; QueueToMainThread: Boolean = True): IFLSubscription;
   end;
@@ -202,6 +203,7 @@ function DeferBlobs(Defer: Boolean = True): TFLQuery;
     procedure SetDoc(const Doc: TFLDocument);
     function Get: TFLDocument;
     procedure Delete;
+    procedure DeleteLocal;
   end;
 
   TFLCollection = class
@@ -269,6 +271,8 @@ function DeferBlobs(Defer: Boolean = True): TFLQuery;
     procedure CreateCompositeIndex(const ACollection: string; const Fields: array of string);
     function StartBatch: TFLBatch;
     function StartTransaction: TFLTransaction;
+    procedure SetCollectionLocal(const ACollection: string; Local: Boolean);
+    procedure ReplicateKey(const ACollection, ADocID: string);
     function CreateNetSyncer(const Name, RoomKey: string): TFLNetSyncer;
     function CreateCloudSyncer(Mode: TFLCloudSyncMode; const ClientID, RoomName, RoomKey, AuthToken: string): TFLCloudSync;
     function CreateCloudServerSyncer(const ServerID, AuthToken: string): TFLCloudSync;
@@ -793,6 +797,14 @@ begin
   finally fl_query_free(Q); end;
 end;
 
+function TFLQuery.DeleteLocal: Int64;
+var Q: PFL_Query;
+begin
+  Q := BuildNativeQuery; try
+    Result := fl_query_delete_local(FDB.Handle, Q);
+  finally fl_query_free(Q); end;
+end;
+
 function TFLQuery.Patch(Doc: TFLDocument): Int64;
 var Q: PFL_Query;
 begin
@@ -897,6 +909,11 @@ end;
 procedure TFLDocumentRef.Delete;
 begin
   CheckStatus(fl_engine_delete(FDB.Handle, PChar(FCollection), PChar(FDocID)), 'DocRefDelete');
+end;
+
+procedure TFLDocumentRef.DeleteLocal;
+begin
+  CheckStatus(fl_engine_delete_local(FDB.Handle, PChar(FCollection), PChar(FDocID)), 'DocRefDeleteLocal');
 end;
 
 { TFLCollection }
@@ -1007,6 +1024,16 @@ destructor TFireLite.Destroy; begin if FHandle <> nil then fl_engine_free(FHandl
 function TFireLite.Collection(const Name: string): TFLCollection; begin Result := TFLCollection.Create(Self, Name); end;
 function TFireLite.StartBatch: TFLBatch; begin Result := TFLBatch.Create(FHandle); end;
 function TFireLite.StartTransaction: TFLTransaction; begin Result := TFLTransaction.Create(FHandle); end;
+procedure TFireLite.SetCollectionLocal(const ACollection: string; Local: Boolean);
+var L: cint32;
+begin
+  if Local then L := 1 else L := 0;
+  CheckStatus(fl_engine_set_collection_local(FHandle, PChar(ACollection), L), 'SetCollectionLocal');
+end;
+procedure TFireLite.ReplicateKey(const ACollection, ADocID: string);
+begin
+  CheckStatus(fl_engine_replicate_key(FHandle, PChar(ACollection), PChar(ADocID)), 'ReplicateKey');
+end;
 function TFireLite.CreateNetSyncer(const Name, RoomKey: string): TFLNetSyncer; begin Result := TFLNetSyncer.Create(FHandle, Name, RoomKey); end;
 function TFireLite.CreateCloudSyncer(Mode: TFLCloudSyncMode; const ClientID, RoomName, RoomKey, AuthToken: string): TFLCloudSync; begin Result := TFLCloudSync.Create(FHandle, Mode, ClientID, RoomName, RoomKey, AuthToken); end;
 function TFireLite.CreateCloudServerSyncer(const ServerID, AuthToken: string): TFLCloudSync; begin Result := TFLCloudSync.CreateServer(FHandle, ServerID, AuthToken); end;

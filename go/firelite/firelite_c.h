@@ -72,6 +72,9 @@ int32_t fl_engine_insert_take(FL_Engine *engine, const char *collection, const c
 int32_t fl_doc_resolve_blobs(FL_Engine *engine, const char *collection, FL_Doc *doc);
 FL_Doc *fl_engine_get(FL_Engine *engine, const char *collection, const char *doc_id);
 int32_t fl_engine_delete(FL_Engine *engine, const char *collection, const char *doc_id);
+int32_t fl_engine_delete_local(FL_Engine *engine, const char *collection, const char *doc_id);
+int32_t fl_engine_set_collection_local(FL_Engine *engine, const char *collection, int32_t local);
+int32_t fl_engine_replicate_key(FL_Engine *engine, const char *collection, const char *doc_id);
 int32_t fl_engine_patch(FL_Engine *engine, const char *collection, const char *doc_id, const FL_Doc *updates);
 FL_Doc *fl_engine_get_by_ref(FL_Engine *engine, const FL_Doc *doc, const char *field_key);
 
@@ -117,6 +120,7 @@ int32_t fl_query_end_at(FL_Query *query, const FL_Doc *anchor_doc);
 int32_t fl_query_end_before(FL_Query *query, const FL_Doc *anchor_doc);
 char *fl_query_execute(FL_Engine *engine, const FL_Query *query);
 int32_t fl_query_delete(FL_Engine *engine, FL_Query *query);
+int32_t fl_query_delete_local(FL_Engine *engine, FL_Query *query);
 int32_t fl_query_patch(FL_Engine *engine, FL_Query *query, const FL_Doc *patch_doc);
 FL_ResultSet *fl_query_execute_to_handles(FL_Engine *engine, const FL_Query *query);
 uintptr_t fl_result_set_count(FL_ResultSet *results);

@@ -707,6 +707,85 @@ pub extern "C" fn fl_engine_delete(
     }
 }
 
+/// Local-only delete: marks the key so no sync tailer or handshake
+/// catch-up ever transmits it, then deletes normally (fresh tombstone
+/// timestamp keeps the version clock advanced — handshake-stable).
+#[no_mangle]
+pub extern "C" fn fl_engine_delete_local(
+    engine: *mut FL_Engine,
+    collection: *const c_char,
+    doc_id: *const c_char,
+) -> i32 {
+    if engine.is_null() {
+        return set_last_error("null engine handle");
+    }
+    let collection = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(e) => return set_last_error(e),
+    };
+    let doc_id = match cstr_to_string(doc_id) {
+        Ok(v) => v,
+        Err(e) => return set_last_error(e),
+    };
+
+    let engine = unsafe { &mut *engine };
+    match engine.db.delete_local(&collection, &doc_id) {
+        Ok(_) => {
+            clear_last_error();
+            0
+        }
+        Err(e) => {
+            set_last_error(e.to_string());
+            -1
+        }
+    }
+}
+
+/// Marks a collection local-only (`local != 0`) or rejoins it to sync.
+/// A local-only collection never emits nor is caught up from the network.
+#[no_mangle]
+pub extern "C" fn fl_engine_set_collection_local(
+    engine: *mut FL_Engine,
+    collection: *const c_char,
+    local: i32,
+) -> i32 {
+    if engine.is_null() {
+        return set_last_error("null engine handle");
+    }
+    let collection = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(e) => return set_last_error(e),
+    };
+    let engine = unsafe { &mut *engine };
+    engine.db.set_collection_local(&collection, local != 0);
+    clear_last_error();
+    0
+}
+
+/// Opts a key back into replication (future ops only).
+#[no_mangle]
+pub extern "C" fn fl_engine_replicate_key(
+    engine: *mut FL_Engine,
+    collection: *const c_char,
+    doc_id: *const c_char,
+) -> i32 {
+    if engine.is_null() {
+        return set_last_error("null engine handle");
+    }
+    let collection = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(e) => return set_last_error(e),
+    };
+    let doc_id = match cstr_to_string(doc_id) {
+        Ok(v) => v,
+        Err(e) => return set_last_error(e),
+    };
+    let engine = unsafe { &mut *engine };
+    engine.db.replicate_key(&collection, &doc_id);
+    clear_last_error();
+    0
+}
+
 #[no_mangle]
 pub extern "C" fn fl_batch_new() -> *mut FL_Batch {
     Box::into_raw(Box::new(FL_Batch { ops: Vec::new() }))
@@ -899,6 +978,25 @@ pub extern "C" fn fl_query_delete(engine: *mut FL_Engine, query: *mut FL_Query) 
         let query_ptr = unsafe { &*query };
 
         match engine.db.delete_where(query_ptr.query.clone()) {
+            Ok(count) => {
+                clear_last_error();
+                count as i32
+            },
+            Err(e) => set_last_error(e.to_string()),
+        }
+    })
+}
+
+/// Local-only mass delete: marks every match so the wipe never leaves
+/// this device, then deletes. See `fl_engine_delete_local`.
+#[no_mangle]
+pub extern "C" fn fl_query_delete_local(engine: *mut FL_Engine, query: *mut FL_Query) -> i32 {
+    safety_shield!(-1, {
+        if engine.is_null() || query.is_null() { return -1; }
+        let engine = unsafe { &*engine };
+        let query_ptr = unsafe { &*query };
+
+        match engine.db.delete_where_local(query_ptr.query.clone()) {
             Ok(count) => {
                 clear_last_error();
                 count as i32

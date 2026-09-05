@@ -154,7 +154,7 @@ export class QuerySnapshot {
     forEach(callback: (doc: DocumentSnapshot) => void) { this.docs.forEach(callback); }
 }
 
-export type QueryConstraintType = 'where' | 'order_by' | 'limit' | 'offset' | 'select' | 'start_at' | 'start_after' | 'end_at' | 'end_before' | 'or' | 'defer_blobs';
+export type QueryConstraintType = 'where' | 'order_by' | 'limit' | 'offset' | 'select' | 'start_at' | 'start_after' | 'end_at' | 'end_before' | 'or' | 'defer_blobs' | 'local_only';
 
 export class QueryConstraint {
     constructor(public readonly type: QueryConstraintType, public readonly data: any) {}
@@ -221,18 +221,21 @@ export const updateDocs = async (
     return res.bulk_action_result.count;
 };
 
-export const deleteDoc = async (ref: DocumentReference) => {
-    await exec({ op: 'delete', collection: ref.collectionPath, doc_id: ref.id });
+export const deleteDoc = async (ref: DocumentReference, options?: { localOnly?: boolean }) => {
+    await exec({ op: 'delete', collection: ref.collectionPath, doc_id: ref.id, local_only: options?.localOnly ?? false });
 };
 
 export const deleteDocs = async (
-    q: Query | CollectionReference | CollectionGroupReference
+    q: Query | CollectionReference | CollectionGroupReference,
+    options?: { localOnly?: boolean }
 ) => {
     const params = buildQueryParams(q);
-    const res = await exec({ 
-        op: 'query', 
-        action: 'delete', 
-        ...params 
+    const res = await exec({
+        op: 'query',
+        action: 'delete',
+        ...params,
+        // Explicit option wins over the localOnly() constraint.
+        local_only: options?.localOnly ?? params.local_only ?? false
     });
     return res.bulk_action_result.count;
 };
@@ -260,6 +263,8 @@ export const endBefore = (...values: any[]) => new QueryConstraint('end_before',
 // Blob-backed fields come back as __blob__ placeholders (no blob-file
 // reads); resolve per doc with a getDoc. List views over image docs.
 export const deferBlobs = () => new QueryConstraint('defer_blobs', true);
+// Local-only scope for deleteDocs: matched docs never leave this device.
+export const localOnly = () => new QueryConstraint('local_only', true);
 
 export const getDocs = async (q: Query | CollectionReference | CollectionGroupReference) => {
     const params = buildQueryParams(q);
@@ -518,7 +523,8 @@ function buildQueryParams(q: Query | CollectionReference | CollectionGroupRefere
             start_after: undefined,
             end_at: undefined,
             end_before: undefined,
-            defer_blobs: false
+            defer_blobs: false,
+            local_only: false
         };
     }
 
@@ -536,6 +542,7 @@ function buildQueryParams(q: Query | CollectionReference | CollectionGroupRefere
     let end_at: any[] | undefined = undefined;
     let end_before: any[] | undefined = undefined;
     let defer_blobs = false;
+    let local_only = false;
 
     // 3. Extract all constraints from the query object
     for (const c of queryObj.constraints) {
@@ -563,6 +570,7 @@ function buildQueryParams(q: Query | CollectionReference | CollectionGroupRefere
             case 'end_at': end_at = c.data.map(normalizeValue); break;
             case 'end_before': end_before = c.data.map(normalizeValue); break;
             case 'defer_blobs': defer_blobs = true; break;
+            case 'local_only': local_only = true; break;
         }
     }
 
@@ -585,7 +593,8 @@ function buildQueryParams(q: Query | CollectionReference | CollectionGroupRefere
         start_after,
         end_at,
         end_before,
-        defer_blobs
+        defer_blobs,
+        local_only
     };
 }
 

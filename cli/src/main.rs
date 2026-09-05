@@ -66,6 +66,13 @@ enum DurabilityArg {
 enum Commands {
     /// List collections
     Collections,
+    /// Mark a collection local-only (never syncs) or rejoin it with --off
+    CollectionLocal {
+        collection: String,
+        /// Rejoin the collection to sync instead of marking local-only
+        #[arg(long)]
+        off: bool,
+    },
     /// Get one document by path: <collection>/<doc_id>
     Get {
         path: String,
@@ -117,6 +124,9 @@ enum Commands {
         batch: Option<bool>,
         #[arg(long)]
         data: Option<String>,
+        /// Local-only: mark so no sync tailer or handshake ever transmits it
+        #[arg(long)]
+        local: bool,
     },
     /// Query documents in a collection
     Query {
@@ -168,6 +178,9 @@ enum Commands {
         /// Mass delete the results of this query
         #[arg(long)]
         delete: bool,
+        /// Local-only mass delete: matched docs never leave this device
+        #[arg(long)]
+        local: bool,
         /// Mass update/patch the results of this query
         #[arg(long)]
         set: bool,
@@ -366,7 +379,10 @@ fn emit_json(value: &JsonValue, output: Option<&str>) -> Result<()> {
 
 fn list_collections(db: &FireLite) -> Result<()> {
     let cols = db.list_collections()?;
-    println!("{}", serde_json::to_string_pretty(&cols)?);
+    let marked: Vec<String> = cols.into_iter()
+        .map(|c| if db.is_collection_local(&c) { format!("{c} (local-only)") } else { c })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&marked)?);
     Ok(())
 }
 
@@ -519,7 +535,7 @@ fn set_doc(db: &FireLite, path: &str, data: &str, merge: bool, is_batch: bool, s
     Ok(())
 }
 
-fn delete_doc(db: &FireLite, path: &str, is_batch: bool, data: Option<&str>, show_time: bool) -> Result<()> {
+fn delete_doc(db: &FireLite, path: &str, is_batch: bool, data: Option<&str>, show_time: bool, local_only: bool) -> Result<()> {
     let start_time = Instant::now();
     if is_batch {
         let collection = path;
@@ -530,22 +546,30 @@ fn delete_doc(db: &FireLite, path: &str, is_batch: bool, data: Option<&str>, sho
             .as_array()
             .ok_or_else(|| anyhow!("--data must be an array of ID strings"))?;
 
-        let mutations: Vec<_> = ids
-            .iter()
-            .filter_map(|v| v.as_str())
-            .map(|id| firelite::engine::BatchMutation::Delete {
-                collection: collection.to_string(),
-                doc_id: id.to_string(),
-            })
-            .collect();
-
-        let count = mutations.len();
-        db.write_batch(mutations)?;
+        let id_list: Vec<String> = ids.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        let count = if local_only {
+            db.delete_ids_local(collection, &id_list)?
+        } else {
+            let mutations: Vec<_> = id_list.iter()
+                .map(|id| firelite::engine::BatchMutation::Delete {
+                    collection: collection.to_string(),
+                    doc_id: id.clone(),
+                })
+                .collect();
+            let count = mutations.len();
+            db.write_batch(mutations)?;
+            count
+        };
         println!("OK: deleted {} documents from {}", count, collection);
     } else {
         let (collection, doc_id) = split_doc_path(path)?;
-        let id = db.delete(collection, doc_id)?;
-        println!("OK: deleted {collection}/{id}");
+        if local_only {
+            let id = db.delete_local(collection, doc_id)?;
+            println!("OK: locally deleted {collection}/{id} (not synced)");
+        } else {
+            let id = db.delete(collection, doc_id)?;
+            println!("OK: deleted {collection}/{id}");
+        }
     }
     if show_time {
         eprintln!("Execution time: {:?}", start_time.elapsed());
@@ -620,6 +644,7 @@ fn run_query(
     aggregates: &[String],
     output: Option<&str>,
     delete_action: bool,
+    local_only: bool,
     set_action: bool,
     action_data: Option<&str>,
     show_count: bool,
@@ -658,9 +683,14 @@ fn run_query(
 
     // --- CORE CHAINING: Mass Delete ---
     if delete_action {
-        let count = db.delete_where(q.clone())
-            .context("Failed to execute chained delete")?;
-        println!("OK: mass deleted {count} documents from {collection}");
+        let count = if local_only {
+            db.delete_where_local(q.clone())
+        } else {
+            db.delete_where(q.clone())
+        }
+        .context("Failed to execute chained delete")?;
+        let scope = if local_only { " (local-only, not synced)" } else { "" };
+        println!("OK: mass deleted {count} documents from {collection}{scope}");
         if show_time {
             eprintln!("Execution time: {:?}", start_time.elapsed());
         }
@@ -927,6 +957,7 @@ fn run_rest(
                     None,
                     false,
                     false,
+                    false,
                     None,
                     false,
                     false
@@ -951,7 +982,7 @@ fn run_rest(
             false,
             false
         ),
-        "DELETE" => delete_doc(db, path, false, Some(" "), false),
+        "DELETE" => delete_doc(db, path, false, Some(" "), false, false),
         other => bail!("unsupported REST method: {other}"),
     }
 }
@@ -1160,6 +1191,14 @@ fn execute_command(
     // let start_time = Instant::now();
     match command {
         Commands::Collections => list_collections(db)?,
+        Commands::CollectionLocal { collection, off } => {
+            db.set_collection_local(&collection, !off);
+            if off {
+                println!("OK: {collection} rejoined sync (newer remote ops apply per LWW)");
+            } else {
+                println!("OK: {collection} is now local-only (never syncs)");
+            }
+        }
         Commands::Get {
             path,
             output,
@@ -1192,8 +1231,8 @@ fn execute_command(
             let payload = read_payload_input(data.as_deref(), fromfile.as_deref())?;
             set_doc(db, &path, &payload, true, batch.unwrap_or(false), show_time)?
         }
-        Commands::Delete { path, batch, data } => {
-            delete_doc(db, &path, batch.unwrap_or(false), data.as_deref(), show_time)?
+        Commands::Delete { path, batch, data, local } => {
+            delete_doc(db, &path, batch.unwrap_or(false), data.as_deref(), show_time, local)?
         }
         Commands::Query {
             collection,
@@ -1212,6 +1251,7 @@ fn execute_command(
             aggregates,
             output,
             delete,
+            local,
             set,
             data,
             fromfile,
@@ -1241,6 +1281,7 @@ fn execute_command(
                 &aggregates,
                 output.as_deref(),
                 delete,
+                local,
                 set,
                 payload.as_deref(),
                 show_count,

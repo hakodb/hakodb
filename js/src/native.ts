@@ -59,6 +59,9 @@ export interface NativeBindings {
   engineInsert(engine: Handle, collection: string, docId: string, doc: Handle): number;
   engineGet(engine: Handle, collection: string, docId: string): Handle;
   engineDelete(engine: Handle, collection: string, docId: string): number;
+  engineDeleteLocal(engine: Handle, collection: string, docId: string): number;
+  engineSetCollectionLocal(engine: Handle, collection: string, local: number): number;
+  engineReplicateKey(engine: Handle, collection: string, docId: string): number;
   enginePatch(engine: Handle, collection: string, docId: string, updates: Handle): number;
   engineInsertSubDoc(engine: Handle, col: string, id: string, subCol: string, subId: string, doc: Handle): number;
   engineGetByRef(engine: Handle, doc: Handle, fieldKey: string): Handle;
@@ -100,6 +103,7 @@ export interface NativeBindings {
   querySelectField(query: Handle, field: string): number;
   queryExecute(engine: Handle, query: Handle): string | null;
   queryDelete(engine: Handle, query: Handle): number;
+  queryDeleteLocal(engine: Handle, query: Handle): number;
   queryPatch(engine: Handle, query: Handle, patchDoc: Handle): number;
   queryExecuteToHandles(engine: Handle, query: Handle): Handle;
   resultSetCount(results: Handle): number;
@@ -231,6 +235,9 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     fl_engine_insert: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring, FFIType.ptr], returns: FFIType.i32 },
     fl_engine_get: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.ptr },
     fl_engine_delete: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
+    fl_engine_delete_local: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
+    fl_engine_set_collection_local: { args: [FFIType.ptr, FFIType.cstring, FFIType.i32], returns: FFIType.i32 },
+    fl_engine_replicate_key: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
     fl_engine_patch: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring, FFIType.ptr], returns: FFIType.i32 },
     fl_engine_insert_subdoc: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring, FFIType.cstring, FFIType.cstring, FFIType.ptr], returns: FFIType.i32 },
     fl_engine_get_by_ref: { args: [FFIType.ptr, FFIType.ptr, FFIType.cstring], returns: FFIType.ptr },
@@ -273,6 +280,7 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     fl_query_select_field: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.i32 },
     fl_query_execute: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.ptr },
     fl_query_delete: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+    fl_query_delete_local: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
     fl_query_patch: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
     fl_query_execute_to_handles: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.ptr },
     fl_result_set_count: { args: [FFIType.ptr], returns: FFIType.usize },
@@ -389,6 +397,9 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     engineInsert: (engine, collection, docId, doc) => symbols.fl_engine_insert(engine, toC(collection), toC(docId), doc),
     engineGet: (engine, collection, docId) => symbols.fl_engine_get(engine, toC(collection), toC(docId)),
     engineDelete: (engine, collection, docId) => symbols.fl_engine_delete(engine, toC(collection), toC(docId)),
+    engineDeleteLocal: (engine, collection, docId) => symbols.fl_engine_delete_local(engine, toC(collection), toC(docId)),
+    engineSetCollectionLocal: (engine, collection, local) => symbols.fl_engine_set_collection_local(engine, toC(collection), local),
+    engineReplicateKey: (engine, collection, docId) => symbols.fl_engine_replicate_key(engine, toC(collection), toC(docId)),
     enginePatch: (engine, collection, docId, updates) => symbols.fl_engine_patch(engine, toC(collection), toC(docId), updates),
     engineInsertSubDoc: (engine, col, id, subCol, subId, doc) => symbols.fl_engine_insert_subdoc(engine, toC(col), toC(id), toC(subCol), toC(subId), doc),
     engineGetByRef: (engine, doc, fieldKey) => symbols.fl_engine_get_by_ref(engine, doc, toC(fieldKey)),
@@ -433,6 +444,7 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     querySelectField: (query, field) => symbols.fl_query_select_field(query, toC(field)),
     queryExecute: (engine, query) => ptrToStringAndFree(symbols.fl_query_execute(engine, query)),
     queryDelete: (engine, query) => symbols.fl_query_delete(engine, query),
+    queryDeleteLocal: (engine, query) => symbols.fl_query_delete_local(engine, query),
     queryPatch: (engine, query, patchDoc) => symbols.fl_query_patch(engine, query, patchDoc),
     queryExecuteToHandles: (engine, query) => symbols.fl_query_execute_to_handles(engine, query),
     resultSetCount: (results) => symbols.fl_result_set_count(results),
@@ -546,6 +558,9 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_engine_insert: lib.func('int fl_engine_insert(FL_Engine* engine, const char* collection, const char* doc_id, const FL_Doc* doc)'),
     fl_engine_get: lib.func('FL_Doc* fl_engine_get(FL_Engine* engine, const char* collection, const char* doc_id)'),
     fl_engine_delete: lib.func('int fl_engine_delete(FL_Engine* engine, const char* collection, const char* doc_id)'),
+    fl_engine_delete_local: lib.func('int fl_engine_delete_local(FL_Engine* engine, const char* collection, const char* doc_id)'),
+    fl_engine_set_collection_local: lib.func('int fl_engine_set_collection_local(FL_Engine* engine, const char* collection, int local)'),
+    fl_engine_replicate_key: lib.func('int fl_engine_replicate_key(FL_Engine* engine, const char* collection, const char* doc_id)'),
     fl_engine_patch: lib.func('int fl_engine_patch(FL_Engine* engine, const char* collection, const char* doc_id, const FL_Doc* updates)'),
     fl_engine_insert_subdoc: lib.func('int fl_engine_insert_subdoc(FL_Engine* engine, const char* col, const char* id, const char* sub_col, const char* sub_id, const FL_Doc* doc)'),
     fl_engine_get_by_ref: lib.func('FL_Doc* fl_engine_get_by_ref(FL_Engine* engine, const FL_Doc* doc, const char* field_key)'),
@@ -588,6 +603,7 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_query_select_field: lib.func('int fl_query_select_field(FL_Query* query, const char* field)'),
     fl_query_execute: lib.func('char* fl_query_execute(FL_Engine* engine, const FL_Query* query)'),
     fl_query_delete: lib.func('int fl_query_delete(FL_Engine* engine, FL_Query* query)'),
+    fl_query_delete_local: lib.func('int fl_query_delete_local(FL_Engine* engine, FL_Query* query)'),
     fl_query_patch: lib.func('int fl_query_patch(FL_Engine* engine, FL_Query* query, const FL_Doc* patch_doc)'),
     fl_query_execute_to_handles: lib.func('FL_ResultSet* fl_query_execute_to_handles(FL_Engine* engine, const FL_Query* query)'),
     fl_result_set_count: lib.func('size_t fl_result_set_count(FL_ResultSet* results)'),
@@ -705,6 +721,9 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     engineInsert: (engine, collection, docId, doc) => fn.fl_engine_insert(engine, collection, docId, doc),
     engineGet: (engine, collection, docId) => fn.fl_engine_get(engine, collection, docId),
     engineDelete: (engine, collection, docId) => fn.fl_engine_delete(engine, collection, docId),
+    engineDeleteLocal: (engine, collection, docId) => fn.fl_engine_delete_local(engine, collection, docId),
+    engineSetCollectionLocal: (engine, collection, local) => fn.fl_engine_set_collection_local(engine, collection, local),
+    engineReplicateKey: (engine, collection, docId) => fn.fl_engine_replicate_key(engine, collection, docId),
     enginePatch: (engine, collection, docId, updates) => fn.fl_engine_patch(engine, collection, docId, updates),
     engineInsertSubDoc: (engine, col, id, subCol, subId, doc) => fn.fl_engine_insert_subdoc(engine, col, id, subCol, subId, doc),
     engineGetByRef: (engine, doc, fieldKey) => fn.fl_engine_get_by_ref(engine, doc, fieldKey),
@@ -749,6 +768,7 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     querySelectField: (query, field) => fn.fl_query_select_field(query, field),
     queryExecute: (engine, query) => ptrToStringAndFree(fn.fl_query_execute(engine, query)),
     queryDelete: (engine, query) => fn.fl_query_delete(engine, query),
+    queryDeleteLocal: (engine, query) => fn.fl_query_delete_local(engine, query),
     queryPatch: (engine, query, patchDoc) => fn.fl_query_patch(engine, query, patchDoc),
     queryExecuteToHandles: (engine, query) => fn.fl_query_execute_to_handles(engine, query),
     resultSetCount: (results) => fn.fl_result_set_count(results),

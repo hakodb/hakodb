@@ -344,6 +344,37 @@ func (e *Engine) Delete(collection, docID string) error {
 	return checkStatus("fl_engine_delete", C.fl_engine_delete(e.ptr, cc, ci))
 }
 
+// DeleteLocal marks the key so no sync tailer or handshake ever transmits
+// it, then deletes normally (fresh tombstone keeps the version clock ahead).
+func (e *Engine) DeleteLocal(collection, docID string) error {
+	cc, fc := cString(collection)
+	ci, fi := cString(docID)
+	defer fc()
+	defer fi()
+	return checkStatus("fl_engine_delete_local", C.fl_engine_delete_local(e.ptr, cc, ci))
+}
+
+// SetCollectionLocal marks a collection local-only (never syncs) or, with
+// local=false, rejoins it to sync.
+func (e *Engine) SetCollectionLocal(collection string, local bool) error {
+	cc, fc := cString(collection)
+	defer fc()
+	l := C.int(0)
+	if local {
+		l = 1
+	}
+	return checkStatus("fl_engine_set_collection_local", C.fl_engine_set_collection_local(e.ptr, cc, l))
+}
+
+// ReplicateKey opts a key back into replication (future ops only).
+func (e *Engine) ReplicateKey(collection, docID string) error {
+	cc, fc := cString(collection)
+	ci, fi := cString(docID)
+	defer fc()
+	defer fi()
+	return checkStatus("fl_engine_replicate_key", C.fl_engine_replicate_key(e.ptr, cc, ci))
+}
+
 func (e *Engine) Patch(collection, docID string, updates *Doc) error {
 	cc, fc := cString(collection)
 	ci, fi := cString(docID)
@@ -825,6 +856,16 @@ func (e *Engine) DeleteWhere(q *Query) (int32, error) {
 	n := C.fl_query_delete(e.ptr, q.ptr)
 	if n < 0 {
 		return 0, fmt.Errorf("fl_query_delete failed: %s", lastError())
+	}
+	return int32(n), nil
+}
+
+// DeleteWhereLocal marks every match so the wipe never leaves this device,
+// then deletes. Returns the number of deleted documents.
+func (e *Engine) DeleteWhereLocal(q *Query) (int32, error) {
+	n := C.fl_query_delete_local(e.ptr, q.ptr)
+	if n < 0 {
+		return 0, fmt.Errorf("fl_query_delete_local failed: %s", lastError())
 	}
 	return int32(n), nil
 }

@@ -123,6 +123,18 @@ FL_Doc *fl_engine_get(FL_Engine *engine, const char *collection, const char *doc
 
 int32_t fl_engine_delete(FL_Engine *engine, const char *collection, const char *doc_id);
 
+/// Local-only delete: marks the key so no sync tailer or handshake
+/// catch-up ever transmits it, then deletes normally (fresh tombstone
+/// timestamp keeps the version clock advanced — handshake-stable).
+int32_t fl_engine_delete_local(FL_Engine *engine, const char *collection, const char *doc_id);
+
+/// Marks a collection local-only (`local != 0`) or rejoins it to sync.
+/// A local-only collection never emits nor is caught up from the network.
+int32_t fl_engine_set_collection_local(FL_Engine *engine, const char *collection, int32_t local);
+
+/// Opts a key back into replication (future ops only).
+int32_t fl_engine_replicate_key(FL_Engine *engine, const char *collection, const char *doc_id);
+
 FL_Batch *fl_batch_new();
 
 void fl_batch_free(FL_Batch *batch);
@@ -144,6 +156,10 @@ int32_t fl_query_where_eq_bool(FL_Query *query, const char *field, bool value);
 /// Executes the query and deletes all matching documents.
 /// Returns the number of deleted documents, or -1 on error.
 int32_t fl_query_delete(FL_Engine *engine, FL_Query *query);
+
+/// Local-only mass delete: marks every match so the wipe never leaves
+/// this device, then deletes. See `fl_engine_delete_local`.
+int32_t fl_query_delete_local(FL_Engine *engine, FL_Query *query);
 
 /// Executes the query and applies the updates from 'patch_doc' to all matches.
 /// Returns the number of updated documents, or -1 on error.

@@ -97,6 +97,9 @@ function fl_engine_insert_take(engine: PFL_Engine; col, doc_id: PChar; doc: PFL_
 function fl_doc_resolve_blobs(engine: PFL_Engine; col: PChar; doc: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;
 function fl_engine_get(engine: PFL_Engine; col, doc_id: PChar): PFL_Doc; cdecl; external FIRELITE_LIB;
 function fl_engine_delete(engine: PFL_Engine; col, doc_id: PChar): cint32; cdecl; external FIRELITE_LIB;
+function fl_engine_delete_local(engine: PFL_Engine; col, doc_id: PChar): cint32; cdecl; external FIRELITE_LIB;
+function fl_engine_set_collection_local(engine: PFL_Engine; col: PChar; local: cint32): cint32; cdecl; external FIRELITE_LIB;
+function fl_engine_replicate_key(engine: PFL_Engine; col, doc_id: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_engine_patch(engine: PFL_Engine; col, doc_id: PChar; updates: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;
 function fl_engine_get_by_ref(engine: PFL_Engine; doc: PFL_Doc; field_key: PChar): PFL_Doc; cdecl; external FIRELITE_LIB;
 function fl_engine_insert_subdoc(engine: PFL_Engine; col, id, sub_col, sub_id: PChar; doc: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;
@@ -144,6 +147,7 @@ function fl_query_select_field(query: PFL_Query; field: PChar): cint32; cdecl; e
 function fl_query_defer_blobs(query: PFL_Query; defer: cint32): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_execute(engine: PFL_Engine; query: PFL_Query): PChar; cdecl; external FIRELITE_LIB;
 function fl_query_delete(engine: PFL_Engine; query: PFL_Query): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_delete_local(engine: PFL_Engine; query: PFL_Query): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_patch(engine: PFL_Engine; query: PFL_Query; patch_doc: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_execute_to_handles(engine: PFL_Engine; query: PFL_Query): PFL_ResultSet; cdecl; external FIRELITE_LIB;
 function fl_result_set_count(results: PFL_ResultSet): SizeUInt; cdecl; external FIRELITE_LIB;

@@ -446,6 +446,24 @@ export class FireLiteClient {
     ensureOk(this.native.engineDelete(this.engine, collection, docId), this.native, 'engineDelete');
   }
 
+  /** Local-only delete: never leaves this device (no sync tailer or handshake transmits it). */
+  async deleteLocal(collection: string, docId: string): Promise<void> {
+    this.assertOpen();
+    ensureOk(this.native.engineDeleteLocal(this.engine, collection, docId), this.native, 'engineDeleteLocal');
+  }
+
+  /** Mark a collection local-only (never syncs) or rejoin it with `local=false`. */
+  async setCollectionLocal(collection: string, local: boolean): Promise<void> {
+    this.assertOpen();
+    ensureOk(this.native.engineSetCollectionLocal(this.engine, collection, local ? 1 : 0), this.native, 'engineSetCollectionLocal');
+  }
+
+  /** Opt a key back into replication (future ops only). */
+  async replicateKey(collection: string, docId: string): Promise<void> {
+    this.assertOpen();
+    ensureOk(this.native.engineReplicateKey(this.engine, collection, docId), this.native, 'engineReplicateKey');
+  }
+
   nativeBindings(): NativeBindings { return this.native; }
   engineHandle(): unknown { return this.engine; }
 
@@ -805,6 +823,19 @@ return this;
     try {
       const n = native.queryDelete(this.client.engineHandle(), handle);
       if (n < 0) throw new Error(`queryDelete failed: ${native.lastError()}`);
+      return n;
+    } finally {
+      native.queryFree(handle);
+    }
+  }
+
+  /** Local-only mass delete: matched docs never leave this device. */
+  async deleteLocal(): Promise<number> {
+    const native = this.client.nativeBindings();
+    const handle = this.prepareNativeQuery();
+    try {
+      const n = native.queryDeleteLocal(this.client.engineHandle(), handle);
+      if (n < 0) throw new Error(`queryDeleteLocal failed: ${native.lastError()}`);
       return n;
     } finally {
       native.queryFree(handle);

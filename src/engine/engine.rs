@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, RwLock, Once};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH, Instant};
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 use crate::config::FireLiteConfig;
 use crate::document::firelite_doc::FireLiteDoc;
@@ -313,6 +313,16 @@ pub struct FireLite {
     /// every write bumps, so a version match is exact; writes also remove
     /// the key outright so stale entries can't linger.
     pub(crate) doc_cache: RwLock<HashMap<String, (u64, Arc<FireLiteDoc>)>>,
+    /// Local-only replication scope ("the signal"): collections and keys
+    /// whose writes must never leave this device. Advancing clocks is
+    /// untouched (tombstones keep fresh timestamps, so the deleter never
+    /// looks "behind" to a handshake); every sync outbound tailer and both
+    /// handshake catch-up paths consult `is_local_only` and skip matches.
+    /// Key format is `col\0id` (NUL separator — ids may contain anything).
+    /// Persisted best-effort into `__firelite_system/local_only` so a
+    /// restart can't re-tail un-checkpointed local-only ops upstream.
+    pub(crate) local_only_cols: RwLock<HashSet<String>>,
+    pub(crate) local_only_keys: RwLock<HashSet<String>>,
 }
 
 impl FireLite {
@@ -542,9 +552,12 @@ impl FireLite {
             indexes_ready,
             plan_cache: PlanCache::default(),
             doc_cache: RwLock::new(HashMap::new()),
+            local_only_cols: RwLock::new(HashSet::new()),
+            local_only_keys: RwLock::new(HashSet::new()),
         };
 
         let _ = db.restore_index_defs();
+        let _ = db.restore_local_only();
 
         // 6. ORCHESTRATED BACKGROUND RECOVERY
         let shards_ptr = Arc::clone(&db.shards);
@@ -1045,6 +1058,138 @@ impl FireLite {
             doc_id: id.into(),
         }])?;
         Ok(res.into_iter().next().unwrap_or_default())
+    }
+
+    /// The single shared gate for the local-only signal. Collection-level
+    /// flag OR per-key mark. `key` may arrive bare (`id`) or namespaced
+    /// (`col:id`) depending on the sync path — both forms are honored.
+    pub fn is_local_only(&self, col: &str, key: &str) -> bool {
+        if self.local_only_cols.read().unwrap().contains(col) {
+            return true;
+        }
+        let keys = self.local_only_keys.read().unwrap();
+        if keys.contains(&format!("{col}\0{key}")) {
+            return true;
+        }
+        // ponytail: namespaced fallback — strip one leading `col:` only.
+        if let Some(id) = key.strip_prefix(col).and_then(|s| s.strip_prefix(':')) {
+            return keys.contains(&format!("{col}\0{id}"));
+        }
+        false
+    }
+
+    /// Mark a whole collection local-only (never emits, never accepts
+    /// remote ops for it once sync filters check this — fully local).
+    /// `false` rejoins: subsequent local writes replicate again, and any
+    /// newer remote op applies per LWW (resurrect rule).
+    pub fn set_collection_local(&self, col: &str, local: bool) {
+        {
+            let mut cols = self.local_only_cols.write().unwrap();
+            if local {
+                cols.insert(col.to_string());
+            } else {
+                cols.remove(col);
+            }
+        }
+        self.persist_local_only();
+    }
+
+    pub fn is_collection_local(&self, col: &str) -> bool {
+        self.local_only_cols.read().unwrap().contains(col)
+    }
+
+    /// Local-only single delete: marks the key, then runs the normal
+    /// delete path so the tombstone keeps a fresh timestamp and the
+    /// collection version advances (handshake-stability rule).
+    pub fn delete_local(&self, col: &str, id: &str) -> Result<String> {
+        self.local_only_keys.write().unwrap().insert(format!("{col}\0{id}"));
+        self.persist_local_only();
+        self.delete(col, id)
+    }
+
+    /// Opt a key back into replication. Only affects future ops; the
+    /// existing local tombstone still stands until overwritten.
+    pub fn replicate_key(&self, col: &str, id: &str) {
+        self.local_only_keys.write().unwrap().remove(&format!("{col}\0{id}"));
+        self.persist_local_only();
+    }
+
+    /// Local-only mass delete ("reset this query scope, don't propagate"):
+    /// marks every matched key first (single persist), then batch-deletes.
+    pub fn delete_where_local(&self, query: crate::query::query::Query) -> Result<usize> {
+        let results = self.query(query.clone())?;
+        if results.is_empty() { return Ok(0); }
+        let count = results.len();
+        {
+            let mut marks = self.local_only_keys.write().unwrap();
+            for (id, _) in &results {
+                marks.insert(format!("{}\0{id}", query.collection));
+            }
+        }
+        self.persist_local_only();
+        let mutations = results.into_iter()
+            .map(|(id, _)| BatchMutation::Delete {
+                collection: query.collection.clone(),
+                doc_id: id
+            })
+            .collect();
+        self.write_batch(mutations)?;
+        Ok(count)
+    }
+
+    /// Local-only batch delete by explicit ids (single mark persist +
+    /// single batch — the CLI/SDK batch path).
+    pub fn delete_ids_local(&self, col: &str, ids: &[String]) -> Result<usize> {
+        if ids.is_empty() { return Ok(0); }
+        {
+            let mut marks = self.local_only_keys.write().unwrap();
+            for id in ids {
+                marks.insert(format!("{col}\0{id}"));
+            }
+        }
+        self.persist_local_only();
+        let mutations = ids.iter()
+            .map(|id| BatchMutation::Delete {
+                collection: col.to_string(),
+                doc_id: id.clone()
+            })
+            .collect();
+        self.write_batch(mutations)?;
+        Ok(ids.len())
+    }
+
+    /// Best-effort durability for the marks. Lives in `__firelite_system`,
+    /// which net_sync already excludes from its tail and cloud_sync never
+    /// routes (no room prefix) — the marker itself never replicates.
+    fn persist_local_only(&self) {
+        let cols: Vec<Value> = self.local_only_cols.read().unwrap().iter()
+            .map(|c| Value::String(c.clone())).collect();
+        let keys: Vec<Value> = self.local_only_keys.read().unwrap().iter()
+            .map(|k| Value::String(k.clone())).collect();
+        let mut doc = FireLiteDoc::default();
+        doc.insert("cols", Value::Array(cols));
+        doc.insert("keys", Value::Array(keys));
+        let _ = self.put("__firelite_system", "local_only", &doc);
+    }
+
+    fn restore_local_only(&self) -> Result<()> {
+        let doc = match self.get("__firelite_system", "local_only")? {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+        if let Some(Value::Array(cols)) = doc.get("cols") {
+            let mut set = self.local_only_cols.write().unwrap();
+            for c in cols {
+                if let Value::String(s) = c { set.insert(s.clone()); }
+            }
+        }
+        if let Some(Value::Array(keys)) = doc.get("keys") {
+            let mut set = self.local_only_keys.write().unwrap();
+            for k in keys {
+                if let Value::String(s) = k { set.insert(s.clone()); }
+            }
+        }
+        Ok(())
     }
 
     pub fn collection(&self, name: &str) -> Collection<'_> {

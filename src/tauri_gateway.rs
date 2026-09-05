@@ -45,7 +45,13 @@ pub enum FireLiteOp {
     Get { collection: String, doc_id: String },
     Set { collection: String, doc_id: String, data: serde_json::Value },
     Patch { collection: String, doc_id: String, data: serde_json::Value },
-    Delete { collection: String, doc_id: String },
+    Delete {
+        collection: String,
+        doc_id: String,
+        // ponytail: old clients omit it and get replicated behavior via default.
+        #[serde(default)]
+        local_only: bool,
+    },
     CreateIndex { collection: String, field: String },
     CreateFtsIndex { collection: String, field: String },
     CreateCompositeIndex { collection: String, fields: Vec<CompositeFieldInput> },
@@ -69,6 +75,9 @@ pub enum FireLiteOp {
         // get eager behavior via serde default).
         #[serde(default)]
         defer_blobs: bool,
+        // Local-only scope for the Delete action (Fetch ignores it).
+        #[serde(default)]
+        local_only: bool,
     },
     Batch { mutations: Vec<BatchInput> },
     Aggregate {
@@ -148,6 +157,9 @@ pub struct BatchInput {
     pub collection: String,
     pub doc_id: String,
     pub data: Option<serde_json::Value>,
+    // Local-only scope for Delete items (Set/Patch ignore it).
+    #[serde(default)]
+    pub local_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,6 +419,7 @@ struct QueryInput {
     end_before: Option<Vec<serde_json::Value>>,
     doc_id_filter: Option<String>,
     defer_blobs: bool,
+    local_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -446,8 +459,12 @@ pub async fn firelite_exec<R: Runtime>(
                 gateway.db.patch(&collection, &doc_id, updates).map_err(|e| e.to_string())?;
                 Ok(FireLiteResponse::Ok)
             }
-            FireLiteOp::Delete { collection, doc_id } => {
-                gateway.db.delete(&collection, &doc_id).map_err(|e| e.to_string())?;
+            FireLiteOp::Delete { collection, doc_id, local_only } => {
+                if local_only {
+                    gateway.db.delete_local(&collection, &doc_id).map_err(|e| e.to_string())?;
+                } else {
+                    gateway.db.delete(&collection, &doc_id).map_err(|e| e.to_string())?;
+                }
                 Ok(FireLiteResponse::Ok)
             }
             FireLiteOp::CreateIndex { collection, field } => {
@@ -464,9 +481,9 @@ pub async fn firelite_exec<R: Runtime>(
                 gateway.db.persist_index_defs().map_err(|e| e.to_string())?;
                 Ok(FireLiteResponse::Ok)
             }
-            FireLiteOp::Query { collection, action, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before, defer_blobs } => {
+            FireLiteOp::Query { collection, action, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before, defer_blobs, local_only } => {
                 let input = QueryInput { 
-                    collection, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before, defer_blobs 
+                    collection, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before, defer_blobs, local_only 
                 };
                 let query_obj = build_query_from_input(&input)?;
 
@@ -476,7 +493,11 @@ pub async fn firelite_exec<R: Runtime>(
                         Ok(FireLiteResponse::QueryResult { rows })
                     }
                     QueryAction::Delete => {
-                        let count = gateway.db.delete_where(query_obj).map_err(|e| e.to_string())?;
+                        let count = if input.local_only {
+                            gateway.db.delete_where_local(query_obj).map_err(|e| e.to_string())?
+                        } else {
+                            gateway.db.delete_where(query_obj).map_err(|e| e.to_string())?
+                        };
                         Ok(FireLiteResponse::BulkActionResult { count })
                     }
                     QueryAction::Patch { data } => {
@@ -488,6 +509,10 @@ pub async fn firelite_exec<R: Runtime>(
             }
             FireLiteOp::Batch { mutations } => {
                 let mut batch = Vec::with_capacity(mutations.len());
+                // ponytail: local-only deletes bypass the shared batch so
+                // their marks persist once per collection, not per item.
+                let mut local_dels: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
                 for item in mutations {
                     match item.mutation {
                         BatchMutationKind::Set => {
@@ -498,10 +523,16 @@ pub async fn firelite_exec<R: Runtime>(
                             let data = item.data.ok_or("missing data")?;
                             batch.push(BatchMutation::Patch { collection: item.collection, doc_id: item.doc_id, updates: json_to_vec(&data)? });
                         }
+                        BatchMutationKind::Delete if item.local_only => {
+                            local_dels.entry(item.collection).or_default().push(item.doc_id);
+                        }
                         BatchMutationKind::Delete => {
                             batch.push(BatchMutation::Delete { collection: item.collection, doc_id: item.doc_id });
                         }
                     }
+                }
+                for (col, ids) in local_dels {
+                    gateway.db.delete_ids_local(&col, &ids).map_err(|e| e.to_string())?;
                 }
                 gateway.db.write_batch(batch).map_err(|e| e.to_string())?;
                 Ok(FireLiteResponse::Ok)
@@ -539,7 +570,7 @@ pub async fn firelite_exec<R: Runtime>(
                 gateway.register_subscription(
                     _window,
                     listener_id.clone(),
-                    QueryInput { collection, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before, defer_blobs: false },
+                    QueryInput { collection, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before, defer_blobs: false, local_only: false },
                     event_name.unwrap_or_else(|| "firelite://snapshot".to_string()),
                 )?;
                 Ok(FireLiteResponse::SubscriptionAck { listener_id })
