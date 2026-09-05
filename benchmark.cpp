@@ -97,6 +97,40 @@ static void dump_wstats(const char* tag) {
     if (s) printf("\n[WSTATS %s]\n%s", tag, s.get());
 }
 
+// CI regression gate (Manual profile only). Two layers:
+// - Relative invariants: hardware-independent; catch routing/planner
+//   regressions (the P2/P4-recapture and BTree-fallback bug classes).
+// - Smoke floors: 5-10x below the worst observed on any machine; catch
+//   total breakage without flaking on noisy CI runners.
+// Returns failure count (0 = pass). Called with --gate.
+static int check_gate(const Report& r) {
+    int fails = 0;
+    auto need = [&](bool ok, const char* msg, double a, double b) {
+        cout << (ok ? "PASS" : "FAIL") << " GATE " << left << setw(24) << msg
+             << " (" << (int)a << " vs " << (int)b << ")\n";
+        if (!ok) fails++;
+    };
+    // Smoke floors.
+    need(r.stress_query_qps > 500, "Qry smoke", r.stress_query_qps, 500);
+    need(r.comp_query_qps > 500, "Cmp smoke", r.comp_query_qps, 500);
+    need(r.offset_qps > 500, "Off smoke", r.offset_qps, 500);
+    need(r.cursor_qps > 500, "Cur smoke", r.cursor_qps, 500);
+    need(r.stress_get_rps > 5000, "Get smoke", r.stress_get_rps, 5000);
+    need(r.single_wps > 1000, "Single smoke", r.single_wps, 1000);
+    need(r.tx_wps > 2000, "Tx smoke", r.tx_wps, 2000);
+    // Relative invariants (guarded against div-by-zero via the smoke gates).
+    if (r.comp_query_qps > 0)
+        need(r.stress_query_qps >= r.comp_query_qps, "Qry>=Cmp", r.stress_query_qps, r.comp_query_qps);
+    else { need(false, "Qry>=Cmp", r.stress_query_qps, r.comp_query_qps); }
+    need(r.offset_qps <= 2 * r.cursor_qps && r.cursor_qps <= 2 * r.offset_qps,
+         "Off/Cur within 2x", r.offset_qps, r.cursor_qps);
+    if (r.stress_query_qps > 0)
+        need(r.stress_get_rps > 5 * r.stress_query_qps, "Get>5xQry", r.stress_get_rps, r.stress_query_qps);
+    else { need(false, "Get>5xQry", r.stress_get_rps, r.stress_query_qps); }
+    need(r.batch_wps >= r.single_wps, "Batch>=Single", r.batch_wps, r.single_wps);
+    return fails;
+}
+
 extern "C" void bench_on_snapshot(const char* col, const char* path, int kind, void* user_data) {
     g_snapshot_received.fetch_add(1, std::memory_order_relaxed);
 }
@@ -402,13 +436,17 @@ int main(int argc, char** argv) {
     int g_docs = 1000;
     string only_profile;
     bool wstats = false;
+    bool gate = false;
     for (int i = 1; i < argc; i++) {
         string a = argv[i];
         if (a.find("--docs=") == 0) g_docs = stoi(a.substr(7));
         if (a.find("--profile=") == 0) only_profile = a.substr(10);
         if (a == "--wstats") wstats = true;
+        if (a == "--gate") gate = true;
     }
     g_wstats_enabled = wstats;
+    // Gate mode: Manual profile only (fast, covers all gated shapes).
+    if (gate) only_profile = "Manual";
 
     vector<BenchConfig> suite = {
         {"Always",      g_docs, 10,  0, 4, false, false, 4,  false},
@@ -420,7 +458,7 @@ int main(int argc, char** argv) {
     };
 
     cout << "============================================================================================\n";
-    cout << " FIRE LITE PERFORMANCE MATRIX (v0.6.4) | THROUGHPUT MODE (Ops/Sec) | Total Docs: " << g_docs << "\n";
+    cout << " FIRE LITE PERFORMANCE MATRIX (v0.7.4) | THROUGHPUT MODE (Ops/Sec) | Total Docs: " << g_docs << "\n";
     cout << "============================================================================================\n";
 
     vector<Report> results;
@@ -467,6 +505,13 @@ int main(int argc, char** argv) {
              << fixed << setprecision(1) << r.storage_mb << "MB\n";
     }
     cout << string(170, '=') << endl;
+
+    if (gate) {
+        cout << "\n--- REGRESSION GATE (Manual) ---\n";
+        int fails = results.empty() ? 1 : check_gate(results[0]);
+        cout << (fails == 0 ? "GATE RESULT: PASS\n" : "GATE RESULT: FAIL\n");
+        return fails == 0 ? 0 : 1;
+    }
 
     return 0;
 }

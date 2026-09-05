@@ -16,3 +16,9 @@ jobs:
         run: g++ -O2 -std=c++17 -Iinclude benchmark.cpp -Ltarget/release -lfirelite -o benchmark
       - name: Run official benchmark (benchmark.cpp)
         run: LD_LIBRARY_PATH=target/release ./benchmark --docs=1000
+      - name: Regression gate (Manual profile, relative invariants + smoke floors)
+        # check_gate() in benchmark.cpp: Qry>=Cmp, Off/Cur within 2x,
+        # Get>5xQry, Batch>=Single, plus 5-10x-headroom smoke floors.
+        # Relative invariants are hardware-independent; smoke floors only
+        # catch total breakage, so noisy CI runners don't flake.
+        run: LD_LIBRARY_PATH=target/release ./benchmark --docs=1000 --gate
