@@ -458,7 +458,7 @@ int main(int argc, char** argv) {
     };
 
     cout << "============================================================================================\n";
-    cout << " FIRE LITE PERFORMANCE MATRIX (v0.7.5) | THROUGHPUT MODE (Ops/Sec) | Total Docs: " << g_docs << "\n";
+    cout << " FIRE LITE PERFORMANCE MATRIX (v0.7.6) | THROUGHPUT MODE (Ops/Sec) | Total Docs: " << g_docs << "\n";
     cout << "============================================================================================\n";
 
     vector<Report> results;
