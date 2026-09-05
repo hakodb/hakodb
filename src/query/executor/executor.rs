@@ -75,18 +75,17 @@ impl ParallelQueryExecutor {
             let mut results = Vec::with_capacity(doc_count);
 
             // ponytail: shared decode helper for both byte sources below.
+            // Decodes skeletons ONLY — blob inflation happens once below,
+            // concurrently across all rows (positional blob reads are
+            // thread-safe). With plan.defer_blobs the placeholders are
+            // returned as-is; resolve later per doc if needed.
+            let defer = plan.defer_blobs;
             let push_row = |id: String, bytes: &[u8], results: &mut Vec<(String, FireLiteDoc)>| {
                 if plan.filters_satisfied_by_index {
-                    if let Some(mut doc) = FireLiteDoc::decode(bytes) {
-                        if let Some(bm) = blob_manager {
-                            let _ = crate::query::executor::worker::inflate_blobs(&mut doc, bm);
-                        }
+                    if let Some(doc) = FireLiteDoc::decode(bytes) {
                         results.push((id, doc));
                     }
-                } else if let Some(mut doc) = crate::query::executor::worker::unified_match_decode(&id, bytes, &optimized_plan) {
-                    if let Some(bm) = blob_manager {
-                        let _ = crate::query::executor::worker::inflate_blobs(&mut doc, bm);
-                    }
+                } else if let Some(doc) = crate::query::executor::worker::unified_match_decode(&id, bytes, &optimized_plan) {
                     results.push((id, doc));
                 }
             };
@@ -101,6 +100,25 @@ impl ParallelQueryExecutor {
                         if let Ok(Some(bytes)) = storage_guard.read_pointer(&other) {
                             push_row(id, &bytes, &mut results);
                         }
+                    }
+                }
+            }
+
+            // ponytail: parallel blob inflation. Skeletons are all decoded
+            // above; resolve every BlobLink concurrently (positional preads
+            // are thread-safe, no shared state). Sequential 20x50KB disk
+            // reads serialize on I/O latency; concurrent reads queue in the
+            // OS. Link-free results (the common small-doc case) skip the
+            // pass via one branchy scan — no rayon dispatch, no per-doc
+            // overhead, same speed as before.
+            if !defer {
+                if let Some(bm) = blob_manager {
+                    use rayon::prelude::*;
+                    use crate::query::executor::worker::doc_has_links;
+                    if results.iter().any(|(_, doc)| doc_has_links(doc)) {
+                        results.par_iter_mut().for_each(|(_, doc)| {
+                            let _ = crate::query::executor::worker::inflate_blobs(doc, bm);
+                        });
                     }
                 }
             }

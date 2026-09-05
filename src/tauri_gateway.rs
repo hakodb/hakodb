@@ -65,6 +65,10 @@ pub enum FireLiteOp {
         start_after: Option<Vec<serde_json::Value>>,
         end_at: Option<Vec<serde_json::Value>>,
         end_before: Option<Vec<serde_json::Value>>,
+        // ponytail: opt-in per-query blob deferral (old clients omit it and
+        // get eager behavior via serde default).
+        #[serde(default)]
+        defer_blobs: bool,
     },
     Batch { mutations: Vec<BatchInput> },
     Aggregate {
@@ -402,6 +406,7 @@ struct QueryInput {
     end_at: Option<Vec<serde_json::Value>>,
     end_before: Option<Vec<serde_json::Value>>,
     doc_id_filter: Option<String>,
+    defer_blobs: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -459,9 +464,9 @@ pub async fn firelite_exec<R: Runtime>(
                 gateway.db.persist_index_defs().map_err(|e| e.to_string())?;
                 Ok(FireLiteResponse::Ok)
             }
-            FireLiteOp::Query { collection, action, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before } => {
+            FireLiteOp::Query { collection, action, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before, defer_blobs } => {
                 let input = QueryInput { 
-                    collection, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before 
+                    collection, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before, defer_blobs 
                 };
                 let query_obj = build_query_from_input(&input)?;
 
@@ -534,7 +539,7 @@ pub async fn firelite_exec<R: Runtime>(
                 gateway.register_subscription(
                     _window,
                     listener_id.clone(),
-                    QueryInput { collection, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before },
+                    QueryInput { collection, doc_id_filter, filters, or_groups, order_by, limit, offset, projection, start_at, start_after, end_at, end_before, defer_blobs: false },
                     event_name.unwrap_or_else(|| "firelite://snapshot".to_string()),
                 )?;
                 Ok(FireLiteResponse::SubscriptionAck { listener_id })
@@ -603,6 +608,8 @@ pub async fn firelite_exec<R: Runtime>(
 
 fn build_query_from_input(input: &QueryInput) -> Result<Query, String> {
     let mut query = Query::new(&input.collection);
+    // ponytail: per-query blob deferral (list views skip image reads).
+    query.defer_blobs = input.defer_blobs;
 
     // 1. CRITICAL FIX: Inject doc_id_filter into the Query filters.
     // The TS client often sends this for single-document snapshots or targeted queries.

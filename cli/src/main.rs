@@ -155,6 +155,10 @@ enum Commands {
         /// comma separated projection fields
         #[arg(long)]
         select: Option<String>,
+        /// return blob-backed fields as __blob__ placeholders (no blob reads);
+        /// resolve later with `get`. List views over image docs stay tiny.
+        #[arg(long)]
+        defer_blobs: bool,
         /// Repeated aggregate: count | sum:<field> | avg:<field>
         #[arg(long = "aggregate")]
         aggregates: Vec<String>,
@@ -612,6 +616,7 @@ fn run_query(
     end_at: Option<&str>,
     end_before: Option<&str>,
     select: Option<&str>,
+    defer_blobs: bool,
     aggregates: &[String],
     output: Option<&str>,
     delete_action: bool,
@@ -622,6 +627,8 @@ fn run_query(
 ) -> Result<()> {
     let start_time = Instant::now();
     let mut q = Query::new(collection);
+    // ponytail: deferred blob fields come back as __blob__ placeholders.
+    q.defer_blobs = defer_blobs;
 
     // --- Build Query using new Fluent logic ---
     for f in filters.iter().chain(and_filters.iter()) {
@@ -915,6 +922,7 @@ fn run_rest(
                     None,
                     None,
                     None,
+                    false,
                     &[],
                     None,
                     false,
@@ -1207,6 +1215,7 @@ fn execute_command(
             set,
             data,
             fromfile,
+            defer_blobs,
         } => {
             let payload = if set {
                 Some(read_payload_input(data.as_deref(), fromfile.as_deref())?)
@@ -1228,6 +1237,7 @@ fn execute_command(
                 end_at.as_deref(),
                 end_before.as_deref(),
                 select.as_deref(),
+                defer_blobs,
                 &aggregates,
                 output.as_deref(),
                 delete,

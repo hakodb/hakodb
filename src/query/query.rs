@@ -18,6 +18,12 @@ pub struct Query {
     pub start_after: Option<Vec<Value>>,
     pub end_at: Option<Vec<Value>>,
     pub end_before: Option<Vec<Value>>,
+    /// ponytail: when true, blob-backed fields come back as `Value::BlobLink`
+    /// (offset/len placeholders) instead of being inflated from the blob
+    /// file. List views over docs with images skip MBs of reads per query;
+    /// resolve on demand via `resolve_doc` / `fl_doc_resolve_blobs`.
+    /// Default false — current eager behavior, zero risk to existing apps.
+    pub defer_blobs: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +49,7 @@ impl Query {
             start_after: None,
             end_at: None,
             end_before: None,
+            defer_blobs: false,
         }
     }
 
@@ -98,6 +105,13 @@ impl Query {
 
     pub fn start_after(mut self, values: Vec<Value>) -> Self {
         self.start_after = Some(values);
+        self
+    }
+
+    /// Return blob-backed fields as `Value::BlobLink` placeholders instead
+    /// of inflating them. See field docs.
+    pub fn defer_blobs(mut self, defer: bool) -> Self {
+        self.defer_blobs = defer;
         self
     }
 

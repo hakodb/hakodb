@@ -3,7 +3,6 @@ use crate::document::value::Value;
 use super::task::QueryTask;
 use crate::query::filter::Operator;
 use std::cell::RefCell;
-use std::sync::Arc;
 
 thread_local! {
     /// Scratch buffer for encoding filter values during byte-compare matching.
@@ -27,44 +26,54 @@ pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
 
     for (id, pointer) in task.docs {
         // ponytail: same borrowed-Inlined fast path as execute() — decode
-        // borrows the Arc-shared buffer, zero copy per row.
+        // borrows the Arc-shared buffer, zero copy per row. Skeletons only;
+        // blob inflation happens once below, concurrently (see execute()).
         match pointer {
             crate::storage::engine::Pointer::Inlined(shared) => {
-                decode_row(&id, &shared, &task.plan, &optimized_plan, blob_manager, &mut out);
+                decode_row(&id, &shared, &task.plan, &optimized_plan, &mut out);
             }
             other => {
                 if let Ok(Some(bytes)) = storage_guard.read_pointer(&other) {
-                    decode_row(&id, &bytes, &task.plan, &optimized_plan, blob_manager, &mut out);
+                    decode_row(&id, &bytes, &task.plan, &optimized_plan, &mut out);
                 }
+            }
+        }
+    }
+
+    // ponytail: parallel blob inflation (same shape as execute(): skip when
+    // deferred or link-free). run_task already runs on worker threads;
+    // rayon nests via work-stealing, no oversubscription deadlock.
+    if !task.plan.defer_blobs {
+        if let Some(bm) = blob_manager {
+            if out.iter().any(|(_, doc)| doc_has_links(doc)) {
+                use rayon::prelude::*;
+                out.par_iter_mut().for_each(|(_, doc)| {
+                    let _ = inflate_blobs(doc, bm);
+                });
             }
         }
     }
     out
 }
 
-/// Shared decode+inflate+push helper for run_task's borrowed/owned sources.
+/// Shared decode+push helper for run_task's borrowed/owned sources.
+/// Inflation is the caller's job (once, concurrently — see above).
 fn decode_row(
     id: &str,
     bytes: &[u8],
     plan: &crate::query::plan::QueryPlan,
     optimized_plan: &crate::query::plan::QueryPlan,
-    blob_manager: Option<&Arc<crate::storage::blob::BlobManager>>,
     out: &mut Vec<(String, FireLiteDoc)>,
 ) {
-    // CRITICAL FIX: If index handled everything, bypass `unified_match_decode` completely
+    // CRITICAL FIX: If index handled everything, bypass `unified_match_decode` completely.
+    // Skeletons only — the caller inflates once, concurrently (see above).
     if plan.filters_satisfied_by_index {
-        if let Some(mut doc) = FireLiteDoc::decode(bytes) {
-            if let Some(bm) = blob_manager {
-                let _ = inflate_blobs(&mut doc, bm);
-            }
+        if let Some(doc) = FireLiteDoc::decode(bytes) {
             out.push((id.to_string(), doc));
         }
     } else {
         // Slower Path: Query contains filters that the index couldn't verify
-        if let Some(mut doc) = unified_match_decode(id, bytes, optimized_plan) {
-            if let Some(bm) = blob_manager {
-                let _ = inflate_blobs(&mut doc, bm);
-            }
+        if let Some(doc) = unified_match_decode(id, bytes, optimized_plan) {
             out.push((id.to_string(), doc));
         }
     }
@@ -79,22 +88,41 @@ pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)
 
     for (id, pointer) in task.docs {
         if let Ok(Some(bytes)) = storage_guard.read_pointer(&pointer) {
-            // HIGH PERFORMANCE: Single-pass filtering and partial decoding
+            // HIGH PERFORMANCE: Single-pass filtering and partial decoding.
             if let Some(fields) = unified_match_projected(&id, &bytes, &optimized_plan) {
-                let mut finalized_fields = fields;
-                
-                if let Some(ref manager) = blob_manager {
-                    for (_, val) in finalized_fields.iter_mut() {
+                out.push((id, fields));
+            }
+        }
+    }
+
+    // ponytail: parallel blob inflation over rows (same shape as run_task).
+    // Link-free rows skip via one scan — no rayon dispatch when idle.
+    if !task.plan.defer_blobs {
+        if let Some(ref manager) = blob_manager {
+            let has_links = out.iter().any(|(_, fields)| {
+                fields.iter().any(|(_, v)| matches!(v, Value::BlobLink { .. }))
+            });
+            if has_links {
+                use rayon::prelude::*;
+                out.par_iter_mut().for_each(|(_, fields)| {
+                    for (_, val) in fields.iter_mut() {
                         if let Value::BlobLink { offset, len } = *val {
                             *val = resolve_single_blob_in_worker(manager, offset, len);
                         }
                     }
-                }
-                out.push((id, finalized_fields));
+                });
             }
         }
     }
     out
+}
+
+/// ponytail: fast BlobLink probe — lets callers skip the inflate pass
+/// entirely for link-free rows (the common small-doc case) instead of
+/// paying per-doc scan+Vec overhead inside `inflate_blobs`.
+#[inline]
+pub(crate) fn doc_has_links(doc: &FireLiteDoc) -> bool {
+    doc.fields.iter().any(|(_, v)| matches!(v, Value::BlobLink { .. }))
 }
 
 /// Pre-converts numeric 'id' filters into strings to avoid allocations in the document loop.

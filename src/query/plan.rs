@@ -75,4 +75,7 @@ pub struct QueryPlan {
     pub scan_limit: Option<usize>,
     pub order_by_satisfied: bool,
     pub filters_satisfied_by_index: bool,
+    /// ponytail: mirrors `Query::defer_blobs` — part of the plan (and the
+    /// plan-cache key) because it changes what the executor returns.
+    pub defer_blobs: bool,
 }

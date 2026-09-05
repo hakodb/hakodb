@@ -181,6 +181,16 @@ int32_t fl_query_order_by(FL_Query *query, const char *field, bool ascending);
 
 int32_t fl_query_limit(FL_Query *query, uintptr_t limit);
 
+/// Opt in to deferred blobs: matching docs come back with blob-backed
+/// fields as `Value::BlobLink` placeholders (no blob-file reads).
+/// Resolve later with `fl_doc_resolve_blobs`. Default off (eager).
+int32_t fl_query_defer_blobs(FL_Query *query, int defer);
+
+/// Resolve deferred blob fields of a query-returned doc in place.
+/// No-op for docs without BlobLinks. Needs the owning collection (blob
+/// addresses are per-shard).
+int32_t fl_doc_resolve_blobs(FL_Engine *engine, const char *collection, FL_Doc *doc);
+
 int32_t fl_query_offset(FL_Query *query, uintptr_t offset);
 
 int32_t fl_query_select_field(FL_Query *query, const char *field);
@@ -194,6 +204,11 @@ uintptr_t fl_result_set_count(FL_ResultSet *results);
 FL_Doc *fl_result_set_get_doc(FL_ResultSet *results, uintptr_t index);
 
 void fl_result_set_free(FL_ResultSet *results);
+
+/// Bulk result-set to JSON: one call, one JSON array string, no per-doc
+/// DOM and no per-doc FFI round trips. Byte-identical to joining
+/// `fl_doc_to_json` per row. Caller frees with `fl_string_free`.
+char *fl_result_set_to_json(FL_ResultSet *results);
 
 char *fl_doc_to_json(const FL_Doc *doc);
 

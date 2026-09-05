@@ -18,6 +18,7 @@ use std::path::PathBuf;
 #[repr(C)] pub struct FL_ResultSet { _private: [u8; 0] }
 #[repr(C)] pub struct FL_Config { _private: [u8; 0] }
 #[repr(C)] pub struct FL_Transaction { _private: [u8; 0] }
+#[repr(C)] pub struct FL_Array { _private: [u8; 0] }
 
 #[link(name = "firelite", kind = "dylib")]
 extern "C" {
@@ -45,6 +46,21 @@ extern "C" {
     fn fl_query_execute_to_handles(engine: *mut FL_Engine, query: *const FL_Query) -> *mut FL_ResultSet;
     fn fl_query_start_at(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> c_int;
     fn fl_query_start_after(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> c_int;
+    fn fl_query_defer_blobs(query: *mut FL_Query, defer: c_int) -> c_int;
+    fn fl_doc_resolve_blobs(engine: *mut FL_Engine, collection: *const c_char, doc: *mut FL_Doc) -> c_int;
+    fn fl_result_set_to_json(results: *mut FL_ResultSet) -> *mut c_char;
+    fn fl_doc_insert_float(doc: *mut FL_Doc, key: *const c_char, value: f64) -> c_int;
+    fn fl_doc_insert_bool(doc: *mut FL_Doc, key: *const c_char, value: bool) -> c_int;
+    fn fl_doc_insert_null(doc: *mut FL_Doc, key: *const c_char) -> c_int;
+    fn fl_doc_insert_bin(doc: *mut FL_Doc, key: *const c_char, data: *const u8, len: usize) -> c_int;
+    fn fl_doc_insert_timestamp(doc: *mut FL_Doc, key: *const c_char, micros: i64) -> c_int;
+    fn fl_doc_insert_server_timestamp(doc: *mut FL_Doc, key: *const c_char) -> c_int;
+    fn fl_doc_insert_reference(doc: *mut FL_Doc, key: *const c_char, target_collection: *const c_char, target_id: *const c_char) -> c_int;
+    fn fl_doc_insert_doc(parent: *mut FL_Doc, key: *const c_char, child: *const FL_Doc) -> c_int;
+    fn fl_doc_insert_array(doc: *mut FL_Doc, key: *const c_char, array: *mut FL_Array) -> c_int;
+    fn fl_array_new() -> *mut FL_Array;
+    fn fl_array_append_str(array: *mut FL_Array, value: *const c_char) -> c_int;
+    fn fl_array_append_int(array: *mut FL_Array, value: i64) -> c_int;
     fn fl_result_set_count(rs: *mut FL_ResultSet) -> usize;
     fn fl_result_set_get_doc(rs: *mut FL_ResultSet, index: usize) -> *mut FL_Doc;
     fn fl_result_set_free(rs: *mut FL_ResultSet);
@@ -291,6 +307,180 @@ fn cursor_start_at_and_after_on_id() {
     unsafe { fl_result_set_free(rs2) };
     unsafe { fl_query_free(q2) };
 
+    unsafe { fl_engine_free(engine) };
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn deferred_blobs_skip_inflate_and_resolve() {
+    // A 20KB photo field (> 16KB default blob threshold) spills to the blob
+    // file. Deferred queries must return the BlobLink placeholder without
+    // touching the blob file; resolve restores the full data.
+    let dir = temp_dir("defer");
+    let path = cs(dir.to_str().unwrap());
+    let engine = unsafe { fl_engine_open(path.as_ptr()) };
+
+    let coll = cs("bench");
+    let photo: String = "PHOTO_".to_string() + &"x".repeat(20 * 1024);
+    unsafe {
+        let batch = fl_batch_new();
+        let id = cs("pic_01");
+        let doc = fl_doc_new();
+        fl_doc_insert_str(doc, cs("name").as_ptr(), cs("pic").as_ptr());
+        fl_doc_insert_str(doc, cs("photo").as_ptr(), cs(photo.as_str()).as_ptr());
+        fl_batch_set(batch, coll.as_ptr(), id.as_ptr(), doc);
+        assert_eq!(fl_batch_commit(engine, batch), 0);
+    }
+
+    wait_for_indexes(engine);
+
+    // 1. Default (eager): photo inflated inline.
+    let q = unsafe { fl_query_new(coll.as_ptr()) };
+    unsafe { fl_query_limit(q, 10) };
+    let rs = unsafe { fl_query_execute_to_handles(engine, q) };
+    assert_eq!(unsafe { fl_result_set_count(rs) }, 1);
+    let d = unsafe { fl_result_set_get_doc(rs, 0) };
+    let j = read_cstr(unsafe { fl_doc_to_json(d) });
+    assert!(j.contains("PHOTO_"), "eager query should inflate photo");
+    assert!(!j.contains("__blob__"), "eager query should have no placeholder, got len {}", j.len());
+    unsafe { fl_result_set_free(rs) };
+    unsafe { fl_query_free(q) };
+
+    // 2. Deferred: BlobLink placeholder, no 20KB payload.
+    let q2 = unsafe { fl_query_new(coll.as_ptr()) };
+    unsafe {
+        fl_query_limit(q2, 10);
+        assert_eq!(fl_query_defer_blobs(q2, 1), 0, "defer rc");
+    }
+    let rs2 = unsafe { fl_query_execute_to_handles(engine, q2) };
+    assert_eq!(unsafe { fl_result_set_count(rs2) }, 1);
+    let d2 = unsafe { fl_result_set_get_doc(rs2, 0) };
+    let j2 = read_cstr(unsafe { fl_doc_to_json(d2) });
+    assert!(j2.contains("__blob__"), "deferred query should carry placeholder");
+    assert!(!j2.contains("PHOTO_"), "deferred query must not read blob data");
+    assert!(j2.len() < 1024, "deferred json should be tiny, got {}", j2.len());
+
+    // 3. Resolve in place: full photo back.
+    assert_eq!(unsafe { fl_doc_resolve_blobs(engine, coll.as_ptr(), d2) }, 0, "resolve rc");
+    let j3 = read_cstr(unsafe { fl_doc_to_json(d2) });
+    assert!(j3.contains("PHOTO_"), "resolved doc should have photo");
+    assert!(j3.len() > 20 * 1024, "resolved json should hold 20KB, got {}", j3.len());
+
+    unsafe { fl_result_set_free(rs2) };
+    unsafe { fl_query_free(q2) };
+    unsafe { fl_engine_free(engine) };
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn bulk_json_matches_per_doc() {
+    // Locks the bulk serializer: output must be byte-identical to joining
+    // fl_doc_to_json per row. Covers every StreamValue arm, including the
+    // sorted-key order, non-finite floats (-> null), nested maps/arrays,
+    // references and blob placeholders.
+    let dir = temp_dir("bulkjson");
+    let path = cs(dir.to_str().unwrap());
+    let engine = unsafe { fl_engine_open(path.as_ptr()) };
+
+    let coll = cs("bench");
+    unsafe {
+        let batch = fl_batch_new();
+        for i in 0..3 {
+            let id = cs(format!("j_{i}").as_str());
+            let doc = fl_doc_new();
+            fl_doc_insert_str(doc, cs("name").as_ptr(), cs(format!("n_{i}").as_str()).as_ptr());
+            fl_doc_insert_int(doc, cs("age").as_ptr(), 20 + i as i64);
+            fl_doc_insert_float(doc, cs("score").as_ptr(), 1.5 + i as f64);
+            fl_doc_insert_float(doc, cs("inf").as_ptr(), f64::INFINITY);
+            fl_doc_insert_bool(doc, cs("active").as_ptr(), i % 2 == 0);
+            fl_doc_insert_null(doc, cs("nil").as_ptr());
+            let blob: &[u8] = &[0u8, 1, 2, 250];
+            fl_doc_insert_bin(doc, cs("raw").as_ptr(), blob.as_ptr(), blob.len());
+            fl_doc_insert_timestamp(doc, cs("ts").as_ptr(), 1_700_000_000_000_000 + i as i64);
+            fl_doc_insert_server_timestamp(doc, cs("sts").as_ptr());
+            fl_doc_insert_reference(doc, cs("friend").as_ptr(), cs("users").as_ptr(), cs("u_9").as_ptr());
+            let child = fl_doc_new();
+            fl_doc_insert_int(child, cs("zip").as_ptr(), 90210);
+            fl_doc_insert_doc(doc, cs("addr").as_ptr(), child);
+            fl_doc_free(child);
+            let arr = fl_array_new();
+            fl_array_append_str(arr, cs("a").as_ptr());
+            fl_array_append_int(arr, 7);
+            fl_doc_insert_array(doc, cs("tags").as_ptr(), arr);
+            fl_doc_insert_str(doc, cs("thumb").as_ptr(), cs("tiny-bytes").as_ptr());
+            let photo: String = "PHOTO_".to_string() + &"y".repeat(20 * 1024);
+            fl_doc_insert_str(doc, cs("photo").as_ptr(), cs(photo.as_str()).as_ptr());
+            fl_batch_set(batch, coll.as_ptr(), id.as_ptr(), doc);
+        }
+        assert_eq!(fl_batch_commit(engine, batch), 0);
+    }
+
+    wait_for_indexes(engine);
+
+    let q = unsafe { fl_query_new(coll.as_ptr()) };
+    unsafe { fl_query_limit(q, 10) };
+    let rs = unsafe { fl_query_execute_to_handles(engine, q) };
+    let n = unsafe { fl_result_set_count(rs) };
+    assert_eq!(n, 3);
+
+    // Per-doc reference rendering.
+    let mut expected = String::from("[");
+    for i in 0..n {
+        let d = unsafe { fl_result_set_get_doc(rs, i) };
+        let j = read_cstr(unsafe { fl_doc_to_json(d) });
+        if i > 0 { expected.push(','); }
+        expected.push_str(&j);
+    }
+    expected.push(']');
+
+    // Bulk rendering must match byte-for-byte.
+    let bulk = read_cstr(unsafe { fl_result_set_to_json(rs) });
+    assert_eq!(bulk, expected, "bulk JSON diverged from per-doc rendering");
+
+    // Spot-check arms survived (eager path inflates: no placeholders here).
+    assert!(bulk.contains("PHOTO_"), "inflated photo arm");
+    assert!(bulk.contains("\"inf\":null"), "non-finite float arm");
+    assert!(bulk.contains("\"zip\":90210"), "nested map arm");
+    assert!(bulk.contains("\"__ref__\":\"users/u_9\""), "reference arm");
+
+    // Same query deferred: placeholders on both renderers, byte-identical.
+    let qd = unsafe { fl_query_new(coll.as_ptr()) };
+    unsafe {
+        fl_query_limit(qd, 10);
+        assert_eq!(fl_query_defer_blobs(qd, 1), 0);
+    }
+    let rsd = unsafe { fl_query_execute_to_handles(engine, qd) };
+    assert_eq!(unsafe { fl_result_set_count(rsd) }, 3);
+    let mut expected_d = String::from("[");
+    for i in 0..3 {
+        let d = unsafe { fl_result_set_get_doc(rsd, i) };
+        let j = read_cstr(unsafe { fl_doc_to_json(d) });
+        if i > 0 { expected_d.push(','); }
+        expected_d.push_str(&j);
+    }
+    expected_d.push(']');
+    let bulk_d = read_cstr(unsafe { fl_result_set_to_json(rsd) });
+    assert_eq!(bulk_d, expected_d, "deferred bulk diverged");
+    assert!(bulk_d.contains("__blob__"), "deferred blob arm");
+    assert!(!bulk_d.contains("PHOTO_"), "deferred must not read blob data");
+    unsafe { fl_result_set_free(rsd) };
+    unsafe { fl_query_free(qd) };
+
+    // Empty set renders as [].
+    let qe = unsafe { fl_query_new(coll.as_ptr()) };
+    unsafe {
+        fl_query_where_eq_str(qe, cs("name").as_ptr(), cs("no-such-doc").as_ptr());
+        fl_query_limit(qe, 10);
+    }
+    let rse = unsafe { fl_query_execute_to_handles(engine, qe) };
+    assert_eq!(unsafe { fl_result_set_count(rse) }, 0);
+    let be = read_cstr(unsafe { fl_result_set_to_json(rse) });
+    assert_eq!(be, "[]");
+    unsafe { fl_result_set_free(rse) };
+    unsafe { fl_query_free(qe) };
+
+    unsafe { fl_result_set_free(rs) };
+    unsafe { fl_query_free(q) };
     unsafe { fl_engine_free(engine) };
     std::fs::remove_dir_all(&dir).ok();
 }
