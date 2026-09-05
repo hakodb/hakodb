@@ -304,7 +304,7 @@ impl FireLiteGateway {
 
                         let mut changes = Vec::new();
                         for event in events {
-                            let doc_id = event.path.clone(); // The path is the ID in FireLite
+                            let doc_id: String = event.path.to_string(); // The path is the ID in FireLite
                             
                             // ID Filtering (Optimization: check before reading disk)
                             if let Some(ref target_id) = query_template.doc_id_filter {
