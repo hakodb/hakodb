@@ -6,13 +6,47 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 FireLite speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.7.1 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.7.5 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+
+---
+
+## What's new (0.7.2 → 0.7.5)
+
+### v0.7.5 — deferred blobs, parallel inflation, bulk JSON
+- **`defer_blobs` query flag** — queries can skip blob inflation and return a `{"__blob__": {"len", "offset"}}` placeholder per blob field instead of the bytes. A 20-doc query over 50 KB images drops from ~1.2 ms to ~240 µs (~5×; more for larger blobs).
+- **`fl_doc_resolve_blobs`** — fetch the real blob bytes for a deferred doc on demand (point-get path, stays fast).
+- **Parallel blob inflation** — multi-blob docs inflate link targets on the rayon pool; link-free docs skip the scan entirely.
+- **`fl_result_set_to_json`** — stream a whole result set to one JSON array in a single call (~1.92× vs per-doc `fl_doc_to_json`).
+- **CLI `--defer-blobs`** on `query` (one-shot and serve mode); `get` stays eager. Tauri `QueryInput.defer_blobs` supported end to end.
+- SDK surface: Go `DeferBlobs`/`ToJSON`/`ResolveBlobs`, JS `query.deferBlobs()`, Pascal `TFLQuery.DeferBlobs`.
+- `build.rs` refreshes the Windows import lib on every build (stale `.lib` after header regen is gone).
+
+### v0.7.4 — durability fix + perf gate
+- **Linux fdatasync restore** — WAL append/flush uses `sync_data` (fdatasync) instead of `sync_all`; codespace `Always` write throughput 535 → 1115 WPS (+109%). No-op on Windows (`FlushFileBuffers` covers both).
+- **`benchmark --gate`** — CI-enforced regression gate (`.github/workflows/perf.yml`): Qry ≥ Cmp, Off/Cur within 2×, point-get > 5× query, batch ≥ single, plus smoke floors.
+- `benches/read_path.rs` + `benches/write_path.rs` criterion benches tracked in git (were ignored).
+
+### v0.7.3 — read/write path optimization
+- **Zero-copy decode** — `Pointer::Inlined(Arc<Vec<u8>>)`, byte-compare matcher (`unified_match_decode`), scratch-buffer scalar encode, field-name interning.
+- **Limit pushdown** — `range_scan_limit` and unordered single-`Eq` yield to the secondary index instead of the composite path; empty-`ORDER BY` limit pushdown with offset-safe limits.
+- **Id-cursor fast path** — `start_at`/`start_after` on document id resolves to a `SortedKeys` Vec range instead of a composite scan.
+- **Plan-cache key fix** — cursor bound tags (`start_at` vs `start_after`) included in the key; previously colliding plans could return wrong pages.
+- **Write fast path** — `put_owned` / `fl_engine_insert_take` (no clone on owned docs), shard-lookup hoist, `ChangeEvent.path: Arc<str>`, 8192-entry version-stamped hot doc cache.
+- **WAL headroom** — configurable `wal_reserve_bytes` (default 4 MB sparse prealloc, skipped for Manual) via `FireLiteConfig::wal_reserve_bytes` / `fl_config_set_wal_reserve_bytes`.
+- **Write-phase timers** — `WRITE_STATS` + `write_stats_report()` / `fl_debug_write_stats()`; `benchmark --profile=<mode> --wstats` attributes write latency (Manual ~11.7 µs after shard hoist, −24%).
+
+### v0.7.2 — pagination, WAL hardening, FFI slab
+- **O(1) offset pagination** — `sorted_key_range` slice + `offset_to_apply_later`; descending order via `SortedKeys` reverse ranges.
+- **WAL decoder + recovery fixes** — padding-safe replay/tail/reset, Manual-mode double-size fix, recovery-vs-write race fix (`entry().or_insert`).
+- **FFI slab allocator** — `Vec<FL_Doc>` slab refactor for result sets; `eprintln!` → log sink; `tests/ffi_roundtrip.rs` + `tests/write_path.rs`.
+- **Fair benchmark** — all four query shapes decode the same 20 docs (limits raised 5 → 20), so Qry/Cmp vs Off/Cur numbers are comparable.
 
 ---
 
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
+- [What's new (0.7.2 → 0.7.5)](#whats-new-072--075)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)
@@ -157,6 +191,11 @@ firelite-cli --db ./demo.db set users --batch --data '[
 # query with filters, ordering, and pagination
 firelite-cli --db ./demo.db query users --where age:gte:21 --order name:asc --limit 10 --offset 5
 firelite-cli --db ./demo.db query users --or status:eq:active --or status:eq:pending --count
+
+# deferred blobs: skip blob inflation, return {"__blob__": {"len","offset"}} placeholders
+firelite-cli --db ./demo.db query bench --where active:eq:true --defer-blobs --limit 20
+# resolve later with a point get (always eager):
+firelite-cli --db ./demo.db get bench/b_121
 
 # full-text search (match) and projections
 firelite-cli --db ./demo.db query users --fts description:seeded
@@ -318,7 +357,7 @@ func main() {
 }
 ```
 
-Coverage includes `Engine`, `Config`, `Doc`, `Array`, `Query`, `Batch`, `Transaction`, `Watch` (native cgo callback bridge), `ResultSet`, `NetSyncer` and `CloudSync`.
+Coverage includes `Engine`, `Config`, `Doc`, `Array`, `Query`, `Batch`, `Transaction`, `Watch` (native cgo callback bridge), `ResultSet`, `NetSyncer` and `CloudSync` — plus `DeferBlobs`/`ResolveBlobs` (deferred blob fetching), `ToJSON` (bulk result export), `InsertTake` (owned insert) and `SetWALReserveBytes`.
 
 > Run it: [`example/go`](example/go) is a complete Go program (`go run ./example/go`)
 > that also demonstrates NetSync and CloudSync setup.
@@ -360,6 +399,15 @@ const rows = await db
   .select("name", "age")
   .get();
 
+// deferred blobs: large binary fields come back as { __blob__: { len, offset } }
+// placeholders; resolve per-doc only when the bytes are actually needed
+const deferred = await db
+  .collection("bench")
+  .where("active", "==", true)
+  .deferBlobs()
+  .limit(20)
+  .get();
+
 const batch = db.batch();
 batch
   .set(db.collection("users").doc("bob"), { name: "Bob", age: 31 })
@@ -397,6 +445,7 @@ A production-focused Pascal wrapper is available under `pascal/`:
 - `pascal/FireLiteRaw.pas` — C-ABI translation with opaque handles (`PFL_Engine`, `PFL_Doc`, `PFL_Batch`, `PFL_Query`, `PFL_ResultSet`, `PFL_CloudSync`, …) and `cdecl` imports for Windows/Linux/macOS.
 - `pascal/FireLite.pas` — object-oriented API: `TFireLite`, `TFLCollection`, `TFLDocument`, `TFLQuery`, `TFLBatch`, `TFLTransaction`, `TFLCloudSync`.
   - fluent Firestore-like flow (`Collection(...).Doc(...).SetDoc/Get/Delete`, query chaining)
+  - deferred blobs (`TFLQuery.DeferBlobs`) returning `__blob__` placeholders for list views
   - projection pushdown (`Select([...])`) wired to `fl_query_select_field`
   - advanced filters (`WhereNotIn`, `ArrayContains`, `ArrayContainsAny`, `WhereOr*`) mapped to FFI
   - callback-based `OnSnapshot` via a polling thread with optional main-thread queue dispatch.
@@ -477,14 +526,15 @@ Platform outputs:
 ### C API highlights
 
 - **Engine / memory:** `fl_engine_open`, `fl_engine_open_with_config`, `fl_engine_is_indexes_ready`, `fl_engine_free`, `fl_engine_backup`, `fl_engine_compact`, `fl_engine_list_collections`, `fl_engine_list_indexes`, `fl_engine_get_stats`, `fl_engine_get_audit_log`, `fl_engine_snapshot_indices`, `fl_last_error`, `fl_string_free`.
-- **Configuration:** `fl_config_new/free`, `fl_config_set_durability`, `fl_config_set_encryption_key`, `fl_config_set_encrypted_collections`, `fl_config_set_audit_log`, `fl_config_set_query_workers`, `fl_config_set_memory_limits`, `fl_config_set_storage_tuning`, `fl_config_set_blob_threshold`, `fl_config_set_compression`.
+- **Configuration:** `fl_config_new/free`, `fl_config_set_durability`, `fl_config_set_encryption_key`, `fl_config_set_encrypted_collections`, `fl_config_set_audit_log`, `fl_config_set_query_workers`, `fl_config_set_memory_limits`, `fl_config_set_storage_tuning`, `fl_config_set_blob_threshold`, `fl_config_set_compression`, `fl_config_set_wal_reserve_bytes`.
 - **Real-time:** `fl_engine_watch`, `fl_watch_free`.
-- **Documents:** `fl_doc_new/free`, `fl_doc_insert_str/int/float/bool/null/bin/timestamp/server_timestamp/doc/array/reference`, `fl_doc_to_json`.
-- **CRUD:** `fl_engine_insert`, `fl_engine_get`, `fl_engine_delete`, `fl_engine_patch`, `fl_engine_get_by_ref`, `fl_engine_insert_subdoc`.
+- **Documents:** `fl_doc_new/free`, `fl_doc_insert_str/int/float/bool/null/bin/timestamp/server_timestamp/doc/array/reference`, `fl_doc_to_json`, `fl_doc_resolve_blobs` (materialize deferred `__blob__` placeholders).
+- **CRUD:** `fl_engine_insert`, `fl_engine_insert_take` (owned doc, no clone), `fl_engine_get`, `fl_engine_delete`, `fl_engine_patch`, `fl_engine_get_by_ref`, `fl_engine_insert_subdoc`.
 - **Batches:** `fl_batch_new/free`, `fl_batch_set`, `fl_batch_delete`, `fl_batch_commit`.
 - **Transactions:** `fl_transaction_begin/get/set/commit/free`.
-- **Queries:** `fl_query_new/free`, all `fl_query_where_*` filters, `fl_query_order_by`, `fl_query_limit/offset`, `fl_query_select_field`, cursor functions (`start_at/start_after/end_at/end_before`), `fl_query_execute`, `fl_query_execute_to_handles`, `fl_query_delete`, `fl_query_patch`, aggregates (`fl_query_aggregate_count/sum/avg`, `fl_query_execute_aggregation`).
-- **Result sets:** `fl_result_set_count/get_doc/free`.
+- **Queries:** `fl_query_new/free`, all `fl_query_where_*` filters, `fl_query_order_by`, `fl_query_limit/offset`, `fl_query_select_field`, `fl_query_defer_blobs`, cursor functions (`start_at/start_after/end_at/end_before`), `fl_query_execute`, `fl_query_execute_to_handles`, `fl_query_delete`, `fl_query_patch`, aggregates (`fl_query_aggregate_count/sum/avg`, `fl_query_execute_aggregation`).
+- **Result sets:** `fl_result_set_count/get_doc/free`, `fl_result_set_to_json` (bulk single-call export).
+- **Diagnostics:** `fl_debug_write_stats` (write-phase timing breakdown; see `--wstats`).
 - **Indexing:** `fl_engine_create_index` (composite JSON), `fl_engine_create_simple_index`, `fl_engine_create_fts_index`.
 - **Net Sync:** `fl_net_syncer_new/start/status/free`.
 - **Cloud Sync:** `fl_cloud_sync_new/start/status/stop/free`, plus the room-agnostic `fl_cloud_sync_server_new` and the room-bound `fl_cloud_sync_client_new`.
@@ -509,7 +559,7 @@ Core FFI functions: `fl_net_syncer_new`, `fl_net_syncer_start`, `fl_net_syncer_s
 
 ```toml
 [dependencies]
-firelite = { version = "0.7.1", features = ["net-sync"] }
+firelite = { version = "0.7.5", features = ["net-sync"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -525,7 +575,7 @@ The `cloud-sync` feature provides cloud-level, **bi-directional synchronization*
 
 ```toml
 [dependencies]
-firelite = { version = "0.7.1", features = ["cloud-sync"] }
+firelite = { version = "0.7.5", features = ["cloud-sync"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -686,6 +736,12 @@ On Windows, ensure `target\release\firelite.dll` is on `PATH` when running.
 
 # larger dataset
 ./benchmark --docs=10000
+
+# single-profile write-phase breakdown (encode / wal / index / flush timings)
+./benchmark --profile=Always --wstats
+
+# CI regression gate: Qry>=Cmp, Off/Cur within 2x, Get>5xQry, Batch>=Single + smoke floors
+./benchmark --gate
 
 # if the shared library is not on the default loader path (Linux/macOS)
 LD_LIBRARY_PATH=target/release ./benchmark --docs=1000
