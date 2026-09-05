@@ -105,6 +105,11 @@ export interface NativeBindings {
   resultSetCount(results: Handle): number;
   resultSetGetDoc(results: Handle, index: number): Handle;
   resultSetFree(results: Handle): void;
+  resultSetToJson(results: Handle): string | null;
+  queryDeferBlobs(query: Handle, defer: boolean): number;
+  docResolveBlobs(engine: Handle, collection: string, doc: Handle): number;
+  engineInsertTake(engine: Handle, collection: string, docId: string, doc: Handle): number;
+  configSetWalReserveBytes(c: Handle, bytes: number | bigint): void;
 
   // Full-Text Search Queries (Added)
   queryWhereMatch(query: Handle, field: string, value: string): number;
@@ -273,6 +278,11 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     fl_result_set_count: { args: [FFIType.ptr], returns: FFIType.usize },
     fl_result_set_get_doc: { args: [FFIType.ptr, FFIType.usize], returns: FFIType.ptr },
     fl_result_set_free: { args: [FFIType.ptr], returns: FFIType.void },
+    fl_result_set_to_json: { args: [FFIType.ptr], returns: FFIType.ptr },
+    fl_query_defer_blobs: { args: [FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+    fl_doc_resolve_blobs: { args: [FFIType.ptr, FFIType.cstring, FFIType.ptr], returns: FFIType.i32 },
+    fl_engine_insert_take: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring, FFIType.ptr], returns: FFIType.i32 },
+    fl_config_set_wal_reserve_bytes: { args: [FFIType.ptr, FFIType.u64], returns: FFIType.void },
 
     fl_query_aggregate_count: { args: [FFIType.ptr], returns: FFIType.i32 },
     fl_query_aggregate_sum: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.i32 },
@@ -428,6 +438,11 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     resultSetCount: (results) => symbols.fl_result_set_count(results),
     resultSetGetDoc: (results, index) => symbols.fl_result_set_get_doc(results, index),
     resultSetFree: (results) => symbols.fl_result_set_free(results),
+    resultSetToJson: (results) => ptrToStringAndFree(symbols.fl_result_set_to_json(results)),
+    queryDeferBlobs: (query, defer) => symbols.fl_query_defer_blobs(query, defer ? 1 : 0),
+    docResolveBlobs: (engine, collection, doc) => symbols.fl_doc_resolve_blobs(engine, toC(collection), doc),
+    engineInsertTake: (engine, collection, docId, doc) => symbols.fl_engine_insert_take(engine, toC(collection), toC(docId), doc),
+    configSetWalReserveBytes: (c, bytes) => symbols.fl_config_set_wal_reserve_bytes(c, bytes),
 
     queryAggregateCount: (q) => symbols.fl_query_aggregate_count(q),
     queryAggregateSum: (q, f) => symbols.fl_query_aggregate_sum(q, toC(f)),
@@ -578,6 +593,11 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_result_set_count: lib.func('size_t fl_result_set_count(FL_ResultSet* results)'),
     fl_result_set_get_doc: lib.func('FL_Doc* fl_result_set_get_doc(FL_ResultSet* results, size_t index)'),
     fl_result_set_free: lib.func('void fl_result_set_free(FL_ResultSet* results)'),
+    fl_result_set_to_json: lib.func('char* fl_result_set_to_json(FL_ResultSet* results)'),
+    fl_query_defer_blobs: lib.func('int fl_query_defer_blobs(FL_Query* query, int defer)'),
+    fl_doc_resolve_blobs: lib.func('int fl_doc_resolve_blobs(FL_Engine* engine, const char* collection, FL_Doc* doc)'),
+    fl_engine_insert_take: lib.func('int fl_engine_insert_take(FL_Engine* engine, const char* collection, const char* doc_id, FL_Doc* doc)'),
+    fl_config_set_wal_reserve_bytes: lib.func('void fl_config_set_wal_reserve_bytes(FL_Config* config, uint64_t bytes)'),
 
     fl_query_aggregate_count: lib.func('int fl_query_aggregate_count(FL_Query* query)'),
     fl_query_aggregate_sum: lib.func('int fl_query_aggregate_sum(FL_Query* query, const char* field)'),
@@ -734,6 +754,11 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     resultSetCount: (results) => fn.fl_result_set_count(results),
     resultSetGetDoc: (results, index) => fn.fl_result_set_get_doc(results, index),
     resultSetFree: (results) => fn.fl_result_set_free(results),
+    resultSetToJson: (results) => ptrToStringAndFree(fn.fl_result_set_to_json(results)),
+    queryDeferBlobs: (query, defer) => fn.fl_query_defer_blobs(query, defer ? 1 : 0),
+    docResolveBlobs: (engine, collection, doc) => fn.fl_doc_resolve_blobs(engine, collection, doc),
+    engineInsertTake: (engine, collection, docId, doc) => fn.fl_engine_insert_take(engine, collection, docId, doc),
+    configSetWalReserveBytes: (c, bytes) => fn.fl_config_set_wal_reserve_bytes(c, bytes),
 
     queryAggregateCount: (q) => fn.fl_query_aggregate_count(q),
     queryAggregateSum: (q, f) => fn.fl_query_aggregate_sum(q, f),

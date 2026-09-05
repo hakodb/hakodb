@@ -38,6 +38,7 @@ void fl_config_set_query_workers(FL_Config *config, uintptr_t count);
 void fl_config_set_memory_limits(FL_Config *config, uintptr_t mmap_size, uintptr_t max_inlined_bytes);
 void fl_config_set_storage_tuning(FL_Config *config, uintptr_t page_size, uintptr_t compaction_threshold, uintptr_t group_commit_max_ops);
 void fl_config_set_blob_threshold(FL_Config *config, uintptr_t threshold_bytes);
+void fl_config_set_wal_reserve_bytes(FL_Config *config, uint64_t bytes);
 void fl_config_set_compression(FL_Config *config, bool enabled, int32_t level);
 
 FL_Watch *fl_engine_watch(FL_Engine *engine, const char *collection, FL_OnSnapshotCallback callback, void *user_data_ptr);
@@ -65,6 +66,10 @@ int32_t fl_array_append_int(FL_Array *array, int64_t value);
 int32_t fl_array_append_doc(FL_Array *array, const FL_Doc *doc);
 
 int32_t fl_engine_insert(FL_Engine *engine, const char *collection, const char *doc_id, const FL_Doc *doc);
+/* Owned-doc insert: consumes the FL_Doc handle (no deep clone). */
+int32_t fl_engine_insert_take(FL_Engine *engine, const char *collection, const char *doc_id, FL_Doc *doc);
+/* Resolve deferred blob fields of a query-returned doc in place. */
+int32_t fl_doc_resolve_blobs(FL_Engine *engine, const char *collection, FL_Doc *doc);
 FL_Doc *fl_engine_get(FL_Engine *engine, const char *collection, const char *doc_id);
 int32_t fl_engine_delete(FL_Engine *engine, const char *collection, const char *doc_id);
 int32_t fl_engine_patch(FL_Engine *engine, const char *collection, const char *doc_id, const FL_Doc *updates);
@@ -105,6 +110,7 @@ int32_t fl_query_order_by(FL_Query *query, const char *field, bool ascending);
 int32_t fl_query_limit(FL_Query *query, uintptr_t limit);
 int32_t fl_query_offset(FL_Query *query, uintptr_t offset);
 int32_t fl_query_select_field(FL_Query *query, const char *field);
+int32_t fl_query_defer_blobs(FL_Query *query, int defer);
 int32_t fl_query_start_after(FL_Query *query, const FL_Doc *anchor_doc);
 int32_t fl_query_start_at(FL_Query *query, const FL_Doc *anchor_doc);
 int32_t fl_query_end_at(FL_Query *query, const FL_Doc *anchor_doc);
@@ -116,6 +122,8 @@ FL_ResultSet *fl_query_execute_to_handles(FL_Engine *engine, const FL_Query *que
 uintptr_t fl_result_set_count(FL_ResultSet *results);
 FL_Doc *fl_result_set_get_doc(FL_ResultSet *results, uintptr_t index);
 void fl_result_set_free(FL_ResultSet *results);
+/* Bulk result-set to JSON: one call, one JSON array string. Free with fl_string_free. */
+char *fl_result_set_to_json(FL_ResultSet *results);
 int32_t fl_query_aggregate_count(FL_Query *query);
 int32_t fl_query_aggregate_sum(FL_Query *query, const char *field);
 int32_t fl_query_aggregate_avg(FL_Query *query, const char *field);

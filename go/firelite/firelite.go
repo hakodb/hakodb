@@ -180,6 +180,11 @@ func (c *Config) SetBlobThreshold(thresholdBytes uintptr) {
 	C.fl_config_set_blob_threshold(c.ptr, C.uintptr_t(thresholdBytes))
 }
 
+// SetWALReserveBytes sets the WAL headroom reservation (0 = off).
+func (c *Config) SetWALReserveBytes(bytes uint64) {
+	C.fl_config_set_wal_reserve_bytes(c.ptr, C.uint64_t(bytes))
+}
+
 func NewDoc() *Doc { return &Doc{ptr: C.fl_doc_new()} }
 func (d *Doc) Free() {
 	if d != nil && d.ptr != nil {
@@ -298,6 +303,25 @@ func (e *Engine) Set(collection, docID string, doc *Doc) error {
 	defer fc()
 	defer fi()
 	return checkStatus("fl_engine_insert", C.fl_engine_insert(e.ptr, cc, ci, doc.ptr))
+}
+
+// InsertTake moves doc into the engine without cloning (no deep copy).
+// The Doc handle is always consumed — do not use or free it afterwards.
+func (e *Engine) InsertTake(collection, docID string, doc *Doc) error {
+	cc, fc := cString(collection)
+	ci, fi := cString(docID)
+	defer fc()
+	defer fi()
+	err := checkStatus("fl_engine_insert_take", C.fl_engine_insert_take(e.ptr, cc, ci, doc.ptr))
+	doc.ptr = nil
+	return err
+}
+
+// ResolveBlobs hydrates deferred blob fields of a query-returned doc.
+func (e *Engine) ResolveBlobs(collection string, doc *Doc) error {
+	cc, fc := cString(collection)
+	defer fc()
+	return checkStatus("fl_doc_resolve_blobs", C.fl_doc_resolve_blobs(e.ptr, cc, doc.ptr))
 }
 
 func (e *Engine) GetDoc(collection, docID string) (*Doc, error) {
@@ -754,6 +778,15 @@ func (q *Query) SelectField(field string) error {
 	defer ff()
 	return checkStatus("fl_query_select_field", C.fl_query_select_field(q.ptr, cf))
 }
+
+// DeferBlobs returns blob-backed fields as placeholders (no blob reads).
+func (q *Query) DeferBlobs(deferBlobs bool) error {
+	var d C.int
+	if deferBlobs {
+		d = 1
+	}
+	return checkStatus("fl_query_defer_blobs", C.fl_query_defer_blobs(q.ptr, d))
+}
 func (q *Query) StartAfter(anchor *Doc) error {
 	return checkStatus("fl_query_start_after", C.fl_query_start_after(q.ptr, anchor.ptr))
 }
@@ -844,6 +877,20 @@ func (r *ResultSet) Free() {
 		C.fl_result_set_free(r.ptr)
 		r.ptr = nil
 	}
+}
+
+// ToJSON renders the whole result set as one JSON array string in a single
+// call (no per-doc round trips). Byte-identical to joining per-doc JSON.
+func (r *ResultSet) ToJSON() (string, error) {
+	if r == nil || r.ptr == nil {
+		return "", errors.New("result set is nil")
+	}
+	ptr := C.fl_result_set_to_json(r.ptr)
+	if ptr == nil {
+		return "", fmt.Errorf("fl_result_set_to_json failed: %s", lastError())
+	}
+	defer C.fl_string_free(ptr)
+	return C.GoString(ptr), nil
 }
 
 func ownedCStringJSON(fn func() *C.char) (string, error) {
@@ -1133,6 +1180,12 @@ func (q *QueryRef) Select(fields ...string) *QueryRef {
 		}
 		return nil
 	})
+	return q
+}
+
+// DeferBlobs returns blob-backed fields as placeholders (no blob reads).
+func (q *QueryRef) DeferBlobs() *QueryRef {
+	q.ops = append(q.ops, func(raw *Query) error { return raw.DeferBlobs(true) })
 	return q
 }
 

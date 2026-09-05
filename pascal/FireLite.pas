@@ -133,8 +133,9 @@ type
     FWhereArrayContainsAny: array of record Field: string; Data: TJSONArray; end;
     FOrderByField: string;
     FOrderByAsc: Boolean;
-    FLimit, FOffset: NativeUInt;
-    FHasLimit, FHasOffset: Boolean;
+FLimit, FOffset: NativeUInt;
+FHasLimit, FHasOffset: Boolean;
+FDeferBlobs: Boolean;
     FSelectFields: TStringList;
     FStartAt, FStartAfter, FEndAt, FEndBefore: PFL_Doc;
     FWhereOrStr: array of record Field, Value: string; end;
@@ -171,6 +172,8 @@ type
     function Limit(ACount: NativeUInt): TFLQuery;
     function Offset(ACount: NativeUInt): TFLQuery;
     function Select(const Fields: array of string): TFLQuery;
+{ Blob fields come back as placeholders (no blob reads); resolve per doc. }
+function DeferBlobs(Defer: Boolean = True): TFLQuery;
 
     function StartAt(ASnapshot: TFLDocument): TFLQuery;
     function StartAfter(ASnapshot: TFLDocument): TFLQuery;
@@ -642,6 +645,9 @@ begin FLimit := ACount; FHasLimit := True; Result := Self; end;
 function TFLQuery.Offset(ACount: NativeUInt): TFLQuery;
 begin FOffset := ACount; FHasOffset := True; Result := Self; end;
 
+function TFLQuery.DeferBlobs(Defer: Boolean): TFLQuery;
+begin FDeferBlobs := Defer; Result := Self; end;
+
 function TFLQuery.StartAt(ASnapshot: TFLDocument): TFLQuery;
 begin
   if ASnapshot <> nil then FStartAt := ASnapshot.Handle;
@@ -735,6 +741,7 @@ begin
     if FHasLimit then fl_query_limit(Result, FLimit);
     if FHasOffset then fl_query_offset(Result, FOffset);
     for I := 0 to FSelectFields.Count - 1 do fl_query_select_field(Result, PChar(FSelectFields[I]));
+if FDeferBlobs then fl_query_defer_blobs(Result, 1);
   except fl_query_free(Result); raise; end;
 end;
 

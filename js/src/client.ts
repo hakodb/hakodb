@@ -626,9 +626,10 @@ export class Query {
   private readonly filters: QueryConstraint[] = [];
   private readonly orFilters: QueryConstraint[] = [];
   private order?: QueryOrder;
-  private queryLimit?: number;
-  private queryOffset?: number;
-  private projection: string[] = [];
+private queryLimit?: number;
+private queryOffset?: number;
+private projection: string[] = [];
+private deferBlobsDef = false;
 
   constructor(private readonly client: FireLiteClient, private readonly collection: string) { }
 
@@ -677,10 +678,15 @@ export class Query {
     return this;
   }
 
-  select(...fields: string[]): Query {
-    this.projection = fields;
-    return this;
-  }
+select(...fields: string[]): Query {
+this.projection = fields;
+return this;
+}
+
+deferBlobs(defer = true): Query {
+this.deferBlobsDef = defer;
+return this;
+}
 
   private prepareNativeQuery(): unknown {
     const native = this.client.nativeBindings();
@@ -774,6 +780,7 @@ export class Query {
       if (this.queryLimit !== undefined) ensureOk(native.queryLimit(handle, this.queryLimit), native, 'queryLimit');
       if (this.queryOffset !== undefined) ensureOk(native.queryOffset(handle, this.queryOffset), native, 'queryOffset');
       for (const field of this.projection) ensureOk(native.querySelectField(handle, field), native, 'querySelectField');
+      if (this.deferBlobsDef) ensureOk(native.queryDeferBlobs(handle, true), native, 'queryDeferBlobs');
 
       return handle;
     } catch (err) {

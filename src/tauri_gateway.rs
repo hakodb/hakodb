@@ -790,3 +790,34 @@ fn value_to_json(v: &Value) -> Result<serde_json::Value, String> {
         Value::Array(values) => Ok(serde_json::Value::Array(values.iter().map(value_to_json).collect::<Result<Vec<_>, _>>()?)),
     }
 }
+
+#[cfg(test)]
+mod casing_tests {
+    use super::*;
+
+    #[test]
+    fn query_op_field_casing_contract() {
+        // Locks the wire contract the JS clients depend on: struct-variant
+        // fields are snake_case (rename_all applies to fields, not just the
+        // op tag), unknown fields are ignored, and defer_blobs defaults off.
+        let snake = r#"{"op":"query","collection":"c","order_by":{"field":"x","ascending":true},"defer_blobs":true}"#;
+        let op: FireLiteOp = serde_json::from_str(snake).expect("snake_case must parse");
+        match op {
+            FireLiteOp::Query { order_by, defer_blobs, .. } => {
+                assert!(order_by.is_some());
+                assert!(defer_blobs);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let minimal: FireLiteOp =
+            serde_json::from_str(r#"{"op":"query","collection":"c"}"#).expect("minimal must parse");
+        match minimal {
+            FireLiteOp::Query { defer_blobs, filters, .. } => {
+                assert!(!defer_blobs, "old clients omit the flag -> eager");
+                assert!(filters.is_empty());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+}

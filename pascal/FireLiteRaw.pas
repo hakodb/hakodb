@@ -59,6 +59,7 @@ procedure fl_config_set_query_workers(config: PFL_Config; count: SizeUInt); cdec
 procedure fl_config_set_memory_limits(config: PFL_Config; mmap_size, max_inlined_bytes: SizeUInt); cdecl; external FIRELITE_LIB;
 procedure fl_config_set_storage_tuning(config: PFL_Config; page_size, compaction_threshold, group_commit_max_ops: SizeUInt); cdecl; external FIRELITE_LIB;
 procedure fl_config_set_blob_threshold(config: PFL_Config; threshold_bytes: SizeUInt); cdecl; external FIRELITE_LIB;
+procedure fl_config_set_wal_reserve_bytes(config: PFL_Config; bytes: QWord); cdecl; external FIRELITE_LIB;
 procedure fl_config_set_compression(config: PFL_Config; enabled: cbool; level: cint32); cdecl; external FIRELITE_LIB;
 
 { Real-time Snapshots }
@@ -90,6 +91,10 @@ function fl_array_append_doc(arr: PFL_Array; doc: PFL_Doc): cint32; cdecl; exter
 
 { Sharded Operations }
 function fl_engine_insert(engine: PFL_Engine; col, doc_id: PChar; doc: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;
+{ Owned-doc insert: consumes the FL_Doc handle (no deep clone). Do not use or free doc afterwards. }
+function fl_engine_insert_take(engine: PFL_Engine; col, doc_id: PChar; doc: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;
+{ Resolve deferred blob fields of a query-returned doc in place. }
+function fl_doc_resolve_blobs(engine: PFL_Engine; col: PChar; doc: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;
 function fl_engine_get(engine: PFL_Engine; col, doc_id: PChar): PFL_Doc; cdecl; external FIRELITE_LIB;
 function fl_engine_delete(engine: PFL_Engine; col, doc_id: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_engine_patch(engine: PFL_Engine; col, doc_id: PChar; updates: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;
@@ -136,6 +141,7 @@ function fl_query_order_by(query: PFL_Query; field: PChar; ascending: cbool): ci
 function fl_query_limit(query: PFL_Query; limit: SizeUInt): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_offset(query: PFL_Query; offset: SizeUInt): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_select_field(query: PFL_Query; field: PChar): cint32; cdecl; external FIRELITE_LIB;
+function fl_query_defer_blobs(query: PFL_Query; defer: cint32): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_execute(engine: PFL_Engine; query: PFL_Query): PChar; cdecl; external FIRELITE_LIB;
 function fl_query_delete(engine: PFL_Engine; query: PFL_Query): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_patch(engine: PFL_Engine; query: PFL_Query; patch_doc: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;
@@ -143,6 +149,8 @@ function fl_query_execute_to_handles(engine: PFL_Engine; query: PFL_Query): PFL_
 function fl_result_set_count(results: PFL_ResultSet): SizeUInt; cdecl; external FIRELITE_LIB;
 function fl_result_set_get_doc(results: PFL_ResultSet; index: SizeUInt): PFL_Doc; cdecl; external FIRELITE_LIB;
 procedure fl_result_set_free(results: PFL_ResultSet); cdecl; external FIRELITE_LIB;
+{ Bulk result-set to JSON: one call, one JSON array string. Free with fl_string_free. }
+function fl_result_set_to_json(results: PFL_ResultSet): PChar; cdecl; external FIRELITE_LIB;
 function fl_query_where_match(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_where_match_prefix(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_where_contains(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;

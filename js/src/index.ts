@@ -33,4 +33,7 @@
 
 export * from './client';
 export * from './native';
-export * from './tauri';
+// ponytail: firestore-style client lives under the `firestore` namespace —
+// its Query/CollectionReference/DocumentReference names collide with the
+// native client above, and export-* can't pick a winner.
+export * as firestore from './tauri';
