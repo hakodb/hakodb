@@ -131,3 +131,39 @@ fn tx_get_put_commit() {
     assert_eq!(after.get("counter"), Some(&Value::Int(42)));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn wal_reserve_skipped_for_internal_collections() {
+    // The 4MB WAL headroom must not inflate system shards (checkpoints,
+    // scope markers): sparse zeros still count in logical file length,
+    // which is what users and the benchmark Size column see.
+    let dir = std::env::temp_dir().join(format!(
+        "fl-test-reserve-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut cfg = FireLiteConfig::default();
+    cfg.durability_mode = DurabilityMode::Always;
+    let db = FireLite::open(&dir, cfg).expect("open");
+
+    let mut doc = FireLiteDoc::default();
+    doc.insert("v", Value::Int(1));
+    db.put("user_data", "a", &doc).expect("put");
+    db.put("__firelite_system", "probe", &doc).expect("put");
+    db.flush().ok();
+
+    let wal_len = |col: &str| {
+        std::fs::metadata(dir.join(col).join("wal.log"))
+            .map(|m| m.len())
+            .unwrap_or(u64::MAX)
+    };
+    assert!(wal_len("user_data") >= 4 * 1024 * 1024, "user shard lost its reserve");
+    assert!(
+        wal_len("__firelite_system") < 1024 * 1024,
+        "system shard carries phantom reserve: {} bytes",
+        wal_len("__firelite_system")
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

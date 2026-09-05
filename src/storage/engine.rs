@@ -102,12 +102,16 @@ impl StorageEngine {
         let cache_limit_bytes = cfg.page_cache_capacity * cfg.page_size;
         let cache = Arc::new(Mutex::new(PageCache::new(cache_limit_bytes)));
 
+        // ponytail: internal collections (checkpoints, room registry, scope
+        // markers) hold bytes of data — a multi-MB WAL headroom per system
+        // shard is phantom size (sparse zeros still count in logical length).
+        let wal_reserve = if logical_name.starts_with("__") { 0 } else { cfg.wal_reserve_bytes };
         let wal = Wal::open(
             base_dir.as_ref().join("wal.log"),
             cfg.durability_mode,
             cfg.group_commit_max_ops,
             encryption.clone(),
-            cfg.wal_reserve_bytes,
+            wal_reserve,
         )?;
 
         let mut segments = HashMap::new();
