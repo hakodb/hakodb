@@ -1114,6 +1114,33 @@ impl FireLite {
         self.persist_local_only();
     }
 
+    /// Opt a whole collection back into replication: clears the collection
+    /// flag and every key mark under it. Tombstones themselves are untouched
+    /// (still local history) — pair with `vacuum_collection` for restore.
+    pub fn replicate_collection(&self, col: &str) {
+        self.local_only_cols.write().unwrap().remove(col);
+        {
+            let mut keys = self.local_only_keys.write().unwrap();
+            // ponytail: marks are `col\0id` — split on the separator instead
+            // of prefix-matching, so col "ab" never eats col "abc" marks.
+            keys.retain(|k| k.split_once('\0').map(|(c, _)| c != col).unwrap_or(true));
+        }
+        self.persist_local_only();
+    }
+
+    /// Vacuum a collection: purge its tombstones from the index. Emits no
+    /// WAL op (never replicates) and drops the collection version to the
+    /// newest live doc, so the next handshake pulls peers' current state.
+    /// This is the restore half of rejoin: `vacuum_collection` +
+    /// `replicate_collection` (or `set_collection_local(false)`) lets a
+    /// reset peer pull back the room state without pushing anything out.
+    /// Returns the number of tombstones purged.
+    pub fn vacuum_collection(&self, col: &str) -> Result<usize> {
+        let shard_arc = self.get_shard(col)?;
+        let mut shard = shard_arc.write().unwrap();
+        Ok(shard.purge_tombstones())
+    }
+
     /// Local-only mass delete ("reset this query scope, don't propagate"):
     /// marks every matched key first (single persist), then batch-deletes.
     pub fn delete_where_local(&self, query: crate::query::query::Query) -> Result<usize> {

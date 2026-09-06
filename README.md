@@ -6,11 +6,31 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 FireLite speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.7.6 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.7.7 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.7.6)
+## What's new (0.7.2 → 0.7.7)
+
+### v0.7.7 — rejoin-safe local scope: vacuum + delta-send filter
+- **net_sync rejoin leak closed.** `handle_delta_send` (mesh bootstrap/catch-up)
+  now filters local-only tombstones and collections, matching the live tailer
+  and both cloud catch-up paths. No handshake path can transmit a local mark.
+- **Vacuum.** `vacuum_collection` purges a collection's tombstones from the
+  index with zero WAL traffic (FFI `fl_engine_vacuum_collection`, CLI `vacuum`,
+  Tauri `vacuum` op). Version drops to the newest live doc, so the next
+  handshake pulls peer state instead of defending local deletes.
+- **Rejoin recipe (reset now, restore later, wipe nothing):**
+  1. `delete_where_local` / `delete_local` (or `collection-local`) — reset stays
+     local; fresh tombstones keep the version ahead so no ping restores early.
+  2. Optionally turn sync off while reset.
+  3. To restore: `vacuum_collection` + `replicate_collection` (or
+     `collection-local --off`) — marks clear, tombstones gone, version drops.
+  4. Next handshake pulls the room state; nothing is pushed outward at any step.
+  Without vacuum, a fresh local tombstone correctly outranks older peer puts
+  under LWW (the doc stays deleted — that *is* the local-only promise).
+- `replicate_collection` clears a collection's flag plus all its key marks
+  (prefix-safe: `c` never eats `c2`). SDKs: Go/JS/Pascal + Tauri `vacuum`.
 
 ### v0.7.6 — local-only deletes + tombstone catch-up fix
 - **Local-only signal.** `delete_local` / `delete_where_local` / `delete_ids_local`
@@ -66,7 +86,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.7.6)](#whats-new-072--076)
+- [What's new (0.7.2 → 0.7.7)](#whats-new-072--077)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)

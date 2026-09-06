@@ -704,29 +704,35 @@ async fn handle_bootstrap(db: &Arc<FireLite>, peers: &Arc<AsyncMutex<HashMap<Str
 }
 
 #[cfg(feature = "net-sync")]
-async fn handle_delta_send(
-    db: &Arc<FireLite>, 
-    peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, 
-    peer_id: &str, 
-    collection: &str, 
-    since_time: i64
-) {
-    // let shard_arc = db.get_shard(collection);
+/// Rejoin/bootstrap catch-up builder shared by the delta sender: every index
+/// entry (puts AND tombstones) newer than `since_time`, minus local-only
+/// marks. Tombstones replay as `WalOp::Delete` (timestamped, so the
+/// receiver's LWW stays sound). The handshake must not leak what the live
+/// tailer withholds — the pre-v0.7.7 code sent local tombstones here.
+#[cfg(feature = "net-sync")]
+fn collect_delta_ops(
+    db: &Arc<FireLite>,
+    collection: &str,
+    since_time: i64,
+) -> Vec<WalOp> {
+    // Local-only collection: nothing leaves, not even on rejoin.
+    if db.is_collection_local(collection) {
+        return Vec::new();
+    }
     let shard_arc = match db.get_shard(collection) {
         Ok(s) => s,
-        Err(e) => {
-            eprintln!("[sync] Delta send failed for {}: {}", collection, e);
-            return;
-        }
+        Err(_) => return Vec::new(),
     };
     let encryption_key = db.config.encryption_key.as_deref();
 
     // 1. SCAN PHASE (RAM-only)
-    // Identify which keys changed without touching the disk yet.
     let changed_items: Vec<(String, Pointer)> = {
         let guard = shard_arc.read().unwrap();
         guard.index.iter()
             .filter_map(|(k, ptr)| {
+                if db.is_local_only(collection, k) {
+                    return None;
+                }
                 let ts = match ptr {
                     Pointer::Inlined(bytes) => {
                         // Extract _time from version 3 header [2..10]
@@ -739,7 +745,7 @@ async fn handle_delta_send(
                     }
                     _ => 0,
                 };
-                
+
                 if ts > since_time {
                     Some((k.clone(), ptr.clone()))
                 } else {
@@ -749,18 +755,14 @@ async fn handle_delta_send(
             .collect()
     };
 
-    if changed_items.is_empty() { return; }
-
-    // 2. INFLATION & TRANSMISSION PHASE
-    let mut batch_ops = Vec::with_capacity(50);
-
+    // 2. INFLATION PHASE (tombstones pass through directly)
+    let mut batch_ops = Vec::with_capacity(changed_items.len());
     for (key, ptr) in changed_items {
         match ptr {
             Pointer::Deleted { timestamp } => {
                 batch_ops.push(WalOp::Delete { key, timestamp });
             }
             _ => {
-                // Read the skeleton/data from local storage
                 let raw_res = {
                     let guard = shard_arc.read().unwrap();
                     guard.read_pointer_internal(&ptr, false).ok().flatten()
@@ -769,9 +771,8 @@ async fn handle_delta_send(
                 if let Some(bytes) = raw_res {
                     if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
                         // INFLATE: If document has blobs, resolve them.
-                        // resolve_doc_static will look in the RAM queue before hitting blobs.dat
                         let has_blobs = doc.fields.iter().any(|(_, v)| matches!(v, Value::BlobLink { .. }));
-                        
+
                         let finalized_bytes = if has_blobs {
                             if crate::engine::engine::resolve_doc_static(&mut doc, &shard_arc, encryption_key).is_ok() {
                                 doc.encode_buffered()
@@ -787,16 +788,23 @@ async fn handle_delta_send(
                 }
             }
         }
-
-        // 3. BATCH SENDING
-        if batch_ops.len() >= 50 {
-            send_replication_packet(peers, peer_id, collection, std::mem::take(&mut batch_ops)).await;
-        }
     }
+    batch_ops
+}
 
-    // Send the final remaining items
-    if !batch_ops.is_empty() {
-        send_replication_packet(peers, peer_id, collection, batch_ops).await;
+async fn handle_delta_send(
+    db: &Arc<FireLite>,
+    peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>,
+    peer_id: &str,
+    collection: &str,
+    since_time: i64
+) {
+    let batch_ops = collect_delta_ops(db, collection, since_time);
+    if batch_ops.is_empty() { return; }
+
+    // 3. BATCH SENDING (50 ops per packet; msg_id 0 = no mesh relay)
+    for chunk in batch_ops.chunks(50) {
+        send_replication_packet(peers, peer_id, collection, chunk.to_vec()).await;
     }
 }
 
@@ -1077,4 +1085,60 @@ async fn send_packet(writer: &mut OwnedWriteHalf, packet: NetPacket) -> tokio::i
         send_raw(writer, &payload).await?;
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "net-sync"))]
+mod tests {
+    use super::*;
+    use crate::config::{DurabilityMode, FireLiteConfig};
+
+    fn temp_db(tag: &str) -> (Arc<FireLite>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "firelite-netsync-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = FireLiteConfig::default();
+        cfg.durability_mode = DurabilityMode::Manual;
+        let db = Arc::new(FireLite::open(&dir, cfg).unwrap());
+        (db, dir)
+    }
+
+    fn put_simple(db: &Arc<FireLite>, col: &str, id: &str) {
+        let mut doc = FireLiteDoc::default();
+        doc.insert("v", Value::Int(1));
+        db.put(col, id, &doc).unwrap();
+    }
+
+    #[test]
+    fn delta_send_withholds_local_only_tombstones() {
+        let (db, _dir) = temp_db("delta-local");
+        put_simple(&db, "c", "keep");
+        put_simple(&db, "c", "gone-normal");
+        put_simple(&db, "c", "gone-local");
+        db.delete("c", "gone-normal").unwrap();
+        db.delete_local("c", "gone-local").unwrap();
+
+        let ops = collect_delta_ops(&db, "c", 0);
+        let mut puts = 0;
+        let mut dels = Vec::new();
+        for op in &ops {
+            match op {
+                WalOp::PutInlined { .. } => puts += 1,
+                WalOp::Delete { key, .. } => dels.push(key.clone()),
+                _ => {}
+            }
+        }
+        assert_eq!(puts, 1, "expected only the live doc, got {ops:?}");
+        assert_eq!(dels, vec!["gone-normal".to_string()], "local tombstone leaked: {ops:?}");
+    }
+
+    #[test]
+    fn delta_send_empty_for_local_collection() {
+        let (db, _dir) = temp_db("delta-col");
+        put_simple(&db, "c", "a");
+        db.set_collection_local("c", true);
+
+        assert!(collect_delta_ops(&db, "c", 0).is_empty());
+    }
 }

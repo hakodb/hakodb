@@ -375,6 +375,25 @@ func (e *Engine) ReplicateKey(collection, docID string) error {
 	return checkStatus("fl_engine_replicate_key", C.fl_engine_replicate_key(e.ptr, cc, ci))
 }
 
+// ReplicateCollection opts a whole collection back into replication.
+func (e *Engine) ReplicateCollection(collection string) error {
+	cc, fc := cString(collection)
+	defer fc()
+	return checkStatus("fl_engine_replicate_collection", C.fl_engine_replicate_collection(e.ptr, cc))
+}
+
+// VacuumCollection purges a collection's tombstones. Emits nothing (never
+// replicates); the next handshake pulls peer state (restore-on-rejoin).
+func (e *Engine) VacuumCollection(collection string) (int32, error) {
+	cc, fc := cString(collection)
+	defer fc()
+	n := C.fl_engine_vacuum_collection(e.ptr, cc)
+	if n < 0 {
+		return 0, fmt.Errorf("fl_engine_vacuum_collection failed: %s", lastError())
+	}
+	return int32(n), nil
+}
+
 func (e *Engine) Patch(collection, docID string, updates *Doc) error {
 	cc, fc := cString(collection)
 	ci, fi := cString(docID)

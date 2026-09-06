@@ -464,6 +464,20 @@ export class FireLiteClient {
     ensureOk(this.native.engineReplicateKey(this.engine, collection, docId), this.native, 'engineReplicateKey');
   }
 
+  /** Opt a whole collection back into replication. */
+  async replicateCollection(collection: string): Promise<void> {
+    this.assertOpen();
+    ensureOk(this.native.engineReplicateCollection(this.engine, collection), this.native, 'engineReplicateCollection');
+  }
+
+  /** Vacuum: purge tombstones (never replicates); next handshake pulls peer state. */
+  async vacuumCollection(collection: string): Promise<number> {
+    this.assertOpen();
+    const n = this.native.engineVacuumCollection(this.engine, collection);
+    if (n < 0) throw new Error(`engineVacuumCollection failed: ${this.native.lastError()}`);
+    return n;
+  }
+
   nativeBindings(): NativeBindings { return this.native; }
   engineHandle(): unknown { return this.engine; }
 

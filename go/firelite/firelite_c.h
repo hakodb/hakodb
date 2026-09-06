@@ -75,6 +75,8 @@ int32_t fl_engine_delete(FL_Engine *engine, const char *collection, const char *
 int32_t fl_engine_delete_local(FL_Engine *engine, const char *collection, const char *doc_id);
 int32_t fl_engine_set_collection_local(FL_Engine *engine, const char *collection, int32_t local);
 int32_t fl_engine_replicate_key(FL_Engine *engine, const char *collection, const char *doc_id);
+int32_t fl_engine_replicate_collection(FL_Engine *engine, const char *collection);
+int32_t fl_engine_vacuum_collection(FL_Engine *engine, const char *collection);
 int32_t fl_engine_patch(FL_Engine *engine, const char *collection, const char *doc_id, const FL_Doc *updates);
 FL_Doc *fl_engine_get_by_ref(FL_Engine *engine, const FL_Doc *doc, const char *field_key);
 

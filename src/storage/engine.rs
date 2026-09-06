@@ -236,6 +236,27 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Vacuum: physically drop tombstones from the RAM index. The docs are
+    /// already gone (a tombstone holds only a timestamp); this removes the
+    /// markers themselves. Emits no WAL op, so it never replicates.
+    /// Effect on sync: the collection version drops to the newest LIVE doc,
+    /// so the next handshake pulls peers' state (restore-on-rejoin), and
+    /// nothing is pushed outward. Orphaned blob bytes (if any) are left for
+    /// blob-compaction, which owns that space.
+    pub(crate) fn purge_tombstones(&mut self) -> usize {
+        let dead: Vec<String> = self.index.iter()
+            .filter(|(_, p)| matches!(p, Pointer::Deleted { .. }))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let n = dead.len();
+        // ponytail: route through update_index_entry (None = remove) so the
+        // sorted_keys view and byte accounting stay in lockstep.
+        for k in dead {
+            self.update_index_entry(k, None);
+        }
+        n
+    }
+
     pub(crate) fn update_index_entry(&mut self, key: String, new_pointer: Option<Pointer>) {
         // 1. Perform the map operation once.
         // .insert() returns the previous value if it existed.

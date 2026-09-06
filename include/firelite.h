@@ -135,6 +135,14 @@ int32_t fl_engine_set_collection_local(FL_Engine *engine, const char *collection
 /// Opts a key back into replication (future ops only).
 int32_t fl_engine_replicate_key(FL_Engine *engine, const char *collection, const char *doc_id);
 
+/// Opts a whole collection back into replication (clears flag + key marks).
+int32_t fl_engine_replicate_collection(FL_Engine *engine, const char *collection);
+
+/// Vacuum: purge a collection's tombstones. Emits no WAL op (never
+/// replicates); drops the version so the next handshake pulls peer state.
+/// Returns tombstones purged, or -1 on error.
+int32_t fl_engine_vacuum_collection(FL_Engine *engine, const char *collection);
+
 FL_Batch *fl_batch_new();
 
 void fl_batch_free(FL_Batch *batch);

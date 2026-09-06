@@ -273,6 +273,8 @@ function DeferBlobs(Defer: Boolean = True): TFLQuery;
     function StartTransaction: TFLTransaction;
     procedure SetCollectionLocal(const ACollection: string; Local: Boolean);
     procedure ReplicateKey(const ACollection, ADocID: string);
+    procedure ReplicateCollection(const ACollection: string);
+    function VacuumCollection(const ACollection: string): Integer;
     function CreateNetSyncer(const Name, RoomKey: string): TFLNetSyncer;
     function CreateCloudSyncer(Mode: TFLCloudSyncMode; const ClientID, RoomName, RoomKey, AuthToken: string): TFLCloudSync;
     function CreateCloudServerSyncer(const ServerID, AuthToken: string): TFLCloudSync;
@@ -1033,6 +1035,17 @@ end;
 procedure TFireLite.ReplicateKey(const ACollection, ADocID: string);
 begin
   CheckStatus(fl_engine_replicate_key(FHandle, PChar(ACollection), PChar(ADocID)), 'ReplicateKey');
+end;
+procedure TFireLite.ReplicateCollection(const ACollection: string);
+begin
+  CheckStatus(fl_engine_replicate_collection(FHandle, PChar(ACollection)), 'ReplicateCollection');
+end;
+function TFireLite.VacuumCollection(const ACollection: string): Integer;
+var R: cint32;
+begin
+  R := fl_engine_vacuum_collection(FHandle, PChar(ACollection));
+  if R < 0 then CheckStatus(R, 'VacuumCollection');
+  Result := R;
 end;
 function TFireLite.CreateNetSyncer(const Name, RoomKey: string): TFLNetSyncer; begin Result := TFLNetSyncer.Create(FHandle, Name, RoomKey); end;
 function TFireLite.CreateCloudSyncer(Mode: TFLCloudSyncMode; const ClientID, RoomName, RoomKey, AuthToken: string): TFLCloudSync; begin Result := TFLCloudSync.Create(FHandle, Mode, ClientID, RoomName, RoomKey, AuthToken); end;

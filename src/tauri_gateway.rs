@@ -52,6 +52,7 @@ pub enum FireLiteOp {
         #[serde(default)]
         local_only: bool,
     },
+    Vacuum { collection: String },
     CreateIndex { collection: String, field: String },
     CreateFtsIndex { collection: String, field: String },
     CreateCompositeIndex { collection: String, fields: Vec<CompositeFieldInput> },
@@ -467,6 +468,10 @@ pub async fn firelite_exec<R: Runtime>(
                 }
                 Ok(FireLiteResponse::Ok)
             }
+            FireLiteOp::Vacuum { collection } => {
+                let count = gateway.db.vacuum_collection(&collection).map_err(|e| e.to_string())?;
+                Ok(FireLiteResponse::BulkActionResult { count })
+            }
             FireLiteOp::CreateIndex { collection, field } => {
                 gateway.db.create_index(&collection, &field).map_err(|e| e.to_string())?;
                 Ok(FireLiteResponse::Ok)
@@ -830,13 +835,14 @@ mod casing_tests {
     fn query_op_field_casing_contract() {
         // Locks the wire contract the JS clients depend on: struct-variant
         // fields are snake_case (rename_all applies to fields, not just the
-        // op tag), unknown fields are ignored, and defer_blobs defaults off.
-        let snake = r#"{"op":"query","collection":"c","order_by":{"field":"x","ascending":true},"defer_blobs":true}"#;
+        // op tag), unknown fields are ignored, and bool flags default off.
+        let snake = r#"{"op":"query","collection":"c","order_by":[{"field":"x","ascending":true}],"defer_blobs":true,"local_only":true}"#;
         let op: FireLiteOp = serde_json::from_str(snake).expect("snake_case must parse");
         match op {
-            FireLiteOp::Query { order_by, defer_blobs, .. } => {
+            FireLiteOp::Query { order_by, defer_blobs, local_only, .. } => {
                 assert!(order_by.is_some());
                 assert!(defer_blobs);
+                assert!(local_only);
             }
             _ => panic!("wrong variant"),
         }
@@ -844,10 +850,20 @@ mod casing_tests {
         let minimal: FireLiteOp =
             serde_json::from_str(r#"{"op":"query","collection":"c"}"#).expect("minimal must parse");
         match minimal {
-            FireLiteOp::Query { defer_blobs, filters, .. } => {
+            FireLiteOp::Query { defer_blobs, local_only, filters, .. } => {
                 assert!(!defer_blobs, "old clients omit the flag -> eager");
+                assert!(!local_only, "old clients omit the flag -> replicated");
                 assert!(filters.is_empty());
             }
+            _ => panic!("wrong variant"),
+        }
+
+        let del: FireLiteOp = serde_json::from_str(
+            r#"{"op":"delete","collection":"c","doc_id":"a","local_only":true}"#,
+        )
+        .expect("delete must parse");
+        match del {
+            FireLiteOp::Delete { local_only, .. } => assert!(local_only),
             _ => panic!("wrong variant"),
         }
     }

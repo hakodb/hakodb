@@ -225,6 +225,13 @@ export const deleteDoc = async (ref: DocumentReference, options?: { localOnly?: 
     await exec({ op: 'delete', collection: ref.collectionPath, doc_id: ref.id, local_only: options?.localOnly ?? false });
 };
 
+/** Vacuum a collection: purge tombstones locally (never replicates); the
+ * next handshake pulls peer state. The restore half of a local reset. */
+export const vacuumCollection = async (collectionPath: string) => {
+    const res = await exec({ op: 'vacuum', collection: collectionPath });
+    return res.bulk_action_result.count;
+};
+
 export const deleteDocs = async (
     q: Query | CollectionReference | CollectionGroupReference,
     options?: { localOnly?: boolean }

@@ -100,6 +100,8 @@ function fl_engine_delete(engine: PFL_Engine; col, doc_id: PChar): cint32; cdecl
 function fl_engine_delete_local(engine: PFL_Engine; col, doc_id: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_engine_set_collection_local(engine: PFL_Engine; col: PChar; local: cint32): cint32; cdecl; external FIRELITE_LIB;
 function fl_engine_replicate_key(engine: PFL_Engine; col, doc_id: PChar): cint32; cdecl; external FIRELITE_LIB;
+function fl_engine_replicate_collection(engine: PFL_Engine; col: PChar): cint32; cdecl; external FIRELITE_LIB;
+function fl_engine_vacuum_collection(engine: PFL_Engine; col: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_engine_patch(engine: PFL_Engine; col, doc_id: PChar; updates: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;
 function fl_engine_get_by_ref(engine: PFL_Engine; doc: PFL_Doc; field_key: PChar): PFL_Doc; cdecl; external FIRELITE_LIB;
 function fl_engine_insert_subdoc(engine: PFL_Engine; col, id, sub_col, sub_id: PChar; doc: PFL_Doc): cint32; cdecl; external FIRELITE_LIB;

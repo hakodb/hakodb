@@ -62,6 +62,8 @@ export interface NativeBindings {
   engineDeleteLocal(engine: Handle, collection: string, docId: string): number;
   engineSetCollectionLocal(engine: Handle, collection: string, local: number): number;
   engineReplicateKey(engine: Handle, collection: string, docId: string): number;
+  engineReplicateCollection(engine: Handle, collection: string): number;
+  engineVacuumCollection(engine: Handle, collection: string): number;
   enginePatch(engine: Handle, collection: string, docId: string, updates: Handle): number;
   engineInsertSubDoc(engine: Handle, col: string, id: string, subCol: string, subId: string, doc: Handle): number;
   engineGetByRef(engine: Handle, doc: Handle, fieldKey: string): Handle;
@@ -238,6 +240,8 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     fl_engine_delete_local: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
     fl_engine_set_collection_local: { args: [FFIType.ptr, FFIType.cstring, FFIType.i32], returns: FFIType.i32 },
     fl_engine_replicate_key: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring], returns: FFIType.i32 },
+    fl_engine_replicate_collection: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.i32 },
+    fl_engine_vacuum_collection: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.i32 },
     fl_engine_patch: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring, FFIType.ptr], returns: FFIType.i32 },
     fl_engine_insert_subdoc: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring, FFIType.cstring, FFIType.cstring, FFIType.ptr], returns: FFIType.i32 },
     fl_engine_get_by_ref: { args: [FFIType.ptr, FFIType.ptr, FFIType.cstring], returns: FFIType.ptr },
@@ -400,6 +404,8 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     engineDeleteLocal: (engine, collection, docId) => symbols.fl_engine_delete_local(engine, toC(collection), toC(docId)),
     engineSetCollectionLocal: (engine, collection, local) => symbols.fl_engine_set_collection_local(engine, toC(collection), local),
     engineReplicateKey: (engine, collection, docId) => symbols.fl_engine_replicate_key(engine, toC(collection), toC(docId)),
+    engineReplicateCollection: (engine, collection) => symbols.fl_engine_replicate_collection(engine, toC(collection)),
+    engineVacuumCollection: (engine, collection) => symbols.fl_engine_vacuum_collection(engine, toC(collection)),
     enginePatch: (engine, collection, docId, updates) => symbols.fl_engine_patch(engine, toC(collection), toC(docId), updates),
     engineInsertSubDoc: (engine, col, id, subCol, subId, doc) => symbols.fl_engine_insert_subdoc(engine, toC(col), toC(id), toC(subCol), toC(subId), doc),
     engineGetByRef: (engine, doc, fieldKey) => symbols.fl_engine_get_by_ref(engine, doc, toC(fieldKey)),
@@ -561,6 +567,8 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_engine_delete_local: lib.func('int fl_engine_delete_local(FL_Engine* engine, const char* collection, const char* doc_id)'),
     fl_engine_set_collection_local: lib.func('int fl_engine_set_collection_local(FL_Engine* engine, const char* collection, int local)'),
     fl_engine_replicate_key: lib.func('int fl_engine_replicate_key(FL_Engine* engine, const char* collection, const char* doc_id)'),
+    fl_engine_replicate_collection: lib.func('int fl_engine_replicate_collection(FL_Engine* engine, const char* collection)'),
+    fl_engine_vacuum_collection: lib.func('int fl_engine_vacuum_collection(FL_Engine* engine, const char* collection)'),
     fl_engine_patch: lib.func('int fl_engine_patch(FL_Engine* engine, const char* collection, const char* doc_id, const FL_Doc* updates)'),
     fl_engine_insert_subdoc: lib.func('int fl_engine_insert_subdoc(FL_Engine* engine, const char* col, const char* id, const char* sub_col, const char* sub_id, const FL_Doc* doc)'),
     fl_engine_get_by_ref: lib.func('FL_Doc* fl_engine_get_by_ref(FL_Engine* engine, const FL_Doc* doc, const char* field_key)'),
@@ -724,6 +732,8 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     engineDeleteLocal: (engine, collection, docId) => fn.fl_engine_delete_local(engine, collection, docId),
     engineSetCollectionLocal: (engine, collection, local) => fn.fl_engine_set_collection_local(engine, collection, local),
     engineReplicateKey: (engine, collection, docId) => fn.fl_engine_replicate_key(engine, collection, docId),
+    engineReplicateCollection: (engine, collection) => fn.fl_engine_replicate_collection(engine, collection),
+    engineVacuumCollection: (engine, collection) => fn.fl_engine_vacuum_collection(engine, collection),
     enginePatch: (engine, collection, docId, updates) => fn.fl_engine_patch(engine, collection, docId, updates),
     engineInsertSubDoc: (engine, col, id, subCol, subId, doc) => fn.fl_engine_insert_subdoc(engine, col, id, subCol, subId, doc),
     engineGetByRef: (engine, doc, fieldKey) => fn.fl_engine_get_by_ref(engine, doc, fieldKey),

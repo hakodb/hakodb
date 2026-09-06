@@ -73,6 +73,9 @@ enum Commands {
         #[arg(long)]
         off: bool,
     },
+    /// Vacuum a collection: purge tombstones (no sync traffic); next
+    /// handshake pulls peer state. The restore half of a local reset.
+    Vacuum { collection: String },
     /// Get one document by path: <collection>/<doc_id>
     Get {
         path: String,
@@ -1198,6 +1201,10 @@ fn execute_command(
             } else {
                 println!("OK: {collection} is now local-only (never syncs)");
             }
+        }
+        Commands::Vacuum { collection } => {
+            let n = db.vacuum_collection(&collection)?;
+            println!("OK: vacuumed {n} tombstones from {collection} (not synced)");
         }
         Commands::Get {
             path,

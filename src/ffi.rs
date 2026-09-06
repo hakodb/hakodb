@@ -786,6 +786,50 @@ pub extern "C" fn fl_engine_replicate_key(
     0
 }
 
+/// Opts a whole collection back into replication (clears flag + key marks).
+#[no_mangle]
+pub extern "C" fn fl_engine_replicate_collection(
+    engine: *mut FL_Engine,
+    collection: *const c_char,
+) -> i32 {
+    if engine.is_null() {
+        return set_last_error("null engine handle");
+    }
+    let collection = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(e) => return set_last_error(e),
+    };
+    let engine = unsafe { &mut *engine };
+    engine.db.replicate_collection(&collection);
+    clear_last_error();
+    0
+}
+
+/// Vacuum: purge a collection's tombstones. Emits no WAL op (never
+/// replicates); drops the version so the next handshake pulls peer state.
+/// Returns tombstones purged, or -1 on error.
+#[no_mangle]
+pub extern "C" fn fl_engine_vacuum_collection(
+    engine: *mut FL_Engine,
+    collection: *const c_char,
+) -> i32 {
+    if engine.is_null() {
+        return set_last_error("null engine handle");
+    }
+    let collection = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(e) => return set_last_error(e),
+    };
+    let engine = unsafe { &mut *engine };
+    match engine.db.vacuum_collection(&collection) {
+        Ok(n) => {
+            clear_last_error();
+            n as i32
+        }
+        Err(e) => set_last_error(e.to_string()),
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn fl_batch_new() -> *mut FL_Batch {
     Box::into_raw(Box::new(FL_Batch { ops: Vec::new() }))
