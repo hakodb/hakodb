@@ -6,11 +6,26 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 FireLite speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.7.7 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.7.8 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.7.7)
+## What's new (0.7.2 → 0.7.8)
+
+### v0.7.8 — Android UDP broadcast discovery + membership gossip
+- **Why.** Android's WiFi stack filters inbound multicast without a Java-side
+  `MulticastLock`, so mDNS browsing silently hears nothing. Subnet *broadcast*
+  is not filtered: no lock, no new permission, pure Rust on `INTERNET`.
+- **How.** On `target_os = "android"` only, each node beacons
+  `{id, room_hash, tcp_port, known_peers}` to `255.255.255.255:5354` every 5s
+  and listens on the same port. Receivers take the sender address from the UDP
+  source (multi-interface safe) and merge gossiped peers, so finding one peer
+  bootstraps the group. Stale entries expire after 45s (broadcast has no
+  leave event). Desktop binaries are unchanged: same code paths, mDNS only —
+  the spawn sites are the only target-gated lines.
+- No new API, no wire-protocol change, no cloud_sync change.
+
+### v0.7.8 — Android UDP broadcast discovery + membership gossip
 
 ### v0.7.7 — rejoin-safe local scope: vacuum + delta-send filter
 - **net_sync rejoin leak closed.** `handle_delta_send` (mesh bootstrap/catch-up)
@@ -86,7 +101,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.7.7)](#whats-new-072--077)
+- [What's new (0.7.2 → 0.7.8)](#whats-new-072--078)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)
@@ -604,6 +619,14 @@ tokio = { version = "1", features = ["full"] }
 ```
 
 See [Serve mode](#serve-mode-interactive-repl--networking) for the CLI workflow, or `cli/src/main.rs` for the Rust `NetSyncer` usage.
+
+### Android notes
+
+On Android, discovery runs over UDP subnet broadcast (no `MulticastLock`
+needed — broadcast bypasses the WiFi multicast filter). Requirements live on
+the app side: `INTERNET` permission, same WiFi as the group, and realistic
+expectations about Doze (the mesh stalls with the screen off; use a foreground
+service for always-on sync). The core library needs no Java glue.
 
 ---
 

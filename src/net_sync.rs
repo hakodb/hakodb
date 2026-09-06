@@ -49,12 +49,169 @@ pub struct NetworkStatus {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum NetPacket {
     Identify { id: String, room_hash: [u8; 32] },
-    Ping { 
-        versions: HashMap<String, i64>, 
+    Ping {
+        versions: HashMap<String, i64>,
         indexes: crate::engine::engine::IndexList,
     },
     SyncRequest,
     Replication { msg_id: u128, collection: String, ops: Vec<WalOp> },
+}
+
+// --- UDP broadcast discovery (Android path; desktop stays on mDNS) ---
+//
+// Android's WiFi stack filters inbound *multicast* unless the app holds a
+// MulticastLock (Java/Kotlin side) — so mDNS browsing silently hears nothing.
+// Subnet *broadcast* is not subject to that filter: no lock, no new
+// permission beyond INTERNET, pure Rust. Same broadcast domain as mDNS, so
+// no reach is lost. Desktop (Windows/Linux/macOS) never sends nor listens:
+// only the spawn sites in start() are target-gated; everything below is
+// plain logic so the desktop test suite can exercise it over loopback.
+#[cfg(feature = "net-sync")]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+const BEACON_PORT: u16 = 5354; // one above mDNS 5353
+#[cfg(feature = "net-sync")]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+const BEACON_MAGIC: u32 = 0x464C4252; // "FLBR"
+#[cfg(feature = "net-sync")]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+const BEACON_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(feature = "net-sync")]
+const BEACON_EXPIRY: Duration = Duration::from_secs(45); // ~9 missed beacons
+
+/// Beacon payload. The receiver takes the sender's address from the UDP
+/// packet source (src_ip:tcp_port), never from a self-reported IP — Android
+/// devices routinely have several interfaces and the "default" one may not
+/// be the WiFi the mesh lives on. `known` gossips membership so finding one
+/// peer bootstraps the group (the TCP handshake itself carries no peer list).
+#[cfg(feature = "net-sync")]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BeaconPacket {
+    magic: u32,
+    id: String,
+    room_hash: [u8; 32],
+    tcp_port: u16,
+    known: Vec<(String, String)>,
+}
+
+#[cfg(feature = "net-sync")]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn encode_beacon(p: &BeaconPacket) -> Vec<u8> {
+    bincode::serialize(p).unwrap_or_default()
+}
+
+#[cfg(feature = "net-sync")]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn decode_beacon(bytes: &[u8]) -> Option<BeaconPacket> {
+    let p: BeaconPacket = bincode::deserialize(bytes).ok()?;
+    if p.magic != BEACON_MAGIC {
+        return None;
+    }
+    Some(p)
+}
+
+/// Merge one beacon into the discovery cache. Pure function of (cache,
+/// packet, source ip) — unit-tested, no sockets. Returns true if the cache
+/// changed. Rules: wrong room or self → ignore; otherwise upsert sender +
+/// gossiped peers with a fresh last-seen timestamp.
+#[cfg(feature = "net-sync")]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn merge_beacon(
+    cache: &mut HashMap<String, (String, Instant)>,
+    pkt: &BeaconPacket,
+    src_ip: std::net::IpAddr,
+    self_id: &str,
+    room_hash: &[u8; 32],
+    now: Instant,
+) -> bool {
+    if pkt.room_hash != *room_hash || pkt.id == self_id {
+        return false;
+    }
+    let mut changed = false;
+    let mut upsert = |name: &str, addr: &str| {
+        if name == self_id {
+            return;
+        }
+        match cache.get(name) {
+            Some((a, _)) if a == addr => {}
+            _ => changed = true,
+        }
+        cache.insert(name.to_string(), (addr.to_string(), now));
+    };
+    upsert(&pkt.id, &format!("{}:{}", src_ip, pkt.tcp_port));
+    for (name, addr) in &pkt.known {
+        upsert(name, addr);
+    }
+    changed
+}
+
+/// Drop entries unheard-from for longer than BEACON_EXPIRY. Broadcast has no
+/// ServiceRemoved event; without pruning, dead peers get dialed forever
+/// (battery on mobile, timeout spam everywhere).
+#[cfg(feature = "net-sync")]
+fn prune_stale_peers(cache: &mut HashMap<String, (String, Instant)>, now: Instant) {
+    cache.retain(|_, (_, seen)| now.duration_since(*seen) < BEACON_EXPIRY);
+}
+
+/// Beacon sender. `target` is 255.255.255.255:BEACON_PORT in production;
+/// loopback in tests. Gated at the spawn site (Android only) — the fn stays
+/// ungated so desktop tests can run it against the listener over loopback.
+#[cfg(all(feature = "net-sync", any(target_os = "android", test)))]
+async fn beacon_sender_task(
+    cache: Arc<Mutex<HashMap<String, (String, Instant)>>>,
+    self_id: String,
+    room_hash: [u8; 32],
+    tcp_port: u16,
+    target: std::net::SocketAddr,
+) {
+    let sock = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let _ = sock.set_broadcast(true);
+    loop {
+        // Gossip: advertise everyone we know so one heard beacon bootstraps
+        // the whole group (the TCP handshake carries no peer list).
+        let known: Vec<(String, String)> = {
+            let guard = cache.lock().unwrap();
+            guard.iter().map(|(n, (a, _))| (n.clone(), a.clone())).collect()
+        };
+        let pkt = BeaconPacket {
+            magic: BEACON_MAGIC,
+            id: self_id.clone(),
+            room_hash,
+            tcp_port,
+            known,
+        };
+        let _ = sock.send_to(&encode_beacon(&pkt), target).await;
+        tokio::time::sleep(BEACON_INTERVAL).await;
+    }
+}
+
+/// Beacon listener. Binds the wildcard on BEACON_PORT; a second instance on
+/// the same device gets a bind error and silently skips discovery.
+#[cfg(all(feature = "net-sync", any(target_os = "android", test)))]
+async fn beacon_listener_task(
+    cache: Arc<Mutex<HashMap<String, (String, Instant)>>>,
+    self_id: String,
+    room_hash: [u8; 32],
+    bind_addr: std::net::SocketAddr,
+) {
+    let sock = match tokio::net::UdpSocket::bind(bind_addr).await {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut buf = vec![0u8; 2048];
+    loop {
+        let (len, src) = match sock.recv_from(&mut buf).await {
+            Ok(x) => x,
+            Err(_) => continue,
+        };
+        if let Some(pkt) = decode_beacon(&buf[..len]) {
+            let mut guard = cache.lock().unwrap();
+            merge_beacon(&mut guard, &pkt, src.ip(), &self_id, &room_hash, Instant::now());
+        }
+    }
 }
 
 #[cfg(feature = "net-sync")]
@@ -186,10 +343,37 @@ impl NetSyncer {
         let relay_disc = self.enable_relay;
         let echo_cache_clone = self.echo_cache.clone();
 
+        // Shared membership view: Name -> (Last Known Address, last-seen).
+        // mDNS is the only writer on desktop; Android broadcast tasks share it.
+        let discovery_cache: Arc<Mutex<HashMap<String, (String, Instant)>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // 5. UDP broadcast discovery — Android ONLY. Desktop (Windows/Linux/
+        // macOS) stays on mDNS; this block does not exist in their binary.
+        // Handles join self.tasks so stop() aborts them with everything else.
+        #[cfg(all(feature = "net-sync", target_os = "android"))]
+        {
+            use std::net::SocketAddr;
+            let bcast_target = SocketAddr::from(([255, 255, 255, 255], BEACON_PORT));
+            let bcast_bind = SocketAddr::from(([0, 0, 0, 0], BEACON_PORT));
+            let bc_cache = discovery_cache.clone();
+            let bc_id = self.self_id.clone();
+            let bc_hash = self.room_hash;
+            self.tasks.lock().unwrap().push(tokio::spawn(beacon_sender_task(
+                bc_cache, bc_id, bc_hash, port, bcast_target,
+            )));
+            let bl_cache = discovery_cache.clone();
+            let bl_id = self.self_id.clone();
+            let bl_hash = self.room_hash;
+            self.tasks.lock().unwrap().push(tokio::spawn(beacon_listener_task(
+                bl_cache, bl_id, bl_hash, bcast_bind,
+            )));
+        }
+
         // 3. SINGLE Unified Discovery & Reconnection Task
+        // Map of Name -> (Last Known Address, last-seen). Shared with the
+        // Android broadcast tasks (mDNS stays the only writer on desktop).
         let handle_discovery = tokio::spawn(async move {
-            // Map of Name -> Last Known Address
-            let mut discovery_cache: HashMap<String, String> = HashMap::new();
             let mut retry_interval = tokio::time::interval(Duration::from_secs(15));
             let mut connecting: HashSet<String> = HashSet::new();
             
@@ -224,12 +408,13 @@ impl NetSyncer {
                                     .map(|ip| format!("{}:{}", ip, info.get_port()));
 
                                 if let Some(p_addr) = p_addr {
-                                    discovery_cache.insert(p_name, p_addr);
+                                    discovery_cache.lock().unwrap()
+                                        .insert(p_name, (p_addr, Instant::now()));
                                 }
                             }
                             Ok(ServiceEvent::ServiceRemoved(_type, name)) => {
                                 let p_name = name.split('.').next().unwrap_or("");
-                                discovery_cache.remove(p_name);
+                                discovery_cache.lock().unwrap().remove(p_name);
                                 connecting.remove(p_name);
                             }
                             _ => { }
@@ -245,7 +430,16 @@ impl NetSyncer {
 
                         connecting.retain(|name| !active_peer_names.contains(name));
 
-                        for (p_name, p_addr) in &discovery_cache {
+                        // Snapshot + prune under one short lock; dial outside it.
+                        // Pruning also covers broadcast-discovered peers, which
+                        // have no ServiceRemoved event.
+                        let dial_list: Vec<(String, String)> = {
+                            let mut guard = discovery_cache.lock().unwrap();
+                            prune_stale_peers(&mut guard, Instant::now());
+                            guard.iter().map(|(n, (a, _))| (n.clone(), a.clone())).collect()
+                        };
+
+                        for (p_name, p_addr) in &dial_list {
                             // TIE-BREAKING: Only higher ID initiates to prevent double-connections
                             if p_name > &sid_rx && !active_peer_names.contains(p_name) {
                             // if !active_peer_names.contains(p_name) {
@@ -1140,5 +1334,116 @@ mod tests {
         db.set_collection_local("c", true);
 
         assert!(collect_delta_ops(&db, "c", 0).is_empty());
+    }
+
+    fn beacon_pkt(id: &str, room: &[u8; 32], port: u16) -> BeaconPacket {
+        BeaconPacket {
+            magic: BEACON_MAGIC,
+            id: id.to_string(),
+            room_hash: *room,
+            tcp_port: port,
+            known: vec![],
+        }
+    }
+
+    #[test]
+    fn beacon_roundtrip_and_rejects_garbage() {
+        let room = [7u8; 32];
+        let p = beacon_pkt("node-a", &room, 7070);
+        let back = decode_beacon(&encode_beacon(&p)).expect("roundtrip");
+        assert_eq!(back.id, "node-a");
+        assert_eq!(back.tcp_port, 7070);
+
+        assert!(decode_beacon(b"not a beacon").is_none());
+        let mut bad = encode_beacon(&p);
+        bad[0] ^= 0xFF; // corrupt magic
+        assert!(decode_beacon(&bad).is_none());
+    }
+
+    #[test]
+    fn beacon_merge_rules() {
+        use std::net::IpAddr;
+        let room_a = [1u8; 32];
+        let room_b = [2u8; 32];
+        let now = Instant::now();
+        let mut cache: HashMap<String, (String, Instant)> = HashMap::new();
+        let src: IpAddr = "192.168.1.20".parse().unwrap();
+
+        // Wrong room and self are ignored (no insert, returns false).
+        let mut foreign = beacon_pkt("node-x", &room_b, 7070);
+        assert!(!merge_beacon(&mut cache, &foreign, src, "node-me", &room_a, now));
+        foreign.room_hash = room_a;
+        foreign.id = "node-me".to_string();
+        assert!(!merge_beacon(&mut cache, &foreign, src, "node-me", &room_a, now));
+        assert!(cache.is_empty());
+
+        // Sender upsert uses the PACKET SOURCE ip, never a self-reported one.
+        let p = beacon_pkt("node-x", &room_a, 7070);
+        assert!(merge_beacon(&mut cache, &p, src, "node-me", &room_a, now));
+        assert_eq!(cache["node-x"].0, "192.168.1.20:7070");
+
+        // Same content re-announced: no change reported...
+        assert!(!merge_beacon(&mut cache, &p, src, "node-me", &room_a, now));
+        // ...but a changed port updates the entry.
+        let p2 = beacon_pkt("node-x", &room_a, 8080);
+        assert!(merge_beacon(&mut cache, &p2, src, "node-me", &room_a, now));
+        assert_eq!(cache["node-x"].0, "192.168.1.20:8080");
+
+        // Gossip: known peers merge in; self inside gossip is skipped.
+        let mut g = beacon_pkt("node-x", &room_a, 8080);
+        g.known = vec![
+            ("node-y".to_string(), "192.168.1.30:7070".to_string()),
+            ("node-me".to_string(), "192.168.1.99:9999".to_string()),
+        ];
+        assert!(merge_beacon(&mut cache, &g, src, "node-me", &room_a, now));
+        assert_eq!(cache["node-y"].0, "192.168.1.30:7070");
+        assert!(!cache.contains_key("node-me"));
+    }
+
+    #[test]
+    fn stale_peers_pruned() {
+        let now = Instant::now();
+        let old = now - BEACON_EXPIRY - Duration::from_secs(1);
+        let mut cache: HashMap<String, (String, Instant)> = HashMap::from([
+            ("fresh".to_string(), ("1.2.3.4:1".to_string(), now)),
+            ("gone".to_string(), ("1.2.3.5:1".to_string(), old)),
+        ]);
+        prune_stale_peers(&mut cache, now);
+        assert!(cache.contains_key("fresh"));
+        assert!(!cache.contains_key("gone"));
+    }
+
+    #[tokio::test]
+    async fn beacon_sender_reaches_listener_over_loopback() {
+        use std::net::SocketAddr;
+        // Fixed high port, loopback only: proves the socket tasks interoperate.
+        // Production uses 255.255.255.255 (broadcast) instead of 127.0.0.1.
+        let port: u16 = 45354;
+        let room = [9u8; 32];
+        let cache_a: Arc<Mutex<HashMap<String, (String, Instant)>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let cache_b: Arc<Mutex<HashMap<String, (String, Instant)>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let h_listen = tokio::spawn(beacon_listener_task(
+            cache_b.clone(),
+            "node-b".to_string(),
+            room,
+            SocketAddr::from(([127, 0, 0, 1], port)),
+        ));
+        let h_send = tokio::spawn(beacon_sender_task(
+            cache_a.clone(),
+            "node-a".to_string(),
+            room,
+            7070,
+            SocketAddr::from(([127, 0, 0, 1], port)),
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        h_send.abort();
+        h_listen.abort();
+
+        let guard = cache_b.lock().unwrap();
+        let (addr, _) = guard.get("node-a").expect("node-b must hear node-a");
+        assert_eq!(addr, "127.0.0.1:7070");
     }
 }
