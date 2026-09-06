@@ -6,11 +6,29 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 FireLite speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.7.8 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.7.9 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.7.8)
+## What's new (0.7.2 → 0.7.9)
+
+### v0.7.9 — developer-chosen discovery: mDNS / broadcast / both
+- **Why.** v0.7.8 proved UDP broadcast beacons (no MulticastLock, pure Rust),
+  but gated them Android-only — where no desktop listens, so mixed groups
+  could never meet. Discovery must be symmetric: this release puts the choice
+  in the developer's hands on every platform.
+- **How.** `NetSyncer::with_discovery(DiscoveryMode::{Mdns, Broadcast, Both})`
+  (mirrors `with_relay`; CLI `serve --discovery <mdns|broadcast|both>`).
+  Defaults preserve history: **mDNS on desktop, broadcast on mobile** — every
+  existing deployment behaves bit-for-bit as before with zero config.
+- **Mixed-group recipe.** A desktop joining mobile peers opts in once
+  (`--discovery both`); one-directional discovery suffices per pair (whoever
+  hears, dials) and beacon gossip spreads membership group-wide. Beacons carry
+  `{id, room_hash, tcp_port, known_peers}`, receivers use the UDP source IP
+  (multi-interface safe — the exact failure that killed the v0.6-era beacon,
+  which advertised self-reported IPs, room-unaware, dial-per-packet).
+- mDNS paths untouched; no wire-protocol change; no new API beyond the
+  builder flag; no cloud_sync change.
 
 ### v0.7.8 — Android UDP broadcast discovery + membership gossip
 - **Why.** Android's WiFi stack filters inbound multicast without a Java-side
@@ -101,7 +119,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.7.8)](#whats-new-072--078)
+- [What's new (0.7.2 → 0.7.9)](#whats-new-072--079)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)
@@ -622,11 +640,14 @@ See [Serve mode](#serve-mode-interactive-repl--networking) for the CLI workflow,
 
 ### Android notes
 
-On Android, discovery runs over UDP subnet broadcast (no `MulticastLock`
-needed — broadcast bypasses the WiFi multicast filter). Requirements live on
-the app side: `INTERNET` permission, same WiFi as the group, and realistic
-expectations about Doze (the mesh stalls with the screen off; use a foreground
-service for always-on sync). The core library needs no Java glue.
+On Android, discovery defaults to UDP subnet broadcast (no `MulticastLock`
+needed — broadcast bypasses the WiFi multicast filter). Override with
+`with_discovery()` if the app holds a lock and prefers mDNS as well.
+Requirements live on the app side: `INTERNET` permission, same WiFi as the
+group, and realistic expectations about Doze (the mesh stalls with the screen
+off; use a foreground service for always-on sync). Mixed groups: the desktop
+side must opt into `Both` — a default-configured desktop never hears
+broadcast-only mobile peers. The core library needs no Java glue.
 
 ---
 

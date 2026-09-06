@@ -57,23 +57,20 @@ pub enum NetPacket {
     Replication { msg_id: u128, collection: String, ops: Vec<WalOp> },
 }
 
-// --- UDP broadcast discovery (Android path; desktop stays on mDNS) ---
+// --- UDP broadcast discovery (mobile path; desktop opt-in) ---
 //
 // Android's WiFi stack filters inbound *multicast* unless the app holds a
 // MulticastLock (Java/Kotlin side) — so mDNS browsing silently hears nothing.
 // Subnet *broadcast* is not subject to that filter: no lock, no new
 // permission beyond INTERNET, pure Rust. Same broadcast domain as mDNS, so
-// no reach is lost. Desktop (Windows/Linux/macOS) never sends nor listens:
-// only the spawn sites in start() are target-gated; everything below is
-// plain logic so the desktop test suite can exercise it over loopback.
+// no reach is lost. Desktop runs mDNS by default and enables broadcast via
+// DiscoveryMode::Both/Broadcast for mixed groups; the beacon tasks below are
+// plain logic so the desktop test suite exercises them over loopback.
 #[cfg(feature = "net-sync")]
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 const BEACON_PORT: u16 = 5354; // one above mDNS 5353
 #[cfg(feature = "net-sync")]
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 const BEACON_MAGIC: u32 = 0x464C4252; // "FLBR"
 #[cfg(feature = "net-sync")]
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 const BEACON_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(feature = "net-sync")]
 const BEACON_EXPIRY: Duration = Duration::from_secs(45); // ~9 missed beacons
@@ -84,7 +81,6 @@ const BEACON_EXPIRY: Duration = Duration::from_secs(45); // ~9 missed beacons
 /// be the WiFi the mesh lives on. `known` gossips membership so finding one
 /// peer bootstraps the group (the TCP handshake itself carries no peer list).
 #[cfg(feature = "net-sync")]
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct BeaconPacket {
     magic: u32,
@@ -95,13 +91,11 @@ struct BeaconPacket {
 }
 
 #[cfg(feature = "net-sync")]
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 fn encode_beacon(p: &BeaconPacket) -> Vec<u8> {
     bincode::serialize(p).unwrap_or_default()
 }
 
 #[cfg(feature = "net-sync")]
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 fn decode_beacon(bytes: &[u8]) -> Option<BeaconPacket> {
     let p: BeaconPacket = bincode::deserialize(bytes).ok()?;
     if p.magic != BEACON_MAGIC {
@@ -115,7 +109,6 @@ fn decode_beacon(bytes: &[u8]) -> Option<BeaconPacket> {
 /// changed. Rules: wrong room or self → ignore; otherwise upsert sender +
 /// gossiped peers with a fresh last-seen timestamp.
 #[cfg(feature = "net-sync")]
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 fn merge_beacon(
     cache: &mut HashMap<String, (String, Instant)>,
     pkt: &BeaconPacket,
@@ -154,9 +147,8 @@ fn prune_stale_peers(cache: &mut HashMap<String, (String, Instant)>, now: Instan
 }
 
 /// Beacon sender. `target` is 255.255.255.255:BEACON_PORT in production;
-/// loopback in tests. Gated at the spawn site (Android only) — the fn stays
-/// ungated so desktop tests can run it against the listener over loopback.
-#[cfg(all(feature = "net-sync", any(target_os = "android", test)))]
+/// loopback in tests. Spawned only when the discovery mode enables it.
+#[cfg(feature = "net-sync")]
 async fn beacon_sender_task(
     cache: Arc<Mutex<HashMap<String, (String, Instant)>>>,
     self_id: String,
@@ -190,7 +182,7 @@ async fn beacon_sender_task(
 
 /// Beacon listener. Binds the wildcard on BEACON_PORT; a second instance on
 /// the same device gets a bind error and silently skips discovery.
-#[cfg(all(feature = "net-sync", any(target_os = "android", test)))]
+#[cfg(feature = "net-sync")]
 async fn beacon_listener_task(
     cache: Arc<Mutex<HashMap<String, (String, Instant)>>>,
     self_id: String,
@@ -223,14 +215,61 @@ pub struct NetSyncer {
     service_type: String,
     status_tx: watch::Sender<NetworkStatus>,
     status_rx: watch::Receiver<NetworkStatus>,
-    peers: Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, 
+    peers: Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>,
     seen_messages: Arc<AsyncMutex<Vec<u128>>>,
     tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     shard_offsets: Arc<Mutex<HashMap<String, u64>>>,
-    pub enable_relay: bool, 
+    pub enable_relay: bool,
     last_mesh_ping: Arc<Mutex<Instant>>,
     echo_cache: Arc<Mutex<HashMap<String, i64>>>,
     mdns: Arc<Mutex<Option<ServiceDaemon>>>,
+    discovery: DiscoveryMode,
+}
+
+/// Which discovery transports a mesh node runs. mDNS is the desktop sweet
+/// spot and stays the default there; mobile defaults to broadcast (no
+/// MulticastLock needed). Mixed groups need at least one common channel —
+/// i.e. a desktop joining Android/iOS peers must opt into `Both`.
+#[cfg(feature = "net-sync")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiscoveryMode {
+    /// mDNS register + browse only (desktop default; historic behavior).
+    #[default]
+    Mdns,
+    /// UDP broadcast beacons only (mobile default; no multicast).
+    Broadcast,
+    /// Both transports at once (mixed groups, debugging).
+    Both,
+}
+
+/// Platform default: broadcast where multicast is hostile, mDNS elsewhere.
+#[cfg(feature = "net-sync")]
+fn default_discovery_mode() -> DiscoveryMode {
+    #[cfg(target_os = "android")]
+    {
+        DiscoveryMode::Broadcast
+    }
+    // ponytail: iOS gets Broadcast until the Bonjour shim lands; raw
+    // multicast needs an Apple entitlement the library must not assume.
+    #[cfg(target_os = "ios")]
+    {
+        DiscoveryMode::Broadcast
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        DiscoveryMode::Mdns
+    }
+}
+
+/// Pure transport matrix for a mode — unit-tested, so the spawn sites below
+/// stay trivially reviewable.
+#[cfg(feature = "net-sync")]
+fn transports_for(mode: DiscoveryMode) -> (bool, bool) {
+    match mode {
+        DiscoveryMode::Mdns => (true, false),
+        DiscoveryMode::Broadcast => (false, true),
+        DiscoveryMode::Both => (true, true),
+    }
 }
 
 #[cfg(feature = "net-sync")]
@@ -272,6 +311,7 @@ impl NetSyncer {
             last_mesh_ping: Arc::new(Mutex::new(Instant::now())),
             echo_cache: Arc::new(Mutex::new(HashMap::new())),
             mdns: Arc::new(Mutex::new(None)),
+            discovery: default_discovery_mode(),
         }
     }
 
@@ -280,9 +320,21 @@ impl NetSyncer {
         self
     }
 
+    /// Choose discovery transports (default: mDNS on desktop, broadcast on
+    /// mobile). Mixed-platform groups need a common channel — set `Both` on
+    /// the desktop side to meet broadcast-only mobile peers.
+    pub fn with_discovery(mut self, mode: DiscoveryMode) -> Self {
+        self.discovery = mode;
+        self
+    }
+
+    /// Active discovery mode (defaults are platform-dependent).
+    pub fn discovery_mode(&self) -> DiscoveryMode {
+        self.discovery
+    }
+
     pub async fn start(&self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
         self.stop();
-        let my_ip = local_ip_address::local_ip().map(|ip| ip.to_string()).unwrap_or_else(|_| "127.0.0.1".to_string());
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
         let db_ptr = self.db.clone();
         let peers_ptr = self.peers.clone();
@@ -320,16 +372,25 @@ impl NetSyncer {
         });
         self.tasks.lock().unwrap().push(handle_srv);
 
-        // 3. mDNS Discovery (The Working Part)
-        let mdns = ServiceDaemon::new().expect("Failed to create mDNS");
-        * self.mdns.lock().unwrap() = Some(mdns.clone());
-        
-        let hostname = gethostname::gethostname().to_string_lossy().into_owned() + ".local.";
-        let service_info = ServiceInfo::new(&self.service_type, &self.self_id, &hostname, &my_ip, port, None)?;
-        mdns.register(service_info)?;
+        // Discovery transports for this node (mode chosen via with_discovery;
+        // default is mDNS on desktop, broadcast on mobile).
+        let (mdns_on, bcast_on) = transports_for(self.discovery);
 
-        // 1. Create the browser once
-        let browser = mdns.browse(&self.service_type)?;
+        // 3. mDNS Discovery — skipped entirely under Broadcast-only mode.
+        let browser = if mdns_on {
+            let mdns = ServiceDaemon::new().expect("Failed to create mDNS");
+            * self.mdns.lock().unwrap() = Some(mdns.clone());
+
+            let my_ip = local_ip_address::local_ip().map(|ip| ip.to_string()).unwrap_or_else(|_| "127.0.0.1".to_string());
+            let hostname = gethostname::gethostname().to_string_lossy().into_owned() + ".local.";
+            let service_info = ServiceInfo::new(&self.service_type, &self.self_id, &hostname, &my_ip, port, None)?;
+            mdns.register(service_info)?;
+
+            // 1. Create the browser once
+            Some(mdns.browse(&self.service_type)?)
+        } else {
+            None
+        };
 
         // 2. Prepare all clones needed for the background task
         let db_rx = self.db.clone();
@@ -344,15 +405,15 @@ impl NetSyncer {
         let echo_cache_clone = self.echo_cache.clone();
 
         // Shared membership view: Name -> (Last Known Address, last-seen).
-        // mDNS is the only writer on desktop; Android broadcast tasks share it.
+        // Written by whichever transports the mode enables (mDNS and/or
+        // broadcast); the dial loop reads it uniformly.
         let discovery_cache: Arc<Mutex<HashMap<String, (String, Instant)>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        // 5. UDP broadcast discovery — Android ONLY. Desktop (Windows/Linux/
-        // macOS) stays on mDNS; this block does not exist in their binary.
-        // Handles join self.tasks so stop() aborts them with everything else.
-        #[cfg(all(feature = "net-sync", target_os = "android"))]
-        {
+        // 5. UDP broadcast discovery — runs when the mode enables it
+        // (mobile default; desktop opt-in via with_discovery(Both/Broadcast)
+        // for mixed groups). Handles join self.tasks so stop() aborts them.
+        if bcast_on {
             use std::net::SocketAddr;
             let bcast_target = SocketAddr::from(([255, 255, 255, 255], BEACON_PORT));
             let bcast_bind = SocketAddr::from(([0, 0, 0, 0], BEACON_PORT));
@@ -380,8 +441,14 @@ impl NetSyncer {
             // We own 'browser' here and use it exclusively in this loop
             loop {
                 tokio::select! {
-                    // Branch A: Listen for NEW peers via mDNS
-                    event_res = browser.recv_async() => {
+                    // Branch A: Listen for NEW peers via mDNS (parked forever
+                    // under Broadcast-only mode — None has no browser).
+                    event_res = async {
+                        match &browser {
+                            Some(b) => b.recv_async().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
                         match event_res {
                             Ok(ServiceEvent::ServiceResolved(info)) => {
                                 let p_name = info.get_fullname().split('.').next().unwrap_or("").to_string();
@@ -1411,6 +1478,32 @@ mod tests {
         prune_stale_peers(&mut cache, now);
         assert!(cache.contains_key("fresh"));
         assert!(!cache.contains_key("gone"));
+    }
+
+    #[test]
+    fn transports_for_matrix() {
+        assert_eq!(transports_for(DiscoveryMode::Mdns), (true, false));
+        assert_eq!(transports_for(DiscoveryMode::Broadcast), (false, true));
+        assert_eq!(transports_for(DiscoveryMode::Both), (true, true));
+    }
+
+    #[test]
+    fn platform_default_discovery() {
+        // Desktop keeps historic behavior (mDNS only); mobile gets the
+        // multicast-free default. Mixed groups opt into Both explicitly.
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        assert_eq!(default_discovery_mode(), DiscoveryMode::Broadcast);
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        assert_eq!(default_discovery_mode(), DiscoveryMode::Mdns);
+    }
+
+    #[test]
+    fn with_discovery_overrides_default() {
+        let (db, _dir) = temp_db("mode");
+        let s = NetSyncer::new(db, "n", "k", vec![]).with_discovery(DiscoveryMode::Both);
+        assert_eq!(s.discovery_mode(), DiscoveryMode::Both);
+        let d = NetSyncer::new(temp_db("mode2").0, "n", "k", vec![]);
+        assert_eq!(d.discovery_mode(), default_discovery_mode());
     }
 
     #[tokio::test]

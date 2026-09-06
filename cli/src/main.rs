@@ -17,7 +17,7 @@ use rustyline::DefaultEditor;
 use serde_json::{json, Map, Value as JsonValue};
 
 #[cfg(feature = "net-sync")]
-use firelite::net_sync::{NetSyncer, SyncStatus};
+use firelite::net_sync::{NetSyncer, SyncStatus, DiscoveryMode};
 
 #[cfg(feature = "cloud-sync")]
 use firelite::cloud_sync::CloudSync;
@@ -251,6 +251,12 @@ enum Commands {
         #[arg(long, default_value = "default_key")]
         key: String,
 
+        /// LAN discovery transports: mdns (desktop default), broadcast
+        /// (mobile default, no multicast), or both (mixed groups — a desktop
+        /// joining mobile peers must opt into both or broadcast).
+        #[arg(long, value_enum, default_value = "mdns")]
+        discovery: DiscoveryModeArg,
+
         /// Cloud Sync Server bind address (e.g. 0.0.0.0:8080)
         #[arg(long)]
         bind: Option<String>,
@@ -300,6 +306,13 @@ enum IndexCommands {
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
+enum DiscoveryModeArg {
+    Mdns,
+    Broadcast,
+    Both,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
 enum AggregateKindArg {
     Count,
     Sum,
@@ -309,15 +322,16 @@ enum AggregateKindArg {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if let Commands::Serve { 
-        port, 
-        node_id, 
-        key,         
+    if let Commands::Serve {
+        port,
+        node_id,
+        key,
+        discovery,
         bind,
         server,
         room_name,
         token, } = &cli.command {
-        return run_server(&cli, Some(*port), node_id, key, bind.as_deref(), server.as_deref(), room_name.as_deref(), token);
+        return run_server(&cli, Some(*port), node_id, key, *discovery, bind.as_deref(), server.as_deref(), room_name.as_deref(), token);
     }
 
     let db = open_db(&cli)?;
@@ -1396,6 +1410,7 @@ fn run_server(
     port: Option<u16>,
     node_id: &str,
     key: &str,
+    discovery: DiscoveryModeArg,
     bind_addr: Option<&str>,
     server_url: Option<&str>,
     room_name: Option<&str>,
@@ -1409,7 +1424,13 @@ fn run_server(
         // 1. Initialize LAN Net Sync (if --port provided)
         #[cfg(feature = "net-sync")]
         let net_syncer = if let Some(p) = port {
-            let syncer = NetSyncer::new(db.clone(), node_id, key, vec!["app_state".to_string()]);
+            let mode = match discovery {
+                DiscoveryModeArg::Mdns => DiscoveryMode::Mdns,
+                DiscoveryModeArg::Broadcast => DiscoveryMode::Broadcast,
+                DiscoveryModeArg::Both => DiscoveryMode::Both,
+            };
+            let syncer = NetSyncer::new(db.clone(), node_id, key, vec!["app_state".to_string()])
+                .with_discovery(mode);
             syncer.start(p).await.map_err(|e| anyhow!(e.to_string()))?;
             Some(syncer)
         } else {
