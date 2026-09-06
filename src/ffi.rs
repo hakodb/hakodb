@@ -2798,6 +2798,26 @@ pub extern "C" fn fl_net_syncer_new(
     }))
 }
 
+/// Select discovery transports: 0 = mDNS (desktop default), 1 = UDP
+/// broadcast (mobile default, no multicast), 2 = both (mixed groups — a
+/// desktop joining mobile peers must opt into both or broadcast).
+/// Takes effect at the next start().
+#[cfg(feature = "net-sync")]
+#[no_mangle]
+pub extern "C" fn fl_net_syncer_set_discovery(syncer: *mut FL_NetSyncer, mode: i32) -> i32 {
+    if syncer.is_null() { return -1; }
+    let s_ref = unsafe { &*syncer };
+    let m = match mode {
+        0 => crate::net_sync::DiscoveryMode::Mdns,
+        1 => crate::net_sync::DiscoveryMode::Broadcast,
+        2 => crate::net_sync::DiscoveryMode::Both,
+        _ => return set_last_error("invalid discovery mode (0=mdns, 1=broadcast, 2=both)"),
+    };
+    s_ref.inner.set_discovery(m);
+    clear_last_error();
+    0
+}
+
 #[cfg(feature = "net-sync")]
 #[no_mangle]
 pub extern "C" fn fl_net_syncer_start(syncer: *mut FL_NetSyncer, port: u16) -> i32 {

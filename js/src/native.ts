@@ -136,6 +136,7 @@ export interface NativeBindings {
   // Net Sync
   netSyncerNew(engine: Handle, name: string, roomKey: string): Handle;
   netSyncerStart(syncer: Handle, port: number): number;
+  netSyncerSetDiscovery(syncer: Handle, mode: number): number;
   netSyncerStatus(syncer: Handle): string | null;
   netSyncerFree(syncer: Handle): void;
 
@@ -469,6 +470,7 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     engineListCollections: (engine) => ptrToStringAndFree(symbols.fl_engine_list_collections(engine)),
     netSyncerNew: (engine, name, roomKey) => symbols.fl_net_syncer_new(engine, toC(name), toC(roomKey)),
     netSyncerStart: (syncer, port) => symbols.fl_net_syncer_start(syncer, port),
+    netSyncerSetDiscovery: (syncer, mode) => symbols.fl_net_syncer_set_discovery(syncer, mode),
     netSyncerStatus: (syncer) => ptrToStringAndFree(symbols.fl_net_syncer_status(syncer)),
     netSyncerFree: (syncer) => symbols.fl_net_syncer_free(syncer),
 
@@ -633,6 +635,7 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_engine_list_collections: lib.func('char* fl_engine_list_collections(FL_Engine* engine)'),
     fl_net_syncer_new: lib.func('FL_NetSyncer* fl_net_syncer_new(FL_Engine* engine, const char* name, const char* room_key)'),
     fl_net_syncer_start: lib.func('int fl_net_syncer_start(FL_NetSyncer* syncer, uint16_t port)'),
+    fl_net_syncer_set_discovery: lib.func('int fl_net_syncer_set_discovery(FL_NetSyncer* syncer, int mode)'),
     fl_net_syncer_status: lib.func('char* fl_net_syncer_status(FL_NetSyncer* syncer)'),
     fl_net_syncer_free: lib.func('void fl_net_syncer_free(FL_NetSyncer* syncer)'),
 
@@ -797,6 +800,7 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     engineListCollections: (engine) => ptrToStringAndFree(fn.fl_engine_list_collections(engine)),
     netSyncerNew: (engine, name, roomKey) => fn.fl_net_syncer_new(engine, name, roomKey),
     netSyncerStart: (syncer, port) => fn.fl_net_syncer_start(syncer, port),
+    netSyncerSetDiscovery: (syncer, mode) => fn.fl_net_syncer_set_discovery(syncer, mode),
     netSyncerStatus: (syncer) => ptrToStringAndFree(fn.fl_net_syncer_status(syncer)),
     netSyncerFree: (syncer) => fn.fl_net_syncer_free(syncer),
 

@@ -180,6 +180,7 @@ function fl_engine_create_fts_index(engine: PFL_Engine; col, field: PChar): cint
 { Net Sync }
 function fl_net_syncer_new(engine: PFL_Engine; name, room_key: PChar): PFL_NetSyncer; cdecl; external FIRELITE_LIB;
 function fl_net_syncer_start(syncer: PFL_NetSyncer; port: Word): cint32; cdecl; external FIRELITE_LIB;
+function fl_net_syncer_set_discovery(syncer: PFL_NetSyncer; mode: cint32): cint32; cdecl; external FIRELITE_LIB;
 function fl_net_syncer_status(syncer: PFL_NetSyncer): PChar; cdecl; external FIRELITE_LIB;
 procedure fl_net_syncer_free(syncer: PFL_NetSyncer); cdecl; external FIRELITE_LIB;
 

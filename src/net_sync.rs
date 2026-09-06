@@ -11,7 +11,7 @@ use crate::storage::engine::Pointer;
 #[cfg(feature = "net-sync")]
 use std::sync::{Arc, Mutex, RwLock};
 #[cfg(feature = "net-sync")]
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU8, Ordering};
 #[cfg(feature = "net-sync")]
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "net-sync")]
@@ -223,7 +223,9 @@ pub struct NetSyncer {
     last_mesh_ping: Arc<Mutex<Instant>>,
     echo_cache: Arc<Mutex<HashMap<String, i64>>>,
     mdns: Arc<Mutex<Option<ServiceDaemon>>>,
-    discovery: DiscoveryMode,
+    // ponytail: atomic so the FFI setter can change the mode on a shared
+    // (Arc'd) handle; start() reads it once at boot.
+    discovery: AtomicU8,
 }
 
 /// Which discovery transports a mesh node runs. mDNS is the desktop sweet
@@ -232,14 +234,27 @@ pub struct NetSyncer {
 /// i.e. a desktop joining Android/iOS peers must opt into `Both`.
 #[cfg(feature = "net-sync")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
 pub enum DiscoveryMode {
     /// mDNS register + browse only (desktop default; historic behavior).
     #[default]
-    Mdns,
+    Mdns = 0,
     /// UDP broadcast beacons only (mobile default; no multicast).
-    Broadcast,
+    Broadcast = 1,
     /// Both transports at once (mixed groups, debugging).
-    Both,
+    Both = 2,
+}
+
+#[cfg(feature = "net-sync")]
+impl DiscoveryMode {
+    fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(DiscoveryMode::Mdns),
+            1 => Some(DiscoveryMode::Broadcast),
+            2 => Some(DiscoveryMode::Both),
+            _ => None,
+        }
+    }
 }
 
 /// Platform default: broadcast where multicast is hostile, mDNS elsewhere.
@@ -311,7 +326,7 @@ impl NetSyncer {
             last_mesh_ping: Arc::new(Mutex::new(Instant::now())),
             echo_cache: Arc::new(Mutex::new(HashMap::new())),
             mdns: Arc::new(Mutex::new(None)),
-            discovery: default_discovery_mode(),
+            discovery: AtomicU8::new(default_discovery_mode() as u8),
         }
     }
 
@@ -323,14 +338,21 @@ impl NetSyncer {
     /// Choose discovery transports (default: mDNS on desktop, broadcast on
     /// mobile). Mixed-platform groups need a common channel — set `Both` on
     /// the desktop side to meet broadcast-only mobile peers.
-    pub fn with_discovery(mut self, mode: DiscoveryMode) -> Self {
-        self.discovery = mode;
+    pub fn with_discovery(self, mode: DiscoveryMode) -> Self {
+        self.discovery.store(mode as u8, Ordering::Relaxed);
         self
+    }
+
+    /// FFI-facing setter: same as with_discovery, on a shared handle. Takes
+    /// effect at the next start().
+    pub fn set_discovery(&self, mode: DiscoveryMode) {
+        self.discovery.store(mode as u8, Ordering::Relaxed);
     }
 
     /// Active discovery mode (defaults are platform-dependent).
     pub fn discovery_mode(&self) -> DiscoveryMode {
-        self.discovery
+        DiscoveryMode::from_u8(self.discovery.load(Ordering::Relaxed))
+            .unwrap_or(DiscoveryMode::Mdns)
     }
 
     pub async fn start(&self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
@@ -372,9 +394,9 @@ impl NetSyncer {
         });
         self.tasks.lock().unwrap().push(handle_srv);
 
-        // Discovery transports for this node (mode chosen via with_discovery;
-        // default is mDNS on desktop, broadcast on mobile).
-        let (mdns_on, bcast_on) = transports_for(self.discovery);
+        // Discovery transports for this node (mode chosen via with_discovery /
+        // set_discovery; default is mDNS on desktop, broadcast on mobile).
+        let (mdns_on, bcast_on) = transports_for(self.discovery_mode());
 
         // 3. mDNS Discovery — skipped entirely under Broadcast-only mode.
         let browser = if mdns_on {

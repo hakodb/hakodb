@@ -362,6 +362,12 @@ void fl_config_set_compression(FL_Config *config, bool enabled, int32_t level);
 
 FL_NetSyncer *fl_net_syncer_new(FL_Engine *engine, const char *name, const char *room_key);
 
+/// Select discovery transports: 0 = mDNS (desktop default), 1 = UDP
+/// broadcast (mobile default, no multicast), 2 = both (mixed groups — a
+/// desktop joining mobile peers must opt into both or broadcast).
+/// Takes effect at the next start().
+int32_t fl_net_syncer_set_discovery(FL_NetSyncer *syncer, int32_t mode);
+
 int32_t fl_net_syncer_start(FL_NetSyncer *syncer, uint16_t port);
 
 char *fl_net_syncer_status(FL_NetSyncer *syncer);

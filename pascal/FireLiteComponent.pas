@@ -39,6 +39,7 @@ type
     FNetSyncName: string;
     FNetSyncRoomKey: string;
     FNetSyncPort: Word;
+    FNetSyncDiscovery: TFLDiscoveryMode;
     FCloudSyncMode: TFLCloudSyncMode;
     FCloudSyncClientID: string;
     FCloudSyncRoomName: string;
@@ -93,6 +94,7 @@ type
     property NetSyncName: string read FNetSyncName write FNetSyncName;
     property NetSyncRoomKey: string read FNetSyncRoomKey write FNetSyncRoomKey;
     property NetSyncPort: Word read FNetSyncPort write FNetSyncPort default 4456;
+    property NetSyncDiscovery: TFLDiscoveryMode read FNetSyncDiscovery write FNetSyncDiscovery default dmMdns;
 
     { --- CloudSync configuration --- }
     property CloudSyncMode: TFLCloudSyncMode read FCloudSyncMode write FCloudSyncMode default csmClient;
@@ -111,6 +113,7 @@ constructor TFireLiteComponent.Create(AOwner: TComponent);
 begin
   inherited Create(AOwner);
   FNetSyncPort := 4456;
+  FNetSyncDiscovery := dmMdns;
   FCloudSyncMode := csmClient;
 end;
 
@@ -154,6 +157,7 @@ begin
   EnsureOpen;
   FNetSyncer.Free;
   FNetSyncer := FLite.CreateNetSyncer(FNetSyncName, FNetSyncRoomKey);
+  FNetSyncer.SetDiscoveryMode(FNetSyncDiscovery);
   FNetSyncer.Start(FNetSyncPort);
 end;
 

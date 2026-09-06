@@ -15,6 +15,8 @@ type
 
   TFLCloudSyncMode = (csmServer, csmClient);
 
+  TFLDiscoveryMode = (dmMdns = 0, dmBroadcast = 1, dmBoth = 2);
+
   TOnSnapshotCallback = procedure(const JsonSnapshot: string) of object;
 
   IFLSubscription = interface
@@ -234,6 +236,7 @@ function DeferBlobs(Defer: Boolean = True): TFLQuery;
     constructor Create(ADBHandle: PFL_Engine; const Name, RoomKey: string);
     destructor Destroy; override;
     procedure Start(APort: Word);
+    procedure SetDiscoveryMode(AMode: TFLDiscoveryMode);
     function StatusJSON: string;
   end;
 
@@ -947,6 +950,11 @@ end;
 procedure TFLNetSyncer.Start(APort: Word);
 begin
   CheckStatus(fl_net_syncer_start(FHandle, APort), 'NetSyncStart');
+end;
+
+procedure TFLNetSyncer.SetDiscoveryMode(AMode: TFLDiscoveryMode);
+begin
+  CheckStatus(fl_net_syncer_set_discovery(FHandle, Ord(AMode)), 'NetSyncSetDiscovery');
 end;
 
 function TFLNetSyncer.StatusJSON: string;

@@ -495,6 +495,15 @@ export class NetSyncer {
     ensureOk(this.native.netSyncerStart(this.handle, port), this.native, 'netSyncerStart');
   }
 
+  /**
+   * Discovery transports: 0 = mDNS (desktop default), 1 = UDP broadcast
+   * (mobile default, no multicast), 2 = both (mixed groups). Takes effect
+   * at start(). Mirrors the CLI `--discovery` flag.
+   */
+  async setDiscoveryMode(mode: 0 | 1 | 2): Promise<void> {
+    ensureOk(this.native.netSyncerSetDiscovery(this.handle, mode), this.native, 'netSyncerSetDiscovery');
+  }
+
   async status<T = unknown>(): Promise<T | null> {
     const raw = this.native.netSyncerStatus(this.handle);
     return raw ? (JSON.parse(raw) as T) : null;

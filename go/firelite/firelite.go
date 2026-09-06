@@ -465,6 +465,20 @@ func (n *NetSyncer) Start(port uint16) error {
 	return checkStatus("fl_net_syncer_start", C.fl_net_syncer_start(n.ptr, C.uint16_t(port)))
 }
 
+// Discovery transports for LAN mesh: 0 = mDNS (desktop default), 1 = UDP
+// broadcast (mobile default, no multicast), 2 = both (mixed groups — a
+// desktop joining mobile peers must opt into both or broadcast).
+const (
+	DiscoveryMdns      = 0
+	DiscoveryBroadcast = 1
+	DiscoveryBoth      = 2
+)
+
+// SetDiscoveryMode selects discovery transports. Takes effect at Start.
+func (n *NetSyncer) SetDiscoveryMode(mode int) error {
+	return checkStatus("fl_net_syncer_set_discovery", C.fl_net_syncer_set_discovery(n.ptr, C.int(mode)))
+}
+
 func (n *NetSyncer) StatusJSON() (string, error) {
 	return ownedCStringJSON(func() *C.char { return C.fl_net_syncer_status(n.ptr) })
 }

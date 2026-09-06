@@ -156,6 +156,7 @@ int32_t fl_engine_insert_subdoc(FL_Engine *engine, const char *col, const char *
 
 FL_NetSyncer *fl_net_syncer_new(FL_Engine *engine, const char *name, const char *room_key);
 int32_t fl_net_syncer_start(FL_NetSyncer *syncer, uint16_t port);
+int32_t fl_net_syncer_set_discovery(FL_NetSyncer *syncer, int32_t mode);
 char *fl_net_syncer_status(FL_NetSyncer *syncer);
 void fl_net_syncer_free(FL_NetSyncer *syncer);
 
