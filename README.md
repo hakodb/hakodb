@@ -544,18 +544,33 @@ begin
 end;
 ```
 
-The wrapper also ships as a ready-to-use **Lazarus package**:
+The wrapper ships as two Lazarus packages (the standard runtime/designtime
+split — a single mixed package will not install):
 
-- `pascal/FireLitePkg.lpk` — install it via `Package > Open Package File (.lpk)` in
-  the Lazarus IDE (`Compile`, then `Install`). It provides `FireLiteRaw`,
-  `FireLite`, and `FireLiteComponent` (a `TComponent` wrapper you can drop on a
-  form) and puts a **FireLite** tab on the component palette.
+- `pascal/FireLitePkg.lpk` — **runtime** (`Type=RunTime`): `FireLiteRaw`,
+  `FireLite`, `FireLiteComponent`. Add it via Project Inspector → Add → New
+  Requirement to use the SDK from code. Never install this one (Install stays
+  grey by design — there is nothing design-time in it).
+- `pascal/FireLiteDesign.lpk` — **designtime** (`Type=DesignTime`, requires
+  `FireLitePkg`): `FireLitePkgReg` with the `Register` procedure. Open it via
+  `Package > Open Package File (.lpk)`, Compile, then **Install** — the IDE
+  rebuilds and a **FireLite** tab with `TFireLiteComponent` appears on the
+  component palette.
 - `pascal/FireLiteComponent.pas` — the drop-on-form component. NetSync and
   CloudSync are fully exposed as Object Inspector properties:
-  `NetSyncName`, `NetSyncRoomKey`, `NetSyncPort`,
+  `NetSyncName`, `NetSyncRoomKey`, `NetSyncPort`, `NetSyncDiscovery`,
   `CloudSyncMode`, `CloudSyncClientID`, `CloudSyncRoomName`, `CloudSyncRoomKey`,
   `CloudSyncAuthToken`, `CloudSyncAddress`, with one-call `StartNetSync` / `StartCloudSync` methods.
-- `pascal/FireLitePkgReg.pas` — design-time registration unit.
+- `pascal/FireLitePkgReg.pas` — design-time registration unit (belongs to the
+  design package only).
+
+> Contributing to the Lazarus ecosystem (Online Package Manager,
+> `packages.lazarus-ide.org`) expects exactly this split: a runtime package
+> projects depend on, plus a designtime package the IDE installs. Keep
+> engine units out of the design package and registration out of the runtime
+> one, and keep the package `Name` different from every unit name (the IDE
+> auto-generates a `<PackageName>.pas` stub that would otherwise shadow a
+> same-named unit).
 
 > Run it: [`example/pascal/console`](example/pascal/console) is a plain FPC
 > program (`fpc -Fu..\..\..\pascal console_demo.lpr`), and
