@@ -12,9 +12,13 @@
         <Filename Value="FireLiteDesign"/>
       </Target>
       <SearchPaths>
-        <IncludeFiles Value="$(PkgOutDir)"/>
+        <IncludeFiles Value="."/>
+        <OtherUnitFiles Value="."/>
         <UnitOutputDirectory Value="lib\$(TargetCPU)-$(TargetOS)"/>
       </SearchPaths>
+      <Other>
+        <CustomOptions Value="$(IDEBuildOptions)"/>
+      </Other>
     </CompilerOptions>
     <Description Value="FireLite Lazarus design-time package. Registers TFireLiteComponent on the FireLite component palette tab. Requires (and auto-loads) the FireLitePkg runtime package. Install this package into the IDE."/>
     <License Value="MIT"/>

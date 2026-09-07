@@ -12,9 +12,13 @@
         <Filename Value="FireLitePkg"/>
       </Target>
       <SearchPaths>
-        <IncludeFiles Value="$(PkgOutDir)"/>
+        <IncludeFiles Value="."/>
+        <OtherUnitFiles Value="."/>
         <UnitOutputDirectory Value="lib\$(TargetCPU)-$(TargetOS)"/>
       </SearchPaths>
+      <Other>
+        <CustomOptions Value="$(IDEBuildOptions)"/>
+      </Other>
     </CompilerOptions>
     <Description Value="FireLite embedded document database bindings for Lazarus (runtime). Raw C-FFI layer (FireLiteRaw), high-level OO engine (FireLite) and drop-on-form component class (TFireLiteComponent). Requires the firelite shared library (firelite.dll / libfirelite.so / libfirelite.dylib). Add as a project requirement to use; install FireLiteDesign.lpk for the component palette."/>
     <License Value="MIT"/>
