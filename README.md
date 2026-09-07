@@ -6,11 +6,23 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 FireLite speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.7.9 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.7.10 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.7.9)
+## What's new (0.7.2 → 0.7.10)
+
+### v0.7.10 — Pascal SDK install fixes + component polish
+- Canonical runtime/designtime split (`FireLitePkg` + `FireLiteDesign`);
+  the single mixed package would not install.
+- Package renamed `FireLite` → `FireLitePkg`: the IDE auto-generates a
+  `<PackageName>.pas` stub that had overwritten the engine unit, causing a
+  phantom circular reference.
+- Palette icon (`tfirelitecomponent.lrs`, built from `.xpm` via `lazres`).
+- `NetSyncEnabled` / `CloudSyncEnabled` master switches (default off);
+  sync properties are inert until enabled.
+- `TFLDiscoveryMode` + `SetDiscoveryMode` + component `NetSyncDiscovery`
+  property surface the net_sync discovery choice.
 
 ### v0.7.9 — developer-chosen discovery: mDNS / broadcast / both
 - **Why.** v0.7.8 proved UDP broadcast beacons (no MulticastLock, pure Rust),
@@ -119,7 +131,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.7.9)](#whats-new-072--079)
+- [What's new (0.7.2 → 0.7.10)](#whats-new-072--0710)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)
