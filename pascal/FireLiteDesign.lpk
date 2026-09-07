@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <CONFIG>
-  <Package Version="5.0">
+  <Package Version="5">
     <PathDelim Value="\"/>
     <Name Value="FireLiteDesign"/>
     <Type Value="DesignTime"/>
@@ -8,9 +8,6 @@
     <CompilerOptions>
       <Version Value="11"/>
       <PathDelim Value="\"/>
-      <Target>
-        <Filename Value="FireLiteDesign"/>
-      </Target>
       <SearchPaths>
         <IncludeFiles Value="."/>
         <OtherUnitFiles Value="."/>
