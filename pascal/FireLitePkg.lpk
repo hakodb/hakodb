@@ -32,6 +32,7 @@
       <Item4>
         <Filename Value="FireLitePkgReg.pas"/>
         <UnitName Value="FireLitePkgReg"/>
+        <HasRegisterProc Value="True"/>
       </Item4>
     </Files>
     <RequiredPkg Count="1">
