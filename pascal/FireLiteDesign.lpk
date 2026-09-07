@@ -26,10 +26,13 @@
         <HasRegisterProc Value="True"/>
       </Item1>
     </Files>
-    <RequiredPkgs Count="3">
+    <RequiredPkgs Count="4">
       <Item1>
         <PackageName Value="FireLitePkg"/>
       </Item1>
+      <Item2>
+        <PackageName Value="IDEIntf"/>
+      </Item2>
       <Item2>
         <PackageName Value="FCL"/>
       </Item2>
