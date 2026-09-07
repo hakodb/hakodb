@@ -28,4 +28,10 @@ begin
   RegisterComponents('FireLite', [TFireLiteComponent]);
 end;
 
+initialization
+  { Palette icon for TFireLiteComponent (resource name = lowercase class
+    name). Built from tfirelitecomponent.xpm via lazres; replace the .xpm
+    and re-run lazres to change the icon. }
+  {$I tfirelitecomponent.lrs}
+
 end.

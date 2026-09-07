@@ -36,10 +36,12 @@ type
   TFireLiteComponent = class(TComponent)
   private
     FDatabasePath: string;
+    FNetSyncEnabled: Boolean;
     FNetSyncName: string;
     FNetSyncRoomKey: string;
     FNetSyncPort: Word;
     FNetSyncDiscovery: TFLDiscoveryMode;
+    FCloudSyncEnabled: Boolean;
     FCloudSyncMode: TFLCloudSyncMode;
     FCloudSyncClientID: string;
     FCloudSyncRoomName: string;
@@ -91,12 +93,16 @@ type
     property DatabasePath: string read FDatabasePath write FDatabasePath;
 
     { --- NetSync (LAN replication) configuration --- }
+    { Master switch: the NetSync* options below are inert until enabled. }
+    property NetSyncEnabled: Boolean read FNetSyncEnabled write FNetSyncEnabled default False;
     property NetSyncName: string read FNetSyncName write FNetSyncName;
     property NetSyncRoomKey: string read FNetSyncRoomKey write FNetSyncRoomKey;
     property NetSyncPort: Word read FNetSyncPort write FNetSyncPort default 4456;
     property NetSyncDiscovery: TFLDiscoveryMode read FNetSyncDiscovery write FNetSyncDiscovery default dmMdns;
 
     { --- CloudSync configuration --- }
+    { Master switch: the CloudSync* options below are inert until enabled. }
+    property CloudSyncEnabled: Boolean read FCloudSyncEnabled write FCloudSyncEnabled default False;
     property CloudSyncMode: TFLCloudSyncMode read FCloudSyncMode write FCloudSyncMode default csmClient;
     property CloudSyncClientID: string read FCloudSyncClientID write FCloudSyncClientID;
     property CloudSyncRoomName: string read FCloudSyncRoomName write FCloudSyncRoomName;
@@ -112,8 +118,10 @@ implementation
 constructor TFireLiteComponent.Create(AOwner: TComponent);
 begin
   inherited Create(AOwner);
+  FNetSyncEnabled := False;
   FNetSyncPort := 4456;
   FNetSyncDiscovery := dmMdns;
+  FCloudSyncEnabled := False;
   FCloudSyncMode := csmClient;
 end;
 
@@ -155,6 +163,8 @@ end;
 procedure TFireLiteComponent.StartNetSync;
 begin
   EnsureOpen;
+  if not FNetSyncEnabled then
+    raise EFireLiteError.Create('NetSyncEnabled is False: enable it before StartNetSync');
   FNetSyncer.Free;
   FNetSyncer := FLite.CreateNetSyncer(FNetSyncName, FNetSyncRoomKey);
   FNetSyncer.SetDiscoveryMode(FNetSyncDiscovery);
@@ -170,6 +180,8 @@ end;
 procedure TFireLiteComponent.StartCloudSync;
 begin
   EnsureOpen;
+  if not FCloudSyncEnabled then
+    raise EFireLiteError.Create('CloudSyncEnabled is False: enable it before StartCloudSync');
   FCloudSyncer.Free;
   FCloudSyncer := FLite.CreateCloudSyncer(FCloudSyncMode, FCloudSyncClientID,
     FCloudSyncRoomName, FCloudSyncRoomKey, FCloudSyncAuthToken);

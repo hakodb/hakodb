@@ -1,0 +1,15 @@
+LazarusResources.Add('tfirelitecomponent','XPM',[
+  '/* XPM */'#10'static char * tfirelitecomponent_xpm[] = {'#10'"24 24 5 1",'#10
+  +'". c None",'#10'"O c #C2410C",'#10'"o c #F97316",'#10'"W c #FFFFFF",'#10'"Y'
+  +' c #FBBF24",'#10'"........................",'#10'"........................"'
+  +','#10'"..OOOOOOOOOOOOOOOOOOOO..",'#10'"..OooooooooooooooooooO..",'#10'"..Oo'
+  +'ooooooooooooYYoooO..",'#10'"..OoooooooooooooYYoooO..",'#10'"..OooooWWWWWWWW'
+  +'WoooooO..",'#10'"..OooooWWWWWWWWWoooooO..",'#10'"..OooooWWooooooooooooO..",'
+  +#10'"..OooooWWooooooooooooO..",'#10'"..OooooWWooooooooooooO..",'#10'"..Ooooo'
+  +'WWWWWWWoooooooO..",'#10'"..OooooWWWWWWWoooooooO..",'#10'"..OooooWWooooooooo'
+  +'oooO..",'#10'"..OooooWWooooooooooooO..",'#10'"..OooooWWooooooooooooO..",'#10
+  +'"..OooooWWooooooooooooO..",'#10'"..OooooWWooooooooooooO..",'#10'"..Oooooooo'
+  +'oooooooooooO..",'#10'"..OooooooooooooooooooO..",'#10'"..Ooooooooooooooooooo'
+  +'O..",'#10'"..OOOOOOOOOOOOOOOOOOOO..",'#10'"........................",'#10'"'
+  +'........................"};'#10
+]);

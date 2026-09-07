@@ -556,8 +556,12 @@ split — a single mixed package will not install):
   `Package > Open Package File (.lpk)`, Compile, then **Install** — the IDE
   rebuilds and a **FireLite** tab with `TFireLiteComponent` appears on the
   component palette.
-- `pascal/FireLiteComponent.pas` — the drop-on-form component. NetSync and
-  CloudSync are fully exposed as Object Inspector properties:
+- `pascal/FireLiteComponent.pas` — the drop-on-form component (palette icon
+  included via `tfirelitecomponent.lrs`, built from `tfirelitecomponent.xpm`
+  with `lazres`). Sync is opt-in: `NetSyncEnabled` / `CloudSyncEnabled`
+  default to False and the remaining sync properties are inert until enabled
+  (`StartNetSync` / `StartCloudSync` raise otherwise). NetSync and CloudSync
+  options when enabled:
   `NetSyncName`, `NetSyncRoomKey`, `NetSyncPort`, `NetSyncDiscovery`,
   `CloudSyncMode`, `CloudSyncClientID`, `CloudSyncRoomName`, `CloudSyncRoomKey`,
   `CloudSyncAuthToken`, `CloudSyncAddress`, with one-call `StartNetSync` / `StartCloudSync` methods.
