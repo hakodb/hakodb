@@ -2,7 +2,7 @@
 <CONFIG>
   <Package Version="5.0">
     <PathDelim Value="\"/>
-    <Name Value="FireLite"/>
+    <Name Value="FireLitePkg"/>
     <Author Value="FireLite contributors"/>
     <CompilerOptions>
       <Version Value="11"/>
