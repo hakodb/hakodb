@@ -546,7 +546,7 @@ end;
 
 The wrapper also ships as a ready-to-use **Lazarus package**:
 
-- `pascal/firelite.lpk` — install it via `Package > Open Package File (.lpk)` in
+- `pascal/FireLitePkg.lpk` — install it via `Package > Open Package File (.lpk)` in
   the Lazarus IDE (`Compile`, then `Install`). It provides `FireLiteRaw`,
   `FireLite`, and `FireLiteComponent` (a `TComponent` wrapper you can drop on a
   form) and puts a **FireLite** tab on the component palette.
