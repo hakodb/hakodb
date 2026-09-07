@@ -26,13 +26,16 @@
         <HasRegisterProc Value="True"/>
       </Item1>
     </Files>
-    <RequiredPkgs Count="2">
+    <RequiredPkgs Count="3">
       <Item1>
         <PackageName Value="FireLitePkg"/>
       </Item1>
       <Item2>
         <PackageName Value="FCL"/>
       </Item2>
+      <Item3>
+        <PackageName Value="LCL"/>
+      </Item3>
     </RequiredPkgs>
     <UsageOptions>
       <UnitPath Value="$(PkgOutDir)"/>

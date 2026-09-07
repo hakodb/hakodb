@@ -14,7 +14,7 @@ unit FireLitePkgReg;
 interface
 
 uses
-  Classes;
+  Classes, LResources;
 
 procedure Register;
 
