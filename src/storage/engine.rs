@@ -195,6 +195,12 @@ impl StorageEngine {
         };
 
         engine.recover()?;
+        // WAL hygiene: hot-small collections pile history that nothing ever
+        // compacts (segments never spill at this volume). One bounded rewrite
+        // on open when stale history dominates; best-effort, never fails open.
+        if engine.wal_snapshot_worthwhile() {
+            let _ = engine.rewrite_wal_snapshot();
+        }
         Ok(engine)
     }
 
@@ -829,6 +835,18 @@ impl StorageEngine {
         Ok(out)
     }
 
+    /// WAL-bloat check: true when the log file holds mostly stale history
+    /// and a snapshot rewrite would actually reclaim. Heuristic, not exact:
+    /// past the compaction threshold AND over ~3x live inlined bytes.
+    /// Tombstones count as zero live, so a dead-only WAL always qualifies
+    /// once past the threshold. `inlined_bytes` is maintained on every index
+    /// write, so this is O(1) — safe on open and on every manual compact.
+    pub(crate) fn wal_snapshot_worthwhile(&self) -> bool {
+        let wal_len = self.wal.file.metadata().map(|m| m.len()).unwrap_or(0);
+        wal_len > self.compaction_threshold_bytes as u64
+            && wal_len > (self.inlined_bytes as u64).saturating_mul(3)
+    }
+
     pub fn compact(&mut self) -> Result<()> {
         // 1. FORCED ROTATION: Ensure current data is eligible for compaction
         if self.segments.get(&self.active_segment_id)
@@ -860,7 +878,15 @@ impl StorageEngine {
             .filter(|&&id| id != self.active_segment_id)
             .cloned().collect();
 
-        if immutable_ids.is_empty() { return Ok(()); }
+        // ponytail: no segments to merge, but a hot-small collection can
+        // still hold megabytes of stale WAL history (nothing ever spills).
+        // Rewrite the snapshot when bloat dominates; otherwise a no-op.
+        if immutable_ids.is_empty() {
+            if self.wal_snapshot_worthwhile() {
+                self.rewrite_wal_snapshot()?;
+            }
+            return Ok(());
+        }
 
         // 2. GLOBAL MERGE: Collect ALL data from ALL immutable segments
         let mut entries = Vec::new();

@@ -1,6 +1,6 @@
 [package]
 name = "firelite"
-version = "0.7.10"
+version = "0.7.11"
 edition = "2021"
 authors = ["AbcDev Team"]
 description = "Embedded & Cloud-native Document Engine"

@@ -6,11 +6,22 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 FireLite speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.7.10 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.7.11 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.7.10)
+## What's new (0.7.2 → 0.7.11)
+
+### v0.7.11 — WAL history compaction for hot-small collections
+- **Problem.** Small-but-hot collections (sync checkpoints, carts, sessions)
+  appended WAL history nothing ever reclaimed: segments never spill at that
+  volume, and `compact()` early-returned before the WAL rewrite when no
+  segments needed merging — not even manual compact helped.
+- **Fix.** `StorageEngine::compact()` now rewrites the WAL snapshot whenever
+  stale history dominates (file past the compaction threshold *and* over ~3x
+  live inlined bytes — O(1) check, tombstones count as zero), even with zero
+  segments to merge. Same bounded rewrite runs once at open (best-effort).
+  Existing `compact` CLI/FFI/app paths reclaim automatically.
 
 ### v0.7.10 — Pascal SDK install fixes + component polish
 - Canonical runtime/designtime split (`FireLitePkg` + `FireLiteDesign`);
@@ -131,7 +142,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.7.10)](#whats-new-072--0710)
+- [What's new (0.7.2 → 0.7.11)](#whats-new-072--0711)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)
