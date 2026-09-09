@@ -62,7 +62,8 @@ cbindgen = "0.28"
 
 [workspace]
 members = [
-    ".",          
-    "cli",  
-    "fsync"
+    ".",
+    "cli",
+    "fsync",
+    "cloudserver"
 ]
