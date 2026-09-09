@@ -65,6 +65,11 @@ pub enum CloudPacket {
     /// Client -> Server: Initial Auth & Handshake.
     /// `api_key` / `client_version` are additive (serde defaults): old
     /// peers omit them and still authenticate against open groups.
+    /// `enc_fp` / `enc_cols` carry the same capability advertisement as the
+    /// mesh `SyncCaps` packet (see `crate::sync_guard`): the sender's key
+    /// fingerprint plus the collections it encrypts at rest. Absent on old
+    /// peers, which are therefore treated as unverified for encrypted
+    /// rooms (fail closed).
     Authenticate {
         token: String,
         client_id: String,
@@ -74,6 +79,10 @@ pub enum CloudPacket {
         api_key: Option<String>,
         #[serde(default)]
         client_version: Option<String>,
+        #[serde(default)]
+        enc_fp: Option<[u8; 32]>,
+        #[serde(default)]
+        enc_cols: Vec<String>,
     },
     /// Server -> Client: Handshake Response
     AuthResult {
@@ -455,6 +464,10 @@ pub struct CloudSync {
     outbound_tx: Arc<AsyncMutex<Option<mpsc::Sender<CloudPacket>>>>,
     // Server mode: room registry so `status()` can report hosted rooms.
     room_registry: Option<Arc<RoomRegistry>>,
+    /// Peer capability announcements for the encryption fail-closed rules.
+    /// Server: keyed by peer_key, set at auth, cleared on disconnect.
+    /// Client: the server's caps live under the fixed key `"server"`.
+    caps: Arc<crate::sync_guard::CapsMap>,
 }
 
 #[cfg(feature = "cloud-sync")]
@@ -525,6 +538,7 @@ impl CloudSync {
             active_peers: Arc::new(AsyncRwLock::new(HashMap::new())),
             outbound_tx: Arc::new(AsyncMutex::new(None)),
             room_registry: Some(registry),
+            caps: Arc::new(crate::sync_guard::CapsMap::default()),
         }
     }
 
@@ -557,6 +571,7 @@ impl CloudSync {
             active_peers: Arc::new(AsyncRwLock::new(HashMap::new())),
             outbound_tx: Arc::new(AsyncMutex::new(None)),
             room_registry: None,
+            caps: Arc::new(crate::sync_guard::CapsMap::default()),
         }
     }
 
@@ -655,6 +670,7 @@ impl CloudSync {
         let running = self.running.clone();
         let echo_cache = self.echo_cache.clone();
         let active_peers = self.active_peers.clone();
+        let caps_flush = self.caps.clone();
 
         tokio::spawn(async move {
             let mut rx = match rx_option.lock().await.take() {
@@ -668,7 +684,7 @@ impl CloudSync {
             while running.load(Ordering::Relaxed) {
                 tokio::select! {
                     _ = interval.tick() => {
-                        Self::flush_ingest_buffer(&db, &mut batch_buffer, &echo_cache, &active_peers).await;
+                        Self::flush_ingest_buffer(&db, &mut batch_buffer, &echo_cache, &active_peers, &caps_flush).await;
                     }
                     item = rx.recv() => {
                         match item {
@@ -680,7 +696,7 @@ impl CloudSync {
 
                                 let total_pending: usize = batch_buffer.values().map(|v| v.len()).sum();
                                 if total_pending >= 512 {
-                                    Self::flush_ingest_buffer(&db, &mut batch_buffer, &echo_cache, &active_peers).await;
+                                    Self::flush_ingest_buffer(&db, &mut batch_buffer, &echo_cache, &active_peers, &caps_flush).await;
                                 }
                             }
                             None => break,
@@ -696,6 +712,7 @@ impl CloudSync {
         buffer: &mut HashMap<String, Vec<IngestItem>>,
         echo_cache: &Arc<StdMutex<HashMap<String, i64>>>,
         peers: &Arc<AsyncRwLock<HashMap<String, PeerInfo>>>,
+        caps: &Arc<crate::sync_guard::CapsMap>,
     ) {
         if buffer.is_empty() {
             return;
@@ -726,11 +743,44 @@ impl CloudSync {
                 continue;
             }
 
+            // Encryption fail-closed (inbound): when THIS node encrypts the
+            // collection at rest, ops are accepted only from senders that
+            // proved the same key. Namespaces: server shards are storage
+            // names (`prefix_col`), clients use plain names — a match on
+            // either counts (documented; fail-closed direction).
+            // A keyless node never matches: its own encrypted set is empty.
+            let enc_local =
+                db.is_collection_encrypted(&storage_col) || db.is_collection_encrypted(&plain_col);
+            let local_fp =
+                crate::sync_guard::local_fingerprint(db.config.encryption_key.as_deref());
+
             let mut apply_ops: Vec<WalOp> = Vec::with_capacity(items.len());
             let mut index_puts: Vec<(String, Arc<FireLiteDoc>)> = Vec::new();
             let mut sender_relays: HashMap<Option<String>, Vec<WalOp>> = HashMap::new();
 
             for item in &items {
+                // Receiver rule (server side only): drop ops for
+                // locally-encrypted collections unless the sender proved the
+                // same key. Client-side receipts carry no sender
+                // (`sender_client_id: None` — the hub is trusted transport;
+                // the server already filtered what it forwards) and are
+                // always accepted here.
+                if enc_local {
+                    if let Some(sender_key) = item.sender_client_id.as_deref() {
+                        let sender = caps.get(sender_key);
+                        if !crate::sync_guard::caps_allow(true, local_fp, sender.as_ref()) {
+                            caps.warn(
+                                sender_key,
+                                &plain_col,
+                                &format!(
+                                    "dropping inbound ops for locally-encrypted '{plain_col}' from unverified sender '{sender_key}' (local key {}, peer needs the same encryption key; upgrade old peers)",
+                                    crate::sync_guard::fp_short(&local_fp),
+                                ),
+                            );
+                            continue;
+                        }
+                    }
+                }
                 match &item.op {
                     WalOp::PutInlined { key, value } => {
                         let ts = FireLiteDoc::decode(value)
@@ -802,6 +852,12 @@ impl CloudSync {
 
             // Relay packet to connected members of the SAME room (except origin).
             // The collection name is translated back to the client-facing name.
+            // Encryption fail-closed: a batch is withheld from a recipient
+            // when EITHER the origin marked this collection encrypted and the
+            // recipient's fingerprint mismatches, OR this server encrypts it
+            // locally and the recipient mismatches. A keyless hub (no local
+            // key) relays as before — receivers enforce locally. Either way
+            // the plaintext never leaves silently toward an unverified peer.
             for (origin_sender, ops) in sender_relays {
                 if ops.is_empty() {
                     continue;
@@ -821,9 +877,37 @@ impl CloudSync {
                     let peers_guard = peers.read().await;
 
                     for (peer_id, info) in peers_guard.iter() {
-                        if info.prefix == prefix && Some(peer_id) != origin_sender.as_ref() {
-                            let _ = info.tx.try_send(msg.clone());
+                        if info.prefix != prefix || Some(peer_id) == origin_sender.as_ref() {
+                            continue;
                         }
+                        let recipient = caps.get(peer_id);
+                        let origin = origin_sender
+                            .as_deref()
+                            .and_then(|o| caps.get(o));
+                        let origin_encrypted = origin
+                            .as_ref()
+                            .map(|o| o.encrypted_cols.iter().any(|c| c == &plain_col))
+                            .unwrap_or(false);
+                        let origin_fp = origin.map(|o| o.key_fp).unwrap_or([0u8; 32]);
+                        let origin_ok = !origin_encrypted
+                            || crate::sync_guard::caps_allow(
+                                true,
+                                origin_fp,
+                                recipient.as_ref(),
+                            );
+                        let local_ok = !enc_local
+                            || crate::sync_guard::caps_allow(true, local_fp, recipient.as_ref());
+                        if !(origin_ok && local_ok) {
+                            caps.warn(
+                                peer_id,
+                                &plain_col,
+                                &format!(
+                                    "withholding relay of '{plain_col}' from peer '{peer_id}' (unverified key for an encrypted room)"
+                                ),
+                            );
+                            continue;
+                        }
+                        let _ = info.tx.try_send(msg.clone());
                     }
                 }
             }
@@ -908,6 +992,7 @@ kind,
         let running = self.running.clone();
         let seen_messages = self.seen_messages.clone();
         let echo_cache = self.echo_cache.clone();
+        let caps_all = self.caps.clone();
         // The room registry is created once (server constructor) and reused so
         // `status()` can report the number of hosted rooms.
         let rooms = self
@@ -945,6 +1030,7 @@ kind,
                     let active_peers = active_peers.clone();
                     let seen_messages = seen_messages.clone();
                     let rooms = rooms.clone();
+                    let caps_one = caps_all.clone();
 
                     tokio::spawn(async move {
                         if let Ok(ws_stream) = tokio_tungstenite::accept_async(stream).await {
@@ -955,6 +1041,7 @@ kind,
                                 rooms,
                                 active_peers,
                                 seen_messages,
+                                caps_one,
                             )
                             .await;
                         }
@@ -992,6 +1079,7 @@ kind,
         rooms: Arc<RoomRegistry>,
         peers: Arc<AsyncRwLock<HashMap<String, PeerInfo>>>,
         seen_messages: Arc<AsyncMutex<Vec<u128>>>,
+        caps: Arc<crate::sync_guard::CapsMap>,
     ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
@@ -1009,6 +1097,8 @@ kind,
                 room_name,
                 room_key,
                 api_key,
+                enc_fp,
+                enc_cols,
                 ..
             }) = rmp_serde::from_slice(&bytes)
             {
@@ -1045,6 +1135,16 @@ kind,
                             PeerInfo {
                                 tx: client_tx,
                                 prefix,
+                            },
+                        );
+                        // Record encryption capabilities for the fail-closed
+                        // rules (relay + apply consult this, not the wire).
+                        // Absent fields (old peers) store as unverified.
+                        caps.set(
+                            &peer_key,
+                            crate::sync_guard::PeerCaps {
+                                key_fp: enc_fp.unwrap_or([0u8; 32]),
+                                encrypted_cols: enc_cols.clone(),
                             },
                         );
 
@@ -1132,7 +1232,7 @@ kind,
                                         .await;
                                 }
                             }
-                            CloudPacket::VersionPing { versions: client_versions } => {
+                            CloudPacket::VersionPing { versions: client_versions, .. } => {
                                 let prefix = room_prefix.clone();
 
                                 // 1. SYMMETRICAL REPLY: Send the Server's room-scoped
@@ -1165,6 +1265,7 @@ kind,
                                             client_ts,
                                             &peer_key,
                                             &peers,
+                                            &caps,
                                         )
                                         .await;
                                     }
@@ -1182,6 +1283,7 @@ kind,
 
         send_task.abort();
         peers.write().await.remove(&peer_key);
+        caps.remove(&peer_key);
     }
 
     /// LWW guard for inbound deletes: a tombstone older than (or equal
@@ -1275,7 +1377,26 @@ kind,
         since_ts: i64,
         peer_key: &str,
         peers: &Arc<AsyncRwLock<HashMap<String, PeerInfo>>>,
+        caps: &Arc<crate::sync_guard::CapsMap>,
     ) {
+        // Sender rule: a locally-encrypted room (storage namespace on the
+        // server) only replays to a fingerprint-verified peer. Old/silent
+        // peers pause here loudly instead of leaking on catch-up.
+        if db.is_collection_encrypted(storage_col) {
+            let local_fp =
+                crate::sync_guard::local_fingerprint(db.config.encryption_key.as_deref());
+            let peer = caps.get(peer_key);
+            if !crate::sync_guard::caps_allow(true, local_fp, peer.as_ref()) {
+                caps.warn(
+                    peer_key,
+                    plain_col,
+                    &format!(
+                        "withholding catch-up replay of encrypted '{plain_col}' from peer '{peer_key}' (unverified key)"
+                    ),
+                );
+                return;
+            }
+        }
         let ops = Self::collect_catchup_ops(db, storage_col, plain_col, since_ts);
 
         if !ops.is_empty() {
@@ -1303,6 +1424,7 @@ kind,
         let db = self.db.clone();
         let active_peers = self.active_peers.clone();
         let running = self.running.clone();
+        let caps_srv = self.caps.clone();
 
         tokio::task::spawn_blocking(move || {
             let mut offsets: HashMap<String, u64> = HashMap::new();
@@ -1387,6 +1509,16 @@ kind,
                                 }
 
                                 if !to_send.is_empty() {
+                                    // Sender rule: when THIS server encrypts
+                                    // the collection, fan out only to
+                                    // fingerprint-matched peers of the room.
+                                    // (Storage or plain name match counts;
+                                    // see the ingest rule.)
+                                    let enc_local = db.is_collection_encrypted(&col)
+                                        || db.is_collection_encrypted(&plain_col);
+                                    let local_fp = crate::sync_guard::local_fingerprint(
+                                        db.config.encryption_key.as_deref(),
+                                    );
                                     let packet = CloudPacket::Replication {
                                         msg_id: SystemTime::now()
                                             .duration_since(UNIX_EPOCH)
@@ -1400,13 +1532,33 @@ kind,
                                         let msg = Message::Binary(bytes.into());
                                         let rt = tokio::runtime::Handle::current();
                                         let peers_ptr = active_peers.clone();
+                                        let caps_ptr = caps_srv.clone();
                                         let target_prefix = prefix.clone();
+                                        let plain_c = plain_col.clone();
                                         rt.block_on(async move {
                                             let peers_guard = peers_ptr.read().await;
-                                            for (_, info) in peers_guard.iter() {
-                                                if info.prefix == target_prefix {
-                                                    let _ = info.tx.try_send(msg.clone());
+                                            for (peer_id, info) in peers_guard.iter() {
+                                                if info.prefix != target_prefix {
+                                                    continue;
                                                 }
+                                                if enc_local {
+                                                    let peer = caps_ptr.get(peer_id);
+                                                    if !crate::sync_guard::caps_allow(
+                                                        true,
+                                                        local_fp,
+                                                        peer.as_ref(),
+                                                    ) {
+                                                        caps_ptr.warn(
+                                                            peer_id,
+                                                            &plain_c,
+                                                            &format!(
+                                                                "withholding server fan-out of '{plain_c}' from peer '{peer_id}' (unverified key for an encrypted room)"
+                                                            ),
+                                                        );
+                                                        continue;
+                                                    }
+                                                }
+                                                let _ = info.tx.try_send(msg.clone());
                                             }
                                         });
                                     }
@@ -1468,6 +1620,15 @@ kind,
                         room_key: room_key_str.clone(),
                         api_key: api_key.clone(),
                         client_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                        enc_fp: Some(crate::sync_guard::local_fingerprint(
+                            db.config.encryption_key.as_deref(),
+                        )),
+                        enc_cols: db
+                            .list_collections()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|c| db.is_collection_encrypted(c))
+                            .collect(),
                     };
                     let auth_bytes = rmp_serde::to_vec_named(&auth_packet).unwrap();
                     if ws_tx.send(Message::Binary(auth_bytes.into())).await.is_err() {
@@ -1476,12 +1637,12 @@ kind,
                     }
 
                     if let Some(Ok(Message::Binary(bytes))) = ws_rx.next().await {
-                        if let Ok(CloudPacket::AuthResult { success: true, .. }) =
-                            rmp_serde::from_slice(&bytes)
-                        {
-                            let ping = CloudPacket::VersionPing {
-                                versions: db.get_version_map(),
-                            };
+                    if let Ok(CloudPacket::AuthResult { success: true, .. }) =
+                        rmp_serde::from_slice(&bytes)
+                    {
+                        let ping = CloudPacket::VersionPing {
+                            versions: db.get_version_map(),
+                        };
                             let ping_bytes = rmp_serde::to_vec_named(&ping).unwrap();
                             let _ = ws_tx.send(Message::Binary(ping_bytes.into())).await;
 
@@ -1555,6 +1716,8 @@ kind,
         server_ts: i64,
         outbound_tx: &mpsc::Sender<CloudPacket>,
     ) {
+        // NOTE: no encryption gate here by design (see client tailer above):
+        // the hub enforces on receipt and relay.
         let ops = Self::collect_catchup_ops(db, collection, collection, server_ts);
 
         if !ops.is_empty() {
@@ -1595,6 +1758,11 @@ kind,
                     if crate::engine::engine::is_sync_excluded(&col) {
                         continue;
                     }
+                    // NOTE: no encryption gate here by design. This client
+                    // pushes everything upstream; the hub (which sees the
+                    // capabilities we announced at auth) enforces admission,
+                    // relay, and storage rules. Gating here would brick
+                    // encrypted rooms against the standard keyless hub.
                     if let Ok(shard_arc) = db.get_shard(&col) {
                         let last_pos = *offsets.get(&col).unwrap_or(&0);
                         let tail_res = {
@@ -1921,10 +2089,16 @@ mod tests {
             CloudPacket::Authenticate {
                 api_key,
                 client_version,
+                enc_fp,
+                enc_cols,
                 ..
             } => {
                 assert_eq!(api_key, None);
                 assert_eq!(client_version, None);
+                // Encryption caps likewise default: old peers authenticate
+                // as unverified (fail-closed for encrypted rooms).
+                assert_eq!(enc_fp, None);
+                assert!(enc_cols.is_empty());
             }
             _ => panic!("wrong variant"),
         }

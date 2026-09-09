@@ -7,6 +7,7 @@ pub mod index;
 pub mod memory;
 pub mod query;
 pub mod storage;
+pub mod sync_guard;
 
 #[cfg(feature = "tauri-gateway")]
 pub mod tauri_gateway;

@@ -25,6 +25,8 @@ use sha2::{Sha256, Digest};
 #[cfg(feature = "net-sync")]
 use tokio::net::{TcpStream, tcp::OwnedWriteHalf};
 #[cfg(feature = "net-sync")]
+use crate::sync_guard::{self, CapsMap, PeerCaps};
+#[cfg(feature = "net-sync")]
 use mdns_sd::{ServiceDaemon, ServiceInfo, ServiceEvent};
 #[cfg(feature = "net-sync")]
 use crate::storage::blob::BlobWork;
@@ -55,6 +57,14 @@ pub enum NetPacket {
     },
     SyncRequest,
     Replication { msg_id: u128, collection: String, ops: Vec<WalOp> },
+    /// Capability advertisement for the encryption fail-closed rules (see
+    /// `crate::sync_guard`). Appended LAST so old peers keep decoding every
+    /// earlier variant; unknown trailing variants fail decode and are
+    /// silently skipped by the receive loop (no disconnect, no breakage).
+    SyncCaps {
+        key_fp: [u8; 32],
+        encrypted_cols: Vec<String>,
+    },
 }
 
 // --- UDP broadcast discovery (mobile path; desktop opt-in) ---
@@ -362,6 +372,10 @@ impl NetSyncer {
     pub async fn start(&self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
         self.stop();
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+        // Peer capability announcements for the encryption fail-closed
+        // rules. Fresh per start(): reconnects re-announce, so nothing
+        // stale survives a restart.
+        let caps_map: Arc<CapsMap> = Arc::new(CapsMap::default());
         let db_ptr = self.db.clone();
         let peers_ptr = self.peers.clone();
         let seen_ptr = self.seen_messages.clone();
@@ -371,6 +385,7 @@ impl NetSyncer {
         let excl_srv = self.excluded_collections.clone();
         let last_ping_ptr = self.last_mesh_ping.clone();
         let echo_cache_clone = self.echo_cache.clone();
+        let caps_srv = caps_map.clone();
 
         let relay_enabled = self.enable_relay; 
 
@@ -385,13 +400,14 @@ impl NetSyncer {
                 let excl_c = excl_srv.clone();
                 let lp_c = last_ping_ptr.clone();
                 let echo_c = echo_cache_clone.clone();
+                let caps_c = caps_srv.clone();
                 
                 // SPAWN the handler so the loop can continue accepting other peers
                 tokio::spawn(async move {
                     handle_peer(
                         stream, db_c, peers_c, seen_c, stx_c, 
                         sid_c, hash_c, excl_c, relay_enabled, 
-                        lp_c, echo_c
+                        lp_c, echo_c, caps_c
                     ).await;
                 });
             }
@@ -435,6 +451,7 @@ impl NetSyncer {
         // broadcast); the dial loop reads it uniformly.
         let discovery_cache: Arc<Mutex<HashMap<String, (String, Instant)>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let caps_disc = caps_map.clone();
 
         // 5. UDP broadcast discovery — runs when the mode enables it
         // (mobile default; desktop opt-in via with_discovery(Both/Broadcast)
@@ -545,6 +562,7 @@ impl NetSyncer {
                                 let lp_c = lp_disc.clone();
                                 let addr_c = p_addr.clone();
                                 let echo_cache = echo_cache_clone.clone();
+                                let caps_c = caps_disc.clone();
 
                                 tokio::spawn(async move {
                                     // Short timeout so a single dead peer doesn't hang the loop
@@ -552,7 +570,7 @@ impl NetSyncer {
                                         handle_peer(
                                             stream, db_c, peers_c, seen_c, stx_c, 
                                             sid_c, hash_disc, excl_c, relay_disc, lp_c,
-                                            echo_cache
+                                            echo_cache, caps_c
                                         ).await;
                                     }
                                 });
@@ -572,6 +590,7 @@ impl NetSyncer {
         let offsets_tail = self.shard_offsets.clone();
         let excl_tail = self.excluded_collections.clone();
         let echo_cache_clone = self.echo_cache.clone();
+        let caps_tail = caps_map.clone();
         
         let handle_tailer = tokio::task::spawn_blocking(move || {
             let mut last_checkpoint_save = Instant::now(); // Use Instant for timing
@@ -587,6 +606,18 @@ impl NetSyncer {
                 // Adding hidden internal firelite security collection into sync
                 let mut cols = db_tail.list_collections().unwrap_or_default();
                 cols.extend(vec!["__firelite_security".to_string()]);
+
+                // Encryption fail-closed set for this pass: collections WE
+                // encrypt at rest. Empty in unencrypted deployments, in which
+                // case every send below takes the legacy broadcast path.
+                let local_fp = sync_guard::local_fingerprint(
+                    db_tail.config.encryption_key.as_deref(),
+                );
+                let enc_cols: HashSet<String> = cols
+                    .iter()
+                    .filter(|c| db_tail.is_collection_encrypted(c))
+                    .cloned()
+                    .collect();
 
                 for col in cols {
                     if excl_tail.contains(&col) { continue; }
@@ -656,7 +687,20 @@ impl NetSyncer {
                                 }
                             }
                             if !logical_ops.is_empty() {
-                                broadcast_mesh(&peers_tail, &col, logical_ops, 0);
+                                if enc_cols.contains(&col) {
+                                    // Encrypted room: fan out only to
+                                    // fingerprint-matched peers (same msg_id
+                                    // for all, preserving dedup semantics).
+                                    send_filtered_mesh(
+                                        &peers_tail,
+                                        &caps_tail,
+                                        &col,
+                                        logical_ops,
+                                        local_fp,
+                                    );
+                                } else {
+                                    broadcast_mesh(&peers_tail, &col, logical_ops, 0);
+                                }
                             }
                             offsets.insert(col, new_pos);
                             overall_changed = true;
@@ -755,6 +799,62 @@ impl NetSyncer {
 }
 
 // --- Logic Helpers ---
+
+/// This node's capability advertisement: key fingerprint + the collections
+/// it encrypts at rest (including the force-synced security collection,
+/// which `list_collections` omits).
+#[cfg(feature = "net-sync")]
+fn local_caps(db: &Arc<FireLite>) -> PeerCaps {
+    let mut cols: Vec<String> = db
+        .list_collections()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| db.is_collection_encrypted(c))
+        .collect();
+    if db.is_collection_encrypted("__firelite_security")
+        && !cols.iter().any(|c| c == "__firelite_security")
+    {
+        cols.push("__firelite_security".to_string());
+    }
+    PeerCaps {
+        key_fp: sync_guard::local_fingerprint(db.config.encryption_key.as_deref()),
+        encrypted_cols: cols,
+    }
+}
+
+/// Warn text shared by sender/receiver drops. Names the peer, collection,
+/// and both fingerprints so an operator can tell "wrong key" from "no key
+/// / old peer" at a glance.
+#[cfg(feature = "net-sync")]
+fn caps_warn_msg(dir: &str, peer: &str, col: &str, local_fp: [u8; 32]) -> String {
+    format!(
+        "{dir} encrypted collection '{col}' for peer '{peer}' (local key {local}, peer unverified — peer needs the same encryption key; upgrade old peers). Wire stays silent instead of leaking plaintext.",
+        local = sync_guard::fp_short(&local_fp),
+    )
+}
+
+/// Sender-side rule for one (peer, collection): true when the collection
+/// may leave this node toward that peer. Warns (throttled) on refusal.
+#[cfg(feature = "net-sync")]
+fn peer_may_send(
+    db: &Arc<FireLite>,
+    caps: &Arc<CapsMap>,
+    peer_id: &str,
+    col: &str,
+    local_fp: [u8; 32],
+) -> bool {
+    let enc = db.is_collection_encrypted(col);
+    if sync_guard::caps_allow(enc, local_fp, caps.get(&peer_id).as_ref()) {
+        return true;
+    }
+    caps.warn(
+        peer_id,
+        col,
+        &caps_warn_msg("skipping send of", peer_id, col, local_fp),
+    );
+    false
+}
+
 async fn handle_peer(
     stream: TcpStream, 
     db: Arc<FireLite>, 
@@ -767,6 +867,7 @@ async fn handle_peer(
     enable_relay: bool, 
     last_ping: Arc<Mutex<Instant>>,
     echo_cache: Arc<Mutex<HashMap<String, i64>>>,
+    caps: Arc<CapsMap>,
 ) {
     let (mut reader, mut writer) = stream.into_split();
 
@@ -788,6 +889,23 @@ async fn handle_peer(
         }
         _ => return,
     };
+
+    // 1b. Announce our encryption capabilities immediately (before any
+    // data flows). Old peers fail to decode the new variant and skip it
+    // silently — no disconnect, no breakage; they simply never present
+    // caps and are treated as unverified for encrypted rooms.
+    {
+        let ours = local_caps(&db);
+        let packet = NetPacket::SyncCaps {
+            key_fp: ours.key_fp,
+            encrypted_cols: ours.encrypted_cols,
+        };
+        if let Ok(bytes) = bincode::serialize(&packet) {
+            if send_raw(&mut writer, &bytes).await.is_err() {
+                return;
+            }
+        }
+    }
 
     // 2. Register Peer
     {
@@ -853,7 +971,7 @@ async fn handle_peer(
                         // }
                         if let Ok(local_version) = db.get_collection_version(&col) {
                             if local_version > remote_time {
-                                handle_delta_send(&db, &peers_map, &peer_id, &col, remote_time).await;
+                                handle_delta_send(&db, &peers_map, &peer_id, &col, remote_time, &caps).await;
                             }
                         } else {
                             // Log that we couldn't check this collection due to an error
@@ -862,7 +980,7 @@ async fn handle_peer(
                     }
                 }
                 NetPacket::SyncRequest => {
-                    handle_bootstrap(&db, &peers_map, &peer_id, &excluded).await;
+                    handle_bootstrap(&db, &peers_map, &peer_id, &excluded, &caps).await;
                 }
                 NetPacket::Replication { msg_id, collection, ops } => {
                     if excluded.contains(&collection) {continue;}
@@ -874,11 +992,61 @@ async fn handle_peer(
                         if cache.len() > 1000 { cache.remove(0); }
                     }
 
+                    // Receiver rule (fail-closed): drop the batch when the
+                    // collection is encrypted locally and the sender never
+                    // proved the same key. Sender-side filtering is the
+                    // primary guard; this is defense in depth (notably
+                    // against old senders, which announce nothing).
+                    let peer_caps = caps.get(&peer_id);
+                    let enc_local = db.is_collection_encrypted(&collection);
+                    let local_fp = sync_guard::local_fingerprint(
+                        db.config.encryption_key.as_deref(),
+                    );
+                    if !sync_guard::caps_allow(enc_local, local_fp, peer_caps.as_ref()) {
+                        caps.warn(
+                            &peer_id,
+                            &collection,
+                            &caps_warn_msg("dropping", &peer_id, &collection, local_fp),
+                        );
+                        continue;
+                    }
+
                     // Apply (Lock is released here)
                     apply_replication_batch(db.clone(), collection, ops, echo_cache_clone.clone()).await; 
 
                     if msg_id != 0 && enable_relay { 
-                        relay_mesh(&peers_map, &raw, &peer_id).await; 
+                        relay_mesh(&peers_map, &caps, &raw, &peer_id).await; 
+                    }
+                }
+                NetPacket::SyncCaps { key_fp, encrypted_cols } => {
+                    // Record the announcement (clears that peer's warn
+                    // history), then re-request versions: ops the peer
+                    // skipped for lack of caps are still behind our version
+                    // vector and get picked up by the delta that follows.
+                    caps.set(
+                        &peer_id,
+                        PeerCaps {
+                            key_fp,
+                            encrypted_cols: encrypted_cols.clone(),
+                        },
+                    );                    crate::util::log::info(&format!(
+                        "[sync] peer '{peer_id}' announced encryption caps (key {}, {} encrypted cols)",
+                        sync_guard::fp_short(&key_fp),
+                        encrypted_cols.len(),
+                    ));
+                    let my_versions = db.get_version_map();
+                    let my_indexes = db.list_indexes(None);
+                    let mut guard = peers_map.lock().await;
+                    if let Some(w) = guard.get_mut(&peer_id) {
+                        let _ = send_packet(
+                            w,
+                            NetPacket::Ping {
+                                versions: my_versions,
+                                indexes: my_indexes,
+                            },
+                        )
+                        .await;
+                        let _ = send_packet(w, NetPacket::SyncRequest).await;
                     }
                 }
                 _ => {}
@@ -888,6 +1056,7 @@ async fn handle_peer(
 
     // 5. Cleanup
     peers_map.lock().await.remove(&peer_id);
+    caps.remove(&peer_id);
     update_status(&status_tx, &peers_map).await;
 }
 
@@ -925,14 +1094,21 @@ fn resolve_op_to_bytes(shard_arc: &Arc<RwLock<crate::storage::engine::StorageEng
     Some(bytes)
 }
 
-async fn handle_bootstrap(db: &Arc<FireLite>, peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, peer_id: &str, excluded: &HashSet<String>) {
+async fn handle_bootstrap(db: &Arc<FireLite>, peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, peer_id: &str, excluded: &HashSet<String>, caps: &Arc<CapsMap>) {
     let encryption_key = db.config.encryption_key.as_deref();
 
     let mut cols = db.list_collections().unwrap_or_default();
     cols.extend(vec!["__firelite_security".to_string()]);
 
+    // Sender rule, evaluated once per collection (before any disk reads,
+    // so refused rooms also skip the inflation work).
+    let local_fp = sync_guard::local_fingerprint(db.config.encryption_key.as_deref());
+
     for col in cols {
         if excluded.contains(&col) { continue; }
+        if !peer_may_send(db, caps, peer_id, &col, local_fp) {
+            continue;
+        }
         // let shard_arc = db.get_shard(&col);
         let shard_arc = match db.get_shard(&col) {
             Ok(s) => s,
@@ -1084,8 +1260,14 @@ async fn handle_delta_send(
     peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>,
     peer_id: &str,
     collection: &str,
-    since_time: i64
+    since_time: i64,
+    caps: &Arc<CapsMap>,
 ) {
+    // Sender rule first: refused rooms skip the scan/inflation entirely.
+    let local_fp = sync_guard::local_fingerprint(db.config.encryption_key.as_deref());
+    if !peer_may_send(db, caps, peer_id, collection, local_fp) {
+        return;
+    }
     let batch_ops = collect_delta_ops(db, collection, since_time);
     if batch_ops.is_empty() { return; }
 
@@ -1320,15 +1502,38 @@ kind,
     }
 }
 
-async fn relay_mesh(peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, data: &[u8], sender_id: &str) {
+async fn relay_mesh(
+    peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>,
+    caps: &Arc<CapsMap>,
+    data: &[u8],
+    sender_id: &str,
+) {
+    // Peek the collection so origin-marked encrypted rooms are only
+    // forwarded to fingerprint-matched peers. Unknown origin (old sender)
+    // relays as before — receivers enforce locally. The ORIGINAL bytes go
+    // out: no re-encode, no extra crypto.
+    let encrypted_origin: Option<PeerCaps> = match bincode::deserialize::<NetPacket>(data) {
+        Ok(NetPacket::Replication { collection, .. }) => caps
+            .get(sender_id)
+            .filter(|o| o.encrypted_cols.iter().any(|c| c == &collection)),
+        _ => None,
+    };
     let mut guard = peers.lock().await;
     for (id, writer) in guard.iter_mut() {
-        if id != sender_id { let _ = send_raw(writer, data).await; }
+        if id == sender_id {
+            continue;
+        }
+        if let Some(ref origin) = encrypted_origin {
+            let matched = caps.get(id).map(|rc| rc.key_fp == origin.key_fp);
+            if matched != Some(true) {
+                continue;
+            }
+        }
+        let _ = send_raw(writer, data).await;
     }
 }
 
-fn broadcast_mesh(peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, col: &str, ops: Vec<WalOp>, msg_id: u128) {
-    let id = if msg_id == 0 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() } else { msg_id };
+fn broadcast_mesh(peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, col: &str, ops: Vec<WalOp>, msg_id: u128) {    let id = if msg_id == 0 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() } else { msg_id };
     let packet = NetPacket::Replication { msg_id: id, collection: col.to_string(), ops };
     if let Ok(payload) = bincode::serialize(&packet) {
         let p_ptr = peers.clone();
@@ -1338,6 +1543,49 @@ fn broadcast_mesh(peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, col:
                 // let peer = writer.peer_addr().unwrap().ip().to_string();
                 let _ = send_raw(writer, &payload).await; 
 
+            }
+        });
+    }
+}
+
+/// Tailer fan-out for an ENCRYPTED collection: same packet (same msg_id,
+/// preserving dedup semantics) goes only to fingerprint-matched peers.
+/// Everyone else is skipped with a throttled loud warning — never silently.
+/// Plaintext collections keep using `broadcast_mesh` (zero behavior delta).
+#[cfg(feature = "net-sync")]
+fn send_filtered_mesh(
+    peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>,
+    caps: &Arc<CapsMap>,
+    col: &str,
+    ops: Vec<WalOp>,
+    local_fp: [u8; 32],
+) {
+    let id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros();
+    let packet = NetPacket::Replication {
+        msg_id: id,
+        collection: col.to_string(),
+        ops,
+    };
+    if let Ok(payload) = bincode::serialize(&packet) {
+        let p_ptr = peers.clone();
+        let c_ptr = caps.clone();
+        let col_s = col.to_string();
+        tokio::spawn(async move {
+            let mut guard = p_ptr.lock().await;
+            for (peer_id, writer) in guard.iter_mut() {
+                let peer = c_ptr.get(peer_id);
+                if !sync_guard::caps_allow(true, local_fp, peer.as_ref()) {
+                    c_ptr.warn(
+                        peer_id,
+                        &col_s,
+                        &caps_warn_msg("skipping send of", peer_id, &col_s, local_fp),
+                    );
+                    continue;
+                }
+                let _ = send_raw(writer, &payload).await;
             }
         });
     }
@@ -1564,5 +1812,113 @@ mod tests {
         let guard = cache_b.lock().unwrap();
         let (addr, _) = guard.get("node-a").expect("node-b must hear node-a");
         assert_eq!(addr, "127.0.0.1:7070");
+    }
+
+    fn temp_enc_db(tag: &str, key: &str) -> (Arc<FireLite>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "firelite-netsync-enc-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = FireLiteConfig::default();
+        cfg.durability_mode = DurabilityMode::Manual;
+        cfg.encryption_key = Some(key.to_string());
+        // No encrypted_cols list: encryption is global on this node.
+        let db = Arc::new(FireLite::open(&dir, cfg).unwrap());
+        (db, dir)
+    }
+
+    #[test]
+    fn sync_caps_roundtrip_and_old_peers_skip_it() {
+        // New <-> new: the appended variant survives bincode both ways.
+        let pkt = NetPacket::SyncCaps {
+            key_fp: [7u8; 32],
+            encrypted_cols: vec!["notes".to_string()],
+        };
+        let bytes = bincode::serialize(&pkt).unwrap();
+        match bincode::deserialize::<NetPacket>(&bytes).expect("decode own caps") {
+            NetPacket::SyncCaps {
+                key_fp,
+                encrypted_cols,
+            } => {
+                assert_eq!(key_fp, [7u8; 32]);
+                assert_eq!(encrypted_cols, vec!["notes".to_string()]);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // Old peers (which only know indices 0..=3) fail to decode ANY
+        // trailing-variant packet and skip it via `if let Ok` — the exact
+        // property that keeps mixed-version meshes connected. Simulate by
+        // decoding out-of-range variant index bytes.
+        let mut unknown = vec![99u8, 0, 0, 0];
+        unknown.extend_from_slice(&[0u8; 8]);
+        assert!(
+            bincode::deserialize::<NetPacket>(&unknown).is_err(),
+            "unknown variants must fail (and therefore be skipped, never fatal)"
+        );
+        // Pre-existing variants keep their indices (Identify = 0).
+        let id = NetPacket::Identify {
+            id: "n".to_string(),
+            room_hash: [1u8; 32],
+        };
+        let id_bytes = bincode::serialize(&id).unwrap();
+        assert_eq!(&id_bytes[..4], &[0u8, 0, 0, 0]);
+    }
+
+    #[test]
+    fn local_caps_reflects_at_rest_config() {
+        let (plain_db, _d1) = temp_db("caps-plain");
+        let plain = local_caps(&plain_db);
+        assert_eq!(plain.key_fp, [0u8; 32]);
+        assert!(plain.encrypted_cols.is_empty());
+
+        let (enc_db, _d2) = temp_enc_db("caps-enc", "s3cret");
+        assert!(enc_db.is_collection_encrypted("notes"));
+        assert!(!plain_db.is_collection_encrypted("notes"));
+        let caps = local_caps(&enc_db);
+        assert_eq!(
+            caps.key_fp,
+            crate::sync_guard::key_fingerprint("s3cret")
+        );
+        // A written collection shows up once encrypted at rest.
+        put_simple(&enc_db, "notes", "a");
+        let caps = local_caps(&enc_db);
+        assert!(caps.encrypted_cols.contains(&"notes".to_string()));
+    }
+
+    #[test]
+    fn sender_rule_end_to_end_per_peer() {
+        let (enc_db, _d) = temp_enc_db("sender-rule", "s3cret");
+        put_simple(&enc_db, "notes", "a");
+        let caps_map: Arc<CapsMap> = Arc::new(CapsMap::default());
+        let fp = crate::sync_guard::local_fingerprint(Some("s3cret"));
+
+        // Unknown peer (old / silent): refused, warned once per window.
+        assert!(!peer_may_send(&enc_db, &caps_map, "old-peer", "notes", fp));
+        // Wrong-key peer: refused.
+        caps_map.set(
+            "other-peer",
+            crate::sync_guard::PeerCaps {
+                key_fp: [9u8; 32],
+                encrypted_cols: vec!["notes".to_string()],
+            },
+        );
+        assert!(!peer_may_send(&enc_db, &caps_map, "other-peer", "notes", fp));
+        // Same-key peer: allowed.
+        caps_map.set(
+            "good-peer",
+            crate::sync_guard::PeerCaps {
+                key_fp: fp,
+                encrypted_cols: vec!["notes".to_string()],
+            },
+        );
+        assert!(peer_may_send(&enc_db, &caps_map, "good-peer", "notes", fp));
+
+        // Plaintext collection on the same node: everyone allowed.
+        let (plain_db, _d2) = temp_db("sender-plain");
+        put_simple(&plain_db, "open", "a");
+        let fp_none = crate::sync_guard::local_fingerprint(None);
+        assert!(peer_may_send(&plain_db, &caps_map, "old-peer", "open", fp_none));
+        assert!(peer_may_send(&plain_db, &caps_map, "good-peer", "open", fp_none));
     }
 }

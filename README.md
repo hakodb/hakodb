@@ -10,7 +10,15 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.7.13)
+## What's new (0.7.2 → 0.7.14)
+
+### v0.7.14 — encrypted sync goes fail-closed (Layer 0)
+- Encrypted collections no longer replicate as silent plaintext to
+  unverified peers. Handshakes now carry key fingerprints (`SyncCaps` on
+  mesh, `enc_fp`/`enc_cols` on cloud auth); senders skip, receivers drop,
+  and relays filter per recipient — all with throttled loud warnings.
+  Plaintext deployments are byte-identical; mixed-version meshes stay
+  connected. See [Sync encryption posture](#sync-encryption-posture-read-this-before-encrypting).
 
 ### v0.7.13 — net-sync + cloud-sync in default features
 - The release DLL now exports the full mesh + cloud surface
@@ -161,7 +169,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.7.13)](#whats-new-072--0713)
+- [What's new (0.7.2 → 0.7.14)](#whats-new-072--0714)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)
@@ -173,6 +181,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 - [Multi-language platform support (C ABI)](#multi-language-platform-support-c-abi)
 - [Net Sync (LAN replication)](#net-sync-lan-replication)
 - [Cloud Sync (centralized replication)](#cloud-sync-centralized-replication)
+- [Sync encryption posture (read this before encrypting)](#sync-encryption-posture-read-this-before-encrypting)
 - [firelite-cloudserver (managed sync hub + admin console)](#firelite-cloudserver-managed-sync-hub--admin-console)
 - [Benchmark (official tool)](#benchmark-official-tool)
 - [Architecture](#architecture)
@@ -827,6 +836,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+---
+
+## Sync encryption posture (read this before encrypting)
+
+Encryption at rest (WAL/segments, via `encryption_key` + `encrypted_cols`)
+and sync-time plaintext are **independent properties**. The sync tailers
+read through the storage decryption layer and emit decoded documents, so
+an encrypted collection replicates as **plaintext on the wire** unless the
+rules below refuse the transfer. There is deliberately no silent path.
+
+### What is (and isn't) protected
+
+| Threat | Status |
+|---|---|
+| Disk / backup theft on any node | Protected when the node holds the key (at-rest encryption). |
+| Keyless or wrong-key peer receiving your encrypted docs | **Refused, loudly.** Both directions enforce: senders skip the room per peer, receivers drop the batch. |
+| Old (pre-capability) peer in the room | Treated as unverified: encrypted rooms pause for it (it keeps syncing plaintext rooms). Upgrade the peer to resume. |
+| Cloud server operator / DB thief | **Not protected.** The hub sees whatever clients send (and needs `room_key` in the clear to route). If the operator must not read a room, that room needs end-to-end encryption (future work), not at-rest keys. |
+| Passive LAN observer (mesh) | **Not protected.** Packets between verified key-holders are still plaintext. Use mTLS/`wss://` segments or E2E rooms for observer resistance. |
+| Active impersonator replaying a fingerprint | **Not protected.** Fingerprints are assertions, not proofs (no challenge-response yet). Mitigated by group admission + room keys, not eliminated. |
+
+Admission control (groups, API keys, room keys) is **not** confidentiality:
+it decides *who may join*, these rules decide *what may leave*.
+
+### How it works
+
+Every sync handshake now carries encryption capabilities alongside auth:
+
+- **Mesh**: a `SyncCaps` packet (`key_fp` = SHA-256 of the at-rest secret,
+  plus the node's encrypted collection list) right after `Identify`.
+  Appended as the last enum variant, so old peers fail the decode and
+  skip it silently — mixed-version meshes stay connected.
+- **Cloud**: `enc_fp` / `enc_cols` fields on `Authenticate` (serde
+  defaults; old clients omit them and parse fine both directions).
+
+The decision (`caps_allow`, in `src/sync_guard.rs`) is one rule everywhere:
+a locally-encrypted collection flows to/from a peer **iff** that peer
+presented the same non-zero fingerprint. Everything else — old peers,
+keyless peers, wrong-key peers — is refused per collection with a
+throttled loud warning naming peer, collection, and key prefix
+(`[sync-guard] ...`), plus an info line when caps arrive. Plaintext
+collections behave byte-identically to before (zero behavior delta when
+nothing is encrypted).
+
+Enforcement points: mesh tailer (per-peer fan-out), bootstrap, delta
+sender, inbound apply, and mesh relay (origin-aware: an encrypted room's
+bytes are forwarded only to fingerprint-matched peers, original bytes
+untouched); cloud relay fan-out, server apply, server tailer, and both
+catch-up senders. The cloud **client trusts its configured hub** (it
+sends everything upstream; the server enforces on receipt and relay) —
+otherwise encrypted rooms could never use the standard keyless hub.
+Catch-up and version-driven deltas self-heal anything skipped while a
+peer was unknown: skipped ops stay behind the receiver's version vector
+and are re-sent on the next exchange (including the re-`Ping` triggered
+by every caps announcement).
+
+### Operating it
+
+1. Put the **same** `encryption_key` on every node that must share the
+   room; list the room in `encrypted_cols` (or leave the list empty for
+   global encryption).
+2. On the cloud server, configure `encrypted_cols` with **storage** names
+   (`<prefix>_<collection>`); clients use plain names. Either side
+   matching counts.
+3. Expect `[sync-guard]` warnings while any peer is keyless, wrong-keyed,
+   or old — fix by distributing the key / upgrading, not by relaxing.
+4. There is intentionally **no override flag**: a downgrade switch would
+   reintroduce the exact silent leak this removes. Mixed-version rooms
+   keep working for plaintext collections throughout the upgrade.
 
 ---
 

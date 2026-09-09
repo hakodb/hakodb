@@ -747,6 +747,15 @@ impl FireLite {
         }
     }
 
+    /// Cheap policy check for the sync guards: does THIS node encrypt this
+    /// collection at rest? (No context is built — callers that need to
+    /// encrypt/decrypt use `get_encryption_for_col`.)
+    /// Only compiled when a sync transport exists to ask.
+    #[cfg(any(feature = "net-sync", feature = "cloud-sync"))]
+    pub(crate) fn is_collection_encrypted(&self, collection: &str) -> bool {
+        self.get_encryption_for_col(collection).is_some()
+    }
+
     pub fn commit_serializable(
         &self,
         reads: HashMap<String, Option<u64>>,
