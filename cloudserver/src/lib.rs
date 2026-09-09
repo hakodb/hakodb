@@ -4,8 +4,12 @@
 
 pub mod app;
 pub mod auth;
+pub mod cli;
 pub mod config;
 pub mod data;
 pub mod events;
 pub mod groups;
+pub mod server;
 pub mod users;
+#[cfg(windows)]
+pub mod service;

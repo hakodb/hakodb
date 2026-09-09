@@ -247,6 +247,18 @@ async fn static_console_served() {
         r.headers.get("content-type").map(String::as_str),
         Some("text/html; charset=utf-8")
     );
+    // Hardening headers on every response, UI included.
+    assert_eq!(
+        r.headers.get("x-content-type-options").map(String::as_str),
+        Some("nosniff")
+    );
+    assert_eq!(
+        r.headers.get("x-frame-options").map(String::as_str),
+        Some("DENY")
+    );
+    assert!(r.headers.get("content-security-policy").is_some());
+    assert!(r.headers.get("server").is_none());
+    assert!(r.headers.get("strict-transport-security").is_none());
     let r = call(&addr, "GET", "/app.js", None, None).await;
     assert_eq!(r.code, 200);
     assert!(r.body.contains("EventSource"));

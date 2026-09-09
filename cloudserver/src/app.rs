@@ -4,6 +4,7 @@ use axum::{
     async_trait,
     extract::{ConnectInfo, FromRef, FromRequestParts, Path, State},
     http::{header, request::Parts, HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Json, Router,
@@ -616,6 +617,36 @@ async fn delete_group_route(
     }
 }
 
+/// Defense-in-depth response headers for every response (API + UI).
+/// No `Server` version leak, no framing/sniffing, no embedding. HSTS only
+/// makes sense over TLS, so it rides on the Secure-cookie flag.
+async fn security_headers(
+    State(state): State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let hsts = state.secure_cookies;
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    h.insert("x-content-type-options", "nosniff".parse().unwrap());
+    h.insert("x-frame-options", "DENY".parse().unwrap());
+    h.insert("referrer-policy", "no-referrer".parse().unwrap());
+    h.insert(
+        "content-security-policy",
+        "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+            .parse()
+            .unwrap(),
+    );
+    h.remove(header::SERVER);
+    if hsts {
+        h.insert(
+            "strict-transport-security",
+            "max-age=31536000; includeSubDomains".parse().unwrap(),
+        );
+    }
+    res
+}
+
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(health))
@@ -643,5 +674,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/events", get(crate::events::events))
         .merge(crate::data::data_routes())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            security_headers,
+        ))
         .with_state(state)
 }

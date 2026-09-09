@@ -1,0 +1,31 @@
+[Unit]
+Description=FireLite Cloud Server (offline-first sync hub + admin console)
+Documentation=https://github.com/rizaptk/firelite
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as an unprivileged user with a home for nothing but the database dir.
+User=firelite
+Group=firelite
+# All paths absolute: services have no useful CWD.
+ExecStart=/usr/local/bin/firelite-cloudserver \
+  --db-path /var/lib/firelite-cloud/db \
+  --admin-bind 127.0.0.1:8081 \
+  --sync-bind 0.0.0.0:8080
+Environment=RUST_LOG=info
+# If the admin console is exposed beyond loopback, pass TLS material:
+#   --tls-cert /etc/firelite-cloud/fullchain.pem --tls-key /etc/firelite-cloud/privkey.pem
+Restart=always
+RestartSec=3
+# Hardening: read-only system, private /tmp, no new privileges. Grant write
+# access to exactly the database directory.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/firelite-cloud
+
+[Install]
+WantedBy=multi-user.target

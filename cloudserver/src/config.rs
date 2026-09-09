@@ -27,6 +27,11 @@ pub struct ServerConfig {
     /// Sync-plane shared token (presented by clients; admission itself is
     /// governed by group policy — see `__groups`).
     pub sync_token: String,
+    /// TLS certificate (PEM) for the admin plane. Both must be set to
+    /// enable HTTPS; when set, session cookies are forced Secure.
+    pub tls_cert: Option<String>,
+    /// TLS private key (PEM) for the admin plane.
+    pub tls_key: Option<String>,
 }
 
 /// Partial file/env/flag layer. Every field optional; `None` inherits.
@@ -40,6 +45,8 @@ pub struct ConfigLayer {
     pub secure_cookies: Option<bool>,
     pub server_id: Option<String>,
     pub sync_token: Option<String>,
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
 }
 
 impl ConfigLayer {
@@ -66,6 +73,12 @@ impl ConfigLayer {
         if over.sync_token.is_some() {
             self.sync_token = over.sync_token;
         }
+        if over.tls_cert.is_some() {
+            self.tls_cert = over.tls_cert;
+        }
+        if over.tls_key.is_some() {
+            self.tls_key = over.tls_key;
+        }
         self
     }
 
@@ -80,13 +93,31 @@ impl ConfigLayer {
             secure_cookies: self.secure_cookies.unwrap_or(false),
             server_id: self.server_id.unwrap_or_else(|| DEFAULT_SERVER_ID.into()),
             sync_token: self.sync_token.unwrap_or_default(),
+            tls_cert: self.tls_cert,
+            tls_key: self.tls_key,
+        }
+    }
+}
+
+impl ServerConfig {
+    /// TLS is on only when both halves are configured (fail-closed: a lone
+    /// cert or key is a startup error, reported by `tls_error`).
+    pub fn tls_enabled(&self) -> bool {
+        self.tls_cert.is_some() && self.tls_key.is_some()
+    }
+
+    pub fn tls_error(&self) -> Option<String> {
+        match (&self.tls_cert, &self.tls_key) {
+            (Some(_), Some(_)) | (None, None) => None,
+            (Some(_), None) => Some("tls_cert set without tls_key".into()),
+            (None, Some(_)) => Some("tls_key set without tls_cert".into()),
         }
     }
 }
 
 /// `FL_*` environment layer (`FL_DB_PATH`, `FL_ADMIN_BIND`, `FL_SYNC_BIND`,
-/// `FL_LOG_LEVEL`, `FL_SECURE_COOKIES=1`, `FL_SERVER_ID`, `FL_SYNC_TOKEN`).
-/// Only non-empty values count.
+/// `FL_LOG_LEVEL`, `FL_SECURE_COOKIES=1`, `FL_SERVER_ID`, `FL_SYNC_TOKEN`,
+/// `FL_TLS_CERT`, `FL_TLS_KEY`). Only non-empty values count.
 fn env_layer(vars: &HashMap<String, String>) -> ConfigLayer {
     let get = |k: &str| {
         vars.get(k)
@@ -101,6 +132,8 @@ fn env_layer(vars: &HashMap<String, String>) -> ConfigLayer {
         secure_cookies: get("FL_SECURE_COOKIES").map(|v| v == "1" || v.eq_ignore_ascii_case("true")),
         server_id: get("FL_SERVER_ID"),
         sync_token: get("FL_SYNC_TOKEN"),
+        tls_cert: get("FL_TLS_CERT"),
+        tls_key: get("FL_TLS_KEY"),
     }
 }
 
@@ -194,5 +227,37 @@ mod tests {
         )
         .is_err());
         std::fs::remove_file(&dir).ok();
+    }
+
+    #[test]
+    fn tls_fields_and_fail_closed() {
+        // Defaults: off, no error.
+        let cfg = load_config(None, ConfigLayer::default(), &vars(&[])).unwrap();
+        assert!(!cfg.tls_enabled());
+        assert!(cfg.tls_error().is_none());
+        assert!(!cfg.secure_cookies);
+
+        // Env + file merge for the new fields.
+        let dir = std::env::temp_dir().join("fl-cfg-tls.toml");
+        std::fs::write(&dir, "tls_cert = \"/c.pem\"\nserver_id = \"hub-1\"\n").unwrap();
+        let env = vars(&[("FL_TLS_KEY", "/k.pem"), ("FL_SECURE_COOKIES", "true")]);
+        let cfg = load_config(Some(dir.to_str().unwrap()), ConfigLayer::default(), &env).unwrap();
+        assert!(cfg.tls_enabled());
+        assert!(cfg.tls_error().is_none());
+        assert!(cfg.secure_cookies);
+        assert_eq!(cfg.server_id, "hub-1");
+        std::fs::remove_file(&dir).ok();
+
+        // Lone halves fail closed.
+        let half = ConfigLayer {
+            tls_cert: Some("/c.pem".into()),
+            ..Default::default()
+        };
+        let cfg = load_config(None, half, &vars(&[])).unwrap();
+        assert!(!cfg.tls_enabled());
+        assert_eq!(
+            cfg.tls_error(),
+            Some("tls_cert set without tls_key".to_string())
+        );
     }
 }
