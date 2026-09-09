@@ -62,12 +62,18 @@ pub enum CloudSyncMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CloudPacket {
-    /// Client -> Server: Initial Auth & Handshake
+    /// Client -> Server: Initial Auth & Handshake.
+    /// `api_key` / `client_version` are additive (serde defaults): old
+    /// peers omit them and still authenticate against open groups.
     Authenticate {
         token: String,
         client_id: String,
         room_name: String,
         room_key: String,
+        #[serde(default)]
+        api_key: Option<String>,
+        #[serde(default)]
+        client_version: Option<String>,
     },
     /// Server -> Client: Handshake Response
     AuthResult {
@@ -158,9 +164,79 @@ fn hash_room_id(room_name: &str, room_key: &str) -> String {
     hex
 }
 
+/// Group policy store: a `__groups` doc per room name (admin-managed).
+/// Absent row or `mode: "open"` admits everyone (historic behavior);
+/// `mode: "registered"` admits only valid API keys (+ listed members when
+/// the members list is non-empty). This collection never syncs.
 #[cfg(feature = "cloud-sync")]
-fn sanitize_room_name(name: &str) -> String {
-    let mut out = String::new();
+pub const GROUPS_COLLECTION: &str = "__groups";
+
+/// SHA-256 hex of an API key. Keys are 256-bit random (unbounded entropy),
+/// so a fast hash + timing-safe compare is the right tool — no KDF needed.
+#[cfg(feature = "cloud-sync")]
+pub fn hash_api_key(key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        hex.push_str(&format!("{:02x}", b));
+    }
+    hex
+}
+
+#[cfg(feature = "cloud-sync")]
+fn timing_safe_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Admission decision for one handshake. Pure function of (db row, presented
+/// key, client id) — unit-tested without sockets.
+#[cfg(feature = "cloud-sync")]
+pub(crate) fn check_group_access(
+    db: &FireLite,
+    room_name: &str,
+    api_key: Option<&str>,
+    client_id: &str,
+) -> Result<(), String> {
+    let doc = match db.get(GROUPS_COLLECTION, room_name) {
+        Ok(Some(d)) => d,
+        _ => return Ok(()), // no policy row: open group, historic behavior
+    };
+    let mode = doc.get("mode").and_then(value_to_string);
+    match mode.as_deref() {
+        None | Some("open") => Ok(()),
+        Some("registered") => {
+            let presented = api_key.unwrap_or("");
+            let expected = doc.get("api_key_hash").and_then(value_to_string).unwrap_or_default();
+            if expected.is_empty() || !timing_safe_eq(&hash_api_key(presented), &expected) {
+                return Err("group requires a valid API key".to_string());
+            }
+            let members: Vec<String> = match doc.get("members") {
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            if !members.is_empty() && !members.iter().any(|m| m == client_id) {
+                return Err("client not registered for group".to_string());
+            }
+            Ok(())
+        }
+        Some(other) => Err(format!("unknown group mode '{other}'")),
+    }
+}
+
+#[cfg(feature = "cloud-sync")]
+fn sanitize_room_name(name: &str) -> String {    let mut out = String::new();
     for c in name.chars() {
         if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
             out.push(c);
@@ -364,6 +440,10 @@ pub struct CloudSync {
     room_key: String,
     client_id: String,
     auth_token: String,
+    /// Optional group API key presented at handshake (see `set_api_key`).
+    /// Interior mutability so FFI/SDK handles (`Arc<CloudSync>`) can set it
+    /// after construction; read once per (re)connect.
+    api_key: Arc<StdMutex<Option<String>>>,
     running: Arc<AtomicBool>,
     echo_cache: Arc<StdMutex<HashMap<String, i64>>>,
     seen_messages: Arc<AsyncMutex<Vec<u128>>>,
@@ -427,6 +507,7 @@ impl CloudSync {
             room_key: String::new(),
             client_id: server_id.to_string(),
             auth_token: auth_token.to_string(),
+            api_key: Arc::new(StdMutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
             echo_cache: Arc::new(StdMutex::new(HashMap::new())),
             seen_messages: Arc::new(AsyncMutex::new(Vec::with_capacity(1000))),
@@ -458,6 +539,7 @@ impl CloudSync {
             room_key: room_key.to_string(),
             client_id: client_id.to_string(),
             auth_token: auth_token.to_string(),
+            api_key: Arc::new(StdMutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
             echo_cache: Arc::new(StdMutex::new(HashMap::new())),
             seen_messages: Arc::new(AsyncMutex::new(Vec::with_capacity(1000))),
@@ -466,6 +548,15 @@ impl CloudSync {
             active_peers: Arc::new(AsyncRwLock::new(HashMap::new())),
             outbound_tx: Arc::new(AsyncMutex::new(None)),
             room_registry: None,
+        }
+    }
+
+    /// Set the group API key this client presents at handshake. Takes effect
+    /// at the next (re)connect. `None` clears it (anonymous: admitted only
+    /// to open groups).
+    pub fn set_api_key(&self, key: Option<String>) {
+        if let Ok(mut slot) = self.api_key.lock() {
+            *slot = key.filter(|k| !k.is_empty());
         }
     }
 
@@ -887,8 +978,21 @@ kind,
                 client_id: cid,
                 room_name,
                 room_key,
+                api_key,
+                ..
             }) = rmp_serde::from_slice(&bytes)
             {
+                // Group policy first: rejected peers must not create rooms.
+                if let Err(e) = check_group_access(&db, &room_name, api_key.as_deref(), &cid) {
+                    let nack = CloudPacket::AuthResult {
+                        success: false,
+                        error: Some(e),
+                    };
+                    if let Ok(bytes) = rmp_serde::to_vec_named(&nack) {
+                        let _ = ws_tx.send(Message::Binary(bytes.into())).await;
+                    }
+                    return;
+                }
                 // Resolve the room -> storage prefix (register it if needed).
                 let resolve = {
                     let rooms = rooms.clone();
@@ -1309,6 +1413,7 @@ kind,
         let auth_token = self.auth_token.clone();
         let room_name = self.room_name.clone();
         let room_key_str = self.room_key.clone();
+        let api_key = self.api_key.lock().ok().and_then(|g| g.clone());
         let running = self.running.clone();
         let ingest_tx = self.ingest_tx.clone();
         let echo_cache = self.echo_cache.clone();
@@ -1331,6 +1436,8 @@ kind,
                         client_id: client_id.clone(),
                         room_name: room_name.clone(),
                         room_key: room_key_str.clone(),
+                        api_key: api_key.clone(),
+                        client_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                     };
                     let auth_bytes = rmp_serde::to_vec_named(&auth_packet).unwrap();
                     if ws_tx.send(Message::Binary(auth_bytes.into())).await.is_err() {
@@ -1708,5 +1815,88 @@ mod tests {
         assert!(CloudSync::is_stale_remote_delete(&db, "c", "a", ts - 1));
         assert!(!CloudSync::is_stale_remote_delete(&db, "c", "a", ts + 1_000_000));
         assert!(!CloudSync::is_stale_remote_delete(&db, "c", "missing", ts));
+    }
+
+    fn put_group(
+        db: &Arc<FireLite>,
+        room: &str,
+        mode: &str,
+        key_hash: Option<String>,
+        members: Vec<String>,
+    ) {
+        let mut doc = FireLiteDoc::default();
+        doc.insert("mode", Value::String(mode.to_string()));
+        if let Some(h) = key_hash {
+            doc.insert("api_key_hash", Value::String(h));
+        }
+        doc.insert(
+            "members",
+            Value::Array(members.into_iter().map(Value::String).collect()),
+        );
+        db.put(GROUPS_COLLECTION, room, &doc).unwrap();
+    }
+
+    #[test]
+    fn group_access_matrix() {
+        let (db, _dir) = temp_db("groups");
+        // No row: open group, historic behavior (old anonymous peers pass).
+        assert!(check_group_access(&db, "noroom", None, "c1").is_ok());
+
+        put_group(&db, "openroom", "open", None, vec![]);
+        assert!(check_group_access(&db, "openroom", None, "c1").is_ok());
+
+        put_group(
+            &db,
+            "priv",
+            "registered",
+            Some(hash_api_key("sekret")),
+            vec![],
+        );
+        assert!(check_group_access(&db, "priv", Some("sekret"), "c1").is_ok());
+        assert!(check_group_access(&db, "priv", Some("wrong"), "c1").is_err());
+        assert!(check_group_access(&db, "priv", None, "c1").is_err());
+
+        // Member gating: listed passes, unlisted rejected, empty list = any.
+        put_group(
+            &db,
+            "memb",
+            "registered",
+            Some(hash_api_key("k")),
+            vec!["alice".to_string()],
+        );
+        assert!(check_group_access(&db, "memb", Some("k"), "alice").is_ok());
+        assert!(check_group_access(&db, "memb", Some("k"), "mallory").is_err());
+
+        // Unknown mode fails closed.
+        put_group(&db, "weird", "fortress", None, vec![]);
+        assert!(check_group_access(&db, "weird", None, "c1").is_err());
+    }
+
+    #[test]
+    fn api_key_hash_is_stable_and_wrong_key_misses() {
+        assert_eq!(hash_api_key("abc"), hash_api_key("abc"));
+        assert_ne!(hash_api_key("abc"), hash_api_key("abd"));
+        assert_eq!(hash_api_key("abc").len(), 64);
+    }
+
+    #[test]
+    fn old_authenticate_shape_still_parses() {
+        // Pre-api_key peers send maps without the new keys; serde defaults
+        // must admit them (anonymous against open groups).
+        let old: CloudPacket = serde_json::from_str(
+            r#"{"authenticate":{"token":"t","client_id":"c","room_name":"r","room_key":"k"}}"#,
+        )
+        .expect("old shape parses");
+        match old {
+            CloudPacket::Authenticate {
+                api_key,
+                client_version,
+                ..
+            } => {
+                assert_eq!(api_key, None);
+                assert_eq!(client_version, None);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }

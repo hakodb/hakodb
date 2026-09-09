@@ -122,7 +122,7 @@ async fn spawn_app(db: FireLite) -> (std::net::SocketAddr, tokio::task::JoinHand
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let h = tokio::spawn(async move {
-        axum::serve(listener, build_router(Arc::new(AppState::new(db, false))))
+        axum::serve(listener, build_router(Arc::new(AppState::new(Arc::new(db), false))))
             .await
             .unwrap();
     });

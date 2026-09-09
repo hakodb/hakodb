@@ -32,6 +32,12 @@ struct Cli {
     /// Emit Secure on session cookies (enable with TLS).
     #[arg(long)]
     secure_cookies: bool,
+    /// Sync-plane server id shown to peers.
+    #[arg(long)]
+    server_id: Option<String>,
+    /// Sync-plane shared token presented by clients.
+    #[arg(long)]
+    sync_token: Option<String>,
 }
 
 #[tokio::main]
@@ -46,6 +52,8 @@ async fn main() -> Result<(), String> {
             sync_bind: cli.sync_bind,
             log_level: cli.log_level,
             secure_cookies: cli.secure_cookies.then_some(true),
+            server_id: cli.server_id,
+            sync_token: cli.sync_token,
         },
         &env_vars,
     )?;
@@ -59,17 +67,40 @@ async fn main() -> Result<(), String> {
 
     let db = FireLite::open(&cfg.db_path, FireLiteConfig::default())
         .map_err(|e| format!("open db {}: {e}", cfg.db_path))?;
-    tracing::info!(db_path = %cfg.db_path, admin_bind = %cfg.admin_bind, sync_bind = %cfg.sync_bind, "firelite-cloudserver starting (sync plane arrives in a later phase)");
+    tracing::info!(db_path = %cfg.db_path, admin_bind = %cfg.admin_bind, sync_bind = %cfg.sync_bind, server_id = %cfg.server_id, "firelite-cloudserver starting");
+
+    // Sync plane: the shared room-agnostic server. Group admission policy
+    // (__groups) is enforced inside the handshake; see cloud_sync.
+    let db = std::sync::Arc::new(db);
+    let sync = firelite::cloud_sync::CloudSync::server(
+        db.clone(),
+        &cfg.server_id,
+        &cfg.sync_token,
+    );
+    let sync_bind = cfg.sync_bind.clone();
+    let sync_task = tokio::spawn(async move {
+        sync.start(&sync_bind)
+            .await
+            .map_err(|e| format!("sync serve {sync_bind}: {e}"))
+    });
 
     let state = std::sync::Arc::new(AppState::new(db, cfg.secure_cookies));
     let listener = tokio::net::TcpListener::bind(&cfg.admin_bind)
         .await
         .map_err(|e| format!("bind {}: {e}", cfg.admin_bind))?;
-    axum::serve(
-        listener,
-        build_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await
-    .map_err(|e| format!("serve: {e}"))?;
-    Ok(())
+    let admin_task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            build_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .map_err(|e| format!("admin serve: {e}"))
+    });
+    // Either plane dying takes the process down (fail-fast: the service
+    // manager restarts us clean rather than half-serving).
+    match tokio::join!(admin_task, sync_task) {
+        (Ok(Ok(())), Ok(Ok(()))) => Ok(()),
+        (Ok(Err(e)), _) | (_, Ok(Err(e))) => Err(e),
+        (Err(e), _) | (_, Err(e)) => Err(format!("task panicked: {e}")),
+    }
 }

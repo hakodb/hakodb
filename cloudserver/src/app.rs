@@ -2,10 +2,10 @@
 
 use axum::{
     async_trait,
-    extract::{ConnectInfo, FromRef, FromRequestParts, State},
+    extract::{ConnectInfo, FromRef, FromRequestParts, Path, State},
     http::{header, request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use firelite::engine::FireLite;
@@ -18,6 +18,10 @@ use crate::auth::{
     hash_password, load_user, new_session_token, set_cookie_value, setup_required,
     token_from_cookie, upsert_user, verify_password, AuthStore, Role, Session, SESSION_TTL,
 };
+use crate::groups::{
+    add_member, create_group, delete_group, get_group, list_groups, remove_member,
+    rotate_group_key, set_group_mode, GroupMode,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -27,9 +31,9 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(db: FireLite, secure_cookies: bool) -> Self {
+    pub fn new(db: Arc<FireLite>, secure_cookies: bool) -> Self {
         Self {
-            db: Arc::new(db),
+            db,
             auth: Arc::new(AuthStore::default()),
             secure_cookies,
         }
@@ -235,6 +239,172 @@ async fn me(user: AuthedUser) -> Json<MeBody> {
     })
 }
 
+fn require_admin(user: &AuthedUser) -> Result<(), Response> {
+    if user.role == Role::Admin {
+        Ok(())
+    } else {
+        Err((StatusCode::FORBIDDEN, Json(json!({"error": "admin role required"}))).into_response())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateGroupBody {
+    room_name: String,
+    mode: GroupMode,
+}
+
+async fn create_group_route(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Json(body): Json<CreateGroupBody>,
+) -> Response {
+    if let Err(e) = require_admin(&user) {
+        return e;
+    }
+    match create_group(&state.db, body.room_name.trim(), body.mode, new_session_token) {
+        Ok((view, key)) => (
+            StatusCode::CREATED,
+            Json(json!({"group": view, "api_key": key})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+async fn list_groups_route(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+) -> Response {
+    if let Err(e) = require_admin(&user) {
+        return e;
+    }
+    Json(json!({"groups": list_groups(&state.db)})).into_response()
+}
+
+async fn get_group_route(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path(name): Path<String>,
+) -> Response {
+    if let Err(e) = require_admin(&user) {
+        return e;
+    }
+    match get_group(&state.db, &name) {
+        Some(g) => Json(json!({"group": g})).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown group"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn rotate_key_route(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path(name): Path<String>,
+) -> Response {
+    if let Err(e) = require_admin(&user) {
+        return e;
+    }
+    match rotate_group_key(&state.db, &name, new_session_token) {
+        Ok(key) => Json(json!({"api_key": key})).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SetModeBody {
+    mode: GroupMode,
+}
+
+async fn set_mode_route(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path(name): Path<String>,
+    Json(body): Json<SetModeBody>,
+) -> Response {
+    if let Err(e) = require_admin(&user) {
+        return e;
+    }
+    match set_group_mode(&state.db, &name, body.mode) {
+        Ok(g) => Json(json!({"group": g})).into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MemberBody {
+    client_id: String,
+}
+
+async fn add_member_route(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path(name): Path<String>,
+    Json(body): Json<MemberBody>,
+) -> Response {
+    if let Err(e) = require_admin(&user) {
+        return e;
+    }
+    match add_member(&state.db, &name, &body.client_id) {
+        Ok(g) => Json(json!({"group": g})).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+async fn remove_member_route(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path((name, client_id)): Path<(String, String)>,
+) -> Response {
+    if let Err(e) = require_admin(&user) {
+        return e;
+    }
+    match remove_member(&state.db, &name, &client_id) {
+        Ok(g) => Json(json!({"group": g})).into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+async fn delete_group_route(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path(name): Path<String>,
+) -> Response {
+    if let Err(e) = require_admin(&user) {
+        return e;
+    }
+    match delete_group(&state.db, &name) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(health))
@@ -242,5 +412,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
+        .route("/api/groups", post(create_group_route).get(list_groups_route))
+        .route("/api/groups/:name", get(get_group_route).delete(delete_group_route))
+        .route("/api/groups/:name/rotate-key", post(rotate_key_route))
+        .route("/api/groups/:name/mode", put(set_mode_route))
+        .route("/api/groups/:name/members", post(add_member_route))
+        .route(
+            "/api/groups/:name/members/:client_id",
+            delete(remove_member_route),
+        )
         .with_state(state)
 }

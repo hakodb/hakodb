@@ -9,7 +9,7 @@ name = "firelite-cloudserver"
 path = "src/main.rs"
 
 [dependencies]
-firelite = { path = "../" }
+firelite = { path = "../", features = ["cloud-sync"] }
 axum = { version = "0.7", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

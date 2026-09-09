@@ -10,6 +10,7 @@ pub const DEFAULT_DB_PATH: &str = "./firelite-cloud.db";
 pub const DEFAULT_ADMIN_BIND: &str = "127.0.0.1:8081";
 pub const DEFAULT_SYNC_BIND: &str = "0.0.0.0:8080";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
+pub const DEFAULT_SERVER_ID: &str = "firelite-cloudserver";
 
 /// Resolved, fully-defaulted configuration the server runs with.
 #[derive(Debug, Clone)]
@@ -21,6 +22,11 @@ pub struct ServerConfig {
     /// Emit `Secure` on session cookies. Enable with TLS (phase 7);
     /// until then the loopback default bind would only break logins.
     pub secure_cookies: bool,
+    /// Sync-plane server id shown to peers.
+    pub server_id: String,
+    /// Sync-plane shared token (presented by clients; admission itself is
+    /// governed by group policy — see `__groups`).
+    pub sync_token: String,
 }
 
 /// Partial file/env/flag layer. Every field optional; `None` inherits.
@@ -32,6 +38,8 @@ pub struct ConfigLayer {
     pub sync_bind: Option<String>,
     pub log_level: Option<String>,
     pub secure_cookies: Option<bool>,
+    pub server_id: Option<String>,
+    pub sync_token: Option<String>,
 }
 
 impl ConfigLayer {
@@ -52,6 +60,12 @@ impl ConfigLayer {
         if over.secure_cookies.is_some() {
             self.secure_cookies = over.secure_cookies;
         }
+        if over.server_id.is_some() {
+            self.server_id = over.server_id;
+        }
+        if over.sync_token.is_some() {
+            self.sync_token = over.sync_token;
+        }
         self
     }
 
@@ -64,12 +78,15 @@ impl ConfigLayer {
             sync_bind: self.sync_bind.unwrap_or_else(|| DEFAULT_SYNC_BIND.into()),
             log_level: self.log_level.unwrap_or_else(|| DEFAULT_LOG_LEVEL.into()),
             secure_cookies: self.secure_cookies.unwrap_or(false),
+            server_id: self.server_id.unwrap_or_else(|| DEFAULT_SERVER_ID.into()),
+            sync_token: self.sync_token.unwrap_or_default(),
         }
     }
 }
 
 /// `FL_*` environment layer (`FL_DB_PATH`, `FL_ADMIN_BIND`, `FL_SYNC_BIND`,
-/// `FL_LOG_LEVEL`, `FL_SECURE_COOKIES=1`). Only non-empty values count.
+/// `FL_LOG_LEVEL`, `FL_SECURE_COOKIES=1`, `FL_SERVER_ID`, `FL_SYNC_TOKEN`).
+/// Only non-empty values count.
 fn env_layer(vars: &HashMap<String, String>) -> ConfigLayer {
     let get = |k: &str| {
         vars.get(k)
@@ -82,6 +99,8 @@ fn env_layer(vars: &HashMap<String, String>) -> ConfigLayer {
         sync_bind: get("FL_SYNC_BIND"),
         log_level: get("FL_LOG_LEVEL"),
         secure_cookies: get("FL_SECURE_COOKIES").map(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+        server_id: get("FL_SERVER_ID"),
+        sync_token: get("FL_SYNC_TOKEN"),
     }
 }
 
