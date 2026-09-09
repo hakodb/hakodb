@@ -21,6 +21,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 argon2 = "0.5"
 rand = "0.8"
 futures-core = "0.3"
+rust-embed = "8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

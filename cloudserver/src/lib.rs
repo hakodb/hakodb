@@ -8,3 +8,4 @@ pub mod config;
 pub mod data;
 pub mod events;
 pub mod groups;
+pub mod users;

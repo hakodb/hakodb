@@ -47,7 +47,7 @@ impl Role {
         self.rank() >= need.rank()
     }
 
-    fn parse(s: &str) -> Option<Role> {
+    pub(crate) fn parse(s: &str) -> Option<Role> {
         match s {
             "viewer" => Some(Role::Viewer),
             "operator" => Some(Role::Operator),

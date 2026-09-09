@@ -18,8 +18,7 @@ use crate::auth::{
     hash_password, load_user, new_session_token, set_cookie_value, setup_required,
     token_from_cookie, upsert_user, verify_password, AuthStore, Role, Session, SESSION_TTL,
 };
-use crate::groups::{
-    add_member, create_group, delete_group, get_group, list_groups, remove_member,
+use crate::groups::{    add_member, create_group, delete_group, get_group, list_groups, remove_member,
     rotate_group_key, set_group_mode, GroupMode,
 };
 
@@ -30,6 +29,8 @@ pub struct AppState {
     pub secure_cookies: bool,
     /// Sync plane handle (None in tests / before boot).
     pub sync: Option<Arc<firelite::cloud_sync::CloudSync>>,
+    /// Resolved server config snapshot for display (None in tests).
+    pub config: Option<crate::config::ServerConfig>,
 }
 
 impl AppState {
@@ -39,11 +40,17 @@ impl AppState {
             auth: Arc::new(AuthStore::default()),
             secure_cookies,
             sync: None,
+            config: None,
         }
     }
 
     pub fn with_sync(mut self, sync: Arc<firelite::cloud_sync::CloudSync>) -> Self {
         self.sync = Some(sync);
+        self
+    }
+
+    pub fn with_config(mut self, config: crate::config::ServerConfig) -> Self {
+        self.config = Some(config);
         self
     }
 }
@@ -247,6 +254,194 @@ async fn me(user: AuthedUser) -> Json<MeBody> {
     })
 }
 
+/// Public probe driving the setup wizard: true only while no enabled
+/// admin exists. No auth (it must work before any account exists); reveals
+/// nothing beyond a single bit.
+async fn setup_status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(json!({ "setup_required": setup_required(&state.db) }))
+}
+
+/// Non-sensitive server facts for the console config view. The sync token
+/// and any secret are deliberately never serialized here.
+async fn config_view(State(state): State<Arc<AppState>>, user: AuthedUser) -> Response {
+    if let Err(e) = require_role(&user, Role::Operator) {
+        return e;
+    }
+    let (admin_bind, log_level, server_id) = match &state.config {
+        Some(c) => (
+            c.admin_bind.clone(),
+            c.log_level.clone(),
+            c.server_id.clone(),
+        ),
+        None => ("unknown".into(), "unknown".into(), "unknown".into()),
+    };
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "admin_bind": admin_bind,
+        "log_level": log_level,
+        "server_id": server_id,
+    }))
+    .into_response()
+}
+
+#[derive(rust_embed::RustEmbed)]
+#[folder = "static/"]
+struct StaticAssets;
+
+fn content_type(path: &str) -> &'static str {
+    if path.ends_with(".html") {
+        "text/html; charset=utf-8"
+    } else if path.ends_with(".css") {
+        "text/css; charset=utf-8"
+    } else if path.ends_with(".js") {
+        "text/javascript; charset=utf-8"
+    } else if path.ends_with(".json") {
+        "application/json"
+    } else if path.ends_with(".png") {
+        "image/png"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+async fn static_file(Path(path): Path<String>) -> Response {
+    let key = path.trim_start_matches('/');
+    // index + SPA fallback: unknown non-asset paths serve the shell so
+    // hash-routing deep links work when opened directly.
+    let key = if key.is_empty() { "index.html" } else { key };
+    if key.contains("..") {
+        return (StatusCode::BAD_REQUEST, "bad path").into_response();
+    }
+    match StaticAssets::get(key) {
+        Some(f) => (
+            [(header::CONTENT_TYPE, content_type(key))],
+            f.data.into_owned(),
+        )
+            .into_response(),
+        None if !key.contains('.') => match StaticAssets::get("index.html") {
+            Some(f) => (
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                f.data.into_owned(),
+            )
+                .into_response(),
+            None => (StatusCode::NOT_FOUND, "no ui").into_response(),
+        },
+        None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateUserBody {
+    username: String,
+    password: String,
+    #[serde(default = "viewer_default")]
+    role: String,
+}
+
+fn viewer_default() -> String {
+    "viewer".to_string()
+}
+
+fn parse_role(s: &str) -> Result<Role, Response> {
+    Role::parse(s.trim().to_lowercase().as_str()).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "role must be viewer|operator|admin"})),
+        )
+            .into_response()
+    })
+}
+
+async fn list_users_route(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+) -> Response {
+    if let Err(e) = require_role(&user, Role::Admin) {
+        return e;
+    }
+    Json(json!({ "users": crate::users::list_users(&state.db) })).into_response()
+}
+
+async fn create_user_route(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Json(body): Json<CreateUserBody>,
+) -> Response {
+    if let Err(e) = require_role(&user, Role::Admin) {
+        return e;
+    }
+    let role = match parse_role(&body.role) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    match crate::users::create_user(&state.db, body.username.trim(), &body.password, role) {
+        Ok(u) => (StatusCode::CREATED, Json(json!({ "user": u }))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateUserBody {
+    role: Option<String>,
+    disabled: Option<bool>,
+    password: Option<String>,
+}
+
+async fn update_user_route(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path(name): Path<String>,
+    Json(body): Json<UpdateUserBody>,
+) -> Response {
+    if let Err(e) = require_role(&user, Role::Admin) {
+        return e;
+    }
+    let role = match body.role {
+        Some(ref r) => match parse_role(r) {
+            Ok(role) => Some(role),
+            Err(e) => return e,
+        },
+        None => None,
+    };
+    match crate::users::update_user(
+        &state.db,
+        &user.username,
+        &name,
+        role,
+        body.disabled,
+        body.password.as_deref(),
+    ) {
+        Ok(u) => Json(json!({ "user": u })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+async fn delete_user_route(
+    State(state): State<Arc<AppState>>,
+    user: AuthedUser,
+    Path(name): Path<String>,
+) -> Response {
+    if let Err(e) = require_role(&user, Role::Admin) {
+        return e;
+    }
+    match crate::users::delete_user(&state.db, &user.username, &name) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
 fn require_admin(user: &AuthedUser) -> Result<(), Response> {
     require_role(user, Role::Admin)
 }
@@ -428,6 +623,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
+        .route("/api/setup/status", get(setup_status))
+        .route("/api/config", get(config_view))
+        .route("/", get(|| async { static_file(Path("index.html".to_string())).await }))
+        .route("/*path", get(static_file))
+        .route("/api/users", post(create_user_route).get(list_users_route))
+        .route(
+            "/api/users/:name",
+            put(update_user_route).delete(delete_user_route),
+        )
         .route("/api/groups", post(create_group_route).get(list_groups_route))
         .route("/api/groups/:name", get(get_group_route).delete(delete_group_route))
         .route("/api/groups/:name/rotate-key", post(rotate_key_route))

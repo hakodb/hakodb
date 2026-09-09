@@ -87,7 +87,9 @@ async fn main() -> Result<(), String> {
         }
     });
 
-    let state = std::sync::Arc::new(AppState::new(db, cfg.secure_cookies).with_sync(sync));
+    let state = std::sync::Arc::new(
+        AppState::new(db, cfg.secure_cookies).with_sync(sync).with_config(cfg.clone()),
+    );
     let listener = tokio::net::TcpListener::bind(&cfg.admin_bind)
         .await
         .map_err(|e| format!("bind {}: {e}", cfg.admin_bind))?;
