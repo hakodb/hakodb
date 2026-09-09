@@ -6,11 +6,18 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 FireLite speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.7.12 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.7.13 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.7.12)
+## What's new (0.7.2 → 0.7.13)
+
+### v0.7.13 — net-sync + cloud-sync in default features
+- The release DLL now exports the full mesh + cloud surface
+  (`fl_net_syncer_*`, `fl_cloud_sync_*`), matching what the Go/JS/Pascal
+  SDKs already wrap. Previously those symbols existed only with explicit
+  features — SDK calls against the default DLL failed at runtime, not at
+  compile time. `tauri-gateway` stays opt-in.
 
 ### v0.7.12 — WAL reserve off by default
 - **Measured, not theorized.** A/B on the fsync-bound Always profile:
@@ -154,7 +161,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.7.12)](#whats-new-072--0712)
+- [What's new (0.7.2 → 0.7.13)](#whats-new-072--0713)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)
