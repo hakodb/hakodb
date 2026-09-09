@@ -18,6 +18,7 @@ ANDROID_DIR="$RELEASE_DIR/$ANDROID_TARGET"
 echo "Building FireLite v$VERSION for Linux..."
 cargo build --release
 cargo build --release -p firelite-cli
+cargo build --release -p firelite-cloudserver
 
 echo "Compiling benchmark..."
 g++ -O2 -std=c++17 -Iinclude benchmark.cpp -L"$RELEASE_DIR" -lfirelite -o "$RELEASE_DIR/benchmark"
@@ -51,6 +52,8 @@ cp "$RELEASE_DIR/benchmark" \
     "$RELEASE_DIR/sqlite_bench" \
    "$RELEASE_DIR/firelite-cli" \
    "$RELEASE_DIR/firelite-cli.d" \
+   "$RELEASE_DIR/firelite-cloudserver" \
+   "$RELEASE_DIR/firelite-cloudserver.d" \
    "$RELEASE_DIR/libfirelite.so" \
    "$RELEASE_DIR/libfirelite.rlib" \
    "$RELEASE_DIR/libfirelite.d" \
