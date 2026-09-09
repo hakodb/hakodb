@@ -437,6 +437,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/groups/:name/members/:client_id",
             delete(remove_member_route),
         )
+        .route("/api/events", get(crate::events::events))
         .merge(crate::data::data_routes())
         .with_state(state)
 }

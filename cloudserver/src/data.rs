@@ -146,6 +146,17 @@ fn room_docs(db: &FireLite) -> Vec<(String, FireLiteDoc)> {
         .unwrap_or_default()
 }
 
+/// Storage prefixes of all known rooms (drives version-clock snapshots).
+pub(crate) fn room_prefixes(db: &FireLite) -> Vec<String> {
+    room_docs(db)
+        .iter()
+        .filter_map(|(_, doc)| match doc.get("prefix") {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 async fn rooms(State(state): State<Arc<AppState>>, user: AuthedUser) -> Response {
     let _ = user;
     let peer_prefixes: HashMap<String, Vec<String>> = match state.sync.as_ref() {
