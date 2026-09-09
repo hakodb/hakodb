@@ -9,7 +9,7 @@ description = "Embedded & Cloud-native Document Engine"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = []
+default = ["net-sync", "cloud-sync"]
 tauri-gateway = ["dep:tauri", "dep:tokio", "dep:rmp-serde", "dep:rmpv" ]
 net-sync = ["dep:tokio", "dep:mdns-sd", "dep:gethostname", "dep:local-ip-address", "dep:socket2" ]
 cloud-sync = ["dep:tokio", "dep:tokio-tungstenite", "dep:rustls", "dep:futures-util", "dep:rmp-serde"]
