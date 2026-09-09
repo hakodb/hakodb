@@ -471,6 +471,15 @@ struct PeerInfo {
     prefix: String,
 }
 
+/// Admin view of one connected peer. `peer_key` is `{room_id}:{client_id}`;
+/// split on the first ':' to recover both parts.
+#[cfg(feature = "cloud-sync")]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PeerView {
+    pub peer_key: String,
+    pub prefix: String,
+}
+
 #[cfg(feature = "cloud-sync")]
 impl CloudSync {
     /// Creates a Cloud Sync controller. In **server** mode the room parameters
@@ -613,6 +622,27 @@ impl CloudSync {
             queued_writes: 0,
             hosted_rooms,
         }
+    }
+
+    /// Snapshot of currently connected peers (server: all room members;
+    /// client: normally just the uplink, if tracked). Best-effort read.
+    pub fn peer_list(&self) -> Vec<PeerView> {
+        match self.active_peers.try_read() {
+            Ok(guard) => guard
+                .iter()
+                .map(|(k, info)| PeerView {
+                    peer_key: k.clone(),
+                    prefix: info.prefix.clone(),
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Per-collection versions for one storage prefix (room catch-up clock).
+    /// Backs the admin dashboard's room view; pure function of the DB.
+    pub fn room_versions(&self, prefix: &str) -> HashMap<String, i64> {
+        Self::server_room_version_map(&self.db, prefix)
     }
 
     // ========================================================================

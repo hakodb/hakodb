@@ -72,19 +72,22 @@ async fn main() -> Result<(), String> {
     // Sync plane: the shared room-agnostic server. Group admission policy
     // (__groups) is enforced inside the handshake; see cloud_sync.
     let db = std::sync::Arc::new(db);
-    let sync = firelite::cloud_sync::CloudSync::server(
+    let sync = std::sync::Arc::new(firelite::cloud_sync::CloudSync::server(
         db.clone(),
         &cfg.server_id,
         &cfg.sync_token,
-    );
+    ));
     let sync_bind = cfg.sync_bind.clone();
-    let sync_task = tokio::spawn(async move {
-        sync.start(&sync_bind)
-            .await
-            .map_err(|e| format!("sync serve {sync_bind}: {e}"))
+    let sync_task = tokio::spawn({
+        let sync = sync.clone();
+        async move {
+            sync.start(&sync_bind)
+                .await
+                .map_err(|e| format!("sync serve {sync_bind}: {e}"))
+        }
     });
 
-    let state = std::sync::Arc::new(AppState::new(db, cfg.secure_cookies));
+    let state = std::sync::Arc::new(AppState::new(db, cfg.secure_cookies).with_sync(sync));
     let listener = tokio::net::TcpListener::bind(&cfg.admin_bind)
         .await
         .map_err(|e| format!("bind {}: {e}", cfg.admin_bind))?;

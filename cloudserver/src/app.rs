@@ -28,6 +28,8 @@ pub struct AppState {
     pub db: Arc<FireLite>,
     pub auth: Arc<AuthStore>,
     pub secure_cookies: bool,
+    /// Sync plane handle (None in tests / before boot).
+    pub sync: Option<Arc<firelite::cloud_sync::CloudSync>>,
 }
 
 impl AppState {
@@ -36,7 +38,13 @@ impl AppState {
             db,
             auth: Arc::new(AuthStore::default()),
             secure_cookies,
+            sync: None,
         }
+    }
+
+    pub fn with_sync(mut self, sync: Arc<firelite::cloud_sync::CloudSync>) -> Self {
+        self.sync = Some(sync);
+        self
     }
 }
 
@@ -240,10 +248,18 @@ async fn me(user: AuthedUser) -> Json<MeBody> {
 }
 
 fn require_admin(user: &AuthedUser) -> Result<(), Response> {
-    if user.role == Role::Admin {
+    require_role(user, Role::Admin)
+}
+
+pub(crate) fn require_role(user: &AuthedUser, need: Role) -> Result<(), Response> {
+    if user.role.at_least(need) {
         Ok(())
     } else {
-        Err((StatusCode::FORBIDDEN, Json(json!({"error": "admin role required"}))).into_response())
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "insufficient role"})),
+        )
+            .into_response())
     }
 }
 
@@ -421,5 +437,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/groups/:name/members/:client_id",
             delete(remove_member_route),
         )
+        .merge(crate::data::data_routes())
         .with_state(state)
 }
