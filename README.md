@@ -10,7 +10,17 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.7.14)
+## What's new (0.7.2 → 0.8.0)
+
+### v0.8.0 — sync hub/server release
+- The sync batch graduates to minor: `firelite-cloudserver` managed hub
+  (auth, groups, data plane, SSE, admin console, TLS, systemd + Windows
+  Service), mesh discovery modes (mDNS / broadcast / both), rejoin-safe
+  local-only deletes, and fail-closed encrypted sync (Layer 0 handshake
+  capabilities, sender/receiver/relay enforcement — no silent plaintext
+  leaks to unverified peers). `net-sync` + `cloud-sync` ride in default
+  features. Core engine behavior and performance unchanged (verified with
+  `benchmark --gate`, see below).
 
 ### v0.7.14 — encrypted sync goes fail-closed (Layer 0)
 - Encrypted collections no longer replicate as silent plaintext to
@@ -169,7 +179,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.7.14)](#whats-new-072--0714)
+- [What's new (0.7.2 → 0.8.0)](#whats-new-072--080)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)
