@@ -18,6 +18,9 @@ pub struct ServerConfig {
     pub admin_bind: String,
     pub sync_bind: String,
     pub log_level: String,
+    /// Emit `Secure` on session cookies. Enable with TLS (phase 7);
+    /// until then the loopback default bind would only break logins.
+    pub secure_cookies: bool,
 }
 
 /// Partial file/env/flag layer. Every field optional; `None` inherits.
@@ -28,6 +31,7 @@ pub struct ConfigLayer {
     pub admin_bind: Option<String>,
     pub sync_bind: Option<String>,
     pub log_level: Option<String>,
+    pub secure_cookies: Option<bool>,
 }
 
 impl ConfigLayer {
@@ -45,6 +49,9 @@ impl ConfigLayer {
         if over.log_level.is_some() {
             self.log_level = over.log_level;
         }
+        if over.secure_cookies.is_some() {
+            self.secure_cookies = over.secure_cookies;
+        }
         self
     }
 
@@ -56,12 +63,13 @@ impl ConfigLayer {
                 .unwrap_or_else(|| DEFAULT_ADMIN_BIND.into()),
             sync_bind: self.sync_bind.unwrap_or_else(|| DEFAULT_SYNC_BIND.into()),
             log_level: self.log_level.unwrap_or_else(|| DEFAULT_LOG_LEVEL.into()),
+            secure_cookies: self.secure_cookies.unwrap_or(false),
         }
     }
 }
 
 /// `FL_*` environment layer (`FL_DB_PATH`, `FL_ADMIN_BIND`, `FL_SYNC_BIND`,
-/// `FL_LOG_LEVEL`). Only non-empty values count.
+/// `FL_LOG_LEVEL`, `FL_SECURE_COOKIES=1`). Only non-empty values count.
 fn env_layer(vars: &HashMap<String, String>) -> ConfigLayer {
     let get = |k: &str| {
         vars.get(k)
@@ -73,6 +81,7 @@ fn env_layer(vars: &HashMap<String, String>) -> ConfigLayer {
         admin_bind: get("FL_ADMIN_BIND"),
         sync_bind: get("FL_SYNC_BIND"),
         log_level: get("FL_LOG_LEVEL"),
+        secure_cookies: get("FL_SECURE_COOKIES").map(|v| v == "1" || v.eq_ignore_ascii_case("true")),
     }
 }
 

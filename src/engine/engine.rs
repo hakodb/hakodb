@@ -159,6 +159,24 @@ pub struct SecurityRule {
     pub allow: bool,
 }
 
+/// Collections that must never leave the device over sync (net or cloud),
+/// in either direction. Sync-state, room registry, and the admin plane's
+/// credential stores. (`__firelite_security` is deliberately NOT here —
+/// policy documents replicate by design.)
+pub const SYNC_EXCLUDED_COLLECTIONS: &[&str] = &[
+    "__firelite_system",
+    "__firelite_rooms",
+    "__users",
+    "__groups",
+];
+
+/// True when `col` must be withheld from all sync tailers and catch-up.
+/// Consulted on send paths; the net_sync inbound apply uses the same
+/// per-instance set seeded from this list.
+pub fn is_sync_excluded(col: &str) -> bool {
+    SYNC_EXCLUDED_COLLECTIONS.contains(&col)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AuditEntry {
     pub op: AccessOp,

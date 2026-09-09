@@ -3,4 +3,5 @@
 //! future consumers can drive the app directly.
 
 pub mod app;
+pub mod auth;
 pub mod config;

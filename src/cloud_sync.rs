@@ -1452,9 +1452,10 @@ kind,
                 let cols = db.list_collections().unwrap_or_default();
 
                 for col in cols {
-                    // Sync-state + scope markers never leave the device.
-                    // (`__firelite_security` keeps flowing — policies replicate.)
-                    if col == "__firelite_system" || col == INTERNAL_ROOMS_COLLECTION {
+                    // Sync-state, room registry, and admin credential stores
+                    // never leave the device. (`__firelite_security` keeps
+                    // flowing — policies replicate.)
+                    if crate::engine::engine::is_sync_excluded(&col) {
                         continue;
                     }
                     if let Ok(shard_arc) = db.get_shard(&col) {

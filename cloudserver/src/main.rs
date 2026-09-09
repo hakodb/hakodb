@@ -29,6 +29,9 @@ struct Cli {
     /// Log level (error|warn|info|debug|trace).
     #[arg(long)]
     log_level: Option<String>,
+    /// Emit Secure on session cookies (enable with TLS).
+    #[arg(long)]
+    secure_cookies: bool,
 }
 
 #[tokio::main]
@@ -42,6 +45,7 @@ async fn main() -> Result<(), String> {
             admin_bind: cli.admin_bind,
             sync_bind: cli.sync_bind,
             log_level: cli.log_level,
+            secure_cookies: cli.secure_cookies.then_some(true),
         },
         &env_vars,
     )?;
@@ -57,12 +61,15 @@ async fn main() -> Result<(), String> {
         .map_err(|e| format!("open db {}: {e}", cfg.db_path))?;
     tracing::info!(db_path = %cfg.db_path, admin_bind = %cfg.admin_bind, sync_bind = %cfg.sync_bind, "firelite-cloudserver starting (sync plane arrives in a later phase)");
 
-    let state = std::sync::Arc::new(AppState::new(db));
+    let state = std::sync::Arc::new(AppState::new(db, cfg.secure_cookies));
     let listener = tokio::net::TcpListener::bind(&cfg.admin_bind)
         .await
         .map_err(|e| format!("bind {}: {e}", cfg.admin_bind))?;
-    axum::serve(listener, build_router(state))
-        .await
-        .map_err(|e| format!("serve: {e}"))?;
+    axum::serve(
+        listener,
+        build_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .map_err(|e| format!("serve: {e}"))?;
     Ok(())
 }

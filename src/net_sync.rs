@@ -307,7 +307,11 @@ impl NetSyncer {
             }
         }
 
-        excluded.extend(vec!["__firelite_system".into()]);
+        excluded.extend(
+            crate::engine::engine::SYNC_EXCLUDED_COLLECTIONS
+                .iter()
+                .map(|s| s.to_string()),
+        );
 
         Self {
             db: db.clone(), 
