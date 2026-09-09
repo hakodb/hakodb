@@ -195,6 +195,8 @@ fn wal_reserve_skipped_for_internal_collections() {
     ));
     let mut cfg = FireLiteConfig::default();
     cfg.durability_mode = DurabilityMode::Always;
+    // Exercise the reserve mechanism explicitly (default is off/0).
+    cfg.wal_reserve_bytes = 4 * 1024 * 1024;
     let db = FireLite::open(&dir, cfg).expect("open");
 
     let mut doc = FireLiteDoc::default();

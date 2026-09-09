@@ -26,11 +26,13 @@ pub struct FireLiteConfig {
     pub compression_level: i32,
 pub value_blob_threshold_bytes: usize,
 pub replication_collections: Option<Vec<String>>,
-/// WAL headroom reservation in bytes (0 = off). Preallocated ahead of the
-/// write position so steady-state appends never extend the file (fewer
-/// tiny extensions => less fragmentation => cheaper per-commit fsync on
-/// durable modes). Sparse: consumes no disk until written. Ignored for
-/// Manual (never fsyncs mid-session).
+/// WAL headroom reservation in bytes (0 = off, the default). When set,
+/// preallocated ahead of the write position so steady-state appends never
+/// extend the file (fewer tiny extensions => less fragmentation => cheaper
+/// per-commit fsync on durable modes). Sparse: consumes no disk until
+/// written. Measured A/B on fsync-bound workloads: no throughput delta at
+/// benchmark scale, so it stays opt-in — phantom size and mobile storage
+/// cost more than unproven fragmentation gains. Ignored for Manual.
 pub wal_reserve_bytes: u64,
 }
 
@@ -53,7 +55,7 @@ impl Default for FireLiteConfig {
             compression_level: 3,
 value_blob_threshold_bytes: 16 * 1024,
 replication_collections: None,
-wal_reserve_bytes: 4 * 1024 * 1024,
+wal_reserve_bytes: 0,
         }
     }
 }

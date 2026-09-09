@@ -6,11 +6,21 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 FireLite speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.7.11 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.7.12 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.7.11)
+## What's new (0.7.2 → 0.7.12)
+
+### v0.7.12 — WAL reserve off by default
+- **Measured, not theorized.** A/B on the fsync-bound Always profile:
+  746 WPS with reserve 0 vs 626–764 across five reserve-4MB runs — inside
+  the noise band. The fsync cost dominates so completely that file-growth
+  metadata is unmeasurable at this scale.
+- Default `wal_reserve_bytes` is now 0 (was 4 MB): no phantom size per
+  shard, no surprise floors on mobile storage. Opt back in per workload
+  via `fl_config_set_wal_reserve_bytes` if a long-soak test ever shows
+  fragmentation-driven fsync decay.
 
 ### v0.7.11 — WAL history compaction for hot-small collections
 - **Problem.** Small-but-hot collections (sync checkpoints, carts, sessions)
@@ -128,7 +138,9 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 - **Id-cursor fast path** — `start_at`/`start_after` on document id resolves to a `SortedKeys` Vec range instead of a composite scan.
 - **Plan-cache key fix** — cursor bound tags (`start_at` vs `start_after`) included in the key; previously colliding plans could return wrong pages.
 - **Write fast path** — `put_owned` / `fl_engine_insert_take` (no clone on owned docs), shard-lookup hoist, `ChangeEvent.path: Arc<str>`, 8192-entry version-stamped hot doc cache.
-- **WAL headroom** — configurable `wal_reserve_bytes` (default 4 MB sparse prealloc, skipped for Manual) via `FireLiteConfig::wal_reserve_bytes` / `fl_config_set_wal_reserve_bytes`.
+- **WAL headroom** — opt-in `wal_reserve_bytes` (default 0 since v0.7.12;
+  measured no throughput delta on fsync-bound workloads, so no phantom size
+  by default) via `FireLiteConfig::wal_reserve_bytes` / `fl_config_set_wal_reserve_bytes`.
 - **Write-phase timers** — `WRITE_STATS` + `write_stats_report()` / `fl_debug_write_stats()`; `benchmark --profile=<mode> --wstats` attributes write latency (Manual ~11.7 µs after shard hoist, −24%).
 
 ### v0.7.2 — pagination, WAL hardening, FFI slab
@@ -142,7 +154,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.7.11)](#whats-new-072--0711)
+- [What's new (0.7.2 → 0.7.12)](#whats-new-072--0712)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)
