@@ -417,25 +417,39 @@ fn bulk_json_matches_per_doc() {
 
     wait_for_indexes(engine);
 
-    let q = unsafe { fl_query_new(coll.as_ptr()) };
-    unsafe { fl_query_limit(q, 10) };
-    let rs = unsafe { fl_query_execute_to_handles(engine, q) };
-    let n = unsafe { fl_result_set_count(rs) };
-    assert_eq!(n, 3);
+    // ponytail: the 20KB photo persists via the background blob worker;
+    // eager query inflation reads the blob FILE (no flush-queue fallback
+    // on this path), so it races the flush. Poll until the photo lands —
+    // bulk and per-doc renderers share the same docs, so the byte-identity
+    // assert below holds on every iteration, inflated or not.
+    let t0 = std::time::Instant::now();
+    let (_n, _expected, bulk) = loop {
+        let q = unsafe { fl_query_new(coll.as_ptr()) };
+        unsafe { fl_query_limit(q, 10) };
+        let rs = unsafe { fl_query_execute_to_handles(engine, q) };
+        let n = unsafe { fl_result_set_count(rs) };
+        assert_eq!(n, 3);
 
-    // Per-doc reference rendering.
-    let mut expected = String::from("[");
-    for i in 0..n {
-        let d = unsafe { fl_result_set_get_doc(rs, i) };
-        let j = read_cstr(unsafe { fl_doc_to_json(d) });
-        if i > 0 { expected.push(','); }
-        expected.push_str(&j);
-    }
-    expected.push(']');
+        // Per-doc reference rendering.
+        let mut expected = String::from("[");
+        for i in 0..n {
+            let d = unsafe { fl_result_set_get_doc(rs, i) };
+            let j = read_cstr(unsafe { fl_doc_to_json(d) });
+            if i > 0 { expected.push(','); }
+            expected.push_str(&j);
+        }
+        expected.push(']');
 
-    // Bulk rendering must match byte-for-byte.
-    let bulk = read_cstr(unsafe { fl_result_set_to_json(rs) });
-    assert_eq!(bulk, expected, "bulk JSON diverged from per-doc rendering");
+        // Bulk rendering must match byte-for-byte.
+        let bulk = read_cstr(unsafe { fl_result_set_to_json(rs) });
+        assert_eq!(bulk, expected, "bulk JSON diverged from per-doc rendering");
+        unsafe { fl_result_set_free(rs) };
+        unsafe { fl_query_free(q) };
+        if bulk.contains("PHOTO_") || t0.elapsed() > std::time::Duration::from_secs(15) {
+            break (n, expected, bulk);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
 
     // Spot-check arms survived (eager path inflates: no placeholders here).
     assert!(bulk.contains("PHOTO_"), "inflated photo arm");
@@ -479,8 +493,6 @@ fn bulk_json_matches_per_doc() {
     unsafe { fl_result_set_free(rse) };
     unsafe { fl_query_free(qe) };
 
-    unsafe { fl_result_set_free(rs) };
-    unsafe { fl_query_free(q) };
     unsafe { fl_engine_free(engine) };
     std::fs::remove_dir_all(&dir).ok();
 }

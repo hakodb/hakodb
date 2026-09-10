@@ -113,6 +113,9 @@ fn hash_query(q: &Query) -> u64 {
     // so it must key the plan — otherwise a deferred query reuses an eager
     // plan's output shape or vice versa.
     q.defer_blobs.hash(&mut h);
+    // ponytail: raw changes executor output (bytes vs docs) — same
+    // keying requirement as defer_blobs.
+    q.raw.hash(&mut h);
     for p in &q.projection { p.hash(&mut h); }
     for a in &q.aggregations { hash_agg(a, &mut h); }
 

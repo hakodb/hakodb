@@ -34,6 +34,20 @@ fn seed(db: &FireLite) {
         }
         db.write_batch(batch).expect("seed batch");
     }
+    // ponytail: open() returns while index recovery still runs in the
+    // background; queries issued before `indexes_ready` silently plan
+    // FullCollection (planner's index_ready gate) — pages then ignore
+    // cursor bounds and repeat rows. Poll before scanning.
+    wait_ready(db);
+}
+
+/// Poll until background open-recovery finishes (see `seed`).
+fn wait_ready(db: &FireLite) {
+    let t0 = std::time::Instant::now();
+    while !db.is_indexes_ready() {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(30), "indexes never ready");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 fn scan_all(db: &FireLite, ascending: bool) -> (Vec<String>, std::time::Duration) {
@@ -58,8 +72,7 @@ fn scan_all(db: &FireLite, ascending: bool) -> (Vec<String>, std::time::Duration
 }
 
 #[test]
-fn cursor_direction_parity() {
-    let dir = std::env::temp_dir().join(format!(
+fn cursor_direction_parity() {    let dir = std::env::temp_dir().join(format!(
         "fl-test-cursor-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -84,6 +97,42 @@ fn cursor_direction_parity() {
         N as u128 * 1_000_000_000 / fwd_dt.as_nanos().max(1),
         N as u128 * 1_000_000_000 / rev_dt.as_nanos().max(1),
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Steady-state control: fresh writes sit as BlobPending (re-encode per
+/// read) until background conversion; a reopen replays WAL PutInlined
+/// straight into Inlined pointers. Seed → close → reopen → scan measures
+/// the TRUE Inlined ceiling with zero code changes.
+#[test]
+fn reopen_steady_state() {
+    let dir = std::env::temp_dir().join(format!(
+        "fl-test-reopen-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        let db = open_bench(&dir);
+        seed(&db);
+    }
+    let db2 = open_bench(&dir);
+    wait_ready(&db2);
+
+    let (ids, _, dt) = scan_all_raw(&db2, true);
+    assert_eq!(ids.len(), N, "reopened raw scan missed docs");
+    eprintln!(
+        "raw scan REOPENED (Inlined steady state): {N} docs in {dt:?} = {} docs/s",
+        N as u128 * 1_000_000_000 / dt.as_nanos().max(1),
+    );
+    let (dids, ddt) = scan_all(&db2, true);
+    assert_eq!(dids, ids, "reopened decoded ids match raw ids");
+    eprintln!(
+        "decoded scan REOPENED: {N} docs in {ddt:?} = {} docs/s",
+        N as u128 * 1_000_000_000 / ddt.as_nanos().max(1),
+    );
+    drop(db2);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -320,4 +369,67 @@ fn point_get_floor() {
     unsafe { firelite::ffi::fl_engine_free(bengine) };
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(&bdir).ok();
+}
+
+fn scan_all_raw(db: &FireLite, ascending: bool) -> (Vec<String>, usize, std::time::Duration) {
+    let t0 = std::time::Instant::now();
+    let mut ids = Vec::with_capacity(N);
+    let mut total_bytes = 0usize;
+    let mut anchor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let mut q = Query::new("bench");
+        q = q.order_by("id", ascending);
+        q.limit = Some(PAGE);
+        if let Some(a) = &anchor {
+            q = q.start_after(vec![Value::String(a.clone())]);
+        }
+        let rows = db.query_raw(q).expect("raw page query");
+        if rows.is_empty() {
+            break;
+        }
+        anchor = Some(rows.last().unwrap().0.clone());
+        // Decodability spot-check on first/last page only — decoding every
+        // row would measure decode, not the raw path.
+        pages += 1;
+        if pages == 1 {
+            for (id, bytes) in &rows {
+                let doc = FireLiteDoc::decode(bytes).expect("raw bytes decode");
+                assert!(doc.get("v").is_some(), "decoded raw doc {id} has v");
+            }
+        }
+        total_bytes += rows.iter().map(|(_, b)| b.len()).sum::<usize>();
+        ids.extend(rows.into_iter().map(|(id, _)| id));
+    }
+    (ids, total_bytes, t0.elapsed())
+}
+
+#[test]
+fn raw_scan_parity() {    let dir = std::env::temp_dir().join(format!(
+        "fl-test-raw-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let db = open_bench(&dir);
+    seed(&db);
+
+    let (fwd, fwd_bytes, fwd_dt) = scan_all_raw(&db, true);
+    assert_eq!(fwd.len(), N, "raw forward missed docs");
+    assert!(fwd.windows(2).all(|w| w[0] < w[1]), "raw forward not ascending");
+
+    let (rev, _, rev_dt) = scan_all_raw(&db, false);
+    assert_eq!(rev.len(), N, "raw reverse missed docs");
+    assert!(rev.windows(2).all(|w| w[0] > w[1]), "raw reverse not descending");
+    assert_eq!(rev.first().unwrap(), fwd.last().unwrap());
+    assert_eq!(rev.last().unwrap(), fwd.first().unwrap());
+
+    eprintln!(
+        "raw scan: forward {N} docs / {} bytes in {fwd_dt:?} (= {} docs/s), reverse in {rev_dt:?} (= {} docs/s)",
+        fwd_bytes,
+        N as u128 * 1_000_000_000 / fwd_dt.as_nanos().max(1),
+        N as u128 * 1_000_000_000 / rev_dt.as_nanos().max(1),
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }

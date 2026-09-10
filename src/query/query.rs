@@ -24,6 +24,12 @@ pub struct Query {
     /// resolve on demand via `resolve_doc` / `fl_doc_resolve_blobs`.
     /// Default false — current eager behavior, zero risk to existing apps.
     pub defer_blobs: bool,
+    /// ponytail: raw mode — `db.query_raw` returns storage-encoded bytes
+    /// instead of decoded docs (opaque, version-scoped: decode with
+    /// `FireLiteDoc::decode`, do not persist). Skips decode, filter
+    /// re-verify and rayon dispatch; requires index-satisfied filters and
+    /// ordering, else `query_raw` errors. Default false.
+    pub raw: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +56,7 @@ impl Query {
             end_at: None,
             end_before: None,
             defer_blobs: false,
+            raw: false,
         }
     }
 
@@ -112,6 +119,13 @@ impl Query {
     /// of inflating them. See field docs.
     pub fn defer_blobs(mut self, defer: bool) -> Self {
         self.defer_blobs = defer;
+        self
+    }
+
+    /// Raw mode: return storage-encoded bytes via `db.query_raw` instead of
+    /// decoded docs. See field docs for the contract.
+    pub fn raw(mut self, raw: bool) -> Self {
+        self.raw = raw;
         self
     }
 

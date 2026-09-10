@@ -777,6 +777,19 @@ impl StorageEngine {
         self.read_pointer_internal(pointer, true)
     }
 
+    /// Shared-bytes read: `Inlined` / `BlobPendingData` hand back the live
+    /// Arc (zero copies); every other variant does one owned read wrapped
+    /// in an Arc. Backs raw scans — bytes are opaque storage encoding.
+    pub(crate) fn read_pointer_shared(&self, pointer: &Pointer) -> Result<Option<Arc<Vec<u8>>>> {
+        match pointer {
+            Pointer::Inlined(shared) => Ok(Some(Arc::clone(shared))),
+            Pointer::BlobPendingData { data, .. } => Ok(Some(Arc::clone(data))),
+            Pointer::BlobPending(doc) => Ok(Some(Arc::new(doc.encode()))),
+            Pointer::Deleted { .. } => Ok(None),
+            other => Ok(self.read_pointer_internal(other, true)?.map(Arc::new)),
+        }
+    }
+
     // UPDATED: Use the internal helper to avoid E0004
     pub fn read_pointer_uncached(&self, pointer: &Pointer) -> Result<Option<Vec<u8>>> {
         self.read_pointer_internal(pointer, false)

@@ -10,7 +10,28 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.8.1)
+## What's new (0.7.2 → 0.8.2)
+
+### v0.8.2 — inline-at-write + raw scans: 1M+ docs/s
+- **Raw scans hit 1.03–1.20M docs/s** (was ~289k). New `Query.raw` /
+  `db.query_raw()` stops after the index walk and shares buffers
+  (`read_pointer_shared`, zero copies for inlined docs) — no decode, no
+  rayon. Requires index-satisfied filters/ordering; bytes are opaque
+  storage encoding (decode with `FireLiteDoc::decode`).
+- **Inline-at-write** (the bigger lever): every put used to land as
+  `BlobPending` and re-encode on *every read* until background
+  conversion — small docs in Manual mode never converted at all. Writes
+  now store `Inlined` with the bytes already encoded for WAL (durability
+  identical, worker swap no-ops, pre-flush blob reads still resolve via
+  the flush queue). Fresh-state reads run at steady-state speed:
+  point-gets ~105k → ~235k native, FFI+JSON ~50k → ~90-103k.
+  Always-profile writes unchanged (636 WPS, in-band).
+- **Two pre-existing flakes fixed**: (1) queries issued before background
+  index recovery silently plan `FullCollection` (cursor bounds then
+  ignored, pages repeat) — tests now poll the new public
+  `is_indexes_ready()` (mirrors the FFI); benchmark authors take note.
+  (2) `bulk_json_matches_per_doc` raced the blob flush (3/6 fails on
+  main) — now polls for persistence instead of luck.
 
 ### v0.8.1 — reverse-cursor parity + point-get push (dbbench vs MDBX)
 - **Reverse cursor 27x → ~1.1x.** Descending `ORDER BY id` with cursor
@@ -195,7 +216,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.1)](#whats-new-072--081)
+- [What's new (0.7.2 → 0.8.2)](#whats-new-072--082)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)

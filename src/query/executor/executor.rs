@@ -255,6 +255,73 @@ impl ParallelQueryExecutor {
         Ok(results)
     }
 
+    /// Raw scan: phase-1 index walk with byte materialization — no decode,
+    /// no filter re-verify, no blob inflation, no rayon. `Inlined` docs
+    /// share the RAM buffer (Arc bump, zero copies); segment/blob pointers
+    /// do one positional read each. Returns storage-encoded bytes: opaque
+    /// and version-scoped — decode with `FireLiteDoc::decode`, do not
+    /// persist or compare across versions.
+    ///
+    /// Requires index-satisfied filters AND ordering (raw cannot match or
+    /// sort without decoding) — otherwise `QueryError`. Single-threaded by
+    /// design: the work is Arc bumps + memcpys, rayon dispatch would only
+    /// add overhead. Scan order is preserved (no re-sort).
+    pub fn execute_raw(
+        &self,
+        storage_arc: Arc<RwLock<StorageEngine>>,
+        indexes: &IndexManager,
+        plan: QueryPlan,
+    ) -> Result<Vec<(String, Arc<Vec<u8>>)>> {
+        use crate::error::FireLiteError;
+        if (!plan.filters.is_empty() || !plan.or_groups.is_empty())
+            && !plan.filters_satisfied_by_index
+        {
+            return Err(FireLiteError::QueryError(
+                "raw queries require index-satisfied filters (decode to match)".into(),
+            ));
+        }
+        if !plan.order_by_satisfied && !plan.order_by.is_empty() {
+            return Err(FireLiteError::QueryError(
+                "raw queries require index-satisfied ordering (decode to sort)".into(),
+            ));
+        }
+
+        let storage = storage_arc.read().unwrap();
+        let found = self.execute_single_scan(
+            &storage,
+            indexes,
+            &plan.scan,
+            &plan.collection,
+            plan.scan_limit,
+            plan.offset,
+        )?;
+
+        let mut out = Vec::with_capacity(found.len());
+        for (id, ptr) in found {
+            // ponytail: shared read — Inlined hands back the live Arc, no
+            // per-row copy; Deleted defensively skipped (phase 1 already
+            // filters it).
+            if let Some(bytes) = storage.read_pointer_shared(&ptr)? {
+                out.push((id, bytes));
+            }
+        }
+
+        // Phase-6-style truncation for scans that didn't pre-apply it
+        // (mirrors `execute`: SortedKeys pre-applied offset via the range).
+        let skip = match plan.scan {
+            ScanType::SortedKeys { .. } => 0,
+            _ => plan.offset.unwrap_or(0),
+        };
+        let mut out = out;
+        if skip > 0 {
+            out = out.into_iter().skip(skip).collect();
+        }
+        if let Some(limit) = plan.limit {
+            out.truncate(limit);
+        }
+        Ok(out)
+    }
+
     #[inline]
     fn make_key(_collection: &str, doc_id: &str) -> String {
         doc_id.to_string()

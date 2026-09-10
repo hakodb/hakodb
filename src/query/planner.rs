@@ -312,6 +312,7 @@ impl QueryPlanner {
             order_by_satisfied: actual_order_satisfied,
             filters_satisfied_by_index: filters_satisfied,
             defer_blobs: query.defer_blobs,
+            raw: query.raw,
         }
     }
 

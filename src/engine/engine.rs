@@ -923,9 +923,27 @@ impl FireLite {
                     WRITE_STATS.wal_ns.fetch_add(t_wal.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 }
 
-                // Apply storage index changes
+                // Apply storage index changes.
+                // ponytail: docs land Inlined with the bytes already encoded
+                // for WAL (matched by bare key) — no BlobPending detour, no
+                // per-read re-encode until background conversion. The WAL op
+                // carries identical bytes, so durability is unchanged; the
+                // blob worker's BlobPending-gated swap simply no-ops, and
+                // pre-flush blob reads still resolve via the flush queue.
+                // Falls back to BlobPending if the WAL op is ever absent.
+                let mut put_bytes: std::collections::HashMap<&str, &[u8]> =
+                    std::collections::HashMap::with_capacity(work.index_puts.len());
+                for op in &work.ops {
+                    if let WalOp::PutInlined { key, value } = op {
+                        put_bytes.insert(key.as_str(), value.as_slice());
+                    }
+                }
                 for (doc_id, doc_arc) in &work.index_puts {
-                    shard.update_index_entry(doc_id.clone(), Some(Pointer::BlobPending(Arc::clone(doc_arc))));
+                    let ptr = match put_bytes.get(doc_id.as_str()) {
+                        Some(bytes) => Pointer::Inlined(Arc::new(bytes.to_vec())),
+                        None => Pointer::BlobPending(Arc::clone(doc_arc)),
+                    };
+                    shard.update_index_entry(doc_id.clone(), Some(ptr));
                 }
                 for op in &work.ops {
                     if let WalOp::Delete { key, timestamp } = op {
@@ -1287,6 +1305,44 @@ impl FireLite {
             collection: query.collection.clone(),
             doc_id: None,
             ok: true, // prev ->results.is_ok()
+        });
+
+        Ok(results)
+    }
+
+    /// Raw scan: storage-encoded bytes instead of decoded docs. Same
+    /// admission path as [`Self::query`] (security, plan cache, audit);
+    /// execution stops after the index walk — see
+    /// `ParallelQueryExecutor::execute_raw` for the contract (opaque bytes,
+    /// index-satisfied filters/ordering required). Sets `query.raw` so the
+    /// plan-cache key can't collide with a decoded query of the same shape.
+    pub fn query_raw(&self, mut query: Query) -> Result<Vec<(String, std::sync::Arc<Vec<u8>>)>> {
+        query.raw = true;
+        if !self.allowed(&query.collection, AccessOp::Query) {
+            self.record_audit(AuditEntry {
+                op: AccessOp::Query,
+                collection: query.collection.clone(),
+                doc_id: None,
+                ok: false,
+            });
+            return Err(FireLiteError::Corrupt("Denied".into()));
+        }
+
+        let shard_arc = self.get_shard(&query.collection)?;
+        let indexes = self.indexes.read().unwrap();
+        let rows = shard_arc.read().unwrap().count_prefix("");
+
+        let is_ready = self.indexes_ready.load(std::sync::atomic::Ordering::Acquire);
+
+        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
+
+        let results = self.executor.execute_raw(shard_arc, &indexes, (*plan).clone())?;
+
+        self.record_audit(AuditEntry {
+            op: AccessOp::Query,
+            collection: query.collection.clone(),
+            doc_id: None,
+            ok: true,
         });
 
         Ok(results)
@@ -2121,6 +2177,14 @@ impl FireLite {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "firelite_default".to_string())
+    }
+
+    /// True once the background open-recovery pass has rebuilt indexes.
+    /// Queries issued before this silently plan `FullCollection` (the
+    /// planner's `index_ready` gate) — poll after open/seed in benchmarks
+    /// and tests before measuring. Mirrors `fl_engine_is_indexes_ready`.
+    pub fn is_indexes_ready(&self) -> bool {
+        self.indexes_ready.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn record_audit(&self, entry: AuditEntry) {

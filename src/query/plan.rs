@@ -79,4 +79,8 @@ pub struct QueryPlan {
     /// ponytail: mirrors `Query::defer_blobs` — part of the plan (and the
     /// plan-cache key) because it changes what the executor returns.
     pub defer_blobs: bool,
+    /// ponytail: mirrors `Query::raw` — the executor's raw path reads this,
+    /// and it keys the plan cache (a raw query must never reuse a decoded
+    /// plan's output shape or vice versa).
+    pub raw: bool,
 }
