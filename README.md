@@ -10,7 +10,23 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.8.4)
+## What's new (0.7.2 → 0.8.5)
+
+### v0.8.5 — decoded scans 150k → 560k (fetch machinery, not codec)
+- **Measured first**: codec floors are decode 950ns / encode 209ns per
+  100B doc — decode is only ~14% of the 6.7µs scan row. The rest was
+  phases 3–5 (offset-sort, String re-clones, restore-order map) running
+  even when the index already yields final order.
+- **Satisfied fast paths**: order- + filter-satisfied scans now decode
+  in scan order — sequential to 2000 rows, order-preserving parallel
+  beyond (`execute_satisfied_parallel`: one guard, Arc staging, par
+  decode). Small unsatisfied queries keep the old ≤250 path; big
+  unsatisfied keep phases 3–6. No behavior change, just skipped work.
+- **FullCollection limit pushdown**: unordered TOP-N no longer collects
+  the whole collection per page.
+- Result: decoded keyset scans **~150k → 564k fwd / 485k rev**;
+  `benchmark --gate` PASS (one noise FAIL in three runs on the Batch≈
+  Single margin — read-only batch, reruns green).
 
 ### v0.8.4 — zero-alloc walk: 2.1–3.3M docs/s
 - New `db.walk(query, callback)`: the engine lends each row (`&str` id,
@@ -239,7 +255,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.4)](#whats-new-072--084)
+- [What's new (0.7.2 → 0.8.5)](#whats-new-072--085)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)

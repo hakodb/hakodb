@@ -283,8 +283,13 @@ impl QueryPlanner {
         // 7. DEFAULT FALLBACK: Full Collection Scan
         // This is the "Safety Net". If no index was found for 'id:eq',
         // it lands here and the Worker checks the storage keys manually.
+        // ponytail: push limit+offset into the scan — unordered scans can
+        // satisfy TOP-N from ANY rows, so collecting the whole collection
+        // per page (then truncating) was pure waste. Offset still applies
+        // downstream in the executor.
         let no_filters = query.filters.is_empty() && query.or_groups.is_empty();
-        Self::make_plan(query, ScanType::FullCollection, None, false, no_filters)
+        let fc_limit = query.limit.map(|l| l + query.offset.unwrap_or(0));
+        Self::make_plan(query, ScanType::FullCollection, fc_limit, false, no_filters)
     }
 
     /// Helper to build the plan object.

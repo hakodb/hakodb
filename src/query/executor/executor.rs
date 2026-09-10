@@ -66,9 +66,19 @@ impl ParallelQueryExecutor {
 
         let doc_count = keys_from_index.len();
 
-        // --- THE FIX: ULTRA-FAST PATH FOR SMALL QUERIES ---
-        // Bypasses physical sorting, Rayon dispatch, and HashMap recreation overhead.
-        if doc_count <= 250 {
+        // --- THE FAST PATH: satisfied scans skip the heavy machinery ---
+        // Bypasses physical sorting, String re-clones, rayon dispatch, and
+        // HashMap recreation overhead. Small queries always qualify
+        // (<= 250 rows); satisfied scans up to the sequential cap decode in
+        // scan order (that IS the result); bigger satisfied scans go
+        // parallel below. Unordered/unfiltered shapes keep the general path.
+        // ponytail: 2000 rows x ~1us decode ~= 2ms — past that, rayon earns
+        // its dispatch. Typical pages (<= 1000) stay sequential.
+        const SATISFIED_SEQUENTIAL_CAP: usize = 2000;
+        if doc_count <= 250
+            || ((plan.order_by_satisfied && plan.filters_satisfied_by_index)
+                && doc_count <= SATISFIED_SEQUENTIAL_CAP)
+        {
             let storage_guard = storage_arc.read().unwrap();
             let blob_manager = storage_guard.blob_manager.as_ref();
             let optimized_plan = crate::query::executor::worker::prepare_optimized_plan(&plan);
@@ -148,6 +158,16 @@ impl ParallelQueryExecutor {
             }
 
             return Ok(results);
+        }
+
+        // Large satisfied scans (> SEQUENTIAL cap below): same skip-the-
+        // machinery deal, but decode in parallel. Staged as (id, shared
+        // bytes) under one guard, then order-preserving par-decode — no
+        // String re-clones, no restore-order map. Without this, big
+        // satisfied scans would fall into phases 3-6 and regress vs the
+        // old rayon path they used to take.
+        if plan.order_by_satisfied && plan.filters_satisfied_by_index {
+            return self.execute_satisfied_parallel(storage_arc, indexes, plan, keys_from_index);
         }
 
         // 3. PHASE 3: PHYSICAL SORT (The "Sweep" optimization)
@@ -470,6 +490,56 @@ impl ParallelQueryExecutor {
     #[inline]
     fn make_key(_collection: &str, doc_id: &str) -> String {
         doc_id.to_string()
+    }
+
+    /// Parallel twin of the satisfied fast path above, for scans past the
+    /// sequential cap. Stage 1 resolves pointers to shared bytes under one
+    /// guard (Arc bumps, zero copies for inlined); stage 2 is an
+    /// order-preserving parallel decode; stage 3 reuses the standard blob
+    /// inflation + truncation tail. Filters are index-satisfied by the
+    /// caller gate, so no per-row re-verify.
+    fn execute_satisfied_parallel(
+        &self,
+        storage_arc: Arc<RwLock<StorageEngine>>,
+        _indexes: &IndexManager,
+        plan: QueryPlan,
+        keys_from_index: Vec<(String, Pointer)>,
+    ) -> Result<Vec<(String, FireLiteDoc)>> {
+        use crate::query::executor::worker::{doc_has_links, inflate_blobs};
+        let (staged, blob_manager) = {
+            let storage = storage_arc.read().unwrap();
+            let mut v = Vec::with_capacity(keys_from_index.len());
+            for (id, ptr) in keys_from_index {
+                if let Some(bytes) = storage.read_pointer_shared(&ptr)? {
+                    v.push((id, bytes));
+                }
+            }
+            (v, storage.blob_manager.clone())
+        };
+        let mut results: Vec<(String, FireLiteDoc)> = staged
+            .into_par_iter()
+            .filter_map(|(id, bytes)| FireLiteDoc::decode(&bytes).map(|doc| (id, doc)))
+            .collect();
+        if !plan.defer_blobs {
+            if let Some(bm) = blob_manager.as_ref() {
+                if results.iter().any(|(_, doc)| doc_has_links(doc)) {
+                    results.par_iter_mut().for_each(|(_, doc)| {
+                        let _ = inflate_blobs(doc, bm);
+                    });
+                }
+            }
+        }
+        let offset_to_apply_later = match plan.scan {
+            ScanType::SortedKeys { .. } => 0,
+            _ => plan.offset.unwrap_or(0),
+        };
+        if offset_to_apply_later > 0 {
+            results = results.into_iter().skip(offset_to_apply_later).collect();
+        }
+        if let Some(limit) = plan.limit {
+            results.truncate(limit);
+        }
+        Ok(results)
     }
 
     pub fn execute_aggregation(

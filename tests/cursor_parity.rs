@@ -641,3 +641,55 @@ fn walk_scan_parity() {
     assert_eq!(n, 0);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Codec floor: pure decode + encode loops over one representative row
+/// (100B binary doc). Sizes the codec vs the fetch machinery around it.
+#[test]
+fn codec_floor() {
+    use firelite::document::firelite_doc::FireLiteDoc;
+    let dir = std::env::temp_dir().join(format!(
+        "fl-test-codec-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let db = open_bench(&dir);
+    seed(&db);
+
+    let mut q = Query::new("bench").order_by("id", true);
+    q.limit = Some(1);
+    let rows = db.query_raw(q).expect("one raw row");
+    assert_eq!(rows.len(), 1);
+    let bytes: Vec<u8> = rows[0].1.as_ref().clone();
+
+    const K: usize = 200_000;
+    let t0 = std::time::Instant::now();
+    let mut nfields = 0;
+    for _ in 0..K {
+        let doc = FireLiteDoc::decode(&bytes).expect("decode");
+        nfields += doc.fields.len();
+    }
+    let ddt = t0.elapsed();
+    assert_eq!(nfields, K);
+    eprintln!(
+        "codec floor decode x{K}: {ddt:?} = {} ops/s ({} ns/op)",
+        K as u128 * 1_000_000_000 / ddt.as_nanos().max(1),
+        ddt.as_nanos() / K as u128,
+    );
+
+    let doc = FireLiteDoc::decode(&bytes).expect("decode");
+    let t0 = std::time::Instant::now();
+    let mut nbytes = 0;
+    for _ in 0..K {
+        nbytes += doc.encode().len();
+    }
+    let edt = t0.elapsed();
+    assert_eq!(nbytes, K * bytes.len());
+    eprintln!(
+        "codec floor encode x{K}: {edt:?} = {} ops/s ({} ns/op)",
+        K as u128 * 1_000_000_000 / edt.as_nanos().max(1),
+        edt.as_nanos() / K as u128,
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

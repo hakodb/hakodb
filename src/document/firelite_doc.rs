@@ -84,8 +84,12 @@ impl FireLiteDoc {
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let view = FireLiteDocView::new(bytes)?;
+        // ponytail: size the vec from the header count — the old push-grown
+        // vec always paid one backing alloc (+ regrow for wide docs) per
+        // decode. The count is right there in the view.
         let mut doc = FireLiteDoc::default();
         doc._time = view._time;
+        doc.fields = Vec::with_capacity(view.fields_count as usize);
         for (key, tag, data) in view.iter() {
             doc.fields.push((intern_field(key), decode_value(tag, data)?));
         }
@@ -96,6 +100,7 @@ impl FireLiteDoc {
         let view = FireLiteDocView::new(bytes)?;
         let mut doc = FireLiteDoc::default();
         doc._time = view._time;
+        doc.fields = Vec::with_capacity(view.fields_count as usize);
         for (key, tag, data) in view.iter() {
             if projection.is_empty() || projection.iter().any(|p| p == key) {
                 doc.fields.push((intern_field(key), decode_value(tag, data)?));
