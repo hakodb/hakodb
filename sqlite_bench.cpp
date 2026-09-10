@@ -22,7 +22,8 @@
 //   Stress GET 300x50 | Qry tenant-2 lim 20 300x | Cmp +ORDER score 300x |
 //   Agg SUM x50 (full-scan, like FireLite's sum stage) |
 //   SCAN TRIO x5 iters (mirrors benchmark.cpp 1:1): full SELECT * fwd/rev
-//   (all-column materialization ~ full-doc decode) + id-only key scan
+//   with OWNED per-row copies (true full-document materialization, the
+//   fair analog of owned full-doc decode) + id-only key scan
 //   (cursor + key movement ~ byte walk) | Bulk Delete 100 |
 //   shutdown (close) | storage size (bench.db)
 //
@@ -90,6 +91,26 @@ static void read_all_cols(sqlite3_stmt* st) {
     sink += sqlite3_column_bytes(st, 5);
     sink += sqlite3_column_bytes(st, 6);
     sink += sqlite3_column_bytes(st, 7);
+    (void)sink;
+}
+
+// Owned full-row materialization: every TEXT column copied into a fresh
+// std::string per row (ints/doubles are values on both sides — FireLite's
+// Int/Float decode allocates nothing either). Used ONLY by the full-scan
+// stages, where the fair analog is FireLite's owned full-doc decode.
+// read_all_cols above only pokes accessor lengths (borrowed buffers).
+static void copy_all_cols(sqlite3_stmt* st) {
+    volatile size_t sink = 0;
+    for (int c : {0, 1, 5, 6, 7}) {
+        const void* p = sqlite3_column_blob(st, c);
+        int n = sqlite3_column_bytes(st, c);
+        std::string s;
+        if (p && n > 0) s.assign((const char*)p, (size_t)n);
+        sink += s.size();
+    }
+    sink += (size_t)sqlite3_column_int(st, 2);
+    sink += (size_t)sqlite3_column_int(st, 3);
+    sink += (size_t)(sqlite3_column_double(st, 4) != 0.0);
     (void)sink;
 }
 
@@ -322,9 +343,10 @@ static Report run_once(const std::string& mode, const std::string& journal,
     sqlite3_finalize(agg_st);
 
     // 11b. FULL-SCAN TRIO — mirrors benchmark.cpp scan block 1:1 (5 iters).
-    // Fwd/rev: SELECT * over the whole table (all-column materialization,
-    // the fair analog of full-doc decode). Key: id column only (cursor +
-    // key movement, the analog of the byte walk).
+    // Fwd/rev: SELECT * over the whole table with OWNED per-row copies
+    // (the fair analog of FireLite's owned full-doc decode — accessor
+    // pokes alone would measure borrowed buffers, not documents).
+    // Key: id column only (cursor + key movement ~ byte walk).
     {
         const int SCAN_ITERS = 5;
         long total = 0;
@@ -332,7 +354,7 @@ static Report run_once(const std::string& mode, const std::string& journal,
         sqlite3_prepare_v2(db, "SELECT * FROM bench ORDER BY id", -1, &st, nullptr);
         t = now();
         for (int it = 0; it < SCAN_ITERS; it++) {
-            while (sqlite3_step(st) == SQLITE_ROW) { read_all_cols(st); total++; }
+            while (sqlite3_step(st) == SQLITE_ROW) { copy_all_cols(st); total++; }
             sqlite3_reset(st);
         }
         r.scan_fwd_dps = qps((int)total, diff_ms(t));
@@ -343,7 +365,7 @@ static Report run_once(const std::string& mode, const std::string& journal,
         sqlite3_prepare_v2(db, "SELECT * FROM bench ORDER BY id DESC", -1, &st, nullptr);
         t = now();
         for (int it = 0; it < SCAN_ITERS; it++) {
-            while (sqlite3_step(st) == SQLITE_ROW) { read_all_cols(st); total++; }
+            while (sqlite3_step(st) == SQLITE_ROW) { copy_all_cols(st); total++; }
             sqlite3_reset(st);
         }
         r.scan_rev_dps = qps((int)total, diff_ms(t));

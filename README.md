@@ -19,12 +19,13 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
   order (scans run before bulk delete), same math, row counts printed
   for verification.
 - Measured head-to-head, same box: at 10k complex docs, decoded
-  ~130k vs ~480k (owned decode vs borrowed cursor — see below), raw
-  walk ~6.0M vs key scan ~3.8M. At 1k hot docs the walk hits ~10M
-  (L2-resident Arcs).
-- Honest reading: the decoded gap is architectural (we build owned docs
-  per row; SQLite hands buffer pointers) — raw is where the designs
-  meet, and the walk leads there.
+  ~130–220k vs ~430k owned-vs-owned (per-row construction efficiency —
+  8 mallocs + cursor step vs id Strings + field vecs + interning), raw
+  walk ~6.0M vs key scan ~6–7M (parity). At 1k hot docs the walk hits
+  ~10M (L2-resident Arcs).
+- Honest reading: the decoded gap narrowed to construction efficiency
+  once SQLite truly materialized (accessor pokes alone measured borrowed
+  buffers). Raw is where the designs meet, and the walk leads there.
 
 ### v0.8.8 — SDK wiring: raw + walk everywhere it fits
 - **Go** (`go/firelite`): vendored header + `RawDoc`/`RawResultSet`
@@ -1202,10 +1203,11 @@ LD_LIBRARY_PATH=target/release ./benchmark --docs=1000
 
 After the matrix, both `benchmark` and `sqlite_bench` print a scan trio
 over all live docs ×5 iters: decoded forward/reverse (keyset pages /
-`ORDER BY`, full materialization both sides) and byte/key-only
+`ORDER BY`, owned full materialization both sides — SQLite copies every
+column per row, the fair analog of owned full-doc decode) and byte/key-only
 (`fl_cursor_walk` vs id-column scan). Head-to-head at 10k complex docs,
-same box: decoded ~130k vs ~480k (owned decode vs borrowed cursor —
-architectural), raw walk ~6.0M vs key scan ~3.8M.
+same box: decoded ~130–220k vs ~430k (owned-construction efficiency),
+raw walk ~6.0M vs key scan ~6–7M (parity).
 
 Timing guidance: the suites print one line per profile/mode and go quiet
 through all stages — that is normal. Full `--docs=10000` runs take
