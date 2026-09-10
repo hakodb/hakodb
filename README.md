@@ -10,7 +10,25 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.8.6)
+## What's new (0.7.2 → 0.8.7)
+
+### v0.8.7 — integrity matrix: two real bugs caught
+- New `tests/codec_integrity.rs`: codec identity on every Value arm,
+  then a mixed dataset (scalars, unicode, nested, blobs, overwrites,
+  deletes, 300-row volume) read back through **every** path — get,
+  scans both directions + paging, offset/limit, unordered limit,
+  raw+decode, walk+resolve, projections — fresh AND reopened, with
+  `encode(decode(bytes)) == bytes` on every stored row.
+- **Bug 1 (genuine): `Value::PartialEq` missed Binary/Array/Reference
+  arms** — any `==` on docs holding those values returned false while
+  `Ord` ordered them fine. Fixed; eq/cmp consistent.
+- **Bug 2 (genuine): `decode` accepted truncated buffers** as silently
+  short docs (iterator ran dry mid-document, no error). Decode is now
+  strict: field count AND exact consumption required. All 92 tests pass
+  unchanged — no caller relied on lenient decode.
+- **Documented semantic**: blob storage is type-erased bytes; inflation
+  restores String iff valid UTF-8 else Binary. Locked both sides in the
+  matrix (changing it needs per-blob type tags — separate decision).
 
 ### v0.8.6 — FFI walk: 1.64M docs/s over the ABI
 - `fl_cursor_walk(engine, query, cb, userdata)` + `FlWalkCallback`
@@ -265,7 +283,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.6)](#whats-new-072--086)
+- [What's new (0.7.2 → 0.8.7)](#whats-new-072--087)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)

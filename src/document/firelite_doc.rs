@@ -90,8 +90,16 @@ impl FireLiteDoc {
         let mut doc = FireLiteDoc::default();
         doc._time = view._time;
         doc.fields = Vec::with_capacity(view.fields_count as usize);
-        for (key, tag, data) in view.iter() {
+        let mut it = view.iter();
+        for (key, tag, data) in it.by_ref() {
             doc.fields.push((intern_field(key), decode_value(tag, data)?));
+        }
+        // ponytail: strict framing — a buffer that ends mid-document or
+        // carries trailing garbage decodes to None, never to a silently
+        // short doc. All producers (WAL, segments, snapshots) store exact
+        // slices, so well-formed data always consumes exactly.
+        if it.remaining() != 0 || it.position() != bytes.len() {
+            return None;
         }
         Some(doc)
     }
@@ -101,10 +109,14 @@ impl FireLiteDoc {
         let mut doc = FireLiteDoc::default();
         doc._time = view._time;
         doc.fields = Vec::with_capacity(view.fields_count as usize);
-        for (key, tag, data) in view.iter() {
+        let mut it = view.iter();
+        for (key, tag, data) in it.by_ref() {
             if projection.is_empty() || projection.iter().any(|p| p == key) {
                 doc.fields.push((intern_field(key), decode_value(tag, data)?));
             }
+        }
+        if it.remaining() != 0 || it.position() != bytes.len() {
+            return None;
         }
         Some(doc)
     }
@@ -268,9 +280,22 @@ pub struct FireLiteDocIter<'a> {
     remaining: u16,
 }
 
+impl<'a> FireLiteDocIter<'a> {
+    /// Fields not yet consumed. After a full pass this must be 0 —
+    /// `decode` rejects buffers that end mid-document instead of
+    /// returning a silently short doc.
+    pub fn remaining(&self) -> u16 {
+        self.remaining
+    }
+    /// Byte offset after the last consumed value. A well-formed buffer is
+    /// consumed exactly (`decode` rejects trailing garbage the same way).
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+}
+
 impl<'a> Iterator for FireLiteDocIter<'a> {
-    type Item = (&'a str, u8, &'a [u8]);
-    fn next(&mut self) -> Option<Self::Item> {
+    type Item = (&'a str, u8, &'a [u8]);    fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == 0 { return None; }
         let k_len = *self.bytes.get(self.pos)? as usize;
         self.pos += 1;

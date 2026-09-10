@@ -139,6 +139,11 @@ impl PartialEq for Value {
             (Value::Int(a), Value::Float(b)) => (*a as f64) == *b,
             (Value::Float(a), Value::Int(b)) => *a == (*b as f64),
             (Value::String(a), Value::String(b)) => a == b,
+            (Value::Binary(a), Value::Binary(b)) => a == b,
+            (Value::Array(a), Value::Array(b)) => a == b,
+            (Value::Reference { collection: a, doc_id: ad }, Value::Reference { collection: b, doc_id: bd }) => {
+                a == b && ad == bd
+            }
             (Value::BlobLink { offset: a, len: al }, Value::BlobLink { offset: b, len: bl }) => a == b && al == bl,
             (Value::Binary(_a), Value::BlobLink { .. }) => false,
             (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
