@@ -1009,12 +1009,16 @@ impl FireLite {
 
     pub fn get(&self, collection: &str, doc_id: &str) -> Result<Option<FireLiteDoc>> {
         if !self.allowed(collection, AccessOp::Get) {
-            self.record_audit(AuditEntry {
-                op: AccessOp::Get,
-                collection: collection.into(),
-                doc_id: Some(doc_id.into()),
-                ok: false,
-            });
+            // ponytail: gate entry construction (two String allocs) on the
+            // toggle — record_audit already no-ops when disabled.
+            if self.config.enable_audit_log {
+                self.record_audit(AuditEntry {
+                    op: AccessOp::Get,
+                    collection: collection.into(),
+                    doc_id: Some(doc_id.into()),
+                    ok: false,
+                });
+            }
             return Err(FireLiteError::Corrupt("Denied".into()));
         }
 
@@ -1023,8 +1027,11 @@ impl FireLite {
         // interning, so the clone is mostly the value Strings). Ordering is
         // linearizable: a hit linearizes at the version check, same as a
         // storage read racing a write today.
+        // ponytail: one version lookup serves both the probe and the
+        // populate below (the old code paid fxhash + sharded lock twice).
+        let ver = self.current_version(doc_id);
         let cache_key = format!("{collection}\0{doc_id}");
-        if let Some(ver) = self.current_version(doc_id) {
+        if let Some(ver) = ver {
             if let Some((v, cached)) = self.doc_cache.read().unwrap().get(&cache_key) {
                 if *v == ver {
                     return Ok(Some((**cached).clone()));
@@ -1039,18 +1046,20 @@ impl FireLite {
             .and_then(|b| FireLiteDoc::decode(&b));
 
         // AUDIT SUCCESS
-        self.record_audit(AuditEntry {
-            op: AccessOp::Get,
-            collection: collection.into(),
-            doc_id: Some(doc_id.into()),
-            ok: true,
-        });
+        if self.config.enable_audit_log {
+            self.record_audit(AuditEntry {
+                op: AccessOp::Get,
+                collection: collection.into(),
+                doc_id: Some(doc_id.into()),
+                ok: true,
+            });
+        }
         
         if let Some(mut doc) = res {
             self.resolve_doc(&mut doc, collection)?;
             // ponytail: populate post-resolve. Bounded at 8192 with single
             // arbitrary eviction when full.
-            if let Some(ver) = self.current_version(doc_id) {
+            if let Some(ver) = ver {
                 let mut cache = self.doc_cache.write().unwrap();
                 if cache.len() >= 8192 {
                     if let Some(k) = cache.keys().next().cloned() { cache.remove(&k); }

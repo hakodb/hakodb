@@ -17,11 +17,12 @@ pub enum ScanType {
     SortedKeys {
         start_key: Option<String>,
         /// true = `start_after` (exclusive bound), false = `start_at`
-        /// (inclusive) or no bound. Only meaningful when `start_key`
-        /// is Some and `reverse` is false.
+        /// (inclusive) or no bound. Meaningful whenever `start_key` is
+        /// Some, in either direction.
         start_exclusive: bool,
-        /// true = descending tail slice. The planner only sends this
-        /// with `start_key == None` (no cursor bounds).
+        /// true = descending walk (highest key first). Carries the same
+        /// optional upper `start_key` bound as the ascending path; `None`
+        /// means from the top.
         reverse: bool,
     },
     CompositeIndex {

@@ -98,8 +98,8 @@ impl QueryPlanner {
             // in the executor). fl_engine_create_index("id") registers `id`
             // as a composite index with one field, so this short-circuit has
             // to live BEFORE the composite-index loop below or it never
-            // fires. Shapes we can't express here (end bounds, descending
-            // + bounds) fall through to the composite path below.
+            // fires. Only shapes we can't express here (end bounds) fall
+            // through to the composite path below.
             if first_order.field == "id"
                 && query.end_at.is_none() && query.end_before.is_none()
                 && query.filters.is_empty() && query.or_groups.is_empty()
@@ -126,12 +126,14 @@ impl QueryPlanner {
                             true,
                         );
                     }
-                } else if anchor == Some((None, false)) {
-                    // Descending without bounds: tail slice (see executor).
+                } else if let Some((start_key, start_exclusive)) = anchor {
+                    // Descending with or without cursor bounds: the executor
+                    // binary-searches the anchor and walks backward
+                    // (O(log N + limit)) — same fast path as ascending.
                     let safe_limit = query.limit;
                     return Self::make_plan(
                         query,
-                        ScanType::SortedKeys { start_key: None, start_exclusive: false, reverse: true },
+                        ScanType::SortedKeys { start_key, start_exclusive, reverse: true },
                         safe_limit,
                         true,
                         true,

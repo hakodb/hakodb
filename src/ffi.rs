@@ -140,13 +140,56 @@ fn value_to_json(v: &Value) -> serde_json::Value {
     v.to_json()
 }
 
+/// ponytail: 1-3 digit push without fmt machinery (~5ns/byte).
+/// serde_json renders numbers as plain digits — this matches it exactly.
+fn push_u8(out: &mut String, b: u8) {
+    if b >= 100 {
+        out.push((b / 100 + b'0') as char);
+        out.push(((b / 10) % 10 + b'0') as char);
+    } else if b >= 10 {
+        out.push((b / 10 + b'0') as char);
+    }
+    out.push((b % 10 + b'0') as char);
+}
+
 fn doc_to_json(doc: &FireLiteDoc) -> Result<String, String> {
     safety_shield!(Err("Internal Panic".into()), {
-        let mut map = serde_json::Map::new();
-        for (k, v) in &doc.fields {
-            map.insert(k.to_string(), value_to_json(v));
+        // ponytail: stream instead of boxing every value into
+        // serde_json::Value first. A 100-byte Binary used to become 100
+        // boxed Numbers (~8µs/op on point-gets); digits need no escaping
+        // so they format straight into the buffer. Keys and all other
+        // values still go through serde_json (escaping identical). Fields
+        // emit in sorted-key order — byte-identical to the old BTreeMap
+        // output (see test below).
+        let mut fields: Vec<&(std::sync::Arc<str>, Value)> = doc.fields.iter().collect();
+        fields.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
+        let mut out = String::with_capacity(256);
+        out.push('{');
+        for (i, (k, v)) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&serde_json::to_string(k.as_ref()).map_err(|e| e.to_string())?);
+            out.push(':');
+            match v {
+                Value::Binary(bytes) => {
+                    out.push('[');
+                    for (j, b) in bytes.iter().enumerate() {
+                        if j > 0 {
+                            out.push(',');
+                        }
+                        push_u8(&mut out, *b);
+                    }
+                    out.push(']');
+                }
+                _ => {
+                    let s = serde_json::to_string(&value_to_json(v)).map_err(|e| e.to_string())?;
+                    out.push_str(&s);
+                }
+            }
         }
-        serde_json::to_string(&serde_json::Value::Object(map)).map_err(|e| e.to_string())
+        out.push('}');
+        Ok(out)
     })
 }
 
@@ -652,25 +695,38 @@ pub extern "C" fn fl_engine_get(
             set_last_error("null engine handle");
             return ptr::null_mut();
         }
-        let collection = match cstr_to_string(collection) {
+        // ponytail: borrow the caller's C strings — the old code allocated
+        // two Strings per get (strlen + validate + copy each). Only doc_id
+        // still needs ownership (moved into the FL_Doc handle).
+        if collection.is_null() {
+            set_last_error("null collection handle");
+            return ptr::null_mut();
+        }
+        if doc_id.is_null() {
+            set_last_error("null doc_id handle");
+            return ptr::null_mut();
+        }
+        let collection_c = unsafe { CStr::from_ptr(collection) };
+        let doc_id_c = unsafe { CStr::from_ptr(doc_id) };
+        let collection = match collection_c.to_str() {
             Ok(v) => v,
-            Err(e) => {
-                set_last_error(e);
+            Err(_) => {
+                set_last_error("invalid utf8");
                 return ptr::null_mut();
             }
         };
-        let doc_id = match cstr_to_string(doc_id) {
-            Ok(v) => v,
-            Err(e) => {
-                set_last_error(e);
+        let doc_id_owned = match doc_id_c.to_str() {
+            Ok(v) => v.to_string(),
+            Err(_) => {
+                set_last_error("invalid utf8");
                 return ptr::null_mut();
             }
         };
         let engine = unsafe { &*engine };
-        match engine.db.get(&collection, &doc_id) {
+        match engine.db.get(collection, &doc_id_owned) {
             // PONYTAIL: move doc_id into FL_Doc instead of clone — doc_id is
             // already a freshly-allocated String and we don't reuse it.
-            Ok(Some(doc)) => Box::into_raw(Box::new(FL_Doc { id: doc_id, doc })),
+            Ok(Some(doc)) => Box::into_raw(Box::new(FL_Doc { id: doc_id_owned, doc })),
             _ => std::ptr::null_mut(),
         }
     })
@@ -3068,4 +3124,32 @@ pub extern "C" fn fl_cloud_sync_free(cloud_sync: *mut FL_CloudSync) {
             cs.inner.stop();
         }
     })
+}
+
+#[cfg(test)]
+mod ffi_json_tests {
+    use super::*;
+
+    /// The streaming `doc_to_json` must emit byte-identical output to the
+    /// old Box-everything-into-serde-Value approach (BTreeMap = sorted
+    /// keys), including Binary byte arrays and escaping.
+    #[test]
+    fn doc_to_json_matches_serde_map_output() {
+        let mut doc = FireLiteDoc::default();
+        // Deliberately unsorted insertion + escaping-sensitive strings.
+        doc.insert("v", Value::Binary(vec![0u8, 1, 9, 10, 99, 100, 171, 255]));
+        doc.insert("z", Value::Int(-42));
+        doc.insert("a", Value::String("q\"\\qé".to_string()));
+        doc.insert("m", Value::Bool(true));
+
+        let mut reference = serde_json::Map::new();
+        for (k, v) in &doc.fields {
+            reference.insert(k.to_string(), value_to_json(v));
+        }
+        let expected = serde_json::to_string(&serde_json::Value::Object(reference)).unwrap();
+
+        assert_eq!(doc_to_json(&doc).unwrap(), expected);
+        // Spot-check the binary arm shape (no spaces, plain digits).
+        assert!(expected.contains("\"v\":[0,1,9,10,99,100,171,255]"));
+    }
 }

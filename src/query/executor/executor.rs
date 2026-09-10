@@ -647,15 +647,20 @@ impl ParallelQueryExecutor {
                 if total == 0 {
                     return Ok(Vec::new());
                 }
-                // Descending without bounds (planner guarantee): slice the
-                // LAST `offset + limit` keys and walk them in reverse —
-                // no sort pass needed.
+                // Descending, optional upper cursor bound (planner
+                // guarantee): binary-search the anchor, walk backward —
+                // O(log N + limit), no sort pass needed.
                 if *reverse {
-                    let off = offset.unwrap_or(0);
-                    let lim = limit.unwrap_or(total);
-                    let end = total.saturating_sub(off);
-                    let start = end.saturating_sub(lim);
-                    let mut out = Vec::with_capacity(end - start);
+                    let (start, end) = match storage.sorted_key_range_reverse(
+                        start_key.as_deref(),
+                        *start_exclusive,
+                        offset,
+                        limit,
+                    ) {
+                        Some(r) => r,
+                        None => return Ok(Vec::new()),
+                    };
+                    let mut out = Vec::with_capacity(end.saturating_sub(start));
                     for key in storage.sorted_keys[start..end].iter().rev() {
                         if let Some(ptr) = storage.index.get(key) {
                             if !matches!(ptr, Pointer::Deleted { .. }) {

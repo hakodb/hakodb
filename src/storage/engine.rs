@@ -365,6 +365,37 @@ impl StorageEngine {
         Some((start_pos, end_pos))
     }
 
+    /// Reverse mirror of [`Self::sorted_key_range`]: bounds for a descending
+    /// walk over `sorted_keys` with an optional upper anchor. Returns the
+    /// ascending slice `[s, e)` the executor walks with `.rev()`.
+    /// `start_after(anchor)` = keys strictly below anchor;
+    /// `start_at(anchor)` = keys at-or-below anchor; `None` = from the top.
+    /// `offset` skips from the top, `limit` takes the next rows downward.
+    pub(crate) fn sorted_key_range_reverse(
+        &self,
+        start: Option<&str>,
+        start_exclusive: bool,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Option<(usize, usize)> {
+        let total = self.sorted_keys.len();
+        if total == 0 { return Some((0, 0)); }
+
+        let raw_end = match start {
+            Some(s) => match self.sorted_keys.binary_search_by(|k| k.as_str().cmp(s)) {
+                Ok(p) => p + (!start_exclusive as usize),
+                Err(pos) => pos,
+            },
+            None => total,
+        };
+        let end = raw_end.saturating_sub(offset.unwrap_or(0));
+        let s = match limit {
+            Some(l) => end.saturating_sub(l),
+            None => 0,
+        };
+        Some((s.min(end), end))
+    }
+
     pub fn checkpoint_inlined_data(&mut self) -> Result<bool> {
         // Only trigger if we are over the limit
         if self.inlined_bytes < self.max_inlined_bytes {

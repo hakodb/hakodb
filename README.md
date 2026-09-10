@@ -10,7 +10,23 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.8.0)
+## What's new (0.7.2 → 0.8.1)
+
+### v0.8.1 — reverse-cursor parity + point-get push (dbbench vs MDBX)
+- **Reverse cursor 27x → ~1.1x.** Descending `ORDER BY id` with cursor
+  bounds fell through the id fast path into full-scan + sort per page.
+  The planner now emits `SortedKeys{reverse + bound}` for any anchor and
+  the executor walks backward from a binary search
+  (`sorted_key_range_reverse`, O(log N + limit)) — same path as forward.
+- **Point-get 46.8k → ~80k (harness-equivalent).** Split measured:
+  engine floor ~105-140k (vs MDBX 136k raw memcpy — competitive given
+  full doc decode), FFI wrapper tax ~2x, `fl_doc_to_json` Binary arm
+  ~11µs (100 boxed Numbers per 100-byte value). Fixes, all
+  byte-identical output: streaming JSON serializer (digits need no
+  escaping; keys still via serde_json; sorted order kept), borrowed C
+  strings in `fl_engine_get`, single version lookup + audit-gated allocs
+  in `get()`. Remainder is real work-per-row (decode + JSON text vs
+  pointer bumps) — see `tests/cursor_parity.rs`.
 
 ### v0.8.0 — sync hub/server release
 - The sync batch graduates to minor: `firelite-cloudserver` managed hub
@@ -179,7 +195,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.0)](#whats-new-072--080)
+- [What's new (0.7.2 → 0.8.1)](#whats-new-072--081)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)
