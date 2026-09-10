@@ -80,6 +80,32 @@ pub enum FireLiteOp {
         #[serde(default)]
         local_only: bool,
     },
+    /// Raw scan (v0.8.7+): pinned storage bytes per row, no decode, no
+    /// JSON. Bytes cross msgpack as bin (Uint8Array on the TS side) and
+    /// stay opaque there — hash/count/export them, or send selected rows
+    /// back through DecodeRaw. Page with start_after: [lastId] under an
+    /// id order; ids ride along in the clear.
+    QueryRaw {
+        collection: String,
+        doc_id_filter: Option<String>,
+        #[serde(default)]
+        filters: Vec<FilterInput>,
+        or_groups: Option<Vec<Vec<FilterInput>>>,
+        order_by: Option<Vec<OrderByInput>>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        start_at: Option<Vec<serde_json::Value>>,
+        start_after: Option<Vec<serde_json::Value>>,
+        end_at: Option<Vec<serde_json::Value>>,
+        end_before: Option<Vec<serde_json::Value>>,
+    },
+    /// Decode one raw row back into a Document (blobs inflated). The bytes
+    /// must be an exact stored row (e.g. from QueryRaw) — never hand-built.
+    DecodeRaw {
+        collection: String,
+        doc_id: String,
+        bytes: Vec<u8>,
+    },
     Batch { mutations: Vec<BatchInput> },
     Aggregate {
         collection: String,
@@ -119,12 +145,22 @@ pub enum FireLiteOp {
     SetCompression { enabled: bool, level: i32 },
 }
 
+/// One raw row over the bridge: id in the clear, storage bytes as
+/// msgpack bin. Bytes are opaque — decode server-side via DecodeRaw.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawRow {
+    pub id: String,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FireLiteResponse {
     Ok,
     Document { data: Option<serde_json::Value> },
     QueryResult { rows: Vec<serde_json::Value> },
+    /// Raw rows: ids in the clear, bytes as msgpack bin (Uint8Array).
+    RawResult { rows: Vec<RawRow> },
     AggregateResult { value: f64 },
     Aggregate(f64), 
     SubscriptionAck { listener_id: String },
@@ -406,8 +442,7 @@ impl FireLiteGateway {
 }
 
 #[derive(Debug, Clone)]
-struct QueryInput {
-    collection: String,
+struct QueryInput {    collection: String,
     filters: Vec<FilterInput>,
     or_groups: Option<Vec<Vec<FilterInput>>>,
     order_by: Option<Vec<OrderByInput>>,
@@ -511,6 +546,27 @@ pub async fn firelite_exec<R: Runtime>(
                         Ok(FireLiteResponse::BulkActionResult { count })
                     }
                 }
+            }
+            FireLiteOp::QueryRaw { collection, doc_id_filter, filters, or_groups, order_by, limit, offset, start_at, start_after, end_at, end_before } => {
+                // ponytail: same builder as Query (raw forced inside
+                // query_raw), defaults for the non-raw knobs.
+                let input = QueryInput {
+                    collection, doc_id_filter, filters, or_groups, order_by, limit, offset,
+                    projection: None, start_at, start_after, end_at, end_before,
+                    defer_blobs: false, local_only: false,
+                };
+                let query_obj = build_query_from_input(&input)?;
+                let rows = gateway.db.query_raw(query_obj).map_err(|e| e.to_string())?
+                    .into_iter()
+                    .map(|(id, bytes)| RawRow { id, bytes: bytes.as_ref().clone() })
+                    .collect();
+                Ok(FireLiteResponse::RawResult { rows })
+            }
+            FireLiteOp::DecodeRaw { collection, doc_id, bytes } => {
+                let mut doc = FireLiteDoc::decode(&bytes).ok_or("raw bytes do not decode")?;
+                gateway.db.resolve_document_blobs(&mut doc, &collection).map_err(|e| e.to_string())?;
+                let data = doc_to_json_value(&doc_id, &doc)?;
+                Ok(FireLiteResponse::Document { data: Some(data) })
             }
             FireLiteOp::Batch { mutations } => {
                 let mut batch = Vec::with_capacity(mutations.len());

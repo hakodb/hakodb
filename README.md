@@ -10,7 +10,34 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.8.7)
+## What's new (0.7.2 → 0.8.8)
+
+### v0.8.8 — SDK wiring: raw + walk everywhere it fits
+- **Go** (`go/firelite`): vendored header + `RawDoc`/`RawResultSet`
+  (`ExecuteQueryRaw`, `Bytes`, `ID`, `StartAfterRaw`, `ToDoc`) and
+  `Engine.CursorWalk` via a `cgo.Handle` trampoline (same pattern as the
+  watch bridge; builds clean under GCC 16). `IsIndexesReady` already
+  existed.
+- **Pascal** (`FireLiteRaw` + `FireLite.pas`, both compile under FPC
+  3.2.2): raw imports, `TFLRawDoc`/`TFLRawResultSet`,
+  `TFLQuery.ExecuteRaw`/`StartAfterRaw`/`Walk` with `TFL_WalkCallback`.
+- **JS** (`native.ts` both backends + `client.ts`, `tsc` clean):
+  `queryExecuteRaw`, raw set accessors, `queryStartAfterRaw`,
+  `rawDocToDoc`, plus `RawQuerySnapshot`/`getRaw`/`startAfterRaw` at the
+  client level (scan-many/touch-few: page raw, resolve selected rows).
+  Deliberately absent: `rawDocBytes`/`Id` (need unverifiable
+  backend memory reads — resolve-or-anchor covers everything) and JS
+  walk callbacks (a walk you can't touch rows in is a counting loop;
+  use Go/C++/Pascal for byte-level walks).
+- **Tauri gateway + `tauri.ts`**: `query_raw` (bytes cross msgpack as
+  bin → Uint8Array) and `decode_raw` (selected-row resolve
+  server-side). Pointers never cross into TS — raw crosses by value,
+  which is exactly the honest shape: cheaper protocol (bytes vs JSON),
+  never zero-copy.
+- CLI untouched by design (`run_query`'s 24-arg threading for an
+  id+len debug print isn't worth the churn).
+- Ops note: `target/debug/incremental` had eaten the disk (32GB tree,
+  110MB free); cleared, 14GB back. Watch it on CI.
 
 ### v0.8.7 — integrity matrix: two real bugs caught
 - New `tests/codec_integrity.rs`: codec identity on every Value arm,
@@ -283,7 +310,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.7)](#whats-new-072--087)
+- [What's new (0.7.2 → 0.8.8)](#whats-new-072--088)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)

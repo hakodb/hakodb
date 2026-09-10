@@ -284,6 +284,38 @@ export const getDocs = async (q: Query | CollectionReference | CollectionGroupRe
     return new QuerySnapshot(docs);
 };
 
+/** One raw row: id in the clear, storage bytes opaque. */
+export interface RawRow {
+    id: string;
+    bytes: Uint8Array;
+}
+
+/**
+ * Raw scan (v0.8.7+): no server decode, no JSON per row. Hash/count/export
+ * bytes client-side, page with startAfter([lastId]) under an id order,
+ * decode selected rows with decodeRawDoc. Bytes cross msgpack as bin.
+ */
+export const getRawDocs = async (q: Query | CollectionReference | CollectionGroupReference): Promise<RawRow[]> => {
+    const params = buildQueryParams(q);
+    const res = await exec({
+        op: 'query_raw',
+        ...params
+    });
+    return (res.raw_result.rows as any[]).map((r: any) => ({ id: r.id as string, bytes: r.bytes as Uint8Array }));
+};
+
+/**
+ * Decode one raw row server-side (blobs inflated). The bytes must be an
+ * exact stored row from getRawDocs — never hand-built. Crosses as a JSON
+ * number array (invoke args are JSON); prefer it for selected rows, not
+ * bulk transfer.
+ */
+export const decodeRawDoc = async (collectionPath: string, docId: string, bytes: Uint8Array) => {
+    const res = await exec({ op: 'decode_raw', collection: collectionPath, doc_id: docId, bytes: Array.from(bytes) });
+    const data = res.document?.data;
+    return new DocumentSnapshot(docId, !!data, data ?? undefined);
+};
+
 // --- Aggregations ---
 export const getCountFromServer = async (q: Query | CollectionReference | CollectionGroupReference) => {
     const params = buildQueryParams(q);

@@ -112,6 +112,16 @@ export interface NativeBindings {
   resultSetGetDoc(results: Handle, index: number): Handle;
   resultSetFree(results: Handle): void;
   resultSetToJson(results: Handle): string | null;
+  // Raw result sets (v0.8.3): pinned bytes, not decoded docs. Rows are
+  // resolved selectively via rawDocToDoc (decode only what you touch);
+  // page with queryStartAfterRaw (no decode at all). rawDocBytes/Id need
+  // backend memory reads — use resolve-then-read instead (see client.ts).
+  queryExecuteRaw(engine: Handle, query: Handle): Handle;
+  rawResultCount(results: Handle): number;
+  rawResultGet(results: Handle, index: number): Handle;
+  rawResultFree(results: Handle): void;
+  rawDocToDoc(engine: Handle, rawDoc: Handle, collection: string): Handle;
+  queryStartAfterRaw(query: Handle, anchorRawDoc: Handle): number;
   queryDeferBlobs(query: Handle, defer: boolean): number;
   docResolveBlobs(engine: Handle, collection: string, doc: Handle): number;
   engineInsertTake(engine: Handle, collection: string, docId: string, doc: Handle): number;
@@ -292,6 +302,14 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     fl_result_set_get_doc: { args: [FFIType.ptr, FFIType.usize], returns: FFIType.ptr },
     fl_result_set_free: { args: [FFIType.ptr], returns: FFIType.void },
     fl_result_set_to_json: { args: [FFIType.ptr], returns: FFIType.ptr },
+    // Raw result sets (v0.8.3). All crossings are handles/strings/ints —
+    // no (ptr,len) memory reads needed (anchor + resolve by handle).
+    fl_query_execute_raw: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.ptr },
+    fl_rawresult_count: { args: [FFIType.ptr], returns: FFIType.usize },
+    fl_rawresult_get: { args: [FFIType.ptr, FFIType.usize], returns: FFIType.ptr },
+    fl_rawresult_free: { args: [FFIType.ptr], returns: FFIType.void },
+    fl_query_start_after_raw: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+    fl_rawdoc_to_doc: { args: [FFIType.ptr, FFIType.ptr, FFIType.cstring], returns: FFIType.ptr },
     fl_query_defer_blobs: { args: [FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
     fl_doc_resolve_blobs: { args: [FFIType.ptr, FFIType.cstring, FFIType.ptr], returns: FFIType.i32 },
     fl_engine_insert_take: { args: [FFIType.ptr, FFIType.cstring, FFIType.cstring, FFIType.ptr], returns: FFIType.i32 },
@@ -458,7 +476,12 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     resultSetGetDoc: (results, index) => symbols.fl_result_set_get_doc(results, index),
     resultSetFree: (results) => symbols.fl_result_set_free(results),
     resultSetToJson: (results) => ptrToStringAndFree(symbols.fl_result_set_to_json(results)),
-    queryDeferBlobs: (query, defer) => symbols.fl_query_defer_blobs(query, defer ? 1 : 0),
+    queryExecuteRaw: (engine, query) => symbols.fl_query_execute_raw(engine, query),
+    rawResultCount: (results) => symbols.fl_rawresult_count(results),
+    rawResultGet: (results, index) => symbols.fl_rawresult_get(results, index),
+    rawResultFree: (results) => symbols.fl_rawresult_free(results),
+    queryStartAfterRaw: (query, anchorRawDoc) => symbols.fl_query_start_after_raw(query, anchorRawDoc),
+    rawDocToDoc: (engine, rawDoc, collection) => symbols.fl_rawdoc_to_doc(engine, rawDoc, toC(collection)),    queryDeferBlobs: (query, defer) => symbols.fl_query_defer_blobs(query, defer ? 1 : 0),
     docResolveBlobs: (engine, collection, doc) => symbols.fl_doc_resolve_blobs(engine, toC(collection), doc),
     engineInsertTake: (engine, collection, docId, doc) => symbols.fl_engine_insert_take(engine, toC(collection), toC(docId), doc),
     configSetWalReserveBytes: (c, bytes) => symbols.fl_config_set_wal_reserve_bytes(c, bytes),
@@ -620,6 +643,12 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_result_set_get_doc: lib.func('FL_Doc* fl_result_set_get_doc(FL_ResultSet* results, size_t index)'),
     fl_result_set_free: lib.func('void fl_result_set_free(FL_ResultSet* results)'),
     fl_result_set_to_json: lib.func('char* fl_result_set_to_json(FL_ResultSet* results)'),
+    fl_query_execute_raw: lib.func('FL_RawResultSet* fl_query_execute_raw(FL_Engine* engine, const FL_Query* query)'),
+    fl_rawresult_count: lib.func('size_t fl_rawresult_count(FL_RawResultSet* results)'),
+    fl_rawresult_get: lib.func('FL_RawDoc* fl_rawresult_get(FL_RawResultSet* results, size_t index)'),
+    fl_rawresult_free: lib.func('void fl_rawresult_free(FL_RawResultSet* results)'),
+    fl_query_start_after_raw: lib.func('int fl_query_start_after_raw(FL_Query* query, const FL_RawDoc* anchor_doc)'),
+    fl_rawdoc_to_doc: lib.func('FL_Doc* fl_rawdoc_to_doc(FL_Engine* engine, const FL_RawDoc* raw_doc, const char* collection)'),
     fl_query_defer_blobs: lib.func('int fl_query_defer_blobs(FL_Query* query, int defer)'),
     fl_doc_resolve_blobs: lib.func('int fl_doc_resolve_blobs(FL_Engine* engine, const char* collection, FL_Doc* doc)'),
     fl_engine_insert_take: lib.func('int fl_engine_insert_take(FL_Engine* engine, const char* collection, const char* doc_id, FL_Doc* doc)'),
@@ -788,6 +817,12 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     resultSetGetDoc: (results, index) => fn.fl_result_set_get_doc(results, index),
     resultSetFree: (results) => fn.fl_result_set_free(results),
     resultSetToJson: (results) => ptrToStringAndFree(fn.fl_result_set_to_json(results)),
+    queryExecuteRaw: (engine, query) => fn.fl_query_execute_raw(engine, query),
+    rawResultCount: (results) => fn.fl_rawresult_count(results),
+    rawResultGet: (results, index) => fn.fl_rawresult_get(results, index),
+    rawResultFree: (results) => fn.fl_rawresult_free(results),
+    queryStartAfterRaw: (query, anchorRawDoc) => fn.fl_query_start_after_raw(query, anchorRawDoc),
+    rawDocToDoc: (engine, rawDoc, collection) => fn.fl_rawdoc_to_doc(engine, rawDoc, collection),
     queryDeferBlobs: (query, defer) => fn.fl_query_defer_blobs(query, defer ? 1 : 0),
     docResolveBlobs: (engine, collection, doc) => fn.fl_doc_resolve_blobs(engine, collection, doc),
     engineInsertTake: (engine, collection, docId, doc) => fn.fl_engine_insert_take(engine, collection, docId, doc),

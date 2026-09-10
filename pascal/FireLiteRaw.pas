@@ -19,9 +19,14 @@ type
   PFL_Transaction = Pointer; // Added in v0.5.9
   PFL_ResultSet = Pointer;   // Added in v0.6.x
   PFL_CloudSync = Pointer;   // Added in v0.6.65
+  PFL_RawDoc = Pointer;      // Added in v0.8.3
+  PFL_RawResultSet = Pointer;// Added in v0.8.3
 
   { Callback for real-time snapshots }
   TFL_OnSnapshotCallback = procedure(collection: PChar; path: PChar; kind: cint32; user_data: Pointer); cdecl;
+  { Raw walk callback (v0.8.6): return True to continue. Borrowed pointers,
+    valid for the call only. Must not re-enter the engine. }
+  TFL_WalkCallback = function(id: PChar; id_len: SizeUInt; bytes: PByte; bytes_len: SizeUInt; user_data: Pointer): cbool; cdecl;
 
 const
   FL_CHANGE_PUT = 1;
@@ -157,6 +162,18 @@ function fl_result_set_get_doc(results: PFL_ResultSet; index: SizeUInt): PFL_Doc
 procedure fl_result_set_free(results: PFL_ResultSet); cdecl; external FIRELITE_LIB;
 { Bulk result-set to JSON: one call, one JSON array string. Free with fl_string_free. }
 function fl_result_set_to_json(results: PFL_ResultSet): PChar; cdecl; external FIRELITE_LIB;
+{ Raw result sets (v0.8.3): pinned storage bytes, not decoded docs.
+  Borrowed-handle contract mirrors FL_ResultSet. Bytes are opaque. }
+function fl_query_execute_raw(engine: PFL_Engine; query: PFL_Query): PFL_RawResultSet; cdecl; external FIRELITE_LIB;
+function fl_rawresult_count(results: PFL_RawResultSet): SizeUInt; cdecl; external FIRELITE_LIB;
+function fl_rawresult_get(results: PFL_RawResultSet; index: SizeUInt): PFL_RawDoc; cdecl; external FIRELITE_LIB;
+procedure fl_rawresult_free(results: PFL_RawResultSet); cdecl; external FIRELITE_LIB;
+function fl_rawdoc_bytes(doc: PFL_RawDoc; len_out: PSizeUInt): PByte; cdecl; external FIRELITE_LIB;
+function fl_rawdoc_id(doc: PFL_RawDoc; len_out: PSizeUInt): PChar; cdecl; external FIRELITE_LIB;
+function fl_query_start_after_raw(query: PFL_Query; anchor: PFL_RawDoc): cint32; cdecl; external FIRELITE_LIB;
+function fl_rawdoc_to_doc(engine: PFL_Engine; raw_doc: PFL_RawDoc; collection: PChar): PFL_Doc; cdecl; external FIRELITE_LIB;
+{ Zero-alloc walk (v0.8.6): one call per scan. Returns rows visited, -1 on error. }
+function fl_cursor_walk(engine: PFL_Engine; query: PFL_Query; callback: TFL_WalkCallback; user_data: Pointer): Int64; cdecl; external FIRELITE_LIB;
 function fl_query_where_match(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_where_match_prefix(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
 function fl_query_where_contains(query: PFL_Query; field, value: PChar): cint32; cdecl; external FIRELITE_LIB;
