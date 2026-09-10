@@ -10,7 +10,19 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.8.2)
+## What's new (0.7.2 → 0.8.3)
+
+### v0.8.3 — raw FFI surface for byte-fair benchmarks
+- `FL_RawDoc` / `FL_RawResultSet` + 7 functions (`fl_query_execute_raw`,
+  `fl_rawresult_{count,get,free}`, `fl_rawdoc_{bytes,id}`,
+  `fl_query_start_after_raw`, `fl_rawdoc_to_doc`). Same slab + borrowed
+  contract as the decoded path; same `FL_Query` builders (raw forced
+  internally). Measured in-process: **~670k docs/s** over the ABI vs
+  ~1.03M native raw (the gap is per-row id copies on the caller side)
+  vs MDBX 3.66M pointer bumps — remaining 5x is per-row allocs + HashMap
+  that only a zero-alloc cursor-callback API would remove. Honest
+  raw-vs-raw comparison is now possible; `t_firelite.cc` needs its raw
+  branch (caller side).
 
 ### v0.8.2 — inline-at-write + raw scans: 1M+ docs/s
 - **Raw scans hit 1.03–1.20M docs/s** (was ~289k). New `Query.raw` /
@@ -216,7 +228,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.2)](#whats-new-072--082)
+- [What's new (0.7.2 → 0.8.3)](#whats-new-072--083)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)

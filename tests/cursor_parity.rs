@@ -433,3 +433,118 @@ fn raw_scan_parity() {    let dir = std::env::temp_dir().join(format!(
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// FFI raw round-trip: pages through fl_query_execute_raw with
+/// fl_query_start_after_raw anchors (descending, like readreverse), reads
+/// bytes borrowed via fl_rawdoc_bytes, resolves one row via
+/// fl_rawdoc_to_doc. Locks the C ABI contract of the raw surface.
+#[test]
+fn raw_ffi_roundtrip() {
+    use firelite::ffi;
+    let dir = std::env::temp_dir().join(format!(
+        "fl-test-rawffi-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let dir_c = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+    let col = std::ffi::CString::new("bench").unwrap();
+    let field = std::ffi::CString::new("v").unwrap();
+    let idf = std::ffi::CString::new("id").unwrap();
+    let payload = vec![0xABu8; 100];
+
+    let engine = unsafe {
+        let cfg = ffi::fl_config_new();
+        ffi::fl_config_set_durability(cfg, 2);
+        ffi::fl_engine_open_with_config(dir_c.as_ptr(), cfg)
+    };
+    assert!(!engine.is_null());
+    for i in 0..N {
+        let k = std::ffi::CString::new(format!("{i:016x}")).unwrap();
+        let doc = unsafe { ffi::fl_doc_new() };
+        unsafe {
+            assert_eq!(ffi::fl_doc_insert_bin(doc, field.as_ptr(), payload.as_ptr(), payload.len()), 0);
+            assert_eq!(ffi::fl_engine_insert_take(engine, col.as_ptr(), k.as_ptr(), doc), 0);
+        }
+    }
+    let t0 = std::time::Instant::now();
+    while unsafe { !ffi::fl_engine_is_indexes_ready(engine) } {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(30), "indexes never ready");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    // Descending raw pages of PAGE rows. The anchor binds from the live
+    // previous set (start_after_raw copies the id out), so the previous
+    // set is freed only after the next query is bound.
+    let t0 = std::time::Instant::now();
+    let mut ids: Vec<String> = Vec::with_capacity(N);
+    let mut total_bytes = 0usize;
+    let mut resolved_json = String::new();
+    let mut first_page = true;
+    let mut prev_rs: *mut ffi::FL_RawResultSet = std::ptr::null_mut();
+    let mut prev_last: *mut ffi::FL_RawDoc = std::ptr::null_mut();
+    loop {
+        let q = unsafe { ffi::fl_query_new(col.as_ptr()) };
+        unsafe {
+            assert_eq!(ffi::fl_query_order_by(q, idf.as_ptr(), false), 0);
+            assert_eq!(ffi::fl_query_limit(q, PAGE), 0);
+            if !prev_last.is_null() {
+                assert_eq!(ffi::fl_query_start_after_raw(q, prev_last), 0);
+            }
+            if !prev_rs.is_null() {
+                ffi::fl_rawresult_free(prev_rs);
+                prev_rs = std::ptr::null_mut();
+                prev_last = std::ptr::null_mut();
+            }
+        }
+        let rs = unsafe { ffi::fl_query_execute_raw(engine, q) };
+        assert!(!rs.is_null());
+        let n = unsafe { ffi::fl_rawresult_count(rs) };
+        if n == 0 {
+            unsafe { ffi::fl_rawresult_free(rs) };
+            unsafe { ffi::fl_query_free(q) };
+            break;
+        }
+        let mut last_raw: *mut ffi::FL_RawDoc = std::ptr::null_mut();
+        for i in 0..n {
+            let r = unsafe { ffi::fl_rawresult_get(rs, i) };
+            assert!(!r.is_null());
+            let mut len = 0usize;
+            let ptr = unsafe { ffi::fl_rawdoc_bytes(r, &mut len as *mut usize) };
+            assert!(!ptr.is_null() && len > 0, "raw row has bytes");
+            total_bytes += len;
+            let mut idlen = 0usize;
+            let idp = unsafe { ffi::fl_rawdoc_id(r, &mut idlen as *mut usize) };
+            assert!(!idp.is_null() && idlen > 0);
+            let id = unsafe { std::slice::from_raw_parts(idp as *const u8, idlen) };
+            ids.push(String::from_utf8_lossy(id).into_owned());
+            last_raw = r;
+        }
+        // Resolve the first row of the first page end-to-end.
+        if first_page {
+            first_page = false;
+            let first = unsafe { ffi::fl_rawresult_get(rs, 0) };
+            let d = unsafe { ffi::fl_rawdoc_to_doc(engine, first, col.as_ptr()) };
+            assert!(!d.is_null(), "raw row resolves");
+            let js = unsafe { ffi::fl_doc_to_json(d) };
+            assert!(!js.is_null());
+            resolved_json = unsafe { std::ffi::CStr::from_ptr(js) }.to_str().unwrap().to_string();
+            unsafe { ffi::fl_string_free(js) };
+            unsafe { ffi::fl_doc_free(d) };
+        }
+        prev_rs = rs;
+        prev_last = last_raw;
+        unsafe { ffi::fl_query_free(q) };
+    }
+    let dt = t0.elapsed();
+    assert_eq!(ids.len(), N, "raw FFI scan missed docs");
+    assert!(ids.windows(2).all(|w| w[0] > w[1]), "raw FFI not descending");
+    assert!(resolved_json.contains('v'), "resolved row has field v");
+    eprintln!(
+        "raw FFI scan: {N} docs / {total_bytes} bytes in {dt:?} = {} docs/s",
+        N as u128 * 1_000_000_000 / dt.as_nanos().max(1),
+    );
+    unsafe { ffi::fl_engine_free(engine) };
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -24,6 +24,16 @@ struct FL_NetSyncer;
 
 struct FL_Query;
 
+/// Raw (undecoded) document handle. `bytes` pins the storage-encoded
+/// buffer (zero copies for inlined docs); decode on demand with
+/// `fl_rawdoc_to_doc`. Bytes are opaque storage encoding — do not persist
+/// or compare across versions.
+struct FL_RawDoc;
+
+/// Slab of raw docs. Borrowed-handle contract mirrors FL_ResultSet:
+/// `fl_rawresult_get` pointers die with `fl_rawresult_free`.
+struct FL_RawResultSet;
+
 struct FL_ResultSet;
 
 struct FL_Transaction;
@@ -228,6 +238,33 @@ uintptr_t fl_result_set_count(FL_ResultSet *results);
 FL_Doc *fl_result_set_get_doc(FL_ResultSet *results, uintptr_t index);
 
 void fl_result_set_free(FL_ResultSet *results);
+
+FL_RawResultSet *fl_query_execute_raw(FL_Engine *engine, const FL_Query *query);
+
+uintptr_t fl_rawresult_count(FL_RawResultSet *results);
+
+FL_RawDoc *fl_rawresult_get(FL_RawResultSet *results, uintptr_t index);
+
+void fl_rawresult_free(FL_RawResultSet *results);
+
+/// Borrowed byte view of a raw doc. Returns null on null handle; `*len_out`
+/// (when non-null) receives the length. Valid until fl_rawresult_free —
+/// zero copies for inlined docs.
+const uint8_t *fl_rawdoc_bytes(const FL_RawDoc *doc, uintptr_t *len_out);
+
+/// Borrowed id view of a raw doc (for keyset paging without decoding).
+/// Rust Strings are NOT NUL-terminated, so the length goes through
+/// `*len_out` (when non-null) — read `(ptr, len)`, do NOT treat as CStr.
+/// Valid until fl_rawresult_free.
+const char *fl_rawdoc_id(const FL_RawDoc *doc, uintptr_t *len_out);
+
+/// Keyset anchor from a raw row. `id`-ordered queries bind the id with no
+/// decode; other order fields decode the row ONCE per page (not per row).
+int32_t fl_query_start_after_raw(FL_Query *query, const FL_RawDoc *anchor_doc);
+
+/// The pointer resolver: decode a raw row into an owned FL_Doc (blob
+/// fields inflated via the engine, same as a decoded query row).
+FL_Doc *fl_rawdoc_to_doc(FL_Engine *engine, const FL_RawDoc *raw_doc, const char *collection);
 
 /// Bulk result-set to JSON: one call, one JSON array string, no per-doc
 /// DOM and no per-doc FFI round trips. Byte-identical to joining

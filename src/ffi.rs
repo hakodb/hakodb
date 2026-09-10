@@ -91,6 +91,23 @@ pub struct FL_ResultSet {
     pub docs: Vec<FL_Doc>,
 }
 
+/// Raw (undecoded) document handle. `bytes` pins the storage-encoded
+/// buffer (zero copies for inlined docs); decode on demand with
+/// `fl_rawdoc_to_doc`. Bytes are opaque storage encoding — do not persist
+/// or compare across versions.
+#[allow(non_camel_case_types)]
+pub struct FL_RawDoc {
+    pub id: String,
+    pub bytes: std::sync::Arc<Vec<u8>>,
+}
+
+/// Slab of raw docs. Borrowed-handle contract mirrors FL_ResultSet:
+/// `fl_rawresult_get` pointers die with `fl_rawresult_free`.
+#[allow(non_camel_case_types)]
+pub struct FL_RawResultSet {
+    pub docs: Vec<FL_RawDoc>,
+}
+
 #[cfg(feature = "net-sync")]
 #[allow(non_camel_case_types)]
 pub struct FL_NetSyncer {
@@ -1643,6 +1660,180 @@ pub extern "C" fn fl_result_set_free(results: *mut FL_ResultSet) {
         // one shot — no per-doc Box::from_raw walk needed.
         unsafe { drop(Box::from_raw(results)); }
     }
+}
+
+// --- Raw result sets (ponytail) ---
+// Same slab shape as FL_ResultSet, but rows are pinned storage bytes
+// instead of decoded docs. The C++ side reuses the same FL_Query builders
+// (order/limit/start_after via fl_query_start_after_raw) — query_raw
+// forces raw=true internally, so zero new query-builder surface.
+// Page like the decoded path: execute -> read rows via fl_rawdoc_bytes
+// (borrowed, no copy) -> bound the next page with the last row ->
+// free the set -> repeat. Decode any row later with fl_rawdoc_to_doc.
+#[no_mangle]
+pub extern "C" fn fl_query_execute_raw(
+    engine: *mut FL_Engine,
+    query: *const FL_Query,
+) -> *mut FL_RawResultSet {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() || query.is_null() {
+            set_last_error("null engine/query handle");
+            return std::ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let query_obj = unsafe { &*query };
+        let results = engine.db.query_raw(query_obj.query.clone()).unwrap_or_default();
+        let docs: Vec<FL_RawDoc> = results
+            .into_iter()
+            .map(|(id, bytes)| FL_RawDoc { id, bytes })
+            .collect();
+        Box::into_raw(Box::new(FL_RawResultSet { docs }))
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn fl_rawresult_count(results: *mut FL_RawResultSet) -> usize {
+    if results.is_null() { return 0; }
+    unsafe {
+        results.as_ref().map(|rs| rs.docs.len()).unwrap_or(0)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_rawresult_get(results: *mut FL_RawResultSet, index: usize) -> *mut FL_RawDoc {
+    if results.is_null() { return std::ptr::null_mut(); }
+    unsafe {
+        // Borrowed pointer into the slab — same contract as
+        // fl_result_set_get_doc: do not free, free the set first.
+        if let Some(rs) = results.as_ref() {
+            rs.docs.get(index)
+                .map(|d| d as *const FL_RawDoc as *mut FL_RawDoc)
+                .unwrap_or(std::ptr::null_mut())
+        } else {
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_rawresult_free(results: *mut FL_RawResultSet) {
+    if !results.is_null() {
+        unsafe { drop(Box::from_raw(results)); }
+    }
+}
+
+/// Borrowed byte view of a raw doc. Returns null on null handle; `*len_out`
+/// (when non-null) receives the length. Valid until fl_rawresult_free —
+/// zero copies for inlined docs.
+#[no_mangle]
+pub extern "C" fn fl_rawdoc_bytes(doc: *const FL_RawDoc, len_out: *mut usize) -> *const u8 {
+    if doc.is_null() { return std::ptr::null(); }
+    unsafe {
+        if let Some(d) = doc.as_ref() {
+            if !len_out.is_null() {
+                *len_out = d.bytes.len();
+            }
+            d.bytes.as_ptr()
+        } else {
+            std::ptr::null()
+        }
+    }
+}
+
+/// Borrowed id view of a raw doc (for keyset paging without decoding).
+/// Rust Strings are NOT NUL-terminated, so the length goes through
+/// `*len_out` (when non-null) — read `(ptr, len)`, do NOT treat as CStr.
+/// Valid until fl_rawresult_free.
+#[no_mangle]
+pub extern "C" fn fl_rawdoc_id(doc: *const FL_RawDoc, len_out: *mut usize) -> *const c_char {
+    if doc.is_null() { return std::ptr::null(); }
+    unsafe {
+        if let Some(d) = doc.as_ref() {
+            if !len_out.is_null() {
+                *len_out = d.id.len();
+            }
+            d.id.as_ptr() as *const c_char
+        } else {
+            std::ptr::null()
+        }
+    }
+}
+
+/// Keyset anchor from a raw row. `id`-ordered queries bind the id with no
+/// decode; other order fields decode the row ONCE per page (not per row).
+#[no_mangle]
+pub extern "C" fn fl_query_start_after_raw(query: *mut FL_Query, anchor_doc: *const FL_RawDoc) -> i32 {
+    safety_shield!(-1, {
+        if query.is_null() || anchor_doc.is_null() { return -1; }
+        let q = unsafe { &mut *query };
+        let raw = unsafe { &*anchor_doc };
+        if q.query.order_by.is_empty() {
+            return set_last_error("raw anchor needs order_by");
+        }
+        let mut vals = Vec::with_capacity(q.query.order_by.len());
+        let mut decoded: Option<FireLiteDoc> = None;
+        for order in &q.query.order_by {
+            if order.field == "id" {
+                vals.push(Value::String(raw.id.clone()));
+                continue;
+            }
+            if decoded.is_none() {
+                decoded = match FireLiteDoc::decode(&raw.bytes) {
+                    Some(d) => Some(d),
+                    None => return set_last_error("raw anchor bytes do not decode"),
+                };
+            }
+            let d = decoded.as_ref().unwrap();
+            if order.field == "_time" {
+                vals.push(Value::Int(d._time));
+            } else {
+                match d.get(&order.field) {
+                    Some(v) => vals.push(v.clone()),
+                    None => return set_last_error("Anchor document missing one or more fields from sort chain"),
+                }
+            }
+        }
+        q.query.start_after = Some(vals);
+        0
+    })
+}
+
+/// The pointer resolver: decode a raw row into an owned FL_Doc (blob
+/// fields inflated via the engine, same as a decoded query row).
+#[no_mangle]
+pub extern "C" fn fl_rawdoc_to_doc(
+    engine: *mut FL_Engine,
+    raw_doc: *const FL_RawDoc,
+    collection: *const c_char,
+) -> *mut FL_Doc {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() || raw_doc.is_null() || collection.is_null() {
+            set_last_error("null engine/raw_doc/collection handle");
+            return std::ptr::null_mut();
+        }
+        let collection_c = unsafe { CStr::from_ptr(collection) };
+        let collection = match collection_c.to_str() {
+            Ok(v) => v,
+            Err(_) => {
+                set_last_error("invalid utf8");
+                return std::ptr::null_mut();
+            }
+        };
+        let engine = unsafe { &*engine };
+        let raw = unsafe { &*raw_doc };
+        let mut doc = match FireLiteDoc::decode(&raw.bytes) {
+            Some(d) => d,
+            None => {
+                set_last_error("raw bytes do not decode");
+                return std::ptr::null_mut();
+            }
+        };
+        if let Err(e) = engine.db.resolve_document_blobs(&mut doc, collection) {
+            set_last_error(e.to_string());
+            return std::ptr::null_mut();
+        }
+        Box::into_raw(Box::new(FL_Doc { id: raw.id.clone(), doc }))
+    })
 }
 
 // --- Bulk JSON (ponytail) ---
