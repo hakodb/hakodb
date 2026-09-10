@@ -7,6 +7,7 @@ benchmark.obj
 /benches*
 /backup*
 bench_data_*
+sqlite_bench_data_*
 */jniLibs
 /jniLibs
 /.vscode

@@ -1,6 +1,7 @@
 #include "include/firelite.h"
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -80,6 +81,13 @@ struct Report {
     double stress_query_qps = 0;
     double comp_query_qps = 0;
 
+    // FULL SCANS (docs/s over live docs x iters)
+    double scan_fwd_dps = 0;
+    double scan_rev_dps = 0;
+    double scan_raw_dps = 0;
+    long scan_rows = 0;
+    size_t scan_raw_bytes = 0;
+
     // SYSTEM
     double startup_ms = 0;    
     double shutdown_ms = 0;   
@@ -133,6 +141,16 @@ static int check_gate(const Report& r) {
 
 extern "C" void bench_on_snapshot(const char* col, const char* path, int kind, void* user_data) {
     g_snapshot_received.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Full-scan counter for fl_cursor_walk: counts rows + bytes, keeps nothing.
+struct WalkCount { long rows = 0; size_t bytes = 0; };
+static bool scan_count_cb(const char* id, uintptr_t id_len, const uint8_t* bytes, uintptr_t bytes_len, void* userdata) {
+    auto* c = static_cast<WalkCount*>(userdata);
+    c->rows++;
+    c->bytes += (size_t)bytes_len;
+    (void)id; (void)id_len; (void)bytes;
+    return true;
 }
 
 // ============================================================
@@ -403,6 +421,63 @@ Report run_benchmark(BenchConfig cfg) {
     res.agg_qps = to_throughput(50, diff_ms(t_start));
     // cout << (int)res.agg_qps << " qps";
 
+    // 6b. FULL-SCAN TRIO — mirrors sqlite_bench.cpp scan block 1:1.
+    // Decoded fwd/rev: ORDER BY id + start_after pages of 1000 (executing
+    // decodes every row; counting forces the work). Raw: one walk call
+    // per iteration (bytes only, no decode, no pages).
+    {
+        const int SCAN_ITERS = 5;
+        const int PAGE = 1000;
+        long total_rows = 0;
+        auto t = now();
+        for (int it = 0; it < SCAN_ITERS; it++) {
+            UniqueQuery q(fl_query_new("bench"));
+            fl_query_order_by(q.get(), "id", true);
+            fl_query_limit(q.get(), PAGE);
+            for (;;) {
+                UniqueResultSet rs(fl_query_execute_to_handles(db, q.get()));
+                size_t n = fl_result_set_count(rs.get());
+                if (n == 0) break;
+                total_rows += (long)n;
+                FL_Doc* last = fl_result_set_get_doc(rs.get(), n - 1);
+                fl_query_start_after(q.get(), last);
+            }
+        }
+        res.scan_fwd_dps = to_throughput((int)total_rows, diff_ms(t));
+        res.scan_rows = total_rows / SCAN_ITERS;
+
+        total_rows = 0;
+        t = now();
+        for (int it = 0; it < SCAN_ITERS; it++) {
+            UniqueQuery q(fl_query_new("bench"));
+            fl_query_order_by(q.get(), "id", false);
+            fl_query_limit(q.get(), PAGE);
+            for (;;) {
+                UniqueResultSet rs(fl_query_execute_to_handles(db, q.get()));
+                size_t n = fl_result_set_count(rs.get());
+                if (n == 0) break;
+                total_rows += (long)n;
+                FL_Doc* last = fl_result_set_get_doc(rs.get(), n - 1);
+                fl_query_start_after(q.get(), last);
+            }
+        }
+        res.scan_rev_dps = to_throughput((int)total_rows, diff_ms(t));
+
+        total_rows = 0;
+        size_t total_bytes = 0;
+        t = now();
+        for (int it = 0; it < SCAN_ITERS; it++) {
+            UniqueQuery q(fl_query_new("bench"));
+            fl_query_order_by(q.get(), "id", true);
+            WalkCount c;
+            int64_t n = fl_cursor_walk(db, q.get(), scan_count_cb, &c);
+            total_rows += (long)n;
+            total_bytes += c.bytes;
+        }
+        res.scan_raw_dps = to_throughput((int)total_rows, diff_ms(t));
+        res.scan_raw_bytes = total_bytes / SCAN_ITERS;
+    }
+
     // 7. BULK DELETE
     // stage("Bulk Delete WPS");
     t_start = now();
@@ -505,6 +580,16 @@ int main(int argc, char** argv) {
              << fixed << setprecision(1) << r.storage_mb << "MB\n";
     }
     cout << string(170, '=') << endl;
+
+    cout << "\n--- FULL SCAN (docs/s over " << (results.empty() ? 0 : results[0].scan_rows)
+         << " live docs x5 iters; raw bytes avg " << (results.empty() ? 0 : results[0].scan_raw_bytes) << ") ---\n";
+    for (const auto& r : results) {
+        cout << left << setw(14) << r.cfg.name
+             << " fwd " << setw(9) << (int)r.scan_fwd_dps
+             << " rev " << setw(9) << (int)r.scan_rev_dps
+             << " raw " << setw(9) << (int)r.scan_raw_dps
+             << " (rows " << r.scan_rows << ")\n";
+    }
 
     if (gate) {
         cout << "\n--- REGRESSION GATE (Manual) ---\n";

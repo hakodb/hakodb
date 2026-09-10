@@ -10,7 +10,21 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.8.8)
+## What's new (0.7.2 → 0.8.9)
+
+### v0.8.9 — benchmark scan parity (FireLite vs SQLite, 1:1)
+- Both harnesses grow the same full-scan trio (×5 iters, printed after
+  the matrix): decoded forward/reverse over all live docs plus a
+  byte/key-only scan (`fl_cursor_walk` vs id-column select). Same stage
+  order (scans run before bulk delete), same math, row counts printed
+  for verification.
+- Measured head-to-head, same box: at 10k complex docs, decoded
+  ~130k vs ~480k (owned decode vs borrowed cursor — see below), raw
+  walk ~6.0M vs key scan ~3.8M. At 1k hot docs the walk hits ~10M
+  (L2-resident Arcs).
+- Honest reading: the decoded gap is architectural (we build owned docs
+  per row; SQLite hands buffer pointers) — raw is where the designs
+  meet, and the walk leads there.
 
 ### v0.8.8 — SDK wiring: raw + walk everywhere it fits
 - **Go** (`go/firelite`): vendored header + `RawDoc`/`RawResultSet`
@@ -310,7 +324,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.8)](#whats-new-072--088)
+- [What's new (0.7.2 → 0.8.9)](#whats-new-072--089)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)
@@ -1136,6 +1150,8 @@ For each profile it reports throughput (operations per second) and system metric
 | `Agg QPS` | Aggregate queries/sec (`sum`) |
 | `Tx WPS` | Serializable transactions/sec |
 | `Bulk Upd/Del` | Bulk update and bulk delete ops/sec |
+| `Scan (Fwd/Rev)` | Full-table decoded scans both directions, docs/s |
+| `ScanRaw` (FireLite) / `ScanKey` (SQLite) | Byte/key-only full scans, docs/s |
 | `Startup/Flush` | Engine open (ms) and clean shutdown (ms) |
 | `Size` | On-disk database size |
 
@@ -1181,6 +1197,21 @@ On Windows, ensure `target\release\firelite.dll` is on `PATH` when running.
 # if the shared library is not on the default loader path (Linux/macOS)
 LD_LIBRARY_PATH=target/release ./benchmark --docs=1000
 ```
+
+### Full-scan block (both harnesses, 1:1)
+
+After the matrix, both `benchmark` and `sqlite_bench` print a scan trio
+over all live docs ×5 iters: decoded forward/reverse (keyset pages /
+`ORDER BY`, full materialization both sides) and byte/key-only
+(`fl_cursor_walk` vs id-column scan). Head-to-head at 10k complex docs,
+same box: decoded ~130k vs ~480k (owned decode vs borrowed cursor —
+architectural), raw walk ~6.0M vs key scan ~3.8M.
+
+Timing guidance: the suites print one line per profile/mode and go quiet
+through all stages — that is normal. Full `--docs=10000` runs take
+several minutes (durable profiles fsync per write; Gaming moves 500MB).
+For quick scan numbers use `./benchmark --profile=Manual --docs=10000`
+or `sqlite_bench --docs=10000 --sync=OFF --journal=MEMORY`.
 
 > `--docs` controls how many documents each profile inserts (batch-written documents are `--docs - 100`). Use `--docs >= 1000` for meaningful numbers; very small values (e.g. `100`) leave too little data for the batch/query stages.
 

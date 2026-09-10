@@ -20,7 +20,10 @@
 //   Seq reads 200x (b_100) | Par reads threads*50 | Bulk Update 100 (1 tx) |
 //   Tx x50 (read b_200 + update + commit) | Off/Cur pagination 300x |
 //   Stress GET 300x50 | Qry tenant-2 lim 20 300x | Cmp +ORDER score 300x |
-//   Agg SUM x50 (full-scan, like FireLite's sum stage) | Bulk Delete 100 |
+//   Agg SUM x50 (full-scan, like FireLite's sum stage) |
+//   SCAN TRIO x5 iters (mirrors benchmark.cpp 1:1): full SELECT * fwd/rev
+//   (all-column materialization ~ full-doc decode) + id-only key scan
+//   (cursor + key movement ~ byte walk) | Bulk Delete 100 |
 //   shutdown (close) | storage size (bench.db)
 //
 // QryLazy (SELECT id only, same filter) is an EXTRA diagnostic per mode,
@@ -58,6 +61,9 @@ struct Report {
     double agg_qps = 0, tx_wps = 0;
     double bulk_upd_wps = 0, bulk_del_wps = 0;
     double startup_ms = 0, shutdown_ms = 0, storage_mb = 0;
+    // Full scans (docs/s, mirrors benchmark.cpp scan block 1:1).
+    double scan_fwd_dps = 0, scan_rev_dps = 0, scan_key_dps = 0;
+    long scan_rows = 0;
 };
 
 static std::string payload_1k() {
@@ -315,6 +321,45 @@ static Report run_once(const std::string& mode, const std::string& journal,
     r.agg_qps = qps(50, diff_ms(t));
     sqlite3_finalize(agg_st);
 
+    // 11b. FULL-SCAN TRIO — mirrors benchmark.cpp scan block 1:1 (5 iters).
+    // Fwd/rev: SELECT * over the whole table (all-column materialization,
+    // the fair analog of full-doc decode). Key: id column only (cursor +
+    // key movement, the analog of the byte walk).
+    {
+        const int SCAN_ITERS = 5;
+        long total = 0;
+        sqlite3_stmt* st = nullptr;
+        sqlite3_prepare_v2(db, "SELECT * FROM bench ORDER BY id", -1, &st, nullptr);
+        t = now();
+        for (int it = 0; it < SCAN_ITERS; it++) {
+            while (sqlite3_step(st) == SQLITE_ROW) { read_all_cols(st); total++; }
+            sqlite3_reset(st);
+        }
+        r.scan_fwd_dps = qps((int)total, diff_ms(t));
+        r.scan_rows = total / SCAN_ITERS;
+        sqlite3_finalize(st);
+
+        total = 0;
+        sqlite3_prepare_v2(db, "SELECT * FROM bench ORDER BY id DESC", -1, &st, nullptr);
+        t = now();
+        for (int it = 0; it < SCAN_ITERS; it++) {
+            while (sqlite3_step(st) == SQLITE_ROW) { read_all_cols(st); total++; }
+            sqlite3_reset(st);
+        }
+        r.scan_rev_dps = qps((int)total, diff_ms(t));
+        sqlite3_finalize(st);
+
+        total = 0;
+        sqlite3_prepare_v2(db, "SELECT id FROM bench ORDER BY id", -1, &st, nullptr);
+        t = now();
+        for (int it = 0; it < SCAN_ITERS; it++) {
+            while (sqlite3_step(st) == SQLITE_ROW) { volatile auto v = sqlite3_column_bytes(st, 0); (void)v; total++; }
+            sqlite3_reset(st);
+        }
+        r.scan_key_dps = qps((int)total, diff_ms(t));
+        sqlite3_finalize(st);
+    }
+
     // 12. bulk delete x100 in ONE tx — mirrors single batch_commit
     t = now();
     { char* e = nullptr; sqlite3_exec(db, "BEGIN", nullptr, nullptr, &e); }
@@ -417,6 +462,12 @@ int main(int argc, char** argv) {
              << std::fixed << std::setprecision(1) << r.storage_mb << "MB\n";
     }
     std::cout << std::string(170, '=') << std::endl;
+    long scan_n = results.empty() ? 0 : results[0].scan_rows;
+    printf("\n--- FULL SCAN (docs/s over %ld live docs x5 iters; key = id-col only) ---\n", scan_n);
+    for (const auto& r : results) {
+        printf("  %-10s fwd %-9d rev %-9d key %-9d (rows %ld)\n",
+            r.mode.c_str(), (int)r.scan_fwd_dps, (int)r.scan_rev_dps, (int)r.scan_key_dps, r.scan_rows);
+    }
     printf("(EXTRA, not fair-test) QryLazy id-only vs Qry full-row:\n");
     for (const auto& r : results) {
         printf("  %-10s lazy %d qps vs full-row %d qps\n",
