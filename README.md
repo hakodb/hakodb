@@ -10,7 +10,17 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.8.5)
+## What's new (0.7.2 → 0.8.6)
+
+### v0.8.6 — FFI walk: 1.64M docs/s over the ABI
+- `fl_cursor_walk(engine, query, cb, userdata)` + `FlWalkCallback`
+  typedef (header-regenerated): one FFI call per scan, borrowed
+  `(id, id_len, bytes, bytes_len)` per row, `false` stops early,
+  returns rows visited / -1 on error. C cannot unwind so the trampoline
+  needs no per-row shield; same no-reentry contract as `db.walk`.
+- Measured in-process release: **1.64M docs/s** over the ABI (vs
+  2.1–2.5M native with-id — the delta is one indirect call per row).
+  The dbbench backend can now grow its raw branch on this (caller side).
 
 ### v0.8.5 — decoded scans 150k → 560k (fetch machinery, not codec)
 - **Measured first**: codec floors are decode 950ns / encode 209ns per
@@ -255,7 +265,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.5)](#whats-new-072--085)
+- [What's new (0.7.2 → 0.8.6)](#whats-new-072--086)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)

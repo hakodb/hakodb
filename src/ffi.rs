@@ -1836,6 +1836,70 @@ pub extern "C" fn fl_rawdoc_to_doc(
     })
 }
 
+// --- Cursor walk (ponytail) ---
+// Zero-alloc scan: one FFI call per walk (not per row, not per page). The
+// engine lends each row — id and bytes borrowed, no String/Arc/Vec per
+// row — and the callback returns true to continue, false to stop early.
+// Returns rows visited, or -1 on error (see fl_last_error).
+//
+// CONTRACT (mirrors db.walk): borrowed pointers die with the call; the
+// callback MUST NOT re-enter the engine (read lock held for the walk);
+// C cannot unwind, so no per-row shield is needed — the outer shield
+// covers setup only. Decode any row via fl_rawdoc_to_doc semantics on
+// your own copy (copy the bytes first if you must keep them).
+#[allow(non_camel_case_types)]
+pub type FlWalkCallback = Option<
+    unsafe extern "C" fn(
+        id: *const c_char,
+        id_len: usize,
+        bytes: *const u8,
+        bytes_len: usize,
+        userdata: *mut std::ffi::c_void,
+    ) -> bool,
+>;
+
+#[no_mangle]
+pub extern "C" fn fl_cursor_walk(
+    engine: *mut FL_Engine,
+    query: *const FL_Query,
+    callback: FlWalkCallback,
+    userdata: *mut std::ffi::c_void,
+) -> i64 {
+    safety_shield!(-1, {
+        if engine.is_null() || query.is_null() {
+            set_last_error("null engine/query handle");
+            return -1;
+        }
+        let cb = match callback {
+            Some(f) => f,
+            None => {
+                set_last_error("null walk callback");
+                return -1;
+            }
+        };
+        let engine = unsafe { &*engine };
+        let query_obj = unsafe { &*query };
+        // ponytail: C callbacks cannot unwind, so this direct invocation
+        // costs one indirect call per row — no catch_unwind, no copies.
+        let res = engine.db.walk(query_obj.query.clone(), &mut |id: &str, bytes: &[u8]| unsafe {
+            cb(
+                id.as_ptr() as *const c_char,
+                id.len(),
+                bytes.as_ptr(),
+                bytes.len(),
+                userdata,
+            )
+        });
+        match res {
+            Ok(n) => n as i64,
+            Err(e) => {
+                set_last_error(e.to_string());
+                -1
+            }
+        }
+    })
+}
+
 // --- Bulk JSON (ponytail) ---
 // Streams a result set as one JSON array string with NO intermediate
 // serde_json::Value DOM (the per-doc path builds a full Map DOM per row).

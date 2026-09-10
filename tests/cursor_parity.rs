@@ -693,3 +693,132 @@ fn codec_floor() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[derive(Default)]
+struct WalkState {
+    rows: usize,
+    bytes: usize,
+    first_id: String,
+    last_id: String,
+}
+
+/// extern "C" counting callback — mirrors what t_firelite.cc will do.
+unsafe extern "C" fn walk_count_cb(
+    id: *const std::os::raw::c_char,
+    id_len: usize,
+    bytes: *const u8,
+    bytes_len: usize,
+    userdata: *mut std::ffi::c_void,
+) -> bool {
+    let st = &mut *(userdata as *mut WalkState);
+    let idb = std::slice::from_raw_parts(id as *const u8, id_len);
+    let s = String::from_utf8_lossy(idb).into_owned();
+    if st.rows == 0 {
+        st.first_id = s.clone();
+    }
+    st.last_id = s;
+    st.rows += 1;
+    st.bytes += bytes_len;
+    let _ = std::slice::from_raw_parts(bytes, bytes_len);
+    true
+}
+
+unsafe extern "C" fn walk_stop_cb(
+    _id: *const std::os::raw::c_char,
+    _id_len: usize,
+    _bytes: *const u8,
+    _bytes_len: usize,
+    userdata: *mut std::ffi::c_void,
+) -> bool {
+    let n = &mut *(userdata as *mut usize);
+    *n += 1;
+    *n < 100
+}
+
+/// FFI walk: one call per direction over the ABI, early-stop + null
+/// callback coverage. Locks the fl_cursor_walk contract.
+#[test]
+fn walk_ffi() {
+    use firelite::ffi;
+    let dir = std::env::temp_dir().join(format!(
+        "fl-test-walkffi-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let dir_c = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+    let col = std::ffi::CString::new("bench").unwrap();
+    let field = std::ffi::CString::new("v").unwrap();
+    let idf = std::ffi::CString::new("id").unwrap();
+    let payload = vec![0xABu8; 100];
+
+    let engine = unsafe {
+        let cfg = ffi::fl_config_new();
+        ffi::fl_config_set_durability(cfg, 2);
+        ffi::fl_engine_open_with_config(dir_c.as_ptr(), cfg)
+    };
+    assert!(!engine.is_null());
+    for i in 0..N {
+        let k = std::ffi::CString::new(format!("{i:016x}")).unwrap();
+        let doc = unsafe { ffi::fl_doc_new() };
+        unsafe {
+            assert_eq!(ffi::fl_doc_insert_bin(doc, field.as_ptr(), payload.as_ptr(), payload.len()), 0);
+            assert_eq!(ffi::fl_engine_insert_take(engine, col.as_ptr(), k.as_ptr(), doc), 0);
+        }
+    }
+    let t0 = std::time::Instant::now();
+    while unsafe { !ffi::fl_engine_is_indexes_ready(engine) } {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(30), "indexes never ready");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    // Full descending walk, no limit — one call.
+    let q = unsafe { ffi::fl_query_new(col.as_ptr()) };
+    unsafe {
+        assert_eq!(ffi::fl_query_order_by(q, idf.as_ptr(), false), 0);
+    }
+    let mut st = WalkState::default();
+    let t0 = std::time::Instant::now();
+    let n = unsafe {
+        ffi::fl_cursor_walk(
+            engine,
+            q,
+            Some(walk_count_cb),
+            &mut st as *mut WalkState as *mut std::ffi::c_void,
+        )
+    };
+    let dt = t0.elapsed();
+    assert_eq!(n, N as i64, "walk visited all rows");
+    assert_eq!(st.rows, N);
+    assert!(st.first_id > st.last_id, "descending order");
+    eprintln!(
+        "walk FFI: {N} docs / {} bytes in {dt:?} = {} docs/s",
+        st.bytes,
+        N as u128 * 1_000_000_000 / dt.as_nanos().max(1),
+    );
+    unsafe { ffi::fl_query_free(q) };
+
+    // Early-stop + null callback.
+    let q2 = unsafe { ffi::fl_query_new(col.as_ptr()) };
+    unsafe {
+        assert_eq!(ffi::fl_query_order_by(q2, idf.as_ptr(), true), 0);
+    }
+    let mut cnt = 0usize;
+    let n = unsafe {
+        ffi::fl_cursor_walk(
+            engine,
+            q2,
+            Some(walk_stop_cb),
+            &mut cnt as *mut usize as *mut std::ffi::c_void,
+        )
+    };
+    assert_eq!(n, 100, "early stop visits exactly 100");
+    assert_eq!(cnt, 100);
+    let n = unsafe { ffi::fl_cursor_walk(engine, q2, None, std::ptr::null_mut()) };
+    assert_eq!(n, -1, "null callback errors");
+    unsafe { ffi::fl_query_free(q2) };
+
+    unsafe { ffi::fl_engine_free(engine) };
+    std::fs::remove_dir_all(&dir).ok();
+}

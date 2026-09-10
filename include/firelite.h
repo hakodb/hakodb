@@ -45,6 +45,12 @@ using FL_OnSnapshotCallback = void(*)(const char *collection,
                                       int32_t kind,
                                       void *user_data);
 
+using FlWalkCallback = bool(*)(const char *id,
+                               uintptr_t id_len,
+                               const uint8_t *bytes,
+                               uintptr_t bytes_len,
+                               void *userdata);
+
 extern "C" {
 
 FL_Engine *fl_engine_open(const char *path);
@@ -265,6 +271,11 @@ int32_t fl_query_start_after_raw(FL_Query *query, const FL_RawDoc *anchor_doc);
 /// The pointer resolver: decode a raw row into an owned FL_Doc (blob
 /// fields inflated via the engine, same as a decoded query row).
 FL_Doc *fl_rawdoc_to_doc(FL_Engine *engine, const FL_RawDoc *raw_doc, const char *collection);
+
+int64_t fl_cursor_walk(FL_Engine *engine,
+                       const FL_Query *query,
+                       FlWalkCallback callback,
+                       void *userdata);
 
 /// Bulk result-set to JSON: one call, one JSON array string, no per-doc
 /// DOM and no per-doc FFI round trips. Byte-identical to joining
