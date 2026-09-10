@@ -1348,6 +1348,46 @@ impl FireLite {
         Ok(results)
     }
 
+    /// Zero-alloc scan walk: lends each matching row (`&str` id, `&[u8]`
+    /// storage bytes) to `callback`; `false` stops early. Returns rows
+    /// visited. See `ParallelQueryExecutor::execute_walk` for the contract
+    /// (SortedKeys scans only for now; callback must not re-enter the
+    /// engine — the storage read lock is held for the whole walk).
+    pub fn walk<F>(&self, mut query: Query, callback: &mut F) -> Result<usize>
+    where
+        F: FnMut(&str, &[u8]) -> bool,
+    {
+        query.raw = true;
+        if !self.allowed(&query.collection, AccessOp::Query) {
+            self.record_audit(AuditEntry {
+                op: AccessOp::Query,
+                collection: query.collection.clone(),
+                doc_id: None,
+                ok: false,
+            });
+            return Err(FireLiteError::Corrupt("Denied".into()));
+        }
+
+        let shard_arc = self.get_shard(&query.collection)?;
+        let indexes = self.indexes.read().unwrap();
+        let rows = shard_arc.read().unwrap().count_prefix("");
+
+        let is_ready = self.indexes_ready.load(std::sync::atomic::Ordering::Acquire);
+
+        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
+
+        let visited = self.executor.execute_walk(shard_arc, &indexes, (*plan).clone(), callback)?;
+
+        self.record_audit(AuditEntry {
+            op: AccessOp::Query,
+            collection: query.collection.clone(),
+            doc_id: None,
+            ok: true,
+        });
+
+        Ok(visited)
+    }
+
     pub fn query_projected_zero_copy(
         &self,
         query: Query,

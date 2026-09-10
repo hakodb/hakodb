@@ -10,7 +10,18 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.8.3)
+## What's new (0.7.2 → 0.8.4)
+
+### v0.8.4 — zero-alloc walk: 2.1–3.3M docs/s
+- New `db.walk(query, callback)`: the engine lends each row (`&str` id,
+  `&[u8]` bytes, borrowed under one read lock), `false` stops early.
+  No per-row String, Arc bump, Vec, or per-page plan — SortedKeys scans
+  for now, index-satisfied filters/ordering required, callback must not
+  re-enter the engine (documented, same rule as nested MDBX txns).
+- Measured in-process release, 20k docs: **with-id 2.1–2.5M**,
+  **count-only 3.35M vs MDBX 3.66M** (0.92x — effectively parity; our
+  remainder is one HashMap lookup vs their cursor bump). The 2M bar from
+  the design review, cleared with room to spare.
 
 ### v0.8.3 — raw FFI surface for byte-fair benchmarks
 - `FL_RawDoc` / `FL_RawResultSet` + 7 functions (`fl_query_execute_raw`,
@@ -228,7 +239,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.3)](#whats-new-072--083)
+- [What's new (0.7.2 → 0.8.4)](#whats-new-072--084)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)

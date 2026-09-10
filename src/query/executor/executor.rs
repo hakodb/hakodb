@@ -322,6 +322,151 @@ impl ParallelQueryExecutor {
         Ok(out)
     }
 
+    /// Zero-alloc scan walk: the engine lends each row (`&str` id borrowed
+    /// from the sorted key vec, bytes borrowed from the resident Arc or a
+    /// single reused scratch buffer) and the caller decides per row.
+    /// Returning `false` stops early. Returns rows visited.
+    ///
+    /// Currently covers the SortedKeys fast path (order-by-id / no-order
+    /// scans — the hot shape); anything else is `QueryError`, extend
+    /// arm-by-arm on demand. Same index-satisfied requirements as raw.
+    ///
+    /// CONTRACT: the storage read lock is held for the whole walk, so the
+    /// callback MUST NOT re-enter the engine (a waiting writer + second
+    /// read-lock attempt deadlocks, same as nested MDBX txns). Keep it
+    /// short: count, hash, copy, compare — not queries.
+    pub fn execute_walk<F>(
+        &self,
+        storage_arc: Arc<RwLock<StorageEngine>>,
+        indexes: &IndexManager,
+        plan: QueryPlan,
+        callback: &mut F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str, &[u8]) -> bool,
+    {
+        use crate::error::FireLiteError;
+        // ponytail: reserved for the non-SortedKeys arms when the walk
+        // grows beyond order-by-id (underscore until then, not dead).
+        let _ = indexes;
+        if (!plan.filters.is_empty() || !plan.or_groups.is_empty())
+            && !plan.filters_satisfied_by_index
+        {
+            return Err(FireLiteError::QueryError(
+                "walk requires index-satisfied filters (decode to match)".into(),
+            ));
+        }
+        if !plan.order_by_satisfied && !plan.order_by.is_empty() {
+            return Err(FireLiteError::QueryError(
+                "walk requires index-satisfied ordering (decode to sort)".into(),
+            ));
+        }
+        let (reverse, start_key, start_exclusive) = match &plan.scan {
+            ScanType::SortedKeys { start_key, start_exclusive, reverse } => {
+                (*reverse, start_key.clone(), *start_exclusive)
+            }
+            _ => {
+                return Err(FireLiteError::QueryError(
+                    "walk supports SortedKeys scans only (order by id)".into(),
+                ))
+            }
+        };
+
+        // The guard lives to the end of the function — every borrow below
+        // (keys, resident Arcs) is covered by it. ponytail: one reused
+        // scratch buffer for the rare owned reads (segment/blob pointers)
+        // instead of a Vec per row.
+        let storage = storage_arc.read().unwrap();
+        let total = storage.sorted_keys.len();
+        if total == 0 {
+            return Ok(0);
+        }
+        let (start, end) = if reverse {
+            match storage.sorted_key_range_reverse(
+                start_key.as_deref(),
+                start_exclusive,
+                plan.offset,
+                plan.limit,
+            ) {
+                Some(r) => r,
+                None => return Ok(0),
+            }
+        } else {
+            match storage.sorted_key_range(
+                start_key.as_deref(),
+                start_exclusive,
+                plan.offset,
+                plan.limit,
+            ) {
+                Some(r) => r,
+                None => return Ok(0),
+            }
+        };
+        let limit = plan.limit.unwrap_or(usize::MAX);
+        let mut visited = 0usize;
+        let mut scratch = Vec::new();
+        if reverse {
+            for key in storage.sorted_keys[start..end].iter().rev() {
+                if visited >= limit {
+                    break;
+                }
+                let Some(ptr) = storage.index.get(key) else { continue };
+                if matches!(ptr, Pointer::Deleted { .. }) {
+                    continue;
+                }
+                match ptr {
+                    Pointer::Inlined(shared) => {
+                        visited += 1;
+                        if !callback(key.as_str(), shared) {
+                            return Ok(visited);
+                        }
+                    }
+                    other => match storage.read_pointer_internal(other, true)? {
+                        Some(bytes) => {
+                            scratch.clear();
+                            scratch.extend_from_slice(&bytes);
+                            visited += 1;
+                            if !callback(key.as_str(), &scratch) {
+                                return Ok(visited);
+                            }
+                        }
+                        None => continue,
+                    },
+                }
+            }
+        } else {
+            for key in &storage.sorted_keys[start..end] {
+                if visited >= limit {
+                    break;
+                }
+                let Some(ptr) = storage.index.get(key) else { continue };
+                if matches!(ptr, Pointer::Deleted { .. }) {
+                    continue;
+                }
+                match ptr {
+                    Pointer::Inlined(shared) => {
+                        visited += 1;
+                        if !callback(key.as_str(), shared) {
+                            return Ok(visited);
+                        }
+                    }
+                    other => match storage.read_pointer_internal(other, true)? {
+                        Some(bytes) => {
+                            scratch.clear();
+                            scratch.extend_from_slice(&bytes);
+                            visited += 1;
+                            if !callback(key.as_str(), &scratch) {
+                                return Ok(visited);
+                            }
+                        }
+                        None => continue,
+                    },
+                }
+            }
+        }
+        Ok(visited)
+    }
+
     #[inline]
     fn make_key(_collection: &str, doc_id: &str) -> String {
         doc_id.to_string()

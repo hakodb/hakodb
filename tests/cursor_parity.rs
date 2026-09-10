@@ -548,3 +548,96 @@ fn raw_ffi_roundtrip() {
     unsafe { ffi::fl_engine_free(engine) };
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Zero-alloc walk: single call per direction, borrowed rows, early-stop
+/// and contract-error coverage. Caller-side id collection is test-only;
+/// the engine allocates nothing per row.
+#[test]
+fn walk_scan_parity() {
+    let dir = std::env::temp_dir().join(format!(
+        "fl-test-walk-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let db = open_bench(&dir);
+    seed(&db);
+
+    for ascending in [true, false] {
+        let mut ids: Vec<String> = Vec::with_capacity(N);
+        let mut total_bytes = 0usize;
+        let t0 = std::time::Instant::now();
+        let mut q = Query::new("bench");
+        q = q.order_by("id", ascending);
+        let visited = db
+            .walk(q, &mut |id: &str, bytes: &[u8]| {
+                ids.push(id.to_string());
+                total_bytes += bytes.len();
+                true
+            })
+            .expect("walk");
+        let dt = t0.elapsed();
+        assert_eq!(visited, N);
+        assert_eq!(ids.len(), N, "walk missed docs (asc={ascending})");
+        if ascending {
+            assert!(ids.windows(2).all(|w| w[0] < w[1]), "walk not ascending");
+        } else {
+            assert!(ids.windows(2).all(|w| w[0] > w[1]), "walk not descending");
+        }
+        eprintln!(
+            "walk {}: {N} docs / {total_bytes} bytes in {dt:?} = {} docs/s",
+            if ascending { "forward" } else { "reverse" },
+            N as u128 * 1_000_000_000 / dt.as_nanos().max(1),
+        );
+    }
+
+    // Count-only: no caller-side id allocs — isolates engine cost (the
+    // MDBX-equivalent shape: keys available, nothing copied).
+    let mut total = 0usize;
+    let mut nrows = 0usize;
+    let t0 = std::time::Instant::now();
+    let q = Query::new("bench").order_by("id", true);
+    let visited = db
+        .walk(q, &mut |_: &str, bytes: &[u8]| {
+            total += bytes.len();
+            nrows += 1;
+            true
+        })
+        .expect("count-only walk");
+    let dt = t0.elapsed();
+    assert_eq!(visited, N);
+    assert_eq!(nrows, N);
+    eprintln!(
+        "walk count-only: {N} docs / {total} bytes in {dt:?} = {} docs/s",
+        N as u128 * 1_000_000_000 / dt.as_nanos().max(1),
+    );
+
+    // Early-stop: callback false after 100 rows.
+    let mut seen = 0usize;
+    let q = Query::new("bench").order_by("id", true);
+    let visited = db
+        .walk(q, &mut |_: &str, _: &[u8]| {
+            seen += 1;
+            seen < 100
+        })
+        .expect("early-stop walk");
+    assert_eq!(visited, 100, "early stop visits exactly 100");
+    assert_eq!(seen, 100);
+
+    // Contract: non-index filter without decode is an error, not a guess.
+    let q = Query::new("bench")
+        .where_filter("v", firelite::query::filter::Operator::Eq, Value::Binary(vec![1u8]))
+        .order_by("id", true);
+    let mut n = 0;
+    let err = db
+        .walk(q, &mut |_: &str, _: &[u8]| {
+            n += 1;
+            true
+        })
+        .expect_err("unmatched-filter walk must error");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("index-satisfied"), "unexpected error: {msg}");
+    assert_eq!(n, 0);
+    std::fs::remove_dir_all(&dir).ok();
+}
