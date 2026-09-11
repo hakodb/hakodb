@@ -30,9 +30,12 @@ pub replication_collections: Option<Vec<String>>,
 /// preallocated ahead of the write position so steady-state appends never
 /// extend the file (fewer tiny extensions => less fragmentation => cheaper
 /// per-commit fsync on durable modes). Sparse: consumes no disk until
-/// written. Measured A/B on fsync-bound workloads: no throughput delta at
-/// benchmark scale, so it stays opt-in — phantom size and mobile storage
-/// cost more than unproven fragmentation gains. Ignored for Manual.
+/// written. Measured: no delta on fast local disks (v0.7.12 A/B), but
+/// decisive on cloud disks with slow metadata — Codespace Always singles
+/// went 1417us to 855us wal phase (620 to 1111 WPS) with 16MB reserved.
+/// Default stays 0 (phantom logical size + mobile storage); reach for
+/// `--wal-reserve-mb` (benchmark) / `fl_config_set_wal_reserve_bytes`
+/// when fdatasync dominates on network-attached storage. Ignored for Manual.
 pub wal_reserve_bytes: u64,
 }
 
