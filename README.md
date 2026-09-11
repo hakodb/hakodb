@@ -10,7 +10,31 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.8.17)
+## What's new (0.7.2 → 0.8.18)
+
+### v0.8.18 — sync-saving WAL fixes, 4MB reserve default, maintenance hold
+- **Correctness fix (sync)**: `Wal::tail` opened a fresh read handle per
+  call. The old `try_clone` + seek + buffered read shared the file
+  position and dragged the writer cursor, stranding appends inside
+  preallocation padding where readers stop at the first zero header —
+  cloud sync broke deterministically with reserve on (rooms test failed
+  at 4MB, passed at 0MB). Positional `pread` was tried first and also
+  moves the cursor on some platforms; the separate handle is immune
+  everywhere.
+- **Correctness fix (double write)**: `flush()` wrote the buffer twice;
+  every WAL record persisted 2×. Now single-write (3 committed replay
+  tests green again).
+- **Default `wal_reserve_bytes` to 4MB** (was 0): presence-not-size —
+  steady-state appends never extend the file. No delta on fast local
+  disks; decisive on cloud disks with slow file-growth metadata.
+  Internal (`__`) collections still skip it.
+- **Maintenance hold**: `background_maintenance=false` (config +
+  `fl_config_set_background_maintenance` + bench `--no-maintenance`,
+  wired in Go/Pascal/JS) pauses the 5s checkpoint/compaction tick for
+  flat bench rounds; engine stays correct.
+- Re-measured Always singles post-fix (local, `--no-maintenance`):
+  no reserve delta on fast disks; prior cloud figures predate the
+  flush fix (2× WAL bytes).
 
 ### v0.8.17 — allocation census: allocator exonerated, one copy killed
 - Temporary counting allocator over every read path (deleted after —
@@ -442,9 +466,9 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 - **Id-cursor fast path** — `start_at`/`start_after` on document id resolves to a `SortedKeys` Vec range instead of a composite scan.
 - **Plan-cache key fix** — cursor bound tags (`start_at` vs `start_after`) included in the key; previously colliding plans could return wrong pages.
 - **Write fast path** — `put_owned` / `fl_engine_insert_take` (no clone on owned docs), shard-lookup hoist, `ChangeEvent.path: Arc<str>`, 8192-entry version-stamped hot doc cache.
-- **WAL headroom** — opt-in `wal_reserve_bytes` (default 0 since v0.7.12;
-  measured no throughput delta on fsync-bound workloads, so no phantom size
-  by default) via `FireLiteConfig::wal_reserve_bytes` / `fl_config_set_wal_reserve_bytes`.
+- **WAL headroom** — `wal_reserve_bytes` (default 4MB since v0.8.18, was
+  opt-in 0 since v0.7.12; sparse, internal collections skip it) via
+  `FireLiteConfig::wal_reserve_bytes` / `fl_config_set_wal_reserve_bytes`.
 - **Write-phase timers** — `WRITE_STATS` + `write_stats_report()` / `fl_debug_write_stats()`; `benchmark --profile=<mode> --wstats` attributes write latency (Manual ~11.7 µs after shard hoist, −24%).
 
 ### v0.7.2 — pagination, WAL hardening, FFI slab
@@ -458,7 +482,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.17)](#whats-new-072--0817)
+- [What's new (0.7.2 → 0.8.18)](#whats-new-072--0818)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)
