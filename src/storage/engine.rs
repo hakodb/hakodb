@@ -239,6 +239,11 @@ impl StorageEngine {
             .collect();
         keys.sort();
         self.sorted_keys = keys;
+        // ponytail: the live-count cache is exactly this set — seed it here
+        // so count_prefix is O(1) from the first query (update_index_entry
+        // maintains it afterwards; absent entries fall back to a scan).
+        let live = self.sorted_keys.len();
+        self.collection_counts.insert(self.logical_name.clone(), live);
         Ok(())
     }
 
@@ -297,6 +302,8 @@ impl StorageEngine {
         }
 
         // 2. Adjust stats based on the OLD pointer
+        // ponytail: liveness computed before the move below.
+        let old_was_live = old_p.as_ref().map(|v| !matches!(v, Pointer::Deleted { .. })).unwrap_or(false);
         if let Some(old_val) = old_p {
             // Subtract memory stats for the OLD pointer
             match old_val {
@@ -304,29 +311,20 @@ impl StorageEngine {
                 Pointer::BlobPendingData { ref skeleton, .. } => { self.inlined_bytes = self.inlined_bytes.saturating_sub(skeleton.len()); }
                 _ => {}
             }
+        }
 
-            // --- COUNT LOGIC ---
-            // If we are replacing a LIVE doc with a DELETED doc: decrement
-            // If we are replacing a LIVE doc with a LIVE doc: no change
-            let old_was_live = !matches!(old_val, Pointer::Deleted { .. });
-
-            if old_was_live && !new_is_live {
-                if let Some(count) = self.collection_counts.get_mut(&self.logical_name) {
-                    *count = count.saturating_sub(1);
-                }
-            } else if !old_was_live && new_is_live {
-                // Replacing a tombstone with a real doc
-                if let Some(count) = self.collection_counts.get_mut(&self.logical_name) {
-                    *count += 1;
-                }
+        // --- COUNT LOGIC (live = non-Deleted) ---
+        // ponytail: single entry()-based accounting for all transitions.
+        // The old three-branch get_mut silently skipped absent keys, so
+        // brand-new collections never got an entry and the map stayed
+        // dead. Live<->tombstone flips adjust; live<->live and dead
+        // removals (purge) don't.
+        if old_was_live && !new_is_live {
+            if let Some(count) = self.collection_counts.get_mut(&self.logical_name) {
+                *count = count.saturating_sub(1);
             }
-        } else {
-            // Brand new entry (old_p was None)
-            if new_is_live {
-                if let Some(count) = self.collection_counts.get_mut(&self.logical_name) {
-                    *count += 1;
-                }
-            }
+        } else if !old_was_live && new_is_live {
+            *self.collection_counts.entry(self.logical_name.clone()).or_insert(0) += 1;
         }
     }
 
@@ -864,6 +862,12 @@ impl StorageEngine {
 
     pub fn count_prefix(&self, prefix: &str) -> usize {
         if prefix.is_empty() || prefix == self.logical_name {
+            // ponytail: O(1) live count (maintained by update_index_entry,
+            // seeded at open). Absent entry falls back to the scan rather
+            // than lying — correctness over speed, always.
+            if let Some(n) = self.collection_counts.get(&self.logical_name) {
+                return *n;
+            }
             return self.index.values()
                 .filter(|p| !matches!(p, Pointer::Deleted { .. }))
                 .count();
@@ -1063,19 +1067,22 @@ impl StorageEngine {
         self.wal.append_batch(ops, true)?;
         for op in ops {
             match op {
-                crate::storage::wal::WalOp::Put { key, segment_id, segment_offset, len } => {
-                    self.index.insert(key.clone(), Pointer::Segment { 
-                        segment_id: *segment_id, offset: *segment_offset, len: *len 
-                    });
+                // ponytail: route through update_index_entry (not direct
+                // index.insert) so sorted_keys and the live-count cache stay
+                // in lockstep — the old direct inserts skipped both.
+                WalOp::Put { key, segment_id, segment_offset, len } => {
+                    self.update_index_entry(key.clone(), Some(Pointer::Segment {
+                        segment_id: *segment_id, offset: *segment_offset, len: *len
+                    }));
                 }
-                crate::storage::wal::WalOp::PutInlined { key, value } => {
+                WalOp::PutInlined { key, value } => {
                     self.update_index_entry(key.clone(), Some(Pointer::Inlined(Arc::new(value.clone()))));
                 }
-                crate::storage::wal::WalOp::Delete { key, timestamp } => {
+                WalOp::Delete { key, timestamp } => {
                     self.update_index_entry(key.clone(), Some(Pointer::Deleted { timestamp: *timestamp }));
                 }
-                crate::storage::wal::WalOp::PutBlob { key, offset, len } => {
-                    self.index.insert(key.clone(), Pointer::Blob { offset: *offset, len: *len });
+                WalOp::PutBlob { key, offset, len } => {
+                    self.update_index_entry(key.clone(), Some(Pointer::Blob { offset: *offset, len: *len }));
                 }
                 _ => {}
             }

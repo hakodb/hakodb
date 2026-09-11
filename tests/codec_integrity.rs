@@ -254,6 +254,28 @@ fn verify_all(db: &FireLite, expected: &Expected, blob_ids: &[String]) {
         assert_eq!(&fields_of(doc), &expected[id], "full scan mismatch for {id}");
     }
 
+    // 4b. Unindexed filter + limit (no index on `tag` anywhere): exact
+    // match set, not the first-N-rows truncation. Locks the v0.8.5
+    // FullCollection scan_limit regression (pre-truncation returned
+    // wrong/empty results for filtered queries).
+    let mut q = Query::new("docs");
+    q = q.where_filter(
+        "tag",
+        firelite::query::filter::Operator::Eq,
+        Value::String("t3".into()),
+    );
+    q.limit = Some(7);
+    let rows = db.query(q).expect("filtered");
+    assert_eq!(rows.len(), 7, "all t3 docs");
+    for (id, doc) in &rows {
+        assert_eq!(&fields_of(doc), &expected[id], "filtered mismatch for {id}");
+        assert_eq!(
+            doc.get("tag"),
+            Some(&Value::String("t3".into())),
+            "filter predicate holds for {id}"
+        );
+    }
+
     // 5. Raw + decode + encode identity on every row.
     let mut q = Query::new("docs");
     q = q.order_by("id", true);

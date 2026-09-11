@@ -264,8 +264,9 @@ pub extern "C" fn fl_engine_await_quiescent(engine: *mut FL_Engine, timeout_ms: 
 }
 
 /// Point-sample diagnostic as JSON (free with fl_string_free):
-/// {"indexes_ready":b,"pending_index_ops":n,"pending_blob_bytes":n,
-///  "queued_blob_items":n,"maintenance_running":b,"quiescent":b}.
+/// {"indexes_ready":b,"pending_index_ops":n,"index_backfills":n,
+///  "pending_blob_bytes":n,"queued_blob_items":n,
+///  "maintenance_running":b,"quiescent":b}.
 /// Tells you WHAT is outstanding instead of guessing.
 #[no_mangle]
 pub extern "C" fn fl_engine_quiescence_status(engine: *mut FL_Engine) -> *mut c_char {
@@ -278,6 +279,7 @@ pub extern "C" fn fl_engine_quiescence_status(engine: *mut FL_Engine) -> *mut c_
     let text = serde_json::json!({
         "indexes_ready": s.indexes_ready,
         "pending_index_ops": s.pending_index_ops,
+        "index_backfills": s.index_backfills,
         "pending_blob_bytes": s.pending_blob_bytes,
         "queued_blob_items": s.queued_blob_items,
         "maintenance_running": s.maintenance_running,

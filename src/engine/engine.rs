@@ -308,6 +308,8 @@ pub struct QuiescenceStatus {
     pub indexes_ready: bool,
     /// Index updates still queued behind the async index worker.
     pub pending_index_ops: usize,
+    /// Index backfill threads still rebuilding over existing docs.
+    pub index_backfills: usize,
     /// Blob bytes accepted from clients but not yet persisted.
     pub pending_blob_bytes: usize,
     /// Blob work items waiting for the worker.
@@ -321,9 +323,22 @@ impl QuiescenceStatus {
     pub fn is_quiescent(&self) -> bool {
         self.indexes_ready
             && self.pending_index_ops == 0
+            && self.index_backfills == 0
             && self.pending_blob_bytes == 0
             && self.queued_blob_items == 0
             && !self.maintenance_running
+    }
+}
+
+/// Decrements the backfill counter on scope exit — including panics, so a
+/// dying backfill thread can't wedge the quiescence verdict at nonzero.
+struct BackfillGuard {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for BackfillGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -346,6 +361,11 @@ pub struct FireLite {
     /// ponytail: ops sent to the async index worker but not yet applied.
     /// Quiescence reads this instead of channel len (std mpsc has none).
     pub(crate) index_inflight: Arc<std::sync::atomic::AtomicUsize>,
+    /// ponytail: create_*_index backfill threads in flight (one per index
+    /// build over existing docs). Quiescence covers these too — an index
+    /// that exists-but-is-backfilling otherwise serves partial results
+    /// with no signal at all.
+    pub(crate) backfill_inflight: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) blob_tx: crossbeam_channel::Sender<BlobWork>,
     system_stop: Mutex<Option<Sender<()>>>,
     system_handle: Mutex<Option<thread::JoinHandle<()>>>,
@@ -608,6 +628,7 @@ impl FireLite {
             audit_tx,
             index_tx,
             index_inflight,
+            backfill_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             blob_tx: btx.clone(),
             audit_data,
             system_stop: Mutex::new(Some(system_stop_tx)),
@@ -1974,8 +1995,11 @@ impl FireLite {
         let idx_mgr = Arc::clone(&self.indexes);
         let f_name = field.to_string();
         let col_name = collection.to_string();
+        let backfill_count = Arc::clone(&self.backfill_inflight);
+        backfill_count.fetch_add(1, Ordering::Relaxed);
 
         thread::spawn(move || {
+            let _guard = BackfillGuard { counter: backfill_count };
             let pointers = {
                 let storage = shard_arc.read().unwrap();
                 storage.get_physical_index_snapshot()
@@ -2035,9 +2059,12 @@ impl FireLite {
 
         // Capture encryption key for the thread
         let enc_key = self.config.encryption_key.clone();
+        let backfill_count = Arc::clone(&self.backfill_inflight);
+        backfill_count.fetch_add(1, Ordering::Relaxed);
 
         thread::spawn(move || {
             // Step A: Lock, take a snapshot of the pointers, then release IMMEDIATELY
+            let _guard = BackfillGuard { counter: backfill_count };
             let pointers = {
                 let storage = shard_arc.read().unwrap();
                 storage.get_physical_index_snapshot()
@@ -2109,8 +2136,11 @@ impl FireLite {
         let persist_ptr = Arc::clone(&self.index_storage); // <--- Required for persistence
         
         let enc_key = self.config.encryption_key.clone();
+        let backfill_count = Arc::clone(&self.backfill_inflight);
+        backfill_count.fetch_add(1, Ordering::Relaxed);
 
         thread::spawn(move || {
+            let _guard = BackfillGuard { counter: backfill_count };
             let pointers = {
                 let storage = shard_arc.read().unwrap();
                 storage.get_physical_index_snapshot()
@@ -2374,6 +2404,7 @@ impl FireLite {
         QuiescenceStatus {
             indexes_ready: self.is_indexes_ready(),
             pending_index_ops: self.index_inflight.load(Ordering::Relaxed),
+            index_backfills: self.backfill_inflight.load(Ordering::Relaxed),
             pending_blob_bytes,
             queued_blob_items,
             maintenance_running: self.maintenance_running.load(Ordering::Acquire),

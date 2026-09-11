@@ -10,7 +10,25 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.8.15)
+## What's new (0.7.2 → 0.8.16)
+
+### v0.8.16 — count-cache + a real correctness fix found profiling
+- **O(1) live counts**: the `collection_counts` map existed but was
+  dead (never initialized). Now maintained in `update_index_entry`,
+  seeded from the recovery sort, read by `count_prefix` (122µs → 164ns
+  per query). Small indexed queries ~1.6x (169 → 107µs); gate medians
+  roughly doubled on the re-run.
+- **Correctness fix (v0.8.5 regression)**: FullCollection limit
+  pushdown pre-truncated *before* filter matching — unindexed
+  filtered queries with limit returned wrong (usually empty) results.
+  Gated on filter-free; filtered scans collect-then-truncate. Locked
+  by a keeper test (unindexed `tag` filter + limit exactness).
+- **Quiescence covers backfills**: `create_*_index` rebuilds run
+  detached and served partial results with no signal (caught the
+  profiler red-handed: 0-row pages mid-backfill). Panic-safe in-flight
+  counter on all three backfill sites, surfaced as `index_backfills`
+  (Rust + FFI JSON). `apply_replicated_ops` routed through
+  `update_index_entry` (also fixes its sorted_keys bypass).
 
 ### v0.8.15 — startup latency: measure first, then cut
 - Measured release open→ready: 14ms fresh, 93ms per 10k warm docs
@@ -426,7 +444,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.15)](#whats-new-072--0815)
+- [What's new (0.7.2 → 0.8.16)](#whats-new-072--0816)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)
