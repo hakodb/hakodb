@@ -15,19 +15,20 @@ fn main() {
         .expect("Unable to generate C header")
         .write_to_file(output);
 
-// ponytail: cdylib on Windows MSVC produces `firelite.dll.lib` as the
-// import library, but `#[link(name = "firelite")]` looks for `firelite.lib`.
-// Refresh the copy on EVERY build — the old "copy if absent" left a stale
-// import lib shadowing new symbols with LNK2019 forever after.
+// ponytail: the old copy (dll.lib -> lib) was stale-by-design. It ran
+// BEFORE rustc linked, so lib always lagged one build behind — and stayed
+// there whenever cargo skipped the build script (no source changes). A
+// stale .lib SHADOWS the fresh .dll in MinGW ld search order, producing
+// undefined-reference ghosts for new symbols. Delete it instead: MinGW ld
+// falls through to firelite.dll directly (always fresh), and no current
+// consumer needs an MSVC import lib (benchmark + Go use MinGW; Pascal
+// keeps its own .a). Deterministic, no timing, no silent staleness.
 let profile = std::env::var("PROFILE").unwrap_or_else(|_| "release".to_string());
 let target_dir = std::path::Path::new("target").join(&profile);
 #[cfg(windows)]
 {
-let src = target_dir.join("firelite.dll.lib");
 let dst = target_dir.join("firelite.lib");
-if src.exists() {
-let _ = std::fs::copy(&src, &dst);
-}
+let _ = std::fs::remove_file(&dst);
 }
     // Allow integration tests to find firelite.dll when invoked from anywhere.
     println!("cargo:rustc-link-search=native={}", target_dir.display());

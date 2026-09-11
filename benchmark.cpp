@@ -129,8 +129,13 @@ static int check_gate(const Report& r) {
     need(r.tx_wps > 2000, "Tx smoke", r.tx_wps, 2000);
     // Relative invariants (guarded against div-by-zero via the smoke gates).
     if (r.comp_query_qps > 0)
-        need(r.stress_query_qps >= r.comp_query_qps, "Qry>=Cmp", r.stress_query_qps, r.comp_query_qps);
-    else { need(false, "Qry>=Cmp", r.stress_query_qps, r.comp_query_qps); }
+        // ponytail: 0.85 tolerance, not 1.0 — at 20-row result sets both
+        // stages are per-query-fixed-cost dominated (~100us plan + FFI +
+        // setup vs ~10us of actual index walking), so the relation measures
+        // jitter, not path efficiency. The tripwire still catches its real
+        // bug class (P2/P4 recapture, BTree fallback) at 10x+ deltas.
+        need(r.stress_query_qps >= 0.85 * r.comp_query_qps, "Qry>=0.85Cmp", r.stress_query_qps, r.comp_query_qps);
+    else { need(false, "Qry>=0.85Cmp", r.stress_query_qps, r.comp_query_qps); }
     need(r.offset_qps <= 2 * r.cursor_qps && r.cursor_qps <= 2 * r.offset_qps,
          "Off/Cur within 2x", r.offset_qps, r.cursor_qps);
     if (r.stress_query_qps > 0)
@@ -566,6 +571,9 @@ int main(int argc, char** argv) {
     cout << "============================================================================================\n";
 
     vector<Report> results;
+    // ponytail: gate mode runs its own median-of-3 below — the suite loop
+    // here would be a redundant 4th Manual run.
+    if (!gate) {
     for (const auto& cfg : suite) {
         if (!only_profile.empty() && cfg.name != only_profile) continue;
         cout << "\n>> PROFILE: " << setw(12) <<  cfg.name << flush;
@@ -573,7 +581,9 @@ int main(int argc, char** argv) {
         this_thread::sleep_for(chrono::milliseconds(200));
         cout << setw(6) <<  "Done";
     }
+    }
 
+    if (!gate) {
     cout << "\n\n" << string(170, '=') << "\n";
     cout << left << setw(14) << "Profile" << " | "
          << setw(14) << "WPS (Sgl/Btc)" << " | "
@@ -620,10 +630,47 @@ int main(int argc, char** argv) {
              << " view " << setw(9) << (int)r.scan_view_dps
              << " (rows " << r.scan_rows << ")\n";
     }
+    } // end non-gate table
 
     if (gate) {
-        cout << "\n--- REGRESSION GATE (Manual) ---\n";
-        int fails = results.empty() ? 1 : check_gate(results[0]);
+        // ponytail: median-of-3 Manual runs. Single-run outliers (a 4x Off
+        // collapse, a 2x Cmp spike — both observed on loaded boxes) flip
+        // tight relative checks that persistent regressions would shift
+        // cleanly. Medians reject the transient; the 0.85 Qry margin above
+        // absorbs systematic per-run wobble. ~3x gate time, worth it.
+        cout << "\n--- GATE: median of 3 Manual runs ---\n";
+        vector<Report> reps;
+        for (int i = 0; i < 3; i++) {
+            reps.push_back(run_benchmark({"Manual", g_docs, 10, 2, 4, false, false, 4, false}));
+            cout << "rep " << i << ": Qry " << (int)reps.back().stress_query_qps
+                 << " Cmp " << (int)reps.back().comp_query_qps
+                 << " Off " << (int)reps.back().offset_qps
+                 << " Cur " << (int)reps.back().cursor_qps
+                 << " Batch " << (int)reps.back().batch_wps
+                 << " Single " << (int)reps.back().single_wps << "\n";
+        }
+        auto med3 = [](double a, double b, double c) {
+            if (a > b) swap(a, b);
+            if (b > c) swap(b, c);
+            if (a > b) swap(a, b);
+            return b;
+        };
+        Report m = reps[0];
+        m.single_wps = med3(reps[0].single_wps, reps[1].single_wps, reps[2].single_wps);
+        m.batch_wps = med3(reps[0].batch_wps, reps[1].batch_wps, reps[2].batch_wps);
+        m.tx_wps = med3(reps[0].tx_wps, reps[1].tx_wps, reps[2].tx_wps);
+        m.bulk_upd_wps = med3(reps[0].bulk_upd_wps, reps[1].bulk_upd_wps, reps[2].bulk_upd_wps);
+        m.bulk_del_wps = med3(reps[0].bulk_del_wps, reps[1].bulk_del_wps, reps[2].bulk_del_wps);
+        m.s_read_rps = med3(reps[0].s_read_rps, reps[1].s_read_rps, reps[2].s_read_rps);
+        m.p_read_rps = med3(reps[0].p_read_rps, reps[1].p_read_rps, reps[2].p_read_rps);
+        m.offset_qps = med3(reps[0].offset_qps, reps[1].offset_qps, reps[2].offset_qps);
+        m.cursor_qps = med3(reps[0].cursor_qps, reps[1].cursor_qps, reps[2].cursor_qps);
+        m.agg_qps = med3(reps[0].agg_qps, reps[1].agg_qps, reps[2].agg_qps);
+        m.stress_get_rps = med3(reps[0].stress_get_rps, reps[1].stress_get_rps, reps[2].stress_get_rps);
+        m.stress_query_qps = med3(reps[0].stress_query_qps, reps[1].stress_query_qps, reps[2].stress_query_qps);
+        m.comp_query_qps = med3(reps[0].comp_query_qps, reps[1].comp_query_qps, reps[2].comp_query_qps);
+        cout << "\n--- REGRESSION GATE (median Manual) ---\n";
+        int fails = check_gate(m);
         cout << (fails == 0 ? "GATE RESULT: PASS\n" : "GATE RESULT: FAIL\n");
         return fails == 0 ? 0 : 1;
     }

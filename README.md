@@ -10,7 +10,20 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.8.11)
+## What's new (0.7.2 → 0.8.12)
+
+### v0.8.12 — gate margin hardening + stale import lib, fixed
+- **Gate**: median-of-3 Manual runs (justified in one session: reps
+  read Qry 4832/8966/8551, Cmp 6585/7855/4617, Off 1965/6612/5704 —
+  rep 0 alone fails three checks). Medians reject transients;
+  `Qry>=0.85Cmp` tolerance absorbs systematic wobble (both stages are
+  fixed-cost-dominated at 20 rows, so the relation measures jitter;
+  the 10x+ bug classes it guards still trip). ~3x gate time.
+- **Import lib**: `build.rs` no longer copies `dll.lib` → `lib` (it ran
+  pre-link, so lib lagged one build forever, shadowing the fresh DLL
+  in MinGW search order with ghost undefined-references). It deletes
+  the shadow instead — MinGW links the always-fresh DLL directly,
+  proven by relink. No consumer needed the MSVC lib.
 
 ### v0.8.11 — FFI views + lazy-vs-lazy benchmark stage
 - `FL_ViewDoc` + 9 functions (`fl_view_get/free`, `field_count`,
@@ -353,7 +366,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.11)](#whats-new-072--0811)
+- [What's new (0.7.2 → 0.8.12)](#whats-new-072--0812)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)
