@@ -10,7 +10,27 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.8.13)
+## What's new (0.7.2 → 0.8.14)
+
+### v0.8.14 — quiescence API (settle the engine, then measure)
+- New `QuiescenceStatus` (`indexes_ready`, `pending_index_ops`,
+  `pending_blob_bytes`, `queued_blob_items`, `maintenance_running`)
+  with `quiescence_status()`, `is_quiescent()` and
+  `await_quiescent(timeout)` (two consecutive clear samples — a
+  millisecond gap between write batches must not read as settled).
+  Covers all four background stages, including async index updates
+  (new in-flight counter; std mpsc has no `len`) and a new
+  maintenance flag on the 5s system thread.
+- FFI: `fl_engine_await_quiescent` + `fl_engine_quiescence_status`
+  (JSON). CLI waits for quiescence after open (was readiness-only —
+  cursor queries pre-settle repeat rows). `benchmark.cpp` settles
+  before scan stages.
+- Gate: `Batch>=0.5xSingle` (Manual-mode thin margins: batch and
+  single do near-identical work per doc without fsync; observed median
+  0.82x on load — the tripwire now catches breakage, not noise).
+- Test-link fix: integration tests link `firelite.dll` (fresh import
+  lib) instead of `firelite.lib` (deleted by build.rs to stop shadow
+  staleness) — the 1181 break this caused, resolved properly.
 
 ### v0.8.13 — views across SDKs; node backend resurrected
 - **Go**: `ViewDoc` (`GetView`, `GetInt/Float/Bool/String/Bytes`,
@@ -389,7 +409,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.13)](#whats-new-072--0813)
+- [What's new (0.7.2 → 0.8.14)](#whats-new-072--0814)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)

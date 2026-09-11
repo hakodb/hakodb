@@ -246,8 +246,54 @@ pub extern "C" fn fl_engine_is_indexes_ready(engine: *mut FL_Engine) -> bool {
     safety_shield!(false, {
         if engine.is_null() { return false; }
         let engine = unsafe { &*engine };
-        engine.db.indexes_ready.load(std::sync::atomic::Ordering::Acquire)
+        engine.db.is_indexes_ready()
     })
+}
+
+/// Block until background work settles (index recovery + async index
+/// updates + blob persistence + maintenance) or `timeout_ms` lapses.
+/// Requires two consecutive clear samples, so use it before measuring.
+/// Returns true when settled. See `FireLite::await_quiescent`.
+#[no_mangle]
+pub extern "C" fn fl_engine_await_quiescent(engine: *mut FL_Engine, timeout_ms: u64) -> bool {
+    safety_shield!(false, {
+        if engine.is_null() { return false; }
+        let engine = unsafe { &*engine };
+        engine.db.await_quiescent(std::time::Duration::from_millis(timeout_ms))
+    })
+}
+
+/// Point-sample diagnostic as JSON (free with fl_string_free):
+/// {"indexes_ready":b,"pending_index_ops":n,"pending_blob_bytes":n,
+///  "queued_blob_items":n,"maintenance_running":b,"quiescent":b}.
+/// Tells you WHAT is outstanding instead of guessing.
+#[no_mangle]
+pub extern "C" fn fl_engine_quiescence_status(engine: *mut FL_Engine) -> *mut c_char {
+    if engine.is_null() {
+        set_last_error("null engine handle");
+        return ptr::null_mut();
+    }
+    let engine = unsafe { &*engine };
+    let s = engine.db.quiescence_status();
+    let text = serde_json::json!({
+        "indexes_ready": s.indexes_ready,
+        "pending_index_ops": s.pending_index_ops,
+        "pending_blob_bytes": s.pending_blob_bytes,
+        "queued_blob_items": s.queued_blob_items,
+        "maintenance_running": s.maintenance_running,
+        "quiescent": s.is_quiescent(),
+    })
+    .to_string();
+    match CString::new(text) {
+        Ok(cs) => {
+            clear_last_error();
+            cs.into_raw()
+        }
+        Err(e) => {
+            set_last_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
 }
 
 #[no_mangle]
@@ -1799,7 +1845,8 @@ pub extern "C" fn fl_query_start_after_raw(query: *mut FL_Query, anchor_doc: *co
 }
 
 /// The pointer resolver: decode a raw row into an owned FL_Doc (blob
-/// fields inflated via the engine, same as a decoded query row).#[no_mangle]
+/// fields inflated via the engine, same as a decoded query row).
+#[no_mangle]
 pub extern "C" fn fl_rawdoc_to_doc(
     engine: *mut FL_Engine,
     raw_doc: *const FL_RawDoc,

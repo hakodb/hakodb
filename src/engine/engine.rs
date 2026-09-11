@@ -297,9 +297,38 @@ pub(crate) enum IndexOp {
     },
 }
 
+/// Snapshot of background activity behind `FireLite::await_quiescent`.
+/// Fresh writes settle through four stages — open-time index recovery,
+/// async index updates, blob persistence, periodic maintenance — and a
+/// read benchmarked mid-flight measures contention, not the engine.
+/// Poll this to see what is outstanding instead of guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuiescenceStatus {
+    /// Open-time index recovery finished (planner takes index paths).
+    pub indexes_ready: bool,
+    /// Index updates still queued behind the async index worker.
+    pub pending_index_ops: usize,
+    /// Blob bytes accepted from clients but not yet persisted.
+    pub pending_blob_bytes: usize,
+    /// Blob work items waiting for the worker.
+    pub queued_blob_items: usize,
+    /// The 5s system thread is inside checkpoint/purge/snapshot work.
+    pub maintenance_running: bool,
+}
+
+impl QuiescenceStatus {
+    /// Settled: nothing background outstanding.
+    pub fn is_quiescent(&self) -> bool {
+        self.indexes_ready
+            && self.pending_index_ops == 0
+            && self.pending_blob_bytes == 0
+            && self.queued_blob_items == 0
+            && !self.maintenance_running
+    }
+}
+
 pub struct FireLite {
-    root_path: PathBuf,
-    pub(crate) config: FireLiteConfig,
+    root_path: PathBuf,    pub(crate) config: FireLiteConfig,
     pub(crate) shards: Arc<RwLock<HashMap<String, Arc<RwLock<StorageEngine>>>>>, // The only storage
     index_storage: Arc<Mutex<IndexStorage>>,
     pub(crate) indexes: Arc<RwLock<IndexManager>>,
@@ -314,6 +343,9 @@ pub struct FireLite {
     audit_tx: Sender<AuditEntry>,
     #[allow(dead_code)]
     pub(crate) index_tx: Sender<IndexOp>,
+    /// ponytail: ops sent to the async index worker but not yet applied.
+    /// Quiescence reads this instead of channel len (std mpsc has none).
+    pub(crate) index_inflight: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) blob_tx: crossbeam_channel::Sender<BlobWork>,
     system_stop: Mutex<Option<Sender<()>>>,
     system_handle: Mutex<Option<thread::JoinHandle<()>>>,
@@ -322,6 +354,11 @@ pub struct FireLite {
     pub(crate) trigger_blob_flush: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) id_sequence: std::sync::atomic::AtomicU16,
     pub(crate) indexes_ready: Arc<std::sync::atomic::AtomicBool>,
+    /// ponytail: true while the 5s system thread runs maintenance
+    /// (checkpoint, compaction, tombstone purge, index snapshots) on any
+    /// shard. Try-locks make it polite, but readers still share cache and
+    /// IO with it — quiescence checks read this (see await_quiescent).
+    pub(crate) maintenance_running: Arc<std::sync::atomic::AtomicBool>,
     plan_cache: PlanCache,
     /// ponytail: hot decoded-doc cache. Key is `collection\0doc_id` (ids are
     /// NUL-free by FFI construction). Value is the global doc version at
@@ -377,6 +414,8 @@ impl FireLite {
         let trigger_flush = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let trigger_for_system = Arc::clone(&trigger_flush);
         // let trigger_for_blobs = Arc::clone(&trigger_flush);
+        let maintenance_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let maintenance_for_system = Arc::clone(&maintenance_flag);
 
         // 3. Initialize Index Storage
         let index_dir = root_path.join("_indices");
@@ -387,7 +426,9 @@ impl FireLite {
         ));
 
         // --- WORKER 1: PERSISTENT INDEX WORKER ---
+        let index_inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let idx_clone = Arc::clone(&indexes);
+        let index_inflight_worker = Arc::clone(&index_inflight);
         let storage_persist = Arc::clone(&index_storage);
         thread::spawn(move || {
             while let Ok(op) = index_rx.recv() {
@@ -418,6 +459,7 @@ impl FireLite {
                     }
 
                 }
+                index_inflight_worker.fetch_sub(1, Ordering::Relaxed);
             }
         });
 
@@ -442,6 +484,11 @@ impl FireLite {
                     }
                 }
                 if last_maint.elapsed() >= Duration::from_secs(5) {
+                    // ponytail: visible to quiescence checks for the whole
+                    // block (checkpoint, purge, snapshots) — set even though
+                    // the inner locks are try_-based, because readers still
+                    // share page cache and IO bandwidth with it.
+                    maintenance_for_system.store(true, Ordering::Release);
                     let active_shards: Vec<Arc<RwLock<StorageEngine>>> = shards_sys_clone.read().unwrap().values().cloned().collect();
                     for s in active_shards {
                         if let Ok(storage) = s.try_read() {
@@ -469,6 +516,7 @@ impl FireLite {
 
                     trigger_for_system.store(true, Ordering::Release);
                     last_maint = Instant::now();
+                    maintenance_for_system.store(false, Ordering::Release);
                 }
                 if system_stop_rx.recv_timeout(Duration::from_millis(500)).is_ok() { break; }
             }
@@ -559,6 +607,7 @@ impl FireLite {
             security_rules: RwLock::new(Vec::new()),
             audit_tx,
             index_tx,
+            index_inflight,
             blob_tx: btx.clone(),
             audit_data,
             system_stop: Mutex::new(Some(system_stop_tx)),
@@ -568,6 +617,7 @@ impl FireLite {
             blob_worker_handle: Mutex::new(Some(blob_worker_handle)),
             id_sequence: std::sync::atomic::AtomicU16::new(0),
             indexes_ready,
+            maintenance_running: maintenance_flag,
             plan_cache: PlanCache::default(),
             doc_cache: RwLock::new(HashMap::new()),
             local_only_cols: RwLock::new(HashSet::new()),
@@ -982,11 +1032,18 @@ impl FireLite {
             // Notify Indexer (Worker 1)
             let t_idx = Instant::now();
             if !work.index_puts.is_empty() || !work.index_deletes.is_empty() {
-                let _ = self.index_tx.send(IndexOp::Update { 
-                    collection: col_name, 
-                    puts: Arc::new(work.index_puts), 
+                // ponytail: in-flight count for quiescence checks. Bump
+                // before send; the worker drops it after applying. A failed
+                // send (worker gone) refunds immediately so the counter
+                // can't wedge the quiescence verdict.
+                self.index_inflight.fetch_add(1, Ordering::Relaxed);
+                if self.index_tx.send(IndexOp::Update {
+                    collection: col_name,
+                    puts: Arc::new(work.index_puts),
                     deletes: work.index_deletes
-                });
+                }).is_err() {
+                    self.index_inflight.fetch_sub(1, Ordering::Relaxed);
+                }
             }
             WRITE_STATS.index_send_ns.fetch_add(t_idx.elapsed().as_nanos() as u64, Ordering::Relaxed);
             
@@ -2299,6 +2356,59 @@ impl FireLite {
     /// and tests before measuring. Mirrors `fl_engine_is_indexes_ready`.
     pub fn is_indexes_ready(&self) -> bool {
         self.indexes_ready.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Point sample of background activity. All fields best-effort (locks
+    /// are try_-based so the check itself never stalls a writer).
+    pub fn quiescence_status(&self) -> QuiescenceStatus {
+        let mut pending_blob_bytes = 0usize;
+        let mut queued_blob_items = 0usize;
+        if let Ok(shards) = self.shards.read() {
+            for s in shards.values() {
+                if let Ok(storage) = s.try_read() {
+                    pending_blob_bytes += storage.total_pending_blob_bytes.load(Ordering::Relaxed);
+                    queued_blob_items += storage.blob_flush_queue.len();
+                }
+            }
+        }
+        QuiescenceStatus {
+            indexes_ready: self.is_indexes_ready(),
+            pending_index_ops: self.index_inflight.load(Ordering::Relaxed),
+            pending_blob_bytes,
+            queued_blob_items,
+            maintenance_running: self.maintenance_running.load(Ordering::Acquire),
+        }
+    }
+
+    /// True when nothing background is outstanding (see
+    /// `QuiescenceStatus::is_quiescent`). One sample — use
+    /// `await_quiescent` for a settled verdict.
+    pub fn is_quiescent(&self) -> bool {
+        self.quiescence_status().is_quiescent()
+    }
+
+    /// Block until background work settles or `timeout` lapses. Requires
+    /// TWO consecutive clear samples (5ms apart) so a millisecond gap
+    /// between write batches doesn't read as settled. Returns true when
+    /// settled. A continuously-written DB correctly never settles — poll
+    /// `quiescence_status` to see what is outstanding instead.
+    pub fn await_quiescent(&self, timeout: Duration) -> bool {
+        let t0 = Instant::now();
+        let mut clear_streak = 0u32;
+        loop {
+            if self.quiescence_status().is_quiescent() {
+                clear_streak += 1;
+                if clear_streak >= 2 {
+                    return true;
+                }
+            } else {
+                clear_streak = 0;
+            }
+            if t0.elapsed() >= timeout {
+                return self.quiescence_status().is_quiescent();
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn record_audit(&self, entry: AuditEntry) {

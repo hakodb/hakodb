@@ -8,7 +8,31 @@ use clap::{Parser, Subcommand, ValueEnum};
 use firelite::config::{DurabilityMode, FireLiteConfig};
 use firelite::document::firelite_doc::FireLiteDoc;
 use firelite::document::value::Value;
-use firelite::engine::{BatchMutation, FireLite};
+use firelite::engine::{BatchMutation, FireLite, QuiescenceStatus};
+
+/// One-line outstanding-work summary for the degraded-mode warning.
+fn quiescence_note(s: &QuiescenceStatus) -> String {
+    let mut parts = Vec::new();
+    if !s.indexes_ready {
+        parts.push("indexes recovering".to_string());
+    }
+    if s.pending_index_ops > 0 {
+        parts.push(format!("{} index ops queued", s.pending_index_ops));
+    }
+    if s.pending_blob_bytes > 0 || s.queued_blob_items > 0 {
+        parts.push(format!(
+            "{} blob bytes in {} items",
+            s.pending_blob_bytes, s.queued_blob_items
+        ));
+    }
+    if s.maintenance_running {
+        parts.push("maintenance running".to_string());
+    }
+    if parts.is_empty() {
+        parts.push("unknown (transient?)".to_string());
+    }
+    parts.join(", ")
+}
 use firelite::index::composite::definition::SortDirection;
 use firelite::query::filter::Operator;
 use firelite::query::query::{AggregateOp, Query};
@@ -365,18 +389,15 @@ fn open_db(cli: &Cli) -> Result<FireLite> {
     FireLite::open(&cli.db, cfg)
         .with_context(|| format!("failed to open db at {}", &cli.db))
         .map(|db| {
-            // ponytail: open() returns while index recovery still runs;
-            // queries issued first silently plan FullCollection (cursor
+            // ponytail: open() returns while background work is still in
+            // flight (index recovery, blob persistence, maintenance).
+            // Queries issued first silently plan FullCollection (cursor
             // bounds ignored, pages repeat). Block briefly — correctness,
             // not just speed. Warn and proceed past the timeout (reads
             // still work, plans just degrade).
-            let t0 = std::time::Instant::now();
-            while !db.is_indexes_ready() {
-                if t0.elapsed() > std::time::Duration::from_secs(30) {
-                    eprintln!("warning: indexes not ready after 30s, continuing degraded");
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+            if !db.await_quiescent(std::time::Duration::from_secs(30)) {
+                let s = db.quiescence_status();
+                eprintln!("warning: engine not quiescent after 30s ({}), continuing degraded", quiescence_note(&s));
             }
             db
         })

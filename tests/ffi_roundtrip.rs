@@ -20,7 +20,10 @@ use std::path::PathBuf;
 #[repr(C)] pub struct FL_Transaction { _private: [u8; 0] }
 #[repr(C)] pub struct FL_Array { _private: [u8; 0] }
 
-#[link(name = "firelite", kind = "dylib")]
+// ponytail: link the always-fresh dll.lib by its MSVC name — plain
+// "firelite" resolves firelite.lib, which build.rs deletes on purpose
+// (it shadowed the DLL with stale symbols; MinGW links the DLL direct).
+#[link(name = "firelite.dll", kind = "dylib")]
 extern "C" {
     fn fl_engine_open(path: *const c_char) -> *mut FL_Engine;
     fn fl_engine_free(engine: *mut FL_Engine);
@@ -597,7 +600,8 @@ fn transaction_get_put_commit() {
 
     // tx_begin / tx_get / tx_put / tx_commit. If the FFI signature
     // changes, this fails to link — which is the whole point.
-    #[link(name = "firelite", kind = "dylib")]
+    // (firelite.dll: fresh import lib, see top of file.)
+    #[link(name = "firelite.dll", kind = "dylib")]
     extern "C" {
         fn fl_transaction_begin(engine: *mut FL_Engine) -> *mut FL_Transaction;
         fn fl_transaction_get(engine: *mut FL_Engine, tx: *mut FL_Transaction, coll: *const c_char, id: *const c_char) -> *mut FL_Doc;

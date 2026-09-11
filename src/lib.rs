@@ -23,3 +23,4 @@ pub mod cloud_sync;
 pub use cloud_sync::{CloudPacket, CloudStatus, CloudSync, CloudSyncMode};
 
 pub use engine::FireLite;
+pub use engine::QuiescenceStatus;

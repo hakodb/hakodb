@@ -343,3 +343,45 @@ fn codec_integrity_matrix() {
     drop(db2);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Quiescence: an idle engine is settled immediately; a freshly written
+/// one settles quickly (index worker + blob worker drain in ms). The
+/// status shape reports each background stage independently.
+#[test]
+fn quiescence_settles() {
+    use std::time::Duration;
+    let dir = std::env::temp_dir().join(format!(
+        "fl-test-quiesce-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut cfg = FireLiteConfig::default();
+    cfg.durability_mode = DurabilityMode::Manual;
+    let db = FireLite::open(&dir, cfg).expect("open");
+
+    assert!(db.await_quiescent(Duration::from_secs(10)), "idle engine settles");
+    let s = db.quiescence_status();
+    assert!(s.is_quiescent(), "idle status all-clear: {s:?}");
+    assert!(s.indexes_ready);
+    assert_eq!(s.pending_index_ops, 0);
+    assert_eq!(s.pending_blob_bytes, 0);
+    assert_eq!(s.queued_blob_items, 0);
+    assert!(!s.maintenance_running);
+
+    // Writes (one blob-bearing doc to exercise the blob queue) then settle.
+    let mut doc = FireLiteDoc::default();
+    doc.insert("n", Value::Int(1));
+    let mut big = FireLiteDoc::default();
+    big.insert("data", Value::Binary(vec![7u8; 2048]));
+    db.write_batch(vec![
+        BatchMutation::Put { collection: "q".into(), doc_id: "a".into(), doc },
+        BatchMutation::Put { collection: "q".into(), doc_id: "b".into(), doc: big },
+    ])
+    .expect("seed");
+    assert!(db.await_quiescent(Duration::from_secs(15)), "seeded engine settles");
+    assert!(db.quiescence_status().is_quiescent());
+    drop(db);
+    std::fs::remove_dir_all(&dir).ok();
+}
