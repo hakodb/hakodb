@@ -38,6 +38,8 @@ struct FL_ResultSet;
 
 struct FL_Transaction;
 
+struct FL_ViewDoc;
+
 struct FL_Watch;
 
 using FL_OnSnapshotCallback = void(*)(const char *collection,
@@ -51,11 +53,31 @@ using FlWalkCallback = bool(*)(const char *id,
                                uintptr_t bytes_len,
                                void *userdata);
 
+/// View-walk callback: borrowed id + a borrowed view handle (valid for the
+/// call only — do not free, do not retain). Return true to continue.
+using FlViewWalkCallback = bool(*)(const char *id,
+                                   uintptr_t id_len,
+                                   const FL_ViewDoc *view,
+                                   void *userdata);
+
 extern "C" {
 
 FL_Engine *fl_engine_open(const char *path);
 
 bool fl_engine_is_indexes_ready(FL_Engine *engine);
+
+/// Block until background work settles (index recovery + async index
+/// updates + blob persistence + maintenance) or `timeout_ms` lapses.
+/// Requires two consecutive clear samples, so use it before measuring.
+/// Returns true when settled. See `FireLite::await_quiescent`.
+bool fl_engine_await_quiescent(FL_Engine *engine, uint64_t timeout_ms);
+
+/// Point-sample diagnostic as JSON (free with fl_string_free):
+/// {"indexes_ready":b,"pending_index_ops":n,"index_backfills":n,
+///  "pending_blob_bytes":n,"queued_blob_items":n,
+///  "maintenance_running":b,"quiescent":b}.
+/// Tells you WHAT is outstanding instead of guessing.
+char *fl_engine_quiescence_status(FL_Engine *engine);
 
 FL_Config *fl_config_new();
 
@@ -276,6 +298,40 @@ int64_t fl_cursor_walk(FL_Engine *engine,
                        const FL_Query *query,
                        FlWalkCallback callback,
                        void *userdata);
+
+FL_ViewDoc *fl_view_get(FL_Engine *engine, const char *collection, const char *doc_id);
+
+void fl_view_free(FL_ViewDoc *view);
+
+uintptr_t fl_view_field_count(const FL_ViewDoc *view);
+
+bool fl_view_has_field(const FL_ViewDoc *view, const char *key);
+
+bool fl_view_get_int(const FL_ViewDoc *view, const char *key, int64_t *out);
+
+bool fl_view_get_float(const FL_ViewDoc *view, const char *key, double *out);
+
+int32_t fl_view_get_bool(const FL_ViewDoc *view, const char *key);
+
+/// Borrowed UTF-8 view of a String field. Returns null when missing or not
+/// a String; `*len_out` (when non-null) receives the byte length. Valid
+/// until fl_view_free — same borrowed contract as fl_rawdoc_bytes.
+const char *fl_view_get_str(const FL_ViewDoc *view, const char *key, uintptr_t *len_out);
+
+/// Borrowed view of a Binary field. Same lifetime contract as above.
+const uint8_t *fl_view_get_bytes(const FL_ViewDoc *view, const char *key, uintptr_t *len_out);
+
+/// Escape hatch: full owned decode of the pinned bytes (links unresolved —
+/// follow with fl_doc_resolve_blobs when needed).
+FL_Doc *fl_view_to_doc(const FL_ViewDoc *view, const char *doc_id);
+
+/// One-call lazy scan: lends each row as a view (no decode, no owned
+/// construction). Returns rows visited, -1 on error. Same no-reentry
+/// contract as fl_cursor_walk.
+int64_t fl_cursor_walk_view(FL_Engine *engine,
+                            const FL_Query *query,
+                            FlViewWalkCallback callback,
+                            void *userdata);
 
 /// Bulk result-set to JSON: one call, one JSON array string, no per-doc
 /// DOM and no per-doc FFI round trips. Byte-identical to joining
