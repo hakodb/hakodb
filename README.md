@@ -473,6 +473,8 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 - [Sync encryption posture (read this before encrypting)](#sync-encryption-posture-read-this-before-encrypting)
 - [firelite-cloudserver (managed sync hub + admin console)](#firelite-cloudserver-managed-sync-hub--admin-console)
 - [Benchmark (official tool)](#benchmark-official-tool)
+- [Guide: choosing a read path](docs/reads.md)
+- [Guide: benchmarking methodology](docs/benchmarking.md)
 - [Architecture](#architecture)
 - [Implementation status](#implementation-status)
 - [Contribution notes](#contribution-notes)
@@ -1268,6 +1270,11 @@ the TLS pair is deliberate (fail-closed).
 ---
 
 ## Benchmark (official tool)
+
+> Start with [benchmarking methodology](docs/benchmarking.md) (settle
+> before measuring, compare equal work) and [choosing a read
+> path](docs/reads.md) (which API for which question) before running
+> anything below.
 
 The official benchmark harness is **`benchmark.cpp`** — a C++ program that drives the engine exclusively through the public C ABI (`include/firelite.h`). It is the reference tool for measuring and reporting FireLite performance.
 
