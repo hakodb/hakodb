@@ -122,6 +122,17 @@ export interface NativeBindings {
   rawResultFree(results: Handle): void;
   rawDocToDoc(engine: Handle, rawDoc: Handle, collection: string): Handle;
   queryStartAfterRaw(query: Handle, anchorRawDoc: Handle): number;
+  // Borrowed views (v0.8.11): lazy typed pulls, no owned construction.
+  // Numeric/bool getters cross by value (no memory reads); strings and
+  // walks stay on resolve/raw paths (documented in client.ts).
+  viewGet(engine: Handle, collection: string, docId: string): Handle;
+  viewFree(view: Handle): void;
+  viewFieldCount(view: Handle): number;
+  viewHasField(view: Handle, key: string): boolean;
+  viewGetInt(view: Handle, key: string): number | bigint | null;
+  viewGetFloat(view: Handle, key: string): number | null;
+  viewGetBool(view: Handle, key: string): boolean | null;
+  viewToDoc(view: Handle, docId: string): Handle;
   queryDeferBlobs(query: Handle, defer: boolean): number;
   docResolveBlobs(engine: Handle, collection: string, doc: Handle): number;
   engineInsertTake(engine: Handle, collection: string, docId: string, doc: Handle): number;
@@ -365,6 +376,14 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
   }).symbols;
 
   const toC = (s: string | null) => s ? Buffer.from(s + '\0') : null;
+  // ponytail: typed-array pointer for FFI out-params (i64/double reads).
+  // Guarded: only view getters use it, and they throw a clear error on
+  // ancient runtimes instead of a cryptic TypeError.
+  const bunPtr = (ffi as any).ptr;
+  const ptrOf = (arr: BigInt64Array | Float64Array): any => {
+    if (!bunPtr) throw new Error('bun:ffi ptr() unavailable — upgrade Bun');
+    return bunPtr(arr);
+  };
   const ptrToStringAndFree = (ptr: any): string | null => {
     if (!ptr) return null;
     const text = new CString(ptr).toString();
@@ -481,7 +500,25 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     rawResultGet: (results, index) => symbols.fl_rawresult_get(results, index),
     rawResultFree: (results) => symbols.fl_rawresult_free(results),
     queryStartAfterRaw: (query, anchorRawDoc) => symbols.fl_query_start_after_raw(query, anchorRawDoc),
-    rawDocToDoc: (engine, rawDoc, collection) => symbols.fl_rawdoc_to_doc(engine, rawDoc, toC(collection)),    queryDeferBlobs: (query, defer) => symbols.fl_query_defer_blobs(query, defer ? 1 : 0),
+    rawDocToDoc: (engine, rawDoc, collection) => symbols.fl_rawdoc_to_doc(engine, rawDoc, toC(collection)),
+    viewGet: (engine, collection, docId) => symbols.fl_view_get(engine, toC(collection), toC(docId)),
+    viewFree: (view) => symbols.fl_view_free(view),
+    viewFieldCount: (view) => symbols.fl_view_field_count(view),
+    viewHasField: (view, key) => symbols.fl_view_has_field(view, toC(key)),
+    viewGetInt: (view, key) => {
+      const out = new BigInt64Array(1);
+      return symbols.fl_view_get_int(view, toC(key), ptrOf(out)) ? out[0] : null;
+    },
+    viewGetFloat: (view, key) => {
+      const out = new Float64Array(1);
+      return symbols.fl_view_get_float(view, toC(key), ptrOf(out)) ? out[0] : null;
+    },
+    viewGetBool: (view, key) => {
+      const r = symbols.fl_view_get_bool(view, toC(key));
+      return r < 0 ? null : r !== 0;
+    },
+    viewToDoc: (view, docId) => symbols.fl_view_to_doc(view, toC(docId)),
+    queryDeferBlobs: (query, defer) => symbols.fl_query_defer_blobs(query, defer ? 1 : 0),
     docResolveBlobs: (engine, collection, doc) => symbols.fl_doc_resolve_blobs(engine, toC(collection), doc),
     engineInsertTake: (engine, collection, docId, doc) => symbols.fl_engine_insert_take(engine, toC(collection), toC(docId), doc),
     configSetWalReserveBytes: (c, bytes) => symbols.fl_config_set_wal_reserve_bytes(c, bytes),
@@ -545,6 +582,20 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
   const koffi: any = (koffiModule as any).default ?? koffiModule;
   const lib = koffi.load(libPath);
 
+  // ponytail: koffi needs opaque struct declarations up front — without
+  // these EVERY struct-typed decl throws at bindings creation, i.e. the
+  // node backend was dead on arrival (bun resolves pointers structurally
+  // and never noticed). Declared once here for all present and future fns.
+  for (const t of ['FL_Array', 'FL_Batch', 'FL_CloudSync', 'FL_Config', 'FL_Doc', 'FL_Engine', 'FL_NetSyncer', 'FL_Query', 'FL_RawDoc', 'FL_RawResultSet', 'FL_ResultSet', 'FL_Transaction', 'FL_ViewDoc', 'FL_Watch']) koffi.opaque(t);
+
+  // ponytail: owned C strings (Rust-allocated) must come back through a
+  // DISPOSABLE type wired to fl_string_free — never bare char* (koffi
+  // auto-decodes to a JS string and the native buffer leaks) and never
+  // default koffi.free (wrong allocator: Rust memory freed by C free is
+  // UB). Declared before the table; the closure runs post-init.
+  const flStringFreeRaw = lib.func('void fl_string_free(void* value)');
+  const HeapStr = koffi.disposable('HeapStr', 'str', (ptr: any) => { flStringFreeRaw(ptr); });
+
   const OnSnapshotCB = koffi.proto('void FL_OnSnapshotCallback(const char *collection, const char *path, int32_t kind, void *user_data)');
 
   const fn = {
@@ -554,10 +605,14 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_engine_free: lib.func('void fl_engine_free(FL_Engine* engine)'),
     fl_engine_backup: lib.func('int fl_engine_backup(FL_Engine* engine, const char* path)'),
     fl_engine_compact: lib.func('int fl_engine_compact(FL_Engine* engine)'),
-    fl_engine_get_stats: lib.func('char* fl_engine_get_stats(FL_Engine* engine)'),
-    fl_engine_get_audit_log: lib.func('char* fl_engine_get_audit_log(FL_Engine* engine)'),
+    // ponytail: owned-string returns are HeapStr (auto-freed via
+    // fl_string_free by the disposable — never bare char*, which leaks,
+    // and never default koffi.free (wrong allocator for Rust memory).
+    // fl_last_error stays char* (TLS, never freed).
+    fl_engine_get_stats: lib.func('HeapStr fl_engine_get_stats(FL_Engine* engine)'),
+    fl_engine_get_audit_log: lib.func('HeapStr fl_engine_get_audit_log(FL_Engine* engine)'),
     fl_engine_snapshot_indices: lib.func('int fl_engine_snapshot_indices(FL_Engine* engine)'),
-    fl_engine_list_indexes: lib.func('char* fl_engine_list_indexes(FL_Engine* engine, const char* collection)'),
+    fl_engine_list_indexes: lib.func('HeapStr fl_engine_list_indexes(FL_Engine* engine, const char* collection)'),
 
     fl_config_new: lib.func('FL_Config* fl_config_new()'),
     fl_config_free: lib.func('void fl_config_free(FL_Config* config)'),
@@ -571,7 +626,7 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_config_set_blob_threshold: lib.func('void fl_config_set_blob_threshold(FL_Config* config, size_t threshold_bytes)'),
     fl_config_set_compression: lib.func('void fl_config_set_compression(FL_Config* config, bool enabled, int32_t level)'),
 
-    fl_engine_watch: lib.func('FL_Watch* fl_engine_watch(FL_Engine* engine, const char* collection, OnSnapshotCB* callback, void* user_data)'),
+    fl_engine_watch: lib.func('FL_Watch* fl_engine_watch(FL_Engine* engine, const char* collection, FL_OnSnapshotCallback* callback, void* user_data)'),
     fl_watch_free: lib.func('void fl_watch_free(FL_Watch* watch)'),
 
     fl_doc_new: lib.func('FL_Doc* fl_doc_new()'),
@@ -584,7 +639,7 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_doc_insert_bin: lib.func('int fl_doc_insert_bin(FL_Doc* doc, const char* key, const uint8_t* data, size_t len)'),
     fl_doc_insert_timestamp: lib.func('int fl_doc_insert_timestamp(FL_Doc* doc, const char* key, int64_t micros)'),
     fl_doc_insert_server_timestamp: lib.func('int fl_doc_insert_server_timestamp(FL_Doc* doc, const char* key)'),
-    fl_doc_to_json: lib.func('char* fl_doc_to_json(const FL_Doc* doc)'),
+    fl_doc_to_json: lib.func('HeapStr fl_doc_to_json(const FL_Doc* doc)'),
 
     fl_engine_insert: lib.func('int fl_engine_insert(FL_Engine* engine, const char* collection, const char* doc_id, const FL_Doc* doc)'),
     fl_engine_get: lib.func('FL_Doc* fl_engine_get(FL_Engine* engine, const char* collection, const char* doc_id)'),
@@ -634,7 +689,7 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_query_limit: lib.func('int fl_query_limit(FL_Query* query, size_t limit)'),
     fl_query_offset: lib.func('int fl_query_offset(FL_Query* query, size_t offset)'),
     fl_query_select_field: lib.func('int fl_query_select_field(FL_Query* query, const char* field)'),
-    fl_query_execute: lib.func('char* fl_query_execute(FL_Engine* engine, const FL_Query* query)'),
+    fl_query_execute: lib.func('HeapStr fl_query_execute(FL_Engine* engine, const FL_Query* query)'),
     fl_query_delete: lib.func('int fl_query_delete(FL_Engine* engine, FL_Query* query)'),
     fl_query_delete_local: lib.func('int fl_query_delete_local(FL_Engine* engine, FL_Query* query)'),
     fl_query_patch: lib.func('int fl_query_patch(FL_Engine* engine, FL_Query* query, const FL_Doc* patch_doc)'),
@@ -642,13 +697,21 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_result_set_count: lib.func('size_t fl_result_set_count(FL_ResultSet* results)'),
     fl_result_set_get_doc: lib.func('FL_Doc* fl_result_set_get_doc(FL_ResultSet* results, size_t index)'),
     fl_result_set_free: lib.func('void fl_result_set_free(FL_ResultSet* results)'),
-    fl_result_set_to_json: lib.func('char* fl_result_set_to_json(FL_ResultSet* results)'),
+    fl_result_set_to_json: lib.func('HeapStr fl_result_set_to_json(FL_ResultSet* results)'),
     fl_query_execute_raw: lib.func('FL_RawResultSet* fl_query_execute_raw(FL_Engine* engine, const FL_Query* query)'),
     fl_rawresult_count: lib.func('size_t fl_rawresult_count(FL_RawResultSet* results)'),
     fl_rawresult_get: lib.func('FL_RawDoc* fl_rawresult_get(FL_RawResultSet* results, size_t index)'),
     fl_rawresult_free: lib.func('void fl_rawresult_free(FL_RawResultSet* results)'),
     fl_query_start_after_raw: lib.func('int fl_query_start_after_raw(FL_Query* query, const FL_RawDoc* anchor_doc)'),
     fl_rawdoc_to_doc: lib.func('FL_Doc* fl_rawdoc_to_doc(FL_Engine* engine, const FL_RawDoc* raw_doc, const char* collection)'),
+    fl_view_get: lib.func('FL_ViewDoc* fl_view_get(FL_Engine* engine, const char* collection, const char* doc_id)'),
+    fl_view_free: lib.func('void fl_view_free(FL_ViewDoc* view)'),
+    fl_view_field_count: lib.func('size_t fl_view_field_count(const FL_ViewDoc* view)'),
+    fl_view_has_field: lib.func('bool fl_view_has_field(const FL_ViewDoc* view, const char* key)'),
+    fl_view_get_int: lib.func('bool fl_view_get_int(const FL_ViewDoc* view, const char* key, _Out_ int64_t *out)'),
+    fl_view_get_float: lib.func('bool fl_view_get_float(const FL_ViewDoc* view, const char* key, _Out_ double *out)'),
+    fl_view_get_bool: lib.func('int fl_view_get_bool(const FL_ViewDoc* view, const char* key)'),
+    fl_view_to_doc: lib.func('FL_Doc* fl_view_to_doc(const FL_ViewDoc* view, const char* doc_id)'),
     fl_query_defer_blobs: lib.func('int fl_query_defer_blobs(FL_Query* query, int defer)'),
     fl_doc_resolve_blobs: lib.func('int fl_doc_resolve_blobs(FL_Engine* engine, const char* collection, FL_Doc* doc)'),
     fl_engine_insert_take: lib.func('int fl_engine_insert_take(FL_Engine* engine, const char* collection, const char* doc_id, FL_Doc* doc)'),
@@ -657,15 +720,15 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_query_aggregate_count: lib.func('int fl_query_aggregate_count(FL_Query* query)'),
     fl_query_aggregate_sum: lib.func('int fl_query_aggregate_sum(FL_Query* query, const char* field)'),
     fl_query_aggregate_avg: lib.func('int fl_query_aggregate_avg(FL_Query* query, const char* field)'),
-    fl_query_execute_aggregation: lib.func('char* fl_query_execute_aggregation(FL_Engine* engine, const FL_Query* query)'),
+    fl_query_execute_aggregation: lib.func('HeapStr fl_query_execute_aggregation(FL_Engine* engine, const FL_Query* query)'),
     fl_query_where_or_str: lib.func('int fl_query_where_or_str(FL_Query* query, const char* field, const char* value)'),
     fl_query_where_or_int: lib.func('int fl_query_where_or_int(FL_Query* query, const char* field, int64_t value)'),
 
-    fl_engine_list_collections: lib.func('char* fl_engine_list_collections(FL_Engine* engine)'),
+    fl_engine_list_collections: lib.func('HeapStr fl_engine_list_collections(FL_Engine* engine)'),
     fl_net_syncer_new: lib.func('FL_NetSyncer* fl_net_syncer_new(FL_Engine* engine, const char* name, const char* room_key)'),
     fl_net_syncer_start: lib.func('int fl_net_syncer_start(FL_NetSyncer* syncer, uint16_t port)'),
     fl_net_syncer_set_discovery: lib.func('int fl_net_syncer_set_discovery(FL_NetSyncer* syncer, int mode)'),
-    fl_net_syncer_status: lib.func('char* fl_net_syncer_status(FL_NetSyncer* syncer)'),
+    fl_net_syncer_status: lib.func('HeapStr fl_net_syncer_status(FL_NetSyncer* syncer)'),
     fl_net_syncer_free: lib.func('void fl_net_syncer_free(FL_NetSyncer* syncer)'),
 
     // v0.5.9
@@ -700,19 +763,20 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_cloud_sync_server_new: lib.func('FL_CloudSync* fl_cloud_sync_server_new(FL_Engine* engine, const char* server_id, const char* auth_token)'),
     fl_cloud_sync_client_new: lib.func('FL_CloudSync* fl_cloud_sync_client_new(FL_Engine* engine, const char* client_id, const char* room_name, const char* room_key, const char* auth_token)'),
     fl_cloud_sync_start: lib.func('int fl_cloud_sync_start(FL_CloudSync* cloud_sync, const char* address)'),
-    fl_cloud_sync_status: lib.func('char* fl_cloud_sync_status(FL_CloudSync* cloud_sync)'),
+    fl_cloud_sync_status: lib.func('HeapStr fl_cloud_sync_status(FL_CloudSync* cloud_sync)'),
     fl_cloud_sync_stop: lib.func('void fl_cloud_sync_stop(FL_CloudSync* cloud_sync)'),
     fl_cloud_sync_free: lib.func('void fl_cloud_sync_free(FL_CloudSync* cloud_sync)'),
 
     fl_last_error: lib.func('const char* fl_last_error()'),
-    fl_string_free: lib.func('void fl_string_free(char* value)')
+    fl_string_free: lib.func('void fl_string_free(void* value)')
   };
 
-  const ptrToStringAndFree = (ptr: any): string | null => {
-    if (!ptr) return null;
-    const text = koffi.decode(ptr, 'char*') as string;
-    fn.fl_string_free(ptr);
-    return text;
+  // ponytail: HeapStr returns arrive as JS strings, ALREADY freed via
+  // fl_string_free by the disposable — no decode, no manual free (both
+  // crash or leak: decode on externals segfaults, freeing a copy leaks).
+  const ptrToStringAndFree = (s: any): string | null => {
+    if (!s) return null;
+    return s as string;
   };
 
   return {
@@ -823,6 +887,23 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     rawResultFree: (results) => fn.fl_rawresult_free(results),
     queryStartAfterRaw: (query, anchorRawDoc) => fn.fl_query_start_after_raw(query, anchorRawDoc),
     rawDocToDoc: (engine, rawDoc, collection) => fn.fl_rawdoc_to_doc(engine, rawDoc, collection),
+    viewGet: (engine, collection, docId) => fn.fl_view_get(engine, collection, docId),
+    viewFree: (view) => fn.fl_view_free(view),
+    viewFieldCount: (view) => fn.fl_view_field_count(view),
+    viewHasField: (view, key) => fn.fl_view_has_field(view, key),
+    viewGetInt: (view, key) => {
+      const out: bigint[] = [0n];
+      return fn.fl_view_get_int(view, key, out) ? out[0] : null;
+    },
+    viewGetFloat: (view, key) => {
+      const out: number[] = [0];
+      return fn.fl_view_get_float(view, key, out) ? out[0] : null;
+    },
+    viewGetBool: (view, key) => {
+      const r: number = fn.fl_view_get_bool(view, key);
+      return r < 0 ? null : r !== 0;
+    },
+    viewToDoc: (view, docId) => fn.fl_view_to_doc(view, docId),
     queryDeferBlobs: (query, defer) => fn.fl_query_defer_blobs(query, defer ? 1 : 0),
     docResolveBlobs: (engine, collection, doc) => fn.fl_doc_resolve_blobs(engine, collection, doc),
     engineInsertTake: (engine, collection, docId, doc) => fn.fl_engine_insert_take(engine, collection, docId, doc),

@@ -316,6 +316,22 @@ export const decodeRawDoc = async (collectionPath: string, docId: string, bytes:
     return new DocumentSnapshot(docId, !!data, data ?? undefined);
 };
 
+/** True once background index recovery finishes (poll before cursor paging). */
+export const isIndexesReady = async (): Promise<boolean> => {
+    const res = await exec({ op: 'indexes_ready' });
+    return !!res.ready?.ready;
+};
+
+/**
+ * Lazy typed field pull (no decode, no JSON document). Returns the JSON
+ * value or null/undefined when missing. BlobLink fields surface their
+ * placeholder — decodeRawDoc the row when needed.
+ */
+export const viewGetField = async (collectionPath: string, docId: string, field: string): Promise<any> => {
+    const res = await exec({ op: 'view_get_field', collection: collectionPath, doc_id: docId, field });
+    return res.value_result?.value ?? undefined;
+};
+
 // --- Aggregations ---
 export const getCountFromServer = async (q: Query | CollectionReference | CollectionGroupReference) => {
     const params = buildQueryParams(q);

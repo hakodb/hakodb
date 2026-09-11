@@ -261,6 +261,65 @@ export class RawQuerySnapshot {
   }
 }
 
+/**
+ * One borrowed row (v0.8.11+): lazy numeric/bool pulls with no decode
+ * and no JSON. Strings stay on resolve() (no backend memory reads).
+ * Free when done.
+ */
+export class ViewDocSnapshot {
+  private freed = false;
+
+  constructor(
+    private readonly client: FireLiteClient,
+    private readonly collection: string,
+    private readonly docId: string,
+    private readonly handle: unknown
+  ) { }
+
+  get id(): string {
+    return this.docId;
+  }
+
+  get fieldCount(): number {
+    return this.client.nativeBindings().viewFieldCount(this.handle);
+  }
+
+  has(field: string): boolean {
+    return this.client.nativeBindings().viewHasField(this.handle, field);
+  }
+
+  getInt(field: string): number | bigint | null {
+    return this.client.nativeBindings().viewGetInt(this.handle, field);
+  }
+
+  getFloat(field: string): number | null {
+    return this.client.nativeBindings().viewGetFloat(this.handle, field);
+  }
+
+  getBool(field: string): boolean | null {
+    return this.client.nativeBindings().viewGetBool(this.handle, field);
+  }
+
+  /** Full decode + inflate. Prefer pulls for sparse reads. */
+  async resolve(): Promise<FireLiteDocData | undefined> {
+    const native = this.client.nativeBindings();
+    const doc = native.viewToDoc(this.handle, this.docId);
+    if (!doc) return undefined;
+    try {
+      return parseDocJson(native.docToJson(doc));
+    } finally {
+      native.docFree(doc);
+    }
+  }
+
+  free(): void {
+    if (!this.freed) {
+      this.freed = true;
+      this.client.nativeBindings().viewFree(this.handle);
+    }
+  }
+}
+
 export class FireLiteClient {
   private readonly native: NativeBindings;
   private readonly engine: unknown;
@@ -483,6 +542,17 @@ export class FireLiteClient {
     // Keep 'doc' handle for startAfter. Native memory management should be handled
     // by engineFree or manual free if the user keeps thousands of snapshots.
     return new DocumentSnapshot(docId, true, parseDocJson(json), doc);
+  }
+
+  /**
+   * Borrowed point view (v0.8.11+): lazy numeric/bool pulls with no decode
+   * and no JSON. Returns null when missing. Free the snapshot when done.
+   */
+  async viewDoc(collection: string, docId: string): Promise<ViewDocSnapshot | null> {
+    this.assertOpen();
+    const view = this.native.viewGet(this.engine, collection, docId);
+    if (!view) return null;
+    return new ViewDocSnapshot(this, collection, docId, view);
   }
 
   async delete(collection: string, docId: string): Promise<void> {

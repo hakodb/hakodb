@@ -362,7 +362,24 @@ fn open_db(cli: &Cli) -> Result<FireLite> {
     }
 
 
-    FireLite::open(&cli.db, cfg).with_context(|| format!("failed to open db at {}", &cli.db))
+    FireLite::open(&cli.db, cfg)
+        .with_context(|| format!("failed to open db at {}", &cli.db))
+        .map(|db| {
+            // ponytail: open() returns while index recovery still runs;
+            // queries issued first silently plan FullCollection (cursor
+            // bounds ignored, pages repeat). Block briefly — correctness,
+            // not just speed. Warn and proceed past the timeout (reads
+            // still work, plans just degrade).
+            let t0 = std::time::Instant::now();
+            while !db.is_indexes_ready() {
+                if t0.elapsed() > std::time::Duration::from_secs(30) {
+                    eprintln!("warning: indexes not ready after 30s, continuing degraded");
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            db
+        })
 }
 
 fn read_payload_input(data: Option<&str>, fromfile: Option<&str>) -> Result<String> {

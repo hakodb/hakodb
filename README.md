@@ -10,7 +10,30 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.8.12)
+## What's new (0.7.2 → 0.8.13)
+
+### v0.8.13 — views across SDKs; node backend resurrected
+- **Go**: `ViewDoc` (`GetView`, `GetInt/Float/Bool/String/Bytes`,
+  `HasField`, `ToDoc`) + `CursorWalkView` via a second cgo trampoline.
+  Builds clean under GCC 16.
+- **Pascal** (FPC-clean): view imports, `TFLViewDoc`, `TFLQuery.WalkView`,
+  `TFireLite.GetView`.
+- **JS**: point-view numerics + `ViewDocSnapshot`/`viewDoc` on both
+  backends and the client (`tsc` clean; koffi verified end-to-end
+  against the real DLL). Strings and walk callbacks stay on
+  resolve/raw paths — no backend memory reads, by design.
+- **Tauri**: `indexes_ready` probe and stateless `view_get_field`
+  (lazy scalar pulls, no decode) + `tauri.ts` wrappers.
+- **CLI**: waits for index recovery after open (pre-readiness cursor
+  queries repeated rows — correctness, not just speed).
+- **Found en route**: the node/koffi backend was dead three ways —
+  missing opaque declarations (load-time throw on every struct type),
+  `OnSnapshotCB` vs the registered proto name, and auto-decoded
+  `char*` returns that leak + crash on free. Fixed with upfront
+  opaques, the proto name, and a disposable string type wired to
+  `fl_string_free` (never C free — Rust allocator). Also caught a
+  glued `#[no_mangle]` that hid `fl_rawdoc_to_doc` from the DLL while
+  rlib tests passed.
 
 ### v0.8.12 — gate margin hardening + stale import lib, fixed
 - **Gate**: median-of-3 Manual runs (justified in one session: reps
@@ -366,7 +389,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.12)](#whats-new-072--0812)
+- [What's new (0.7.2 → 0.8.13)](#whats-new-072--0813)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)

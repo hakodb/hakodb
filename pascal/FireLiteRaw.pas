@@ -21,12 +21,15 @@ type
   PFL_CloudSync = Pointer;   // Added in v0.6.65
   PFL_RawDoc = Pointer;      // Added in v0.8.3
   PFL_RawResultSet = Pointer;// Added in v0.8.3
+  PFL_ViewDoc = Pointer;     // Added in v0.8.11
 
   { Callback for real-time snapshots }
   TFL_OnSnapshotCallback = procedure(collection: PChar; path: PChar; kind: cint32; user_data: Pointer); cdecl;
   { Raw walk callback (v0.8.6): return True to continue. Borrowed pointers,
     valid for the call only. Must not re-enter the engine. }
   TFL_WalkCallback = function(id: PChar; id_len: SizeUInt; bytes: PByte; bytes_len: SizeUInt; user_data: Pointer): cbool; cdecl;
+  { View-walk callback (v0.8.11): borrowed id + view handle, valid for the call only. }
+  TFL_ViewWalkCallback = function(id: PChar; id_len: SizeUInt; view: PFL_ViewDoc; user_data: Pointer): cbool; cdecl;
 
 const
   FL_CHANGE_PUT = 1;
@@ -162,6 +165,21 @@ function fl_result_set_get_doc(results: PFL_ResultSet; index: SizeUInt): PFL_Doc
 procedure fl_result_set_free(results: PFL_ResultSet); cdecl; external FIRELITE_LIB;
 { Bulk result-set to JSON: one call, one JSON array string. Free with fl_string_free. }
 function fl_result_set_to_json(results: PFL_ResultSet): PChar; cdecl; external FIRELITE_LIB;
+{ Borrowed views (v0.8.11): pinned bytes + lazy typed pulls, no owned
+  construction. Strict scalar matches; views never inflate blobs. }
+function fl_view_get(engine: PFL_Engine; col, doc_id: PChar): PFL_ViewDoc; cdecl; external FIRELITE_LIB;
+procedure fl_view_free(view: PFL_ViewDoc); cdecl; external FIRELITE_LIB;
+function fl_view_field_count(view: PFL_ViewDoc): SizeUInt; cdecl; external FIRELITE_LIB;
+function fl_view_has_field(view: PFL_ViewDoc; key: PChar): cbool; cdecl; external FIRELITE_LIB;
+function fl_view_get_int(view: PFL_ViewDoc; key: PChar; out_value: PInt64): cbool; cdecl; external FIRELITE_LIB;
+function fl_view_get_float(view: PFL_ViewDoc; key: PChar; out_value: PDouble): cbool; cdecl; external FIRELITE_LIB;
+function fl_view_get_bool(view: PFL_ViewDoc; key: PChar): cint32; cdecl; external FIRELITE_LIB;
+function fl_view_get_str(view: PFL_ViewDoc; key: PChar; len_out: PSizeUInt): PChar; cdecl; external FIRELITE_LIB;
+function fl_view_get_bytes(view: PFL_ViewDoc; key: PChar; len_out: PSizeUInt): PByte; cdecl; external FIRELITE_LIB;
+function fl_view_to_doc(view: PFL_ViewDoc; doc_id: PChar): PFL_Doc; cdecl; external FIRELITE_LIB;
+{ View-walk callback: borrowed id + view handle, valid for the call only. }
+{ Lazy view walk (v0.8.11+): one call per scan. Returns rows visited, -1 on error. }
+function fl_cursor_walk_view(engine: PFL_Engine; query: PFL_Query; callback: TFL_ViewWalkCallback; user_data: Pointer): Int64; cdecl; external FIRELITE_LIB;
 { Raw result sets (v0.8.3): pinned storage bytes, not decoded docs.
   Borrowed-handle contract mirrors FL_ResultSet. Bytes are opaque. }
 function fl_query_execute_raw(engine: PFL_Engine; query: PFL_Query): PFL_RawResultSet; cdecl; external FIRELITE_LIB;

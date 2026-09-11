@@ -99,6 +99,15 @@ pub enum FireLiteOp {
         end_at: Option<Vec<serde_json::Value>>,
         end_before: Option<Vec<serde_json::Value>>,
     },
+    /// Lazy typed field pull (v0.8.13+): point view + one field, no
+    /// decode, no JSON document. Scalars cross as JSON values;
+    /// missing/wrong-type reads null. BlobLink fields surface their
+    /// placeholder (resolve the doc via DecodeRaw when needed).
+    ViewGetField {
+        collection: String,
+        doc_id: String,
+        field: String,
+    },
     /// Decode one raw row back into a Document (blobs inflated). The bytes
     /// must be an exact stored row (e.g. from QueryRaw) — never hand-built.
     DecodeRaw {
@@ -137,6 +146,9 @@ pub enum FireLiteOp {
     Backup { path: String },
     Compact,
     GetStats,
+    /// True once background index recovery finishes. Poll after open
+    /// before cursor-paged queries (pre-readiness plans ignore bounds).
+    IndexesReady,
     ListCollections,
     ListIndexes { collection: Option<String> },
     SnapshotIndices,
@@ -161,6 +173,10 @@ pub enum FireLiteResponse {
     QueryResult { rows: Vec<serde_json::Value> },
     /// Raw rows: ids in the clear, bytes as msgpack bin (Uint8Array).
     RawResult { rows: Vec<RawRow> },
+    /// Single lazy field value (or null when missing/wrong-type).
+    ValueResult { value: Option<serde_json::Value> },
+    /// Index readiness probe.
+    Ready { ready: bool },
     AggregateResult { value: f64 },
     Aggregate(f64), 
     SubscriptionAck { listener_id: String },
@@ -568,6 +584,15 @@ pub async fn firelite_exec<R: Runtime>(
                 let data = doc_to_json_value(&doc_id, &doc)?;
                 Ok(FireLiteResponse::Document { data: Some(data) })
             }
+            FireLiteOp::ViewGetField { collection, doc_id, field } => {
+                // ponytail: stateless lazy pull — view borrowed, one field
+                // decoded, nothing owned except the JSON value itself.
+                let value = match gateway.db.get_view(&collection, &doc_id).map_err(|e| e.to_string())? {
+                    Some(view) => view.get(&field).map(|v| v.to_json()),
+                    None => None,
+                };
+                Ok(FireLiteResponse::ValueResult { value })
+            }
             FireLiteOp::Batch { mutations } => {
                 let mut batch = Vec::with_capacity(mutations.len());
                 // ponytail: local-only deletes bypass the shared batch so
@@ -643,6 +668,9 @@ pub async fn firelite_exec<R: Runtime>(
             FireLiteOp::GetStats => {
                 let stats = gateway.db.get_stats();
                 Ok(FireLiteResponse::Stats { details: serde_json::to_value(stats).unwrap() })
+            }
+            FireLiteOp::IndexesReady => {
+                Ok(FireLiteResponse::Ready { ready: gateway.db.is_indexes_ready() })
             }
             FireLiteOp::ListCollections => {
                 let names = gateway.db.list_collections().map_err(|e| e.to_string())?;
