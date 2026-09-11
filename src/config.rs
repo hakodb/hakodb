@@ -32,8 +32,12 @@ pub replication_collections: Option<Vec<String>>,
 /// per-commit fsync on durable modes). Sparse: consumes no disk until
 /// written. Measured: no delta on fast local disks (v0.7.12 A/B), but
 /// decisive on cloud disks with slow metadata — Codespace Always singles
-/// went 1417us to 855us wal phase (620 to 1111 WPS) with 16MB reserved.
-/// Default stays 0 (phantom logical size + mobile storage); reach for
+/// went 1417us to 855us wal phase (620 to 1111 WPS) with 16MB reserved,
+/// and a follow-up showed 2MB performs identically (782us, 1218 WPS)
+/// while no-reserve never broke 800 across 5-6 runs. The effect is
+/// presence-not-size (no file extension during the run), so size the
+/// reserve to the run's WAL volume, not generously. Default stays 0
+/// (phantom logical size + mobile storage); reach for
 /// `--wal-reserve-mb` (benchmark) / `fl_config_set_wal_reserve_bytes`
 /// when fdatasync dominates on network-attached storage. Ignored for Manual.
 pub wal_reserve_bytes: u64,
