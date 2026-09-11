@@ -162,6 +162,7 @@ const uint8_t *fl_view_get_bytes(const FL_ViewDoc *view, const char *key, uintpt
 FL_Doc *fl_view_to_doc(const FL_ViewDoc *view, const char *doc_id);
 typedef bool (*FlViewWalkCallback)(const char *id, uintptr_t id_len, const FL_ViewDoc *view, void *userdata);
 int64_t fl_cursor_walk_view(FL_Engine *engine, const FL_Query *query, FlViewWalkCallback callback, void *userdata);
+void fl_config_set_background_maintenance(FL_Config *config, bool enabled);
 int32_t fl_query_aggregate_count(FL_Query *query);
 int32_t fl_query_aggregate_sum(FL_Query *query, const char *field);
 int32_t fl_query_aggregate_avg(FL_Query *query, const char *field);

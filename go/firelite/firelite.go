@@ -160,6 +160,13 @@ func (c *Config) SetCompression(enabled bool, level int32) {
 	C.fl_config_set_compression(c.ptr, C.bool(enabled), C.int32_t(level))
 }
 
+// SetBackgroundMaintenance holds the 5s maintenance tick (checkpoint,
+// compaction, purge, snapshots) for deterministic benchmarks or hard
+// latency bounds. Engine stays correct; files grow until re-enabled.
+func (c *Config) SetBackgroundMaintenance(enabled bool) {
+	C.fl_config_set_background_maintenance(c.ptr, C.bool(enabled))
+}
+
 func (c *Config) SetEncryptionKey(key string) {
 	ck, free := cString(key)
 	defer free()

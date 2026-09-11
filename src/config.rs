@@ -26,21 +26,26 @@ pub struct FireLiteConfig {
     pub compression_level: i32,
 pub value_blob_threshold_bytes: usize,
 pub replication_collections: Option<Vec<String>>,
-/// WAL headroom reservation in bytes (0 = off, the default). When set,
-/// preallocated ahead of the write position so steady-state appends never
-/// extend the file (fewer tiny extensions => less fragmentation => cheaper
-/// per-commit fsync on durable modes). Sparse: consumes no disk until
-/// written. Measured: no delta on fast local disks (v0.7.12 A/B), but
-/// decisive on cloud disks with slow metadata — Codespace Always singles
-/// went 1417us to 855us wal phase (620 to 1111 WPS) with 16MB reserved,
-/// and a follow-up showed 2MB performs identically (782us, 1218 WPS)
-/// while no-reserve never broke 800 across 5-6 runs. The effect is
-/// presence-not-size (no file extension during the run), so size the
-/// reserve to the run's WAL volume, not generously. Default stays 0
-/// (phantom logical size + mobile storage); reach for
-/// `--wal-reserve-mb` (benchmark) / `fl_config_set_wal_reserve_bytes`
-/// when fdatasync dominates on network-attached storage. Ignored for Manual.
+/// WAL headroom reservation in bytes (default 4MB since v0.8.18).
+/// When set, preallocated ahead of the write position so steady-state
+/// appends never extend the file (fewer tiny extensions => less
+/// fragmentation => cheaper per-commit fsync on durable modes). Sparse:
+/// consumes no disk until written. Measured: no delta on fast local
+/// disks (v0.7.12 A/B), but decisive on cloud disks with slow
+/// file-growth metadata — Codespace Always singles went 1417us to
+/// 855us wal phase with 16MB reserved, and 2MB performs identically
+/// (782us) while no-reserve never broke 800 across 5-6 runs. The effect
+/// is presence-not-size, so 4MB covers typical runs for ~4MB logical
+/// size (internal collections still skip it). Override per workload
+/// with `--wal-reserve-mb` (benchmark) / `fl_config_set_wal_reserve_bytes`.
+/// Ignored for Manual.
 pub wal_reserve_bytes: u64,
+/// Background maintenance (5s system tick: checkpoint, compaction,
+/// tombstone purge, index snapshots). Disable for deterministic
+/// benchmarking or hard latency bounds — the engine stays correct
+/// (writes/reads never depend on it), but the WAL/blob files grow until
+/// re-enabled and maintenance runs. Default true.
+pub background_maintenance: bool,
 }
 
 impl Default for FireLiteConfig {
@@ -62,7 +67,8 @@ impl Default for FireLiteConfig {
             compression_level: 3,
 value_blob_threshold_bytes: 16 * 1024,
 replication_collections: None,
-wal_reserve_bytes: 0,
+wal_reserve_bytes: 4 * 1024 * 1024,
+background_maintenance: true,
         }
     }
 }

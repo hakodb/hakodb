@@ -36,6 +36,7 @@ export interface NativeBindings {
   ): void;
   configSetBlobThreshold(config: Handle, thresholdBytes: number): void;
   configSetCompression(config: Handle, enabled: boolean, level: number): void;
+  configSetBackgroundMaintenance(config: Handle, enabled: boolean): void;
 
   // Real-time Watch
   engineWatch(engine: Handle, collection: string, callback: WatchCallback): Handle;
@@ -240,6 +241,7 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     fl_config_set_storage_tuning: { args: [FFIType.ptr, FFIType.usize, FFIType.usize, FFIType.usize], returns: FFIType.void },
     fl_config_set_blob_threshold: { args: [FFIType.ptr, FFIType.usize], returns: FFIType.void },
     fl_config_set_compression: { args: [FFIType.ptr, FFIType.bool, FFIType.i32], returns: FFIType.void },
+    fl_config_set_background_maintenance: { args: [FFIType.ptr, FFIType.bool], returns: FFIType.void },
 
     fl_engine_watch: { args: [FFIType.ptr, FFIType.cstring, FFIType.function, FFIType.ptr], returns: FFIType.ptr },
     fl_watch_free: { args: [FFIType.ptr], returns: FFIType.void },
@@ -414,6 +416,7 @@ async function createBunBindings(libPath: string): Promise<NativeBindings> {
     configSetStorageTuning: (c, ps, th, gc) => symbols.fl_config_set_storage_tuning(c, ps, th, gc),
     configSetBlobThreshold: (c, t) => symbols.fl_config_set_blob_threshold(c, t),
     configSetCompression: (c, e, l) => symbols.fl_config_set_compression(c, e, l),
+    configSetBackgroundMaintenance: (c, e) => symbols.fl_config_set_background_maintenance(c, e),
 
     engineWatch: (engine, collection, callback) => {
       const cb = new JSCallback((c: any, p: any, kind: number) => {
@@ -625,6 +628,7 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     fl_config_set_storage_tuning: lib.func('void fl_config_set_storage_tuning(FL_Config* config, size_t page_size, size_t compaction_threshold, size_t group_commit_max_ops)'),
     fl_config_set_blob_threshold: lib.func('void fl_config_set_blob_threshold(FL_Config* config, size_t threshold_bytes)'),
     fl_config_set_compression: lib.func('void fl_config_set_compression(FL_Config* config, bool enabled, int32_t level)'),
+    fl_config_set_background_maintenance: lib.func('void fl_config_set_background_maintenance(FL_Config* config, bool enabled)'),
 
     fl_engine_watch: lib.func('FL_Watch* fl_engine_watch(FL_Engine* engine, const char* collection, FL_OnSnapshotCallback* callback, void* user_data)'),
     fl_watch_free: lib.func('void fl_watch_free(FL_Watch* watch)'),
@@ -802,6 +806,7 @@ async function createNodeBindings(libPath: string): Promise<NativeBindings> {
     configSetStorageTuning: (c, ps, th, gc) => fn.fl_config_set_storage_tuning(c, ps, th, gc),
     configSetBlobThreshold: (c, t) => fn.fl_config_set_blob_threshold(c, t),
     configSetCompression: (c, e, l) => fn.fl_config_set_compression(c, e, l),
+    configSetBackgroundMaintenance: (c, e) => fn.fl_config_set_background_maintenance(c, e),
 
     engineWatch: (engine, collection, callback) => {
       const wrapper = (c: string, p: string, kind: number, _user: any) => callback(c, p, kind);

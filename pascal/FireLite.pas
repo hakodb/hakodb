@@ -68,6 +68,7 @@ type
     function SetStorageTuning(PageSize, CompactionThreshold, GroupCommitMaxOps: NativeUInt): TFLConfig;
     function SetBlobThreshold(ThresholdBytes: NativeUInt): TFLConfig;
     function SetCompression(Enabled: Boolean; Level: Integer = 3): TFLConfig;
+    function SetBackgroundMaintenance(Enabled: Boolean): TFLConfig;
     property Handle: PFL_Config read FHandle;
   end;
 
@@ -466,6 +467,12 @@ end;
 function TFLConfig.SetCompression(Enabled: Boolean; Level: Integer): TFLConfig;
 begin
   fl_config_set_compression(FHandle, Enabled, Level);
+  Result := Self;
+end;
+
+function TFLConfig.SetBackgroundMaintenance(Enabled: Boolean): TFLConfig;
+begin
+  fl_config_set_background_maintenance(FHandle, Enabled);
   Result := Self;
 end;
 

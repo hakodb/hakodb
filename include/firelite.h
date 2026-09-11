@@ -464,6 +464,11 @@ int32_t fl_engine_snapshot_indices(FL_Engine *engine);
 
 void fl_config_set_compression(FL_Config *config, bool enabled, int32_t level);
 
+/// Hold background maintenance (checkpoint/compaction/purge/snapshots) for
+/// deterministic benchmarks or hard latency bounds. Engine stays correct;
+/// files grow until re-enabled. Default on.
+void fl_config_set_background_maintenance(FL_Config *config, bool enabled);
+
 FL_NetSyncer *fl_net_syncer_new(FL_Engine *engine, const char *name, const char *room_key);
 
 /// Select discovery transports: 0 = mDNS (desktop default), 1 = UDP

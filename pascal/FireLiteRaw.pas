@@ -69,6 +69,8 @@ procedure fl_config_set_storage_tuning(config: PFL_Config; page_size, compaction
 procedure fl_config_set_blob_threshold(config: PFL_Config; threshold_bytes: SizeUInt); cdecl; external FIRELITE_LIB;
 procedure fl_config_set_wal_reserve_bytes(config: PFL_Config; bytes: QWord); cdecl; external FIRELITE_LIB;
 procedure fl_config_set_compression(config: PFL_Config; enabled: cbool; level: cint32); cdecl; external FIRELITE_LIB;
+{ Hold background maintenance (deterministic benchmarks). Default on. }
+procedure fl_config_set_background_maintenance(config: PFL_Config; enabled: cbool); cdecl; external FIRELITE_LIB;
 
 { Real-time Snapshots }
 function fl_engine_watch(engine: PFL_Engine; collection: PChar; callback: TFL_OnSnapshotCallback; user_data_ptr: Pointer): PFL_Watch; cdecl; external FIRELITE_LIB;

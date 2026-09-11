@@ -3399,6 +3399,16 @@ pub extern "C" fn fl_config_set_compression(config: *mut FL_Config, enabled: boo
     }
 }
 
+/// Hold background maintenance (checkpoint/compaction/purge/snapshots) for
+/// deterministic benchmarks or hard latency bounds. Engine stays correct;
+/// files grow until re-enabled. Default on.
+#[no_mangle]
+pub extern "C" fn fl_config_set_background_maintenance(config: *mut FL_Config, enabled: bool) {
+    if let Some(cfg) = unsafe { config.as_mut() } {
+        cfg.inner.background_maintenance = enabled;
+    }
+}
+
 #[cfg(feature = "net-sync")]
 #[no_mangle]
 pub extern "C" fn fl_net_syncer_new(

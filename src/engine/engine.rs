@@ -493,6 +493,10 @@ impl FireLite {
 
         let indexes_sys_ptr = Arc::clone(&indexes);
         let root_path_sys = root_path.clone();
+        // ponytail: copied, not shared — a benchmark holds maintenance for
+        // a whole run; live-toggling mid-run would only add a race for no
+        // benefit (the tick re-reads every 5s anyway if this ever needs it).
+        let maintenance_on = config.background_maintenance;
 
         let system_handle_thread = thread::spawn(move || {
             let mut last_maint = Instant::now();
@@ -504,6 +508,11 @@ impl FireLite {
                     }
                 }
                 if last_maint.elapsed() >= Duration::from_secs(5) {
+                    // ponytail: holdable via background_maintenance=false
+                    // (deterministic benchmarks, latency bounds). Skipping
+                    // is always safe — writes/reads never depend on this
+                    // block, files just grow until it runs again.
+                    if maintenance_on {
                     // ponytail: visible to quiescence checks for the whole
                     // block (checkpoint, purge, snapshots) — set even though
                     // the inner locks are try_-based, because readers still
@@ -537,6 +546,7 @@ impl FireLite {
                     trigger_for_system.store(true, Ordering::Release);
                     last_maint = Instant::now();
                     maintenance_for_system.store(false, Ordering::Release);
+                    } // end maintenance_on hold gate
                 }
                 if system_stop_rx.recv_timeout(Duration::from_millis(500)).is_ok() { break; }
             }

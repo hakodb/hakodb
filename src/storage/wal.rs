@@ -41,6 +41,8 @@ pub enum WalOp {
 
 pub struct Wal {
     pub(crate) file: File,
+    /// Path, kept so tail() can open an independent read handle (see tail()).
+    path: std::path::PathBuf,
     mode: DurabilityMode,
     group_commit_max_ops: usize,
     pending_ops_since_sync: usize,
@@ -68,6 +70,7 @@ impl Wal {
         encryption: Option<EncryptionContext>,
         reserve_bytes: u64,
     ) -> Result<Self> {
+        let path_buf = path.as_ref().to_path_buf();
         let mut file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -95,6 +98,7 @@ impl Wal {
 
         Ok(Self {
             file,
+            path: path_buf,
             mode,
             group_commit_max_ops: group_commit_max_ops.max(1),
             pending_ops_since_sync: 0,
@@ -251,7 +255,7 @@ impl Wal {
 
         // ONE Syscall to write multiple operations
         self.file.write_all(&self.write_buffer)?;
-        
+
         // ponytail: fdatasync (see append() above for why). The torn-tail
         // crash window this theoretically widens is exactly what replay's
         // partial-record repair already handles.
@@ -495,31 +499,45 @@ impl Wal {
     }
 
     pub fn tail(&self, start_offset: u64) -> Result<(Vec<WalOp>, u64)> {
-        let mut file = self.file.try_clone()?; // Clone handle for independent seeking
+        // ponytail: fresh read handle per tail, never touch self.file's
+        // cursor. try_clone shares the file position (DuplicateHandle/dup),
+        // and even positional reads (pread/seek_read) advance the cursor on
+        // some platforms — either way the next append would strand inside
+        // preallocation padding where readers stop at the first zero header.
+        // A separate open() is an independent description with its own
+        // cursor, so tailing can never disturb concurrent appends.
+        let file = File::open(&self.path)?;
         let file_len = file.metadata()?.len();
-        
+
         if start_offset >= file_len {
             return Ok((vec![], file_len));
         }
 
-        file.seek(SeekFrom::Start(start_offset))?;
         let mut reader = BufReader::new(file);
         let mut ops = Vec::new();
         let mut current_pos = start_offset;
+        // Skip to start_offset on the fresh handle (its cursor is ours alone).
+        reader.seek(SeekFrom::Start(start_offset))?;
 
         loop {
             let mut header = [0u8; 8];
-            if reader.read_exact(&mut header).is_err() { break; }
+            if reader.read_exact(&mut header).is_err() {
+                break;
+            }
 
             let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
             let expected_crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
 
             // Preallocation padding (see open()): clean end, not an error —
             // callers use the returned position to keep tailing.
-            if is_zero_header(&header) { break; }
+            if is_zero_header(&header) {
+                break;
+            }
 
             let mut payload = vec![0u8; len];
-            if reader.read_exact(&mut payload).is_err() { break; }
+            if reader.read_exact(&mut payload).is_err() {
+                break;
+            }
 
             if crc32fast::hash(&payload) == expected_crc {
                 let decoded_payload = if let Some(enc) = &self.encryption {

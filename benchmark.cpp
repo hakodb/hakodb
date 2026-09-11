@@ -66,6 +66,10 @@ struct BenchConfig {
     // showed no delta on fast local disks, but cloud disks with slow
     // metadata may differ — that is exactly what this knob tests).
     uint64_t wal_reserve_bytes = 0;
+    // Hold background maintenance (checkpoint/compaction/purge/snapshots)
+    // for flat bench rounds. Engine stays correct; files grow until the
+    // next run with maintenance on.
+    bool no_maintenance = false;
 };
 
 struct Report {
@@ -249,6 +253,7 @@ FL_Config* create_config_ptr(const BenchConfig& cfg) {
     fl_config_set_storage_tuning(fcfg, 4096, 8 * 1024 * 1024, 256);
     fl_config_set_memory_limits(fcfg, 256 * 1024 * 1024, cfg.inline_mb * 1024 * 1024);
     if (cfg.wal_reserve_bytes > 0) fl_config_set_wal_reserve_bytes(fcfg, cfg.wal_reserve_bytes);
+    if (cfg.no_maintenance) fl_config_set_background_maintenance(fcfg, false);
     if (cfg.enc) fl_config_set_encryption_key(fcfg, "master-key-2026");
     return fcfg;
 }
@@ -572,6 +577,7 @@ int main(int argc, char** argv) {
     bool wstats = false;
     bool gate = false;
     uint64_t wal_reserve_mb = 0;
+    bool no_maintenance = false;
     for (int i = 1; i < argc; i++) {
         string a = argv[i];
         if (a.find("--docs=") == 0) g_docs = stoi(a.substr(7));
@@ -579,6 +585,7 @@ int main(int argc, char** argv) {
         if (a == "--wstats") wstats = true;
         if (a == "--gate") gate = true;
         if (a.find("--wal-reserve-mb=") == 0) wal_reserve_mb = stoull(a.substr(17));
+        if (a == "--no-maintenance") no_maintenance = true;
     }
     g_wstats_enabled = wstats;
     // Gate mode: Manual profile only (fast, covers all gated shapes).
@@ -593,6 +600,7 @@ int main(int argc, char** argv) {
         {"Gaming",      g_docs, 10,  2, 8, false, false, 64, true}
     };
     for (auto& cfg : suite) cfg.wal_reserve_bytes = wal_reserve_mb * 1024ULL * 1024ULL;
+    for (auto& cfg : suite) cfg.no_maintenance = no_maintenance;
 
     cout << "============================================================================================\n";
     cout << " FIRE LITE PERFORMANCE MATRIX (v0.7.6) | THROUGHPUT MODE (Ops/Sec) | Total Docs: " << g_docs << "\n";
