@@ -3,7 +3,7 @@ use rayon::prelude::*;
 use std::sync::{Arc, RwLock};
 use std::thread;
 
-use crate::document::firelite_doc::{BorrowedValue, FireLiteDoc, FireLiteDocView};
+use crate::document::firelite_doc::{BorrowedValue, DocView, FireLiteDoc, FireLiteDocView};
 use crate::document::value::Value;
 use crate::error::Result;
 use crate::index::manager::IndexManager;
@@ -397,34 +397,148 @@ impl ParallelQueryExecutor {
         // scratch buffer for the rare owned reads (segment/blob pointers)
         // instead of a Vec per row.
         let storage = storage_arc.read().unwrap();
-        let total = storage.sorted_keys.len();
-        if total == 0 {
+        if storage.sorted_keys.is_empty() {
             return Ok(0);
         }
-        let (start, end) = if reverse {
-            match storage.sorted_key_range_reverse(
-                start_key.as_deref(),
-                start_exclusive,
-                plan.offset,
-                plan.limit,
-            ) {
-                Some(r) => r,
-                None => return Ok(0),
+        let (start, end) = Self::sorted_walk_bounds(
+            &storage,
+            start_key.as_deref(),
+            start_exclusive,
+            plan.offset,
+            plan.limit,
+            reverse,
+        );
+        let limit = plan.limit.unwrap_or(usize::MAX);
+        let mut scratch = Vec::new();
+        Self::drive_sorted_keys(&storage, start, end, reverse, limit, &mut |key, ptr| {
+            match ptr {
+                Pointer::Inlined(shared) => Ok(callback(key, shared)),
+                other => match storage.read_pointer_internal(other, true)? {
+                    Some(bytes) => {
+                        scratch.clear();
+                        scratch.extend_from_slice(&bytes);
+                        Ok(callback(key, &scratch))
+                    }
+                    None => Ok(true),
+                },
             }
-        } else {
-            match storage.sorted_key_range(
-                start_key.as_deref(),
-                start_exclusive,
-                plan.offset,
-                plan.limit,
-            ) {
-                Some(r) => r,
-                None => return Ok(0),
+        })
+    }
+
+    /// View walk: like [`Self::execute_walk`] but lends each row as a
+    /// `DocView` (lazy per-field reads) instead of raw bytes. Same guards,
+    /// same driver. Construction validates the framing header; per-field
+    /// access is bounds-checked and `to_owned_doc` decodes strictly, so
+    /// corrupt rows surface as empty pulls, never panics.
+    pub fn execute_walk_view<F>(
+        &self,
+        storage_arc: Arc<RwLock<StorageEngine>>,
+        indexes: &IndexManager,
+        plan: QueryPlan,
+        callback: &mut F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str, &DocView) -> bool,
+    {
+        use crate::error::FireLiteError;
+        let _ = indexes;
+        if (!plan.filters.is_empty() || !plan.or_groups.is_empty())
+            && !plan.filters_satisfied_by_index
+        {
+            return Err(FireLiteError::QueryError(
+                "view walk requires index-satisfied filters (decode to match)".into(),
+            ));
+        }
+        if !plan.order_by_satisfied && !plan.order_by.is_empty() {
+            return Err(FireLiteError::QueryError(
+                "view walk requires index-satisfied ordering (decode to sort)".into(),
+            ));
+        }
+        let (reverse, start_key, start_exclusive) = match &plan.scan {
+            ScanType::SortedKeys { start_key, start_exclusive, reverse } => {
+                (*reverse, start_key.clone(), *start_exclusive)
+            }
+            _ => {
+                return Err(FireLiteError::QueryError(
+                    "view walk supports SortedKeys scans only (order by id)".into(),
+                ))
             }
         };
+
+        let storage = storage_arc.read().unwrap();
+        if storage.sorted_keys.is_empty() {
+            return Ok(0);
+        }
+        let (start, end) = Self::sorted_walk_bounds(
+            &storage,
+            start_key.as_deref(),
+            start_exclusive,
+            plan.offset,
+            plan.limit,
+            reverse,
+        );
         let limit = plan.limit.unwrap_or(usize::MAX);
+        Self::drive_sorted_keys(&storage, start, end, reverse, limit, &mut |key, ptr| {
+            let shared = match ptr {
+                Pointer::Inlined(shared) => Arc::clone(shared),
+                Pointer::BlobPendingData { data, .. } => Arc::clone(data),
+                Pointer::BlobPending(doc) => Arc::new(doc.encode()),
+                Pointer::Deleted { .. } => return Ok(true),
+                other => match storage.read_pointer_internal(other, true)? {
+                    Some(bytes) => Arc::new(bytes),
+                    None => return Ok(true),
+                },
+            };
+            match DocView::new(shared) {
+                Some(view) => Ok(callback(key, &view)),
+                None => Ok(true),
+            }
+        })
+    }
+
+    #[inline]
+    fn make_key(_collection: &str, doc_id: &str) -> String {
+        doc_id.to_string()
+    }
+
+    /// Bounds for a SortedKeys walk in either direction: binary-search the
+    /// optional anchor, apply offset from the top, take limit downward.
+    /// Returns an empty range (never None-shaped) when there is nothing.
+    fn sorted_walk_bounds(
+        storage: &StorageEngine,
+        start_key: Option<&str>,
+        start_exclusive: bool,
+        offset: Option<usize>,
+        limit: Option<usize>,
+        reverse: bool,
+    ) -> (usize, usize) {
+        if reverse {
+            storage
+                .sorted_key_range_reverse(start_key, start_exclusive, offset, limit)
+                .unwrap_or((0, 0))
+        } else {
+            storage
+                .sorted_key_range(start_key, start_exclusive, offset, limit)
+                .unwrap_or((0, 0))
+        }
+    }
+
+    /// Drives a SortedKeys slice in either direction, invoking `f` per live
+    /// (non-deleted, indexed) row. `f` returns false to stop early. Returns
+    /// rows PRESENTED to `f`. Shared by the byte walk and the view walk —
+    /// one loop to maintain instead of per-arm duplicates.
+    fn drive_sorted_keys<F>(
+        storage: &StorageEngine,
+        start: usize,
+        end: usize,
+        reverse: bool,
+        limit: usize,
+        f: &mut F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str, &Pointer) -> Result<bool>,
+    {
         let mut visited = 0usize;
-        let mut scratch = Vec::new();
         if reverse {
             for key in storage.sorted_keys[start..end].iter().rev() {
                 if visited >= limit {
@@ -434,24 +548,9 @@ impl ParallelQueryExecutor {
                 if matches!(ptr, Pointer::Deleted { .. }) {
                     continue;
                 }
-                match ptr {
-                    Pointer::Inlined(shared) => {
-                        visited += 1;
-                        if !callback(key.as_str(), shared) {
-                            return Ok(visited);
-                        }
-                    }
-                    other => match storage.read_pointer_internal(other, true)? {
-                        Some(bytes) => {
-                            scratch.clear();
-                            scratch.extend_from_slice(&bytes);
-                            visited += 1;
-                            if !callback(key.as_str(), &scratch) {
-                                return Ok(visited);
-                            }
-                        }
-                        None => continue,
-                    },
+                visited += 1;
+                if !f(key.as_str(), ptr)? {
+                    return Ok(visited);
                 }
             }
         } else {
@@ -463,33 +562,13 @@ impl ParallelQueryExecutor {
                 if matches!(ptr, Pointer::Deleted { .. }) {
                     continue;
                 }
-                match ptr {
-                    Pointer::Inlined(shared) => {
-                        visited += 1;
-                        if !callback(key.as_str(), shared) {
-                            return Ok(visited);
-                        }
-                    }
-                    other => match storage.read_pointer_internal(other, true)? {
-                        Some(bytes) => {
-                            scratch.clear();
-                            scratch.extend_from_slice(&bytes);
-                            visited += 1;
-                            if !callback(key.as_str(), &scratch) {
-                                return Ok(visited);
-                            }
-                        }
-                        None => continue,
-                    },
+                visited += 1;
+                if !f(key.as_str(), ptr)? {
+                    return Ok(visited);
                 }
             }
         }
         Ok(visited)
-    }
-
-    #[inline]
-    fn make_key(_collection: &str, doc_id: &str) -> String {
-        doc_id.to_string()
     }
 
     /// Parallel twin of the satisfied fast path above, for scans past the

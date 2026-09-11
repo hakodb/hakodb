@@ -833,6 +833,17 @@ impl StorageEngine {
         }
     }
 
+    /// Shared-bytes point read: same lookup as [`Self::get`] but hands back
+    /// the resident Arc (zero copies for inlined) instead of an owned Vec.
+    /// Backs `DocView` point reads.
+    pub(crate) fn get_shared(&self, key: &str) -> Result<Option<Arc<Vec<u8>>>> {
+        match self.index.get(key) {
+            Some(Pointer::Deleted { .. }) => Ok(None),
+            Some(pointer) => self.read_pointer_shared(pointer),
+            None => Ok(None),
+        }
+    }
+
     pub fn delete(&mut self, key: &str) -> Result<()> {
         let mutation = StorageMutation::Delete {
             key: key.to_string(),

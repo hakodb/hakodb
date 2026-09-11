@@ -257,7 +257,6 @@ pub struct BorrowedValue<'a> {
     pub tag: u8,
     pub data: &'a [u8],
 }
-
 impl<'a> BorrowedValue<'a> {
     pub fn to_owned_value(&self) -> Option<Value> { decode_value(self.tag, self.data) }
     pub fn as_f64(&self) -> Option<f64> {
@@ -278,6 +277,100 @@ pub struct FireLiteDocIter<'a> {
     bytes: &'a [u8],
     pos: usize,
     remaining: u16,
+}
+
+/// Owned handle to a borrowed document (v0.8.10+): pins the storage bytes
+/// with an Arc and parses field values LAZILY on access. The sqlite3_stmt
+/// analog — a cursor position plus pull-on-touch reads, with none of the
+/// owned-decode cost (no fields Vec, no interning, no value allocs until
+/// a field is actually pulled).
+///
+/// Get one via `FireLite::get_view` (point read) or `FireLite::walk_view`
+/// (scan). `get` walks the framing with `skip_value` (no decode of
+/// skipped fields); `to_owned_doc` fully decodes when you want it all.
+pub struct DocView {
+    bytes: Arc<Vec<u8>>,
+    time: i64,
+    fields_count: u16,
+}
+
+impl DocView {
+    /// Pin already-resident bytes. Validates the framing header (magic,
+    /// version, length floor) — full field walks happen per access, all
+    /// bounds-checked, with strict decode ruling in `to_owned_doc`.
+    /// (A full up-front validation pass cost a second framing walk per
+    /// row, ~2x on scans, for corrupt data storage never holds.)
+    pub fn new(bytes: Arc<Vec<u8>>) -> Option<Self> {
+        let view = FireLiteDocView::new(&bytes)?;
+        Some(Self { time: view._time, fields_count: view.fields_count, bytes })
+    }
+
+    /// Number of top-level fields.
+    pub fn len(&self) -> usize {
+        self.fields_count as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fields_count == 0
+    }
+
+    /// Logical timestamp carried by the encoding.
+    pub fn time(&self) -> i64 {
+        self.time
+    }
+
+    /// Raw storage bytes (opaque encoding — hash/count/export freely).
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Pull one field by name: linear framing walk, decode on hit only.
+    /// Skipped fields cost a `skip_value` pointer bump each, never a decode.
+    pub fn get(&self, field: &str) -> Option<Value> {
+        let mut pos = 12usize;
+        let bytes: &[u8] = &self.bytes;
+        for _ in 0..self.fields_count {
+            let k_len = *bytes.get(pos)? as usize;
+            pos += 1;
+            let key = std::str::from_utf8(bytes.get(pos..pos + k_len)?).ok()?;
+            pos += k_len;
+            let tag = *bytes.get(pos)?;
+            pos += 1;
+            let start = pos;
+            skip_value(tag, bytes, &mut pos)?;
+            if key == field {
+                return decode_value(tag, &bytes[start..pos]);
+            }
+        }
+        None
+    }
+
+    /// Iterate `(key, borrowed value)` pairs without materializing.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, BorrowedValue<'_>)> + '_ {
+        let bytes: &[u8] = &self.bytes;
+        let mut pos = 12usize;
+        let mut remaining = self.fields_count;
+        std::iter::from_fn(move || {
+            if remaining == 0 {
+                return None;
+            }
+            let k_len = *bytes.get(pos)? as usize;
+            pos += 1;
+            let key = std::str::from_utf8(bytes.get(pos..pos + k_len)?).ok()?;
+            pos += k_len;
+            let tag = *bytes.get(pos)?;
+            pos += 1;
+            let start = pos;
+            skip_value(tag, bytes, &mut pos)?;
+            remaining -= 1;
+            Some((key, BorrowedValue { tag, data: &bytes[start..pos] }))
+        })
+    }
+
+    /// Escape hatch: full owned decode.
+    pub fn to_owned_doc(&self) -> Option<FireLiteDoc> {
+        FireLiteDoc::decode(&self.bytes)
+    }
 }
 
 impl<'a> FireLiteDocIter<'a> {

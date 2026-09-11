@@ -1090,6 +1090,42 @@ impl FireLite {
         Ok(None)
     }
 
+    /// Borrowed point read (v0.8.10+): pins the stored bytes and returns a
+    /// `DocView` with lazy per-field access — no decode, no interning, no
+    /// hot-cache interaction. The sqlite3 `SELECT` + typed-accessor analog:
+    /// pull only the fields you touch. Deleted/missing reads None, same as
+    /// [`Self::get`]; framing-invalid rows also read None (strict views).
+    pub fn get_view(&self, collection: &str, doc_id: &str) -> Result<Option<crate::document::firelite_doc::DocView>> {
+        if !self.allowed(collection, AccessOp::Get) {
+            if self.config.enable_audit_log {
+                self.record_audit(AuditEntry {
+                    op: AccessOp::Get,
+                    collection: collection.into(),
+                    doc_id: Some(doc_id.into()),
+                    ok: false,
+                });
+            }
+            return Err(FireLiteError::Corrupt("Denied".into()));
+        }
+
+        let shard = self.get_shard(collection)?;
+        let storage = shard.safe_read()?;
+        let res = storage.get_shared(doc_id)?.and_then(|b| {
+            crate::document::firelite_doc::DocView::new(b)
+        });
+
+        if self.config.enable_audit_log {
+            self.record_audit(AuditEntry {
+                op: AccessOp::Get,
+                collection: collection.into(),
+                doc_id: Some(doc_id.into()),
+                ok: true,
+            });
+        }
+
+        Ok(res)
+    }
+
     pub fn put(&self, col: &str, id: &str, doc: &FireLiteDoc) -> Result<String> {
         self.put_owned(col, id, doc.clone())
     }
@@ -1377,6 +1413,44 @@ impl FireLite {
         let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
 
         let visited = self.executor.execute_walk(shard_arc, &indexes, (*plan).clone(), callback)?;
+
+        self.record_audit(AuditEntry {
+            op: AccessOp::Query,
+            collection: query.collection.clone(),
+            doc_id: None,
+            ok: true,
+        });
+
+        Ok(visited)
+    }
+
+    /// View walk: lends each matching row as a `DocView` (lazy per-field
+    /// reads) instead of raw bytes. Same admission as [`Self::walk`]; see
+    /// `ParallelQueryExecutor::execute_walk_view` for the contract.
+    pub fn walk_view<F>(&self, mut query: Query, callback: &mut F) -> Result<usize>
+    where
+        F: FnMut(&str, &crate::document::firelite_doc::DocView) -> bool,
+    {
+        query.raw = true;
+        if !self.allowed(&query.collection, AccessOp::Query) {
+            self.record_audit(AuditEntry {
+                op: AccessOp::Query,
+                collection: query.collection.clone(),
+                doc_id: None,
+                ok: false,
+            });
+            return Err(FireLiteError::Corrupt("Denied".into()));
+        }
+
+        let shard_arc = self.get_shard(&query.collection)?;
+        let indexes = self.indexes.read().unwrap();
+        let rows = shard_arc.read().unwrap().count_prefix("");
+
+        let is_ready = self.indexes_ready.load(std::sync::atomic::Ordering::Acquire);
+
+        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
+
+        let visited = self.executor.execute_walk_view(shard_arc, &indexes, (*plan).clone(), callback)?;
 
         self.record_audit(AuditEntry {
             op: AccessOp::Query,

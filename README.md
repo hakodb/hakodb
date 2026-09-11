@@ -10,7 +10,18 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.8.9)
+## What's new (0.7.2 → 0.8.10)
+
+### v0.8.10 — borrowed views: our own sharp side
+- New `DocView` (pinned `Arc` + lazy per-field pulls), `db.get_view`
+  and `db.walk_view`: the `sqlite3_step` + typed-accessor analog.
+  Header-only validation at construction (a full up-front framing pass
+  cost ~2x on scans for corrupt data storage never holds); per-field
+  access is bounds-checked, `to_owned_doc` decodes strictly.
+- Measured in-process release: point-view **649k ops/s** (vs 235k owned
+  get), walk count-only **2.33M docs/s**, walk + one field pull **887k**.
+  The lazy-vs-lazy comparison SQLite's shape always deserved is now
+  winnable on our side too.
 
 ### v0.8.9 — benchmark scan parity (FireLite vs SQLite, 1:1)
 - Both harnesses grow the same full-scan trio (×5 iters, printed after
@@ -325,7 +336,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.9)](#whats-new-072--089)
+- [What's new (0.7.2 → 0.8.10)](#whats-new-072--0810)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)

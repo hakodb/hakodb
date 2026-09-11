@@ -642,6 +642,98 @@ fn walk_scan_parity() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Borrowed reads: get_view agreement + floor, walk_view lazy scan vs
+/// decoded, escape hatch, miss contract.
+#[test]
+fn view_reads() {
+    use firelite::document::firelite_doc::DocView;
+    let dir = std::env::temp_dir().join(format!(
+        "fl-test-view-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let db = open_bench(&dir);
+    seed(&db);
+
+    // 1. Agreement: view pulls match owned gets, field for field.
+    for i in 0..N {
+        let k = format!("{i:016x}");
+        let doc = db.get("bench", &k).expect("get").expect("present");
+        let view = db.get_view("bench", &k).expect("view").expect("present");
+        assert_eq!(view.len(), doc.fields.len(), "field count {k}");
+        assert_eq!(view.time(), doc.get_logical_time());
+        for (fk, fv) in &doc.fields {
+            assert_eq!(&view.get(fk).expect("field present"), fv, "field {fk}");
+        }
+        assert!(view.get("no-such-field").is_none());
+        assert_eq!(&view.to_owned_doc().expect("escape hatch").fields, &doc.fields);
+    }
+    assert!(db.get_view("bench", "no-such-id").expect("view").is_none());
+
+    // 2. View floor: random borrows, no field pulls.
+    let mut state: u64 = 0x12345678;
+    let t0 = std::time::Instant::now();
+    let mut found = 0;
+    for _ in 0..N {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let k = format!("{:016x}", (state >> 11) as usize % N);
+        if db.get_view("bench", &k).expect("view").is_some() {
+            found += 1;
+        }
+    }
+    let dt = t0.elapsed();
+    assert_eq!(found, N);
+    eprintln!(
+        "view floor (borrowed, no pulls): {N} gets in {dt:?} = {} ops/s",
+        N as u128 * 1_000_000_000 / dt.as_nanos().max(1),
+    );
+
+    // 3. Lazy scan: full walk pulling nothing (count only).
+    let t0 = std::time::Instant::now();
+    let q = Query::new("bench").order_by("id", true);
+    let mut nrows = 0;
+    let visited = db
+        .walk_view(q, &mut |_: &str, _: &DocView| {
+            nrows += 1;
+            true
+        })
+        .expect("view walk");
+    let dt = t0.elapsed();
+    assert_eq!(visited, N);
+    assert_eq!(nrows, N);
+    eprintln!(
+        "walk_view count-only: {N} docs in {dt:?} = {} docs/s",
+        N as u128 * 1_000_000_000 / dt.as_nanos().max(1),
+    );
+
+    // 4. Lazy scan pulling ONE field per row (the sqlite SELECT a,b analog
+    // at its cheapest honest shape): ids collected for order check.
+    let mut ids: Vec<String> = Vec::with_capacity(N);
+    let mut hits = 0;
+    let t0 = std::time::Instant::now();
+    let q = Query::new("bench").order_by("id", false);
+    let visited = db
+        .walk_view(q, &mut |id: &str, v: &DocView| {
+            if v.get("v").is_some() {
+                hits += 1;
+            }
+            ids.push(id.to_string());
+            true
+        })
+        .expect("view walk pulls");
+    let dt = t0.elapsed();
+    assert_eq!(visited, N);
+    assert_eq!(hits, N);
+    assert!(ids.windows(2).all(|w| w[0] > w[1]), "view walk descending");
+    eprintln!(
+        "walk_view +1 pull: {N} docs in {dt:?} = {} docs/s",
+        N as u128 * 1_000_000_000 / dt.as_nanos().max(1),
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Codec floor: pure decode + encode loops over one representative row
 /// (100B binary doc). Sizes the codec vs the fetch machinery around it.
 #[test]
