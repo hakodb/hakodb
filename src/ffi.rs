@@ -1799,8 +1799,7 @@ pub extern "C" fn fl_query_start_after_raw(query: *mut FL_Query, anchor_doc: *co
 }
 
 /// The pointer resolver: decode a raw row into an owned FL_Doc (blob
-/// fields inflated via the engine, same as a decoded query row).
-#[no_mangle]
+/// fields inflated via the engine, same as a decoded query row).#[no_mangle]
 pub extern "C" fn fl_rawdoc_to_doc(
     engine: *mut FL_Engine,
     raw_doc: *const FL_RawDoc,
@@ -1887,6 +1886,278 @@ pub extern "C" fn fl_cursor_walk(
                 id.len(),
                 bytes.as_ptr(),
                 bytes.len(),
+                userdata,
+            )
+        });
+        match res {
+            Ok(n) => n as i64,
+            Err(e) => {
+                set_last_error(e.to_string());
+                -1
+            }
+        }
+    })
+}
+
+// --- Borrowed views (ponytail, v0.8.11+) ---
+// The sqlite3_column_* analog: an owned FL_ViewDoc handle pins storage
+// bytes; typed getters pull single fields with zero owned construction.
+// Strict matches only (no cross-type coercion — convert caller-side).
+// Views never inflate blobs: BlobLink fields read back as missing here;
+// resolve via fl_view_to_doc + fl_doc_resolve_blobs when you need them.
+#[allow(non_camel_case_types)]
+pub struct FL_ViewDoc {
+    view: crate::document::firelite_doc::DocView,
+}
+
+#[no_mangle]
+pub extern "C" fn fl_view_get(
+    engine: *mut FL_Engine,
+    collection: *const c_char,
+    doc_id: *const c_char,
+) -> *mut FL_ViewDoc {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() || collection.is_null() || doc_id.is_null() {
+            set_last_error("null engine/collection/doc_id handle");
+            return std::ptr::null_mut();
+        }
+        let collection_c = unsafe { CStr::from_ptr(collection) };
+        let doc_id_c = unsafe { CStr::from_ptr(doc_id) };
+        let (collection, doc_id) = match (collection_c.to_str(), doc_id_c.to_str()) {
+            (Ok(c), Ok(d)) => (c, d),
+            _ => {
+                set_last_error("invalid utf8");
+                return std::ptr::null_mut();
+            }
+        };
+        let engine = unsafe { &*engine };
+        match engine.db.get_view(collection, doc_id) {
+            Ok(Some(view)) => Box::into_raw(Box::new(FL_ViewDoc { view })),
+            Ok(None) => std::ptr::null_mut(),
+            Err(e) => {
+                set_last_error(e.to_string());
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn fl_view_free(view: *mut FL_ViewDoc) {
+    if !view.is_null() {
+        unsafe { drop(Box::from_raw(view)); }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_view_field_count(view: *const FL_ViewDoc) -> usize {
+    if view.is_null() {
+        return 0;
+    }
+    unsafe { view.as_ref().map(|v| v.view.len()).unwrap_or(0) }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_view_has_field(view: *const FL_ViewDoc, key: *const c_char) -> bool {
+    if view.is_null() || key.is_null() {
+        return false;
+    }
+    unsafe {
+        match (view.as_ref(), CStr::from_ptr(key).to_str()) {
+            (Some(v), Ok(k)) => v.view.get(k).is_some(),
+            _ => false,
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_view_get_int(view: *const FL_ViewDoc, key: *const c_char, out: *mut i64) -> bool {
+    if view.is_null() || key.is_null() || out.is_null() {
+        return false;
+    }
+    unsafe {
+        match (view.as_ref(), CStr::from_ptr(key).to_str()) {
+            (Some(v), Ok(k)) => match v.view.get(k) {
+                Some(Value::Int(i)) => {
+                    *out = i;
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_view_get_float(view: *const FL_ViewDoc, key: *const c_char, out: *mut f64) -> bool {
+    if view.is_null() || key.is_null() || out.is_null() {
+        return false;
+    }
+    unsafe {
+        match (view.as_ref(), CStr::from_ptr(key).to_str()) {
+            (Some(v), Ok(k)) => match v.view.get(k) {
+                Some(Value::Float(f)) => {
+                    *out = f;
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn fl_view_get_bool(view: *const FL_ViewDoc, key: *const c_char) -> i32 {
+    if view.is_null() || key.is_null() {
+        return -1;
+    }
+    unsafe {
+        match (view.as_ref(), CStr::from_ptr(key).to_str()) {
+            (Some(v), Ok(k)) => match v.view.get(k) {
+                Some(Value::Bool(b)) => {
+                    if b {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                _ => -1,
+            },
+            _ => -1,
+        }
+    }
+}
+
+/// Borrowed UTF-8 view of a String field. Returns null when missing or not
+/// a String; `*len_out` (when non-null) receives the byte length. Valid
+/// until fl_view_free — same borrowed contract as fl_rawdoc_bytes.
+#[no_mangle]
+pub extern "C" fn fl_view_get_str(
+    view: *const FL_ViewDoc,
+    key: *const c_char,
+    len_out: *mut usize,
+) -> *const c_char {
+    if view.is_null() || key.is_null() {
+        return std::ptr::null();
+    }
+    unsafe {
+        match (view.as_ref(), CStr::from_ptr(key).to_str()) {
+            (Some(v), Ok(k)) => match v.view.get(k) {
+                Some(Value::String(s)) => {
+                    if !len_out.is_null() {
+                        *len_out = s.len();
+                    }
+                    s.as_ptr() as *const c_char
+                }
+                _ => std::ptr::null(),
+            },
+            _ => std::ptr::null(),
+        }
+    }
+}
+
+/// Borrowed view of a Binary field. Same lifetime contract as above.
+#[no_mangle]
+pub extern "C" fn fl_view_get_bytes(
+    view: *const FL_ViewDoc,
+    key: *const c_char,
+    len_out: *mut usize,
+) -> *const u8 {
+    if view.is_null() || key.is_null() {
+        return std::ptr::null();
+    }
+    unsafe {
+        match (view.as_ref(), CStr::from_ptr(key).to_str()) {
+            (Some(v), Ok(k)) => match v.view.get(k) {
+                Some(Value::Binary(b)) => {
+                    if !len_out.is_null() {
+                        *len_out = b.len();
+                    }
+                    b.as_ptr()
+                }
+                _ => std::ptr::null(),
+            },
+            _ => std::ptr::null(),
+        }
+    }
+}
+
+/// Escape hatch: full owned decode of the pinned bytes (links unresolved —
+/// follow with fl_doc_resolve_blobs when needed).
+#[no_mangle]
+pub extern "C" fn fl_view_to_doc(view: *const FL_ViewDoc, doc_id: *const c_char) -> *mut FL_Doc {
+    safety_shield!(std::ptr::null_mut(), {
+        if view.is_null() || doc_id.is_null() {
+            set_last_error("null view/doc_id handle");
+            return std::ptr::null_mut();
+        }
+        let id_c = unsafe { CStr::from_ptr(doc_id) };
+        let id = match id_c.to_str() {
+            Ok(v) => v.to_string(),
+            Err(_) => {
+                set_last_error("invalid utf8");
+                return std::ptr::null_mut();
+            }
+        };
+        let view = unsafe { &*view };
+        match view.view.to_owned_doc() {
+            Some(doc) => Box::into_raw(Box::new(FL_Doc { id, doc })),
+            None => {
+                set_last_error("view bytes do not decode");
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// View-walk callback: borrowed id + a borrowed view handle (valid for the
+/// call only — do not free, do not retain). Return true to continue.
+#[allow(non_camel_case_types)]
+pub type FlViewWalkCallback = Option<
+    unsafe extern "C" fn(
+        id: *const c_char,
+        id_len: usize,
+        view: *const FL_ViewDoc,
+        userdata: *mut std::ffi::c_void,
+    ) -> bool,
+>;
+
+/// One-call lazy scan: lends each row as a view (no decode, no owned
+/// construction). Returns rows visited, -1 on error. Same no-reentry
+/// contract as fl_cursor_walk.
+#[no_mangle]
+pub extern "C" fn fl_cursor_walk_view(
+    engine: *mut FL_Engine,
+    query: *const FL_Query,
+    callback: FlViewWalkCallback,
+    userdata: *mut std::ffi::c_void,
+) -> i64 {
+    safety_shield!(-1, {
+        if engine.is_null() || query.is_null() {
+            set_last_error("null engine/query handle");
+            return -1;
+        }
+        let cb = match callback {
+            Some(f) => f,
+            None => {
+                set_last_error("null walk callback");
+                return -1;
+            }
+        };
+        let engine = unsafe { &*engine };
+        let query_obj = unsafe { &*query };
+        // ponytail: one Arc bump per row builds the stack-slot view the C
+        // side borrows — no handle alloc, no free protocol, no byte copies.
+        // The slot dies when the callback returns, so there is nothing to
+        // retain or free, by construction.
+        let res = engine.db.walk_view(query_obj.query.clone(), &mut |id: &str, view: &_| unsafe {
+            let slot = FL_ViewDoc { view: view.clone() };
+            cb(
+                id.as_ptr() as *const c_char,
+                id.len(),
+                &slot as *const FL_ViewDoc,
                 userdata,
             )
         });

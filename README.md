@@ -10,7 +10,24 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.8.10)
+## What's new (0.7.2 → 0.8.11)
+
+### v0.8.11 — FFI views + lazy-vs-lazy benchmark stage
+- `FL_ViewDoc` + 9 functions (`fl_view_get/free`, `field_count`,
+  `has_field`, typed `get_int/float/bool/str/bytes`, `to_doc`) and
+  `fl_cursor_walk_view` with `FlViewWalkCallback` (borrowed id + view
+  handle, valid for the call only — stack-slot views, no alloc, no
+  free protocol). Strict scalar matches; views never inflate (resolve
+  via `to_doc` + `fl_doc_resolve_blobs`).
+- Both harnesses gain the lazy stage: FireLite 2-pull view walk vs
+  SQLite narrow id/tenant/age select. Measured at 10k complex docs:
+  **893k vs 1.11M (0.8x)** — same work, honestly close; our remainder
+  is per-row framing walks (tenant sorts last) + callback hops.
+- Full map at 10k: decoded ~3x (owned construction), lazy 0.8x,
+  raw/key parity-or-better. Each shape now has its fair fight.
+- Gate note: `Qry>=Cmp` flaked twice (Cmp spiking 2x run-to-run) then
+  passed at +53% — untouched paths, transient box noise, but the
+  composite path's variance deserves its own look (margin hardening).
 
 ### v0.8.10 — borrowed views: our own sharp side
 - New `DocView` (pinned `Arc` + lazy per-field pulls), `db.get_view`
@@ -336,7 +353,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.10)](#whats-new-072--0810)
+- [What's new (0.7.2 → 0.8.11)](#whats-new-072--0811)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)

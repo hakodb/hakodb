@@ -23,8 +23,9 @@
 //   Agg SUM x50 (full-scan, like FireLite's sum stage) |
 //   SCAN TRIO x5 iters (mirrors benchmark.cpp 1:1): full SELECT * fwd/rev
 //   with OWNED per-row copies (true full-document materialization, the
-//   fair analog of owned full-doc decode) + id-only key scan
-//   (cursor + key movement ~ byte walk) | Bulk Delete 100 |
+//   fair analog of owned full-doc decode), id-only key scan
+//   (cursor + key movement ~ byte walk), and narrow id/tenant/age select
+//   (the fair analog of the 2-pull view walk) | Bulk Delete 100 |
 //   shutdown (close) | storage size (bench.db)
 //
 // QryLazy (SELECT id only, same filter) is an EXTRA diagnostic per mode,
@@ -63,7 +64,7 @@ struct Report {
     double bulk_upd_wps = 0, bulk_del_wps = 0;
     double startup_ms = 0, shutdown_ms = 0, storage_mb = 0;
     // Full scans (docs/s, mirrors benchmark.cpp scan block 1:1).
-    double scan_fwd_dps = 0, scan_rev_dps = 0, scan_key_dps = 0;
+    double scan_fwd_dps = 0, scan_rev_dps = 0, scan_key_dps = 0, scan_view_dps = 0;
     long scan_rows = 0;
 };
 
@@ -380,6 +381,25 @@ static Report run_once(const std::string& mode, const std::string& journal,
         }
         r.scan_key_dps = qps((int)total, diff_ms(t));
         sqlite3_finalize(st);
+
+        // Narrow: id + tenant + age (the fair analog of the 2-pull view
+        // walk — touch a key and two columns, materialize nothing owned).
+        total = 0;
+        sqlite3_prepare_v2(db, "SELECT id, tenant, age FROM bench ORDER BY id", -1, &st, nullptr);
+        t = now();
+        for (int it = 0; it < SCAN_ITERS; it++) {
+            while (sqlite3_step(st) == SQLITE_ROW) {
+                volatile int sink = 0;
+                sink += sqlite3_column_bytes(st, 0);
+                sink += sqlite3_column_bytes(st, 1);
+                sink += sqlite3_column_int(st, 2);
+                (void)sink;
+                total++;
+            }
+            sqlite3_reset(st);
+        }
+        r.scan_view_dps = qps((int)total, diff_ms(t));
+        sqlite3_finalize(st);
     }
 
     // 12. bulk delete x100 in ONE tx — mirrors single batch_commit
@@ -487,8 +507,8 @@ int main(int argc, char** argv) {
     long scan_n = results.empty() ? 0 : results[0].scan_rows;
     printf("\n--- FULL SCAN (docs/s over %ld live docs x5 iters; key = id-col only) ---\n", scan_n);
     for (const auto& r : results) {
-        printf("  %-10s fwd %-9d rev %-9d key %-9d (rows %ld)\n",
-            r.mode.c_str(), (int)r.scan_fwd_dps, (int)r.scan_rev_dps, (int)r.scan_key_dps, r.scan_rows);
+        printf("  %-10s fwd %-9d rev %-9d key %-9d view %-9d (rows %ld)\n",
+            r.mode.c_str(), (int)r.scan_fwd_dps, (int)r.scan_rev_dps, (int)r.scan_key_dps, (int)r.scan_view_dps, r.scan_rows);
     }
     printf("(EXTRA, not fair-test) QryLazy id-only vs Qry full-row:\n");
     for (const auto& r : results) {

@@ -288,6 +288,7 @@ pub struct FireLiteDocIter<'a> {
 /// Get one via `FireLite::get_view` (point read) or `FireLite::walk_view`
 /// (scan). `get` walks the framing with `skip_value` (no decode of
 /// skipped fields); `to_owned_doc` fully decodes when you want it all.
+#[derive(Clone)]
 pub struct DocView {
     bytes: Arc<Vec<u8>>,
     time: i64,

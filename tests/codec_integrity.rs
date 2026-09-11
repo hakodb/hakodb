@@ -168,6 +168,14 @@ fn seed_mixed(db: &FireLite) -> (Expected, Vec<String>) {
 /// Every read path must agree with `expected` field-for-field (_time is
 /// engine-assigned and excluded by construction: fields_of skips it).
 fn verify_all(db: &FireLite, expected: &Expected, blob_ids: &[String]) {
+    // ponytail: queries issued before background index recovery plan
+    // FullCollection (bounds ignored, pages repeat) — poll first. Same
+    // race the cursor tests guard with wait_ready.
+    let t0 = std::time::Instant::now();
+    while !db.is_indexes_ready() {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(30), "indexes never ready");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     // 1. Point gets.
     for (id, fields) in expected {
         let got = db.get("docs", id).expect("get").unwrap_or_else(|| panic!("{id} missing"));

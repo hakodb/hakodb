@@ -85,6 +85,7 @@ struct Report {
     double scan_fwd_dps = 0;
     double scan_rev_dps = 0;
     double scan_raw_dps = 0;
+    double scan_view_dps = 0;
     long scan_rows = 0;
     size_t scan_raw_bytes = 0;
 
@@ -150,6 +151,22 @@ static bool scan_count_cb(const char* id, uintptr_t id_len, const uint8_t* bytes
     c->rows++;
     c->bytes += (size_t)bytes_len;
     (void)id; (void)id_len; (void)bytes;
+    return true;
+}
+
+// Lazy-scan counter for fl_cursor_walk_view: pulls tenant (str) + age
+// (int) per row (mirrors sqlite's narrow id/tenant/age select), counts rows.
+struct ViewWalkCount { long rows = 0; volatile size_t sink = 0; };
+static bool scan_view_cb(const char* id, uintptr_t id_len, const FL_ViewDoc* view, void* userdata) {
+    auto* c = static_cast<ViewWalkCount*>(userdata);
+    uintptr_t tlen = 0;
+    const char* t = fl_view_get_str(view, "tenant", &tlen);
+    int64_t age = 0;
+    size_t touch = tlen + (t && tlen > 0 ? (size_t)(unsigned char)t[0] : 0);
+    if (fl_view_get_int(view, "age", &age)) touch += (size_t)age;
+    c->rows++;
+    c->sink += touch;
+    (void)id; (void)id_len;
     return true;
 }
 
@@ -476,6 +493,18 @@ Report run_benchmark(BenchConfig cfg) {
         }
         res.scan_raw_dps = to_throughput((int)total_rows, diff_ms(t));
         res.scan_raw_bytes = total_bytes / SCAN_ITERS;
+
+        // View: one walk_view call per iteration, two lazy pulls per row.
+        total_rows = 0;
+        t = now();
+        for (int it = 0; it < SCAN_ITERS; it++) {
+            UniqueQuery q(fl_query_new("bench"));
+            fl_query_order_by(q.get(), "id", true);
+            ViewWalkCount c;
+            int64_t n = fl_cursor_walk_view(db, q.get(), scan_view_cb, &c);
+            total_rows += (long)n;
+        }
+        res.scan_view_dps = to_throughput((int)total_rows, diff_ms(t));
     }
 
     // 7. BULK DELETE
@@ -588,6 +617,7 @@ int main(int argc, char** argv) {
              << " fwd " << setw(9) << (int)r.scan_fwd_dps
              << " rev " << setw(9) << (int)r.scan_rev_dps
              << " raw " << setw(9) << (int)r.scan_raw_dps
+             << " view " << setw(9) << (int)r.scan_view_dps
              << " (rows " << r.scan_rows << ")\n";
     }
 
