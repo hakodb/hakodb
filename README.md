@@ -10,7 +10,24 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.8.14)
+## What's new (0.7.2 → 0.8.15)
+
+### v0.8.15 — startup latency: measure first, then cut
+- Measured release open→ready: 14ms fresh, 93ms per 10k warm docs
+  (Always 420ms on an 11MB WAL — honest I/O+parse, ~40MB/s). The
+  felt slowness was elsewhere, and both causes are fixed:
+- `benchmark.cpp`: the unconditional 1.5s "waiting for indexes" sleep
+  is now a readiness poll (instant on fresh DBs, ~9s saved per full
+  run, more correct on real ones).
+- CLI one-shot: the v0.8.14 quiescence wait was over-scoped for reads
+  (blob drain/maintenance don't affect correctness and can take
+  minutes) — downgraded to readiness-only with the same 30s bound.
+- Non-finding, recorded so nobody rediscovers it: an 11MB-vs-0.9MB WAL
+  "asymmetry" between bench dirs was just different doc counts (gate
+  runs reseed Manual at 1k docs; Always still held 10k). Census
+  verified: exact counts, payloads intact, overwrites/deletes correct.
+  Recovery stays sequential per collection (parallelism helps only
+  multi-collection DBs — skipped with the evidence).
 
 ### v0.8.14 — quiescence API (settle the engine, then measure)
 - New `QuiescenceStatus` (`indexes_ready`, `pending_index_ops`,
@@ -409,7 +426,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.14)](#whats-new-072--0814)
+- [What's new (0.7.2 → 0.8.15)](#whats-new-072--0815)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)

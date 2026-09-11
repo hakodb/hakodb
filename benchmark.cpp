@@ -314,7 +314,16 @@ Report run_benchmark(BenchConfig cfg) {
     dump_wstats("batch-writes");
 
     // stage("Waiting for indexes..");
-    this_thread::sleep_for(chrono::milliseconds(1500));
+    // ponytail: poll readiness instead of a fixed 1.5s sleep — fresh DBs
+    // are ready in ms (9s saved per full run), real DBs wait as long as
+    // recovery actually takes (bounded, then proceed degraded like prod).
+    {
+        auto t_ready = now();
+        while (!fl_engine_is_indexes_ready(db)) {
+            if (diff_ms(t_ready) > 30000) break;
+            this_thread::sleep_for(chrono::milliseconds(20));
+        }
+    }
     // cout << "Done";
 
     // 2. READ TEST
