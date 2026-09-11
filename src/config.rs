@@ -38,6 +38,10 @@ pub replication_collections: Option<Vec<String>>,
 /// is presence-not-size, so 4MB covers typical runs for ~4MB logical
 /// size (internal collections still skip it). Override per workload
 /// with `--wal-reserve-mb` (benchmark) / `fl_config_set_wal_reserve_bytes`.
+/// Re-measured after the single-write flush fix (local Windows, fast disk,
+/// --no-maintenance, 3 runs/arm): no reserve delta locally, consistent
+/// with v0.7.12 — the Codespace figures above are cloud-disk-specific
+/// (and predate the flush fix, so were measured at 2x WAL bytes).
 /// Ignored for Manual.
 pub wal_reserve_bytes: u64,
 /// Background maintenance (5s system tick: checkpoint, compaction,
