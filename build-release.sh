@@ -21,7 +21,7 @@ cargo build --release -p firelite-cli
 cargo build --release -p firelite-cloudserver
 
 echo "Compiling benchmark..."
-g++ -O2 -std=c++17 -Iinclude benchmark.cpp -L"$RELEASE_DIR" -lfirelite -o "$RELEASE_DIR/benchmark"
+g++ -O2 -std=c++17 -Iinclude benchmark.cpp -L"$RELEASE_DIR" -Wl,-rpath,'$ORIGIN' -lfirelite -o "$RELEASE_DIR/benchmark"
 g++ -O2 -std=c++17 -pthread sqlite_bench.cpp -lsqlite3 -o "$RELEASE_DIR/sqlite_bench"
 
 echo "Building FireLite for Android ($ANDROID_TARGET)..."
