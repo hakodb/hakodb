@@ -10,7 +10,21 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.8.16)
+## What's new (0.7.2 → 0.8.17)
+
+### v0.8.17 — allocation census: allocator exonerated, one copy killed
+- Temporary counting allocator over every read path (deleted after —
+  numbers below). Per-op allocs: walk **0.0** (zero-alloc design
+  verified empirically), raw 1.0 (id String), decoded 3.0 (id + fields
+  + values — optimal for owned output), point-get ~9, isolated decode
+  2.0, views ~0.
+- Verdict: allocation was never the bottleneck (walk costs 367ns/row
+  with zero allocs; decoded costs ~2.2µs with three). Time is CPU —
+  hashing, decode loop, memcpy, locks. No allocator swap, no arena,
+  no unsafe: all rejected with evidence.
+- Shipped from the census: `get()` decodes borrowed from the shared
+  Arc instead of cloning the full bytes into a transient Vec (−1 alloc
+  and −1 memcpy per point-get, mechanical certainty).
 
 ### v0.8.16 — count-cache + a real correctness fix found profiling
 - **O(1) live counts**: the `collection_counts` map existed but was
@@ -444,7 +458,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.16)](#whats-new-072--0816)
+- [What's new (0.7.2 → 0.8.17)](#whats-new-072--0817)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)

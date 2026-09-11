@@ -1137,8 +1137,12 @@ impl FireLite {
 
         let shard = self.get_shard(collection)?;
         let storage = shard.safe_read()?;
+        // ponytail: decode borrowed from the shared Arc — the old
+        // storage.get() cloned the full bytes into a transient Vec just
+        // to decode and drop them (one alloc + memcpy per get, found by
+        // the alloc census). Identical output, zero copies.
         let res = storage
-            .get(doc_id)?
+            .get_shared(doc_id)?
             .and_then(|b| FireLiteDoc::decode(&b));
 
         // AUDIT SUCCESS
