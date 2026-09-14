@@ -40,7 +40,20 @@ pub async fn run(cfg: ServerConfig, shutdown: impl Future<Output = ()>) -> Resul
         );
     }
 
-    let db = FireLite::open(&cfg.db_path, FireLiteConfig::default())
+    // Builtin server plane, declared explicitly (never implied by naming):
+    // the room registry, user credentials, and group credentials must not
+    // replicate to clients. The core also excludes these by default; this
+    // declaration keeps the guarantee local to the server crate so it
+    // survives any future change to core defaults. A client naming one of
+    // these in a packet is dropped at the ingest choke point and never
+    // served, relayed, or tail-broadcast under that name.
+    let mut sync_cfg = FireLiteConfig::default();
+    sync_cfg.sync_excluded = vec![
+        "__firelite_rooms".to_string(),
+        "__users".to_string(),
+        "__groups".to_string(),
+    ];
+    let db = FireLite::open(&cfg.db_path, sync_cfg)
         .map_err(|e| format!("open db {}: {e}", cfg.db_path))?;
     tracing::info!(db_path = %cfg.db_path, admin_bind = %cfg.admin_bind, sync_bind = %cfg.sync_bind, server_id = %cfg.server_id, "firelite-cloudserver starting");
 

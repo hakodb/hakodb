@@ -322,6 +322,9 @@ impl NetSyncer {
                 .iter()
                 .map(|s| s.to_string()),
         );
+        // Per-deployment extras ride along too, so mesh honors the same
+        // explicit plane as cloud sync.
+        excluded.extend(db.config.sync_excluded.iter().cloned());
 
         Self {
             db: db.clone(), 
@@ -603,9 +606,10 @@ impl NetSyncer {
                 let mut overall_changed = false;
                 let mut offsets = offsets_tail.lock().unwrap();
 
-                // Adding hidden internal firelite security collection into sync
-                let mut cols = db_tail.list_collections().unwrap_or_default();
-                cols.extend(vec!["__firelite_security".to_string()]);
+                // Sync enumeration (hidden included, excluded dropped).
+                // `__firelite_security` rides along by enumeration now —
+                // policies replicate — no manual re-add.
+                let cols = db_tail.sync_collections().unwrap_or_default();
 
                 // Encryption fail-closed set for this pass: collections WE
                 // encrypt at rest. Empty in unencrypted deployments, in which
@@ -801,21 +805,16 @@ impl NetSyncer {
 // --- Logic Helpers ---
 
 /// This node's capability advertisement: key fingerprint + the collections
-/// it encrypts at rest (including the force-synced security collection,
-/// which `list_collections` omits).
+/// it encrypts at rest (sync enumeration already includes the hidden
+/// security collection, so no manual re-add).
 #[cfg(feature = "net-sync")]
 fn local_caps(db: &Arc<FireLite>) -> PeerCaps {
-    let mut cols: Vec<String> = db
-        .list_collections()
+    let cols: Vec<String> = db
+        .sync_collections()
         .unwrap_or_default()
         .into_iter()
         .filter(|c| db.is_collection_encrypted(c))
         .collect();
-    if db.is_collection_encrypted("__firelite_security")
-        && !cols.iter().any(|c| c == "__firelite_security")
-    {
-        cols.push("__firelite_security".to_string());
-    }
     PeerCaps {
         key_fp: sync_guard::local_fingerprint(db.config.encryption_key.as_deref()),
         encrypted_cols: cols,
@@ -1097,8 +1096,9 @@ fn resolve_op_to_bytes(shard_arc: &Arc<RwLock<crate::storage::engine::StorageEng
 async fn handle_bootstrap(db: &Arc<FireLite>, peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, peer_id: &str, excluded: &HashSet<String>, caps: &Arc<CapsMap>) {
     let encryption_key = db.config.encryption_key.as_deref();
 
-    let mut cols = db.list_collections().unwrap_or_default();
-    cols.extend(vec!["__firelite_security".to_string()]);
+    // Sync enumeration covers hidden collections; the excluded plane is
+    // dropped by the enumerator, `excluded` double-checks per instance.
+    let cols = db.sync_collections().unwrap_or_default();
 
     // Sender rule, evaluated once per collection (before any disk reads,
     // so refused rooms also skip the inflation work).

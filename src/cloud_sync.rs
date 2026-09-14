@@ -45,8 +45,10 @@ fn init_crypto_provider() {
 }
 
 /// Server-internal collection that stores the room registry. It is
-/// `_`-prefixed so it stays hidden from `list_collections()`, the WAL
-/// tailers and the version maps, exactly like `__firelite_security`.
+/// `_`-prefixed so it stays hidden from `list_collections()`, and
+/// sync-excluded by exact name (`SYNC_EXCLUDED_COLLECTIONS`) so it never
+/// leaves the device regardless of naming. (`__firelite_security`, by
+/// contrast, replicates by design.)
 #[cfg(feature = "cloud-sync")]
 pub const INTERNAL_ROOMS_COLLECTION: &str = "__firelite_rooms";
 
@@ -745,14 +747,15 @@ impl CloudSync {
 
             // Sync-excluded plane (inbound): credential stores, sync state,
             // and the room registry never arrive over the wire — in EITHER
-            // namespace (client-plain or server-prefixed). Without this, a
-            // hostile Replication{collection:"__groups"} would plant a
-            // same-named shard AND get relayed back out under the plain
-            // name, poisoning every room member's real store. The outbound
+            // namespace (client-plain or server-prefixed), builtin or
+            // per-deployment extra. Without this, a hostile
+            // Replication{collection:"__groups"} would plant a same-named
+            // shard AND get relayed back out under the plain name,
+            // poisoning every room member's real store. The outbound
             // tailers already skip these; this is the receipt-side choke
             // point both directions route through.
-            if crate::engine::engine::is_sync_excluded(&plain_col)
-                || crate::engine::engine::is_sync_excluded(&storage_col)
+            if db.is_sync_excluded_effective(&plain_col)
+                || db.is_sync_excluded_effective(&storage_col)
             {
                 continue;
             }
@@ -1071,7 +1074,10 @@ kind,
     /// client-facing (unprefixed) collection names.
     fn server_room_version_map(db: &Arc<FireLite>, prefix: &str) -> HashMap<String, i64> {
         let mut map = HashMap::new();
-        if let Ok(cols) = db.list_collections() {
+        // Sync enumeration: hidden room collections (e.g. "_secret") take
+        // part; the excluded plane never appears (dropped by enumeration,
+        // double-checked at serve time).
+        if let Ok(cols) = db.sync_collections() {
             let marker = format!("{}_", prefix);
             for col in cols {
                 if let Some(plain) = col.strip_prefix(&marker) {
@@ -1399,8 +1405,8 @@ kind,
         // Sync-excluded plane is never served, in either namespace: a room
         // collection unfortunately named like an excluded store must not
         // reach members that would apply it unprefixed.
-        if crate::engine::engine::is_sync_excluded(plain_col)
-            || crate::engine::engine::is_sync_excluded(storage_col)
+        if db.is_sync_excluded_effective(plain_col)
+            || db.is_sync_excluded_effective(storage_col)
         {
             return;
         }
@@ -1452,7 +1458,9 @@ kind,
             let mut offsets: HashMap<String, u64> = HashMap::new();
 
             while running.load(Ordering::Relaxed) {
-                let cols = db.list_collections().unwrap_or_default();
+                // Sync enumeration: hidden room collections take part; the
+                // excluded plane is dropped by the enumerator itself.
+                let cols = db.sync_collections().unwrap_or_default();
 
                 for col in cols {
                     // Skip collections that don't belong to any registered room.
@@ -1464,7 +1472,7 @@ kind,
                     // named "__groups"): recipients apply it unprefixed and
                     // would poison their real store. Receipt-side drops it
                     // too — this stops it at the source for unpatched peers.
-                    if crate::engine::engine::is_sync_excluded(&plain_col) {
+                    if db.is_sync_excluded_effective(&plain_col) {
                         continue;
                     }
 
@@ -1654,7 +1662,7 @@ kind,
                             db.config.encryption_key.as_deref(),
                         )),
                         enc_cols: db
-                            .list_collections()
+                            .sync_collections()
                             .unwrap_or_default()
                             .into_iter()
                             .filter(|c| db.is_collection_encrypted(c))
@@ -1749,10 +1757,9 @@ kind,
         // NOTE: no encryption gate here by design (see client tailer above):
         // the hub enforces on receipt and relay.
         // Sync-excluded plane never pushes upstream (defense in depth:
-        // today's excluded names are underscore-hidden so the version map
-        // can't name them, but an explicit check keeps it true if a
-        // non-underscore collection is ever excluded).
-        if crate::engine::engine::is_sync_excluded(collection) {
+        // enumeration already drops it, but an explicit check keeps it
+        // true if collection routing ever bypasses enumeration).
+        if db.is_sync_excluded_effective(collection) {
             return;
         }
         let ops = Self::collect_catchup_ops(db, collection, collection, server_ts);
@@ -1786,13 +1793,15 @@ kind,
                     continue;
                 };
 
-                let cols = db.list_collections().unwrap_or_default();
+                // Sync enumeration (hidden included, excluded dropped) —
+                // the explicit skip below stays as defense in depth.
+                let cols = db.sync_collections().unwrap_or_default();
 
                 for col in cols {
                     // Sync-state, room registry, and admin credential stores
                     // never leave the device. (`__firelite_security` keeps
                     // flowing — policies replicate.)
-                    if crate::engine::engine::is_sync_excluded(&col) {
+                    if db.is_sync_excluded_effective(&col) {
                         continue;
                     }
                     // NOTE: no encryption gate here by design. This client
@@ -2053,8 +2062,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ingest_drops_sync_excluded_plane() {
-        // A hostile Replication{collection:"__groups"} must neither plant a
+    async fn ingest_drops_sync_excluded_plane() {        // A hostile Replication{collection:"__groups"} must neither plant a
         // same-named shard nor poison the real credential store — in either
         // namespace — while legit room traffic still applies.
         let (db, _dir) = temp_db("excluded-ingest");
@@ -2117,6 +2125,67 @@ mod tests {
             db.get("users", "ok").unwrap().is_some(),
             "legit room traffic must still apply"
         );
+    }
+
+    #[test]
+    fn sync_enumeration_is_opt_out_not_underscore() {
+        // Sync enumeration includes `_`-hidden collections and drops only
+        // the explicit excluded plane (builtin + per-deployment extras).
+        let (db, _dir) = temp_db("sync-enum");
+        put_simple(&db, "users", "a");
+        put_simple(&db, "_hidden", "b");
+        put_simple(&db, "__firelite_security", "c");
+        put_simple(&db, "__groups", "d");
+        put_simple(&db, "__firelite_system", "e");
+
+        let cols = db.sync_collections().unwrap();
+        assert!(cols.contains(&"users".to_string()), "plain missing: {cols:?}");
+        assert!(
+            cols.contains(&"_hidden".to_string()),
+            "hidden non-excluded must sync: {cols:?}"
+        );
+        assert!(
+            cols.contains(&"__firelite_security".to_string()),
+            "security replicates by design: {cols:?}"
+        );
+        for excluded in [
+            "__groups",
+            "__users",
+            "__firelite_rooms",
+            "__firelite_system",
+        ] {
+            assert!(
+                !cols.contains(&excluded.to_string()),
+                "excluded plane leaked into enumeration: {cols:?}"
+            );
+        }
+        // User listing keeps `_` hiding (unchanged behavior).
+        let listed = db.list_collections().unwrap();
+        assert!(!listed.contains(&"_hidden".to_string()));
+
+        // Per-deployment extras ride along.
+        let dir2 = std::env::temp_dir().join(format!(
+            "firelite-rooms-{}-sync-enum-extra",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::create_dir_all(&dir2).unwrap();
+        let mut cfg = FireLiteConfig::default();
+        cfg.durability_mode = DurabilityMode::Manual;
+        cfg.sync_excluded = vec!["_hidden".to_string()];
+        let db2 = Arc::new(FireLite::open(&dir2, cfg).unwrap());
+        put_simple(&db2, "users", "a");
+        put_simple(&db2, "_hidden", "b");
+        let cols2 = db2.sync_collections().unwrap();
+        assert!(cols2.contains(&"users".to_string()));
+        assert!(
+            !cols2.contains(&"_hidden".to_string()),
+            "config extra must drop: {cols2:?}"
+        );
+        assert!(db2.is_sync_excluded_effective("_hidden"));
+        assert!(db2.is_sync_excluded_effective("__groups"));
+        assert!(!db2.is_sync_excluded_effective("users"));
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     fn put_group(

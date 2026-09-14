@@ -50,6 +50,13 @@ pub wal_reserve_bytes: u64,
 /// (writes/reads never depend on it), but the WAL/blob files grow until
 /// re-enabled and maintenance runs. Default true.
 pub background_maintenance: bool,
+/// Extra sync-excluded collection names for this deployment, merged over
+/// the builtin `SYNC_EXCLUDED_COLLECTIONS`. Sync is opt-OUT, not opt-in:
+/// every collection on disk (including `_`-hidden ones) replicates unless
+/// it is excluded here or builtin-excluded. Use this to pin down server
+/// planes (e.g. cloudserver declares its room/user/group stores here so
+/// the guarantee never depends on naming conventions). Default empty.
+pub sync_excluded: Vec<String>,
 }
 
 impl Default for FireLiteConfig {
@@ -73,6 +80,7 @@ value_blob_threshold_bytes: 16 * 1024,
 replication_collections: None,
 wal_reserve_bytes: 4 * 1024 * 1024,
 background_maintenance: true,
+sync_excluded: Vec::new(),
         }
     }
 }

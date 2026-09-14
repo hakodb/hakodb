@@ -171,7 +171,8 @@ pub const SYNC_EXCLUDED_COLLECTIONS: &[&str] = &[
 ];
 
 /// True when `col` must be withheld from all sync tailers and catch-up.
-/// Consulted on send paths; the net_sync inbound apply uses the same
+/// Consulted on send AND receipt paths (see `sync_collections` and the
+/// ingest choke point); the net_sync inbound apply uses the same
 /// per-instance set seeded from this list.
 pub fn is_sync_excluded(col: &str) -> bool {
     SYNC_EXCLUDED_COLLECTIONS.contains(&col)
@@ -1776,6 +1777,35 @@ impl FireLite {
         Ok(cols)
     }
 
+    /// True when `col` must be withheld from all sync paths: builtin
+    /// `SYNC_EXCLUDED_COLLECTIONS` plus this deployment's
+    /// `FireLiteConfig::sync_excluded` extras.
+    pub fn is_sync_excluded_effective(&self, col: &str) -> bool {
+        is_sync_excluded(col) || self.config.sync_excluded.iter().any(|c| c == col)
+    }
+
+    /// Sync enumeration: EVERY collection on disk (including `_`-hidden
+    /// ones) minus the explicit excluded plane. Sync is opt-out, not
+    /// opt-in — `list_collections()` stays the user-visible listing with
+    /// `_` hiding, but sync must never depend on naming conventions.
+    pub fn sync_collections(&self) -> Result<Vec<String>> {
+        let mut cols = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&self.root_path) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_dir() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name != "snapshots" && !self.is_sync_excluded_effective(&name) {
+                            cols.push(name);
+                        }
+                    }
+                }
+            }
+        }
+        cols.sort();
+        Ok(cols)
+    }
+
     pub fn get_by_reference(&self, reference: &Value) -> Result<Option<FireLiteDoc>> {
         match reference {
             Value::Reference { collection, doc_id } => self.get(collection, doc_id),
@@ -2490,8 +2520,10 @@ impl FireLite {
 
     pub fn get_version_map(&self) -> std::collections::HashMap<String, i64> {
         let mut map = std::collections::HashMap::new();
-        let mut cols = self.list_collections().unwrap_or_default();
-        cols.extend(vec!["__firelite_security".to_string()]); 
+        // Sync enumeration (hidden included, excluded dropped) — the manual
+        // `__firelite_security` re-add this replaces is gone: enumeration
+        // covers it now that sync no longer depends on `_` hiding.
+        let cols = self.sync_collections().unwrap_or_default();
         for col in cols {
             // map.insert(col.clone(), self.get_collection_version(&col));
             if let Ok(version) = self.get_collection_version(&col) {
