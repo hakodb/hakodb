@@ -10,7 +10,18 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.8.18)
+## What's new (0.7.2 → 0.8.19)
+
+### v0.8.19 — excluded-plane enforcement on all cloud paths
+- **Correctness fix (sync)**: a hostile `Replication{collection:"__groups"}`
+  was applied — server planted an `alpha___groups` shard and the relay
+  rebuilt the packet under the plain name, poisoning every room member's
+  real credential store. `flush_ingest_buffer` now drops excluded batches
+  in either namespace (single choke point for client+server ingest, also
+  suppresses relay); server tailer, client catch-up push, and catch-up
+  serve skip excluded names (source-side, protects unpatched peers).
+  Regression test `ingest_drops_sync_excluded_plane` fails without the
+  fix, passes with it.
 
 ### v0.8.18 — sync-saving WAL fixes, 4MB reserve default, maintenance hold
 - **Correctness fix (sync)**: `Wal::tail` opened a fresh read handle per
@@ -482,7 +493,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.18)](#whats-new-072--0818)
+- [What's new (0.7.2 → 0.8.19)](#whats-new-072--0819)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)

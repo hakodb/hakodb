@@ -1,6 +1,6 @@
 [package]
 name = "firelite"
-version = "0.8.18"
+version = "0.8.19"
 edition = "2021"
 authors = ["AbcDev Team"]
 description = "Embedded & Cloud-native Document Engine"
@@ -67,3 +67,10 @@ members = [
     "fsync",
     "cloudserver"
 ]
+
+# ponytail: line-tables-only keeps backtraces, cuts pdb bulk + link time on weak CPUs
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+strip = true
