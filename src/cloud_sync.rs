@@ -743,6 +743,20 @@ impl CloudSync {
                 continue;
             }
 
+            // Sync-excluded plane (inbound): credential stores, sync state,
+            // and the room registry never arrive over the wire — in EITHER
+            // namespace (client-plain or server-prefixed). Without this, a
+            // hostile Replication{collection:"__groups"} would plant a
+            // same-named shard AND get relayed back out under the plain
+            // name, poisoning every room member's real store. The outbound
+            // tailers already skip these; this is the receipt-side choke
+            // point both directions route through.
+            if crate::engine::engine::is_sync_excluded(&plain_col)
+                || crate::engine::engine::is_sync_excluded(&storage_col)
+            {
+                continue;
+            }
+
             // Encryption fail-closed (inbound): when THIS node encrypts the
             // collection at rest, ops are accepted only from senders that
             // proved the same key. Namespaces: server shards are storage
@@ -1382,6 +1396,14 @@ kind,
         // Sender rule: a locally-encrypted room (storage namespace on the
         // server) only replays to a fingerprint-verified peer. Old/silent
         // peers pause here loudly instead of leaking on catch-up.
+        // Sync-excluded plane is never served, in either namespace: a room
+        // collection unfortunately named like an excluded store must not
+        // reach members that would apply it unprefixed.
+        if crate::engine::engine::is_sync_excluded(plain_col)
+            || crate::engine::engine::is_sync_excluded(storage_col)
+        {
+            return;
+        }
         if db.is_collection_encrypted(storage_col) {
             let local_fp =
                 crate::sync_guard::local_fingerprint(db.config.encryption_key.as_deref());
@@ -1437,6 +1459,14 @@ kind,
                     let Some((prefix, plain_col)) = rooms.prefix_of(&col) else {
                         continue;
                     };
+                    // Never broadcast a room collection whose plain name is
+                    // sync-excluded (e.g. a room collection unfortunately
+                    // named "__groups"): recipients apply it unprefixed and
+                    // would poison their real store. Receipt-side drops it
+                    // too — this stops it at the source for unpatched peers.
+                    if crate::engine::engine::is_sync_excluded(&plain_col) {
+                        continue;
+                    }
 
                     if let Ok(shard_arc) = db.get_shard(&col) {
                         let last_pos = *offsets.get(&col).unwrap_or(&0);
@@ -1718,6 +1748,13 @@ kind,
     ) {
         // NOTE: no encryption gate here by design (see client tailer above):
         // the hub enforces on receipt and relay.
+        // Sync-excluded plane never pushes upstream (defense in depth:
+        // today's excluded names are underscore-hidden so the version map
+        // can't name them, but an explicit check keeps it true if a
+        // non-underscore collection is ever excluded).
+        if crate::engine::engine::is_sync_excluded(collection) {
+            return;
+        }
         let ops = Self::collect_catchup_ops(db, collection, collection, server_ts);
 
         if !ops.is_empty() {
@@ -2013,6 +2050,73 @@ mod tests {
         assert!(CloudSync::is_stale_remote_delete(&db, "c", "a", ts - 1));
         assert!(!CloudSync::is_stale_remote_delete(&db, "c", "a", ts + 1_000_000));
         assert!(!CloudSync::is_stale_remote_delete(&db, "c", "missing", ts));
+    }
+
+    #[tokio::test]
+    async fn ingest_drops_sync_excluded_plane() {
+        // A hostile Replication{collection:"__groups"} must neither plant a
+        // same-named shard nor poison the real credential store — in either
+        // namespace — while legit room traffic still applies.
+        let (db, _dir) = temp_db("excluded-ingest");
+        put_simple(&db, "seed", "k");
+        let hostile_value = db
+            .get("seed", "k")
+            .unwrap()
+            .unwrap()
+            .encode_buffered();
+        let hostile = |collection: &str, prefix: &str| IngestItem {
+            collection: collection.to_string(),
+            prefix: prefix.to_string(),
+            op: WalOp::PutInlined {
+                key: "evil".to_string(),
+                value: hostile_value.clone(),
+            },
+            sender_client_id: Some("mallory".to_string()),
+        };
+        let legit = IngestItem {
+            collection: "users".to_string(),
+            prefix: "alpha".to_string(),
+            op: WalOp::PutInlined {
+                key: "ok".to_string(),
+                value: hostile_value.clone(),
+            },
+            sender_client_id: Some("mallory".to_string()),
+        };
+        let mut buffer: std::collections::HashMap<String, Vec<IngestItem>> =
+            std::collections::HashMap::new();
+        buffer.insert(
+            "alpha___groups".to_string(),
+            vec![hostile("__groups", "alpha")],
+        );
+        buffer.insert("__groups".to_string(), vec![hostile("__groups", "")]);
+        buffer.insert("__users".to_string(), vec![hostile("__users", "")]);
+        buffer.insert("users".to_string(), vec![legit]);
+        let echo_cache = Arc::new(StdMutex::new(
+            std::collections::HashMap::<String, i64>::new(),
+        ));
+        let peers = Arc::new(AsyncRwLock::new(
+            std::collections::HashMap::<String, PeerInfo>::new(),
+        ));
+        let caps = Arc::new(crate::sync_guard::CapsMap::default());
+        CloudSync::flush_ingest_buffer(&db, &mut buffer, &echo_cache, &peers, &caps)
+            .await;
+
+        assert!(
+            db.get("alpha___groups", "evil").unwrap().is_none(),
+            "hostile server-namespace batch planted a shard"
+        );
+        assert!(
+            db.get("__groups", "evil").unwrap().is_none(),
+            "hostile packet poisoned the real credential store"
+        );
+        assert!(
+            db.get("__users", "evil").unwrap().is_none(),
+            "hostile packet poisoned the user store"
+        );
+        assert!(
+            db.get("users", "ok").unwrap().is_some(),
+            "legit room traffic must still apply"
+        );
     }
 
     fn put_group(
