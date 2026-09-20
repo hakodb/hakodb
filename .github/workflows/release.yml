@@ -27,7 +27,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/firelite.dll dist/
-          Copy-Item target/release/firelite.lib dist/
+          Copy-Item target/release/firelite.dll.lib dist/firelite.lib
           Copy-Item include/firelite.h dist/
           (Get-FileHash dist/firelite.dll -Algorithm SHA256).Hash | Out-File dist/SHA256SUMS
           (Get-FileHash dist/firelite.lib -Algorithm SHA256).Hash | Out-File dist/SHA256SUMS -Append
@@ -61,14 +61,17 @@ jobs:
         with:
           targets: aarch64-linux-android
       - uses: nttld/setup-ndk@v1
+        id: setup-ndk
         with:
           ndk-version: r26c
       - name: Build cdylib for aarch64-linux-android (API 21)
-        env:
-          CC_aarch64_linux_android: ${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
-          CXX_aarch64_linux_android: ${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++
-          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
-        run: cargo build --release --target aarch64-linux-android
+        run: |
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          CLANG="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+          export CC_aarch64_linux_android="$CLANG"
+          export CXX_aarch64_linux_android="${CLANG}++"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CLANG"
+          cargo build --release --target aarch64-linux-android
       - name: Collect assets
         run: |
           mkdir -p dist
