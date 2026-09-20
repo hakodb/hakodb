@@ -94,8 +94,9 @@ db.await_quiescent(Duration::from_secs(30)); // indexes + index worker + blobs +
 
 `await_quiescent` (and `quiescence_status()` for diagnostics) is the
 difference between benchmarking the engine and benchmarking contention.
-FFI: `fl_engine_await_quiescent` / `fl_engine_quiescence_status`. The CLI
-waits for readiness on every open; `benchmark.cpp` settles before scans.
+FFI: `fl_engine_await_quiescent` / `fl_engine_quiescence_status`. Settle
+before scans — quiescence is what separates benchmarking the engine from
+benchmarking contention.
 
 ## Blob semantics (the fine print)
 

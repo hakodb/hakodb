@@ -1739,9 +1739,8 @@ impl FireLite {
         rx
     }
 
-    /// Watch support for out-of-tree gateways (e.g. the standalone
-    /// `firelite-tauri` crate): prebuild a filter plan for a subscription
-    /// once, then match per-event bytes against it. The match itself is
+    /// Watch support for out-of-tree gateways: prebuild a filter plan for
+    /// a subscription once, then match per-event bytes against it. The match itself is
     /// zero-decode (borrows the stored bytes, no allocation), so the hot
     /// path costs the same as the former in-tree call — only the location
     /// moved, not the complexity.
@@ -1914,7 +1913,7 @@ impl FireLite {
     }
 
     // 1. The public version (used by create_index). Public (not
-    // pub(crate)) so out-of-tree gateways (firelite-tauri) that create
+    // pub(crate)) so out-of-tree gateways that create
     // indexes can persist defs without reimplementing the walk.
     pub fn persist_index_defs(&self) -> Result<()> {
         let mgr = self.indexes.read().unwrap();
