@@ -7,7 +7,17 @@ fn main() {
     std::fs::create_dir_all(output.parent().expect("header parent should exist"))
         .expect("failed to create include directory");
 
-    let cfg = cbindgen::Config::from_file("cbindgen.toml").unwrap_or_default();
+    // ponytail: absolute path — a relative "cbindgen.toml" silently misses
+    // (build-script cwd is not guaranteed to be the package root), and
+    // from_file().unwrap_or_default() then falls back to cbindgen DEFAULTS
+    // (C++ output, no guard/prefix) with zero diagnostics. The on-disk
+    // header proved it: C++ `using` aliases + <cstdarg> despite
+    // language="C" in the toml. Absolute path or loud failure, never
+    // silent defaults for a shipped ABI header.
+    let cbindgen_toml = std::path::Path::new(&crate_dir).join("cbindgen.toml");
+    let cfg = cbindgen::Config::from_file(&cbindgen_toml)
+        .map_err(|e| format!("read {}: {e}", cbindgen_toml.display()))
+        .expect("cbindgen.toml must load — refusing silent-default ABI header");
     cbindgen::Builder::new()
         .with_crate(crate_dir)
         .with_config(cfg)
