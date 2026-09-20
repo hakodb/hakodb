@@ -9,8 +9,6 @@ pub mod query;
 pub mod storage;
 pub mod sync_guard;
 
-#[cfg(feature = "tauri-gateway")]
-pub mod tauri_gateway;
 pub mod util;
 
 #[cfg(feature = "net-sync")]

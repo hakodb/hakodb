@@ -1739,6 +1739,38 @@ impl FireLite {
         rx
     }
 
+    /// Watch support for out-of-tree gateways (e.g. the standalone
+    /// `firelite-tauri` crate): prebuild a filter plan for a subscription
+    /// once, then match per-event bytes against it. The match itself is
+    /// zero-decode (borrows the stored bytes, no allocation), so the hot
+    /// path costs the same as the former in-tree call — only the location
+    /// moved, not the complexity.
+    pub fn plan_for_watch(&self, query: &crate::query::query::Query) -> crate::query::plan::QueryPlan {
+        let indexes = self.indexes.read().unwrap();
+        let is_ready = self.indexes_ready.load(Ordering::Acquire);
+        crate::query::planner::QueryPlanner::plan(query, &indexes, 0, 1, is_ready)
+    }
+
+    /// Zero-decode view match for one watch event: true when the stored
+    /// `bytes` for `doc_id` satisfy `plan` (built by `plan_for_watch`).
+    /// Handles the exit case too — returns false when an update stops
+    /// matching, so callers emit the removal.
+    pub fn matches_watch(
+        doc_id: &str,
+        bytes: &[u8],
+        plan: &crate::query::plan::QueryPlan,
+    ) -> bool {
+        crate::query::executor::worker::matches_filters_view(doc_id, bytes, plan)
+    }
+
+    /// Raw stored bytes for one document (watch event hydration without a
+    /// full decoded point-get).
+    pub fn get_raw_bytes(&self, collection: &str, doc_id: &str) -> Result<Option<Vec<u8>>> {
+        let shard = self.get_shard(collection)?;
+        let storage = shard.read().unwrap();
+        storage.get(doc_id)
+    }
+
     pub(crate) fn notify_watchers(&self, col: &str, event: ChangeEvent) {
         if let Some(list) = self.listeners.lock().unwrap().get_mut(col) {
             list.retain(|s| s.send(event.clone()).is_ok());

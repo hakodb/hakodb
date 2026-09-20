@@ -25,28 +25,17 @@ LINUX_ARCHIVE="$RELEASE_DIR/linux-build-$VERSION.tar.gz"
 ANDROID_ARCHIVE="$RELEASE_DIR/android-build-$VERSION.tar.gz"
 
 build_linux() {
-    echo "Building FireLite v$VERSION for Linux..."
+    echo "Building FireLite v$VERSION for Linux (library only)..."
     cargo build --release
-    cargo build --release -p firelite-cli
-    cargo build --release -p firelite-cloudserver
-
-    echo "Compiling benchmark..."
-    g++ -O2 -std=c++17 -Iinclude benchmark.cpp -L"$RELEASE_DIR" -Wl,-rpath,'$ORIGIN' -lfirelite -o "$RELEASE_DIR/benchmark"
-    g++ -O2 -std=c++17 -pthread sqlite_bench.cpp -lsqlite3 -o "$RELEASE_DIR/sqlite_bench"
 
     echo "Refreshing Linux bundle..."
     rm -rf "$LINUX_DIR"
     mkdir -p "$LINUX_DIR"
-    cp "$RELEASE_DIR/benchmark" \
-        "$RELEASE_DIR/sqlite_bench" \
-       "$RELEASE_DIR/firelite-cli" \
-       "$RELEASE_DIR/firelite-cli.d" \
-       "$RELEASE_DIR/firelite-cloudserver" \
-       "$RELEASE_DIR/firelite-cloudserver.d" \
-       "$RELEASE_DIR/libfirelite.so" \
-       "$RELEASE_DIR/libfirelite.rlib" \
-       "$RELEASE_DIR/libfirelite.d" \
-       "$LINUX_DIR/"
+    cp "$RELEASE_DIR/libfirelite.so" \
+        "$RELEASE_DIR/libfirelite.rlib" \
+        "$RELEASE_DIR/libfirelite.d" \
+        "$ROOT_DIR/include/firelite.h" \
+        "$LINUX_DIR/"
 
     rm -f "$LINUX_ARCHIVE"
     echo "Creating Linux archive..."

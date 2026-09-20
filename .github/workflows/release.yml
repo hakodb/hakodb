@@ -1,0 +1,92 @@
+name: release
+
+# Core library releases only. Satellites (cli, cloudserver, SDKs, bench,
+# tauri) version independently and carry no workflows; FFI consumers pin
+# these assets by tag: firelite-<version>-<target>.<ext> + headers.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  VERSION: ${{ github.ref_name }}
+
+jobs:
+  windows-msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build cdylib (MSVC import lib is a release artifact)
+        run: cargo build --release
+      - name: Collect assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/firelite.dll dist/
+          Copy-Item target/release/firelite.lib dist/
+          Copy-Item include/firelite.h dist/
+          (Get-FileHash dist/firelite.dll -Algorithm SHA256).Hash | Out-File dist/SHA256SUMS
+          (Get-FileHash dist/firelite.lib -Algorithm SHA256).Hash | Out-File dist/SHA256SUMS -Append
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firelite-${{ github.ref_name }}-x86_64-pc-windows-msvc
+          path: dist/
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build cdylib + rlib
+        run: cargo build --release
+      - name: Collect assets
+        run: |
+          mkdir -p dist
+          cp target/release/libfirelite.so target/release/libfirelite.rlib include/firelite.h dist/
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firelite-${{ github.ref_name }}-x86_64-unknown-linux-gnu
+          path: dist/
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26c
+      - name: Build cdylib for aarch64-linux-android (API 21)
+        env:
+          CC_aarch64_linux_android: ${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
+          CXX_aarch64_linux_android: ${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
+        run: cargo build --release --target aarch64-linux-android
+      - name: Collect assets
+        run: |
+          mkdir -p dist
+          cp target/aarch64-linux-android/release/libfirelite.so include/firelite.h dist/
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firelite-${{ github.ref_name }}-aarch64-linux-android
+          path: dist/
+
+  publish:
+    needs: [windows-msvc, linux, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: assets/**/*

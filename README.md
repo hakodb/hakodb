@@ -10,7 +10,21 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What's new (0.7.2 → 0.8.19)
+## What's new (0.7.2 → 0.8.20)
+
+### v0.8.20 — repo split phase 1: core ships alone
+- **Removed `fsync/`** (5-line re-export wrapper, zero references —
+  redundant since FFI + sync live in one crate) and dropped
+  `cli`/`cloudserver` from the workspace (they become satellite repos).
+- **Tauri gateway seam**: new narrow public watch API
+  (`plan_for_watch`, `matches_watch`, `get_raw_bytes`) carrying the
+  exact zero-decode cost of the former in-tree path; `tauri_gateway`
+  module + `tauri`/`rmpv` deps leave the core for the standalone
+  `firelite-tauri` crate.
+- **MSVC-ready build**: `build.rs` keeps `firelite.lib` on MSVC targets
+  (GNU/MinGW keeps the stale-shadow delete); the tag-triggered release
+  workflow ships `.dll`+`.lib` (Windows), `.so`+`.rlib` (Linux),
+  Android `aarch64` `.so`, all with headers + checksums.
 
 ### v0.8.19 — excluded-plane enforcement on all cloud paths
 - **Correctness fix (sync)**: a hostile `Replication{collection:"__groups"}`
@@ -493,7 +507,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 ## Table of Contents
 
 - [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.19)](#whats-new-072--0819)
+- [What's new (0.7.2 → 0.8.20)](#whats-new-072--0820)
 - [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)

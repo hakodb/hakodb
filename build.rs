@@ -23,12 +23,18 @@ fn main() {
 // falls through to firelite.dll directly (always fresh), and no current
 // consumer needs an MSVC import lib (benchmark + Go use MinGW; Pascal
 // keeps its own .a). Deterministic, no timing, no silent staleness.
+// MSVC exception: the .lib IS the import library MSVC linkers require for
+// the cdylib, and the release workflow ships it — so the delete below runs
+// on GNU/MinGW targets only, never on MSVC.
 let profile = std::env::var("PROFILE").unwrap_or_else(|_| "release".to_string());
+let target = std::env::var("TARGET").unwrap_or_default();
 let target_dir = std::path::Path::new("target").join(&profile);
 #[cfg(windows)]
 {
-let dst = target_dir.join("firelite.lib");
-let _ = std::fs::remove_file(&dst);
+if !target.contains("msvc") {
+    let dst = target_dir.join("firelite.lib");
+    let _ = std::fs::remove_file(&dst);
+}
 }
     // Allow integration tests to find firelite.dll when invoked from anywhere.
     println!("cargo:rustc-link-search=native={}", target_dir.display());
