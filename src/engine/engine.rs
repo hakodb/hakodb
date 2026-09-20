@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH, Instant};
 
 use hashbrown::{HashMap, HashSet};
 
-use crate::config::FireLiteConfig;
+use crate::config::{DurabilityMode, FireLiteConfig};
 use crate::document::firelite_doc::FireLiteDoc;
 use crate::document::value::Value;
 use crate::error::{FireLiteError, Result};
@@ -1745,8 +1745,7 @@ impl FireLite {
     /// zero-decode (borrows the stored bytes, no allocation), so the hot
     /// path costs the same as the former in-tree call — only the location
     /// moved, not the complexity.
-    pub fn plan_for_watch(&self, query: &crate::query::query::Query) -> crate::query::plan::QueryPlan {
-        let indexes = self.indexes.read().unwrap();
+    pub fn plan_for_watch(&self, query: &crate::query::query::Query) -> crate::query::plan::QueryPlan {        let indexes = self.indexes.read().unwrap();
         let is_ready = self.indexes_ready.load(Ordering::Acquire);
         crate::query::planner::QueryPlanner::plan(query, &indexes, 0, 1, is_ready)
     }
@@ -1769,6 +1768,16 @@ impl FireLite {
         let shard = self.get_shard(collection)?;
         let storage = shard.read().unwrap();
         storage.get(doc_id)
+    }
+
+    /// Set WAL durability on every shard (admin plane for out-of-tree
+    /// gateways). Best-effort per shard, mirroring the former in-tree call.
+    pub fn set_durability_mode_all(&self, mode: DurabilityMode) {
+        for shard in self.shards.read().unwrap().values() {
+            if let Ok(mut s) = shard.write() {
+                s.set_durability_mode(mode);
+            }
+        }
     }
 
     pub(crate) fn notify_watchers(&self, col: &str, event: ChangeEvent) {
@@ -1904,8 +1913,10 @@ impl FireLite {
         self.root_path.join("_indices").join("definitions.json")
     }
 
-    // 1. The public version (used by create_index)
-    pub(crate) fn persist_index_defs(&self) -> Result<()> {
+    // 1. The public version (used by create_index). Public (not
+    // pub(crate)) so out-of-tree gateways (firelite-tauri) that create
+    // indexes can persist defs without reimplementing the walk.
+    pub fn persist_index_defs(&self) -> Result<()> {
         let mgr = self.indexes.read().unwrap();
         self.persist_index_defs_with_guard(&mgr)
     }
