@@ -929,14 +929,14 @@ HakoDB lives under the [`hakodb`](https://github.com/hakodb) organization
 | Repo | Delivers | Version |
 |---|---|---|
 | [`hakodb/hakodb`](https://github.com/hakodb/hakodb) | Core library: engine, storage, query, FFI (`hako.h`), net/cloud sync | 0.8.21 |
-| [`hakodb/hako-cli`](https://github.com/hakodb/hako-cli) | Command-line manager + serve REPL | 0.2.1 |
-| [`hakodb/hako-cloudserver`](https://github.com/hakodb/hako-cloudserver) | Managed sync hub + admin console | 0.1.1 |
-| [`hakodb/hako-tauri`](https://github.com/hakodb/hako-tauri) | Tauri gateway crate (Rust) | 0.1.1 |
-| [`hakodb/hako-tauri-ts`](https://github.com/hakodb/hako-tauri-ts) | Tauri client (`@hakodb/tauri`) | 0.1.1 |
-| [`hakodb/hako-bench`](https://github.com/hakodb/hako-bench) | C++ benchmark harnesses + SQLite duel | 0.1.1 |
-| [`hakodb/hako-go`](https://github.com/hakodb/hako-go) | Go SDK (cgo) | 0.1.1 |
-| [`hakodb/hako-js`](https://github.com/hakodb/hako-js) | JS/TS SDK (`@hakodb/client`, Node + Bun) | 0.5.12 |
-| [`hakodb/hako-pascal`](https://github.com/hakodb/hako-pascal) | Lazarus/FPC wrapper + components | 0.1.1 |
+| [`hakodb/hakocli`](https://github.com/hakodb/hakocli) | Command-line manager + serve REPL | 0.2.1 |
+| [`hakodb/hakocloudserver`](https://github.com/hakodb/hakocloudserver) | Managed sync hub + admin console | 0.1.1 |
+| [`hakodb/hakotauri`](https://github.com/hakodb/hakotauri) | Tauri gateway crate (Rust) | 0.1.1 |
+| [`hakodb/hakotaurits`](https://github.com/hakodb/hakotaurits) | Tauri client (`@hakodb/tauri`) | 0.1.1 |
+| [`hakodb/hakobench`](https://github.com/hakodb/hakobench) | C++ benchmark harnesses + SQLite duel | 0.1.1 |
+| [`hakodb/hakogo`](https://github.com/hakodb/hakogo) | Go SDK (cgo) | 0.1.1 |
+| [`hakodb/hakojs`](https://github.com/hakodb/hakojs) | JS/TS SDK (`@hakodb/client`, Node + Bun) | 0.5.12 |
+| [`hakodb/hakopascal`](https://github.com/hakodb/hakopascal) | Lazarus/FPC wrapper + components | 0.1.1 |
 
 Branches: **`main`** (stable — merged releases only) and **`cloud_sync`**
 (active development). The pre-rebrand history remains archived, read-only,
