@@ -28,7 +28,7 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/hakodb.dll dist/
           Copy-Item target/release/hakodb.dll.lib dist/hakodb.lib
-          Copy-Item include/hakodb.h dist/
+          Copy-Item include/hako.h dist/
           (Get-FileHash dist/hakodb.dll -Algorithm SHA256).Hash | Out-File dist/SHA256SUMS
           (Get-FileHash dist/hakodb.lib -Algorithm SHA256).Hash | Out-File dist/SHA256SUMS -Append
       - uses: actions/upload-artifact@v4
@@ -46,7 +46,7 @@ jobs:
       - name: Collect assets
         run: |
           mkdir -p dist
-          cp target/release/libhakodb.so target/release/libhakodb.rlib include/hakodb.h dist/
+          cp target/release/libhakodb.so target/release/libhakodb.rlib include/hako.h dist/
           (cd dist && sha256sum * > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:
@@ -75,7 +75,7 @@ jobs:
       - name: Collect assets
         run: |
           mkdir -p dist
-          cp target/aarch64-linux-android/release/libhakodb.so include/hakodb.h dist/
+          cp target/aarch64-linux-android/release/libhakodb.so include/hako.h dist/
           (cd dist && sha256sum * > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:
@@ -90,6 +90,20 @@ jobs:
         with:
           path: assets
           merge-multiple: true
+      # Flat staging with target-qualified names: deterministic download
+      # URLs regardless of how the uploader preserves directories.
+      # Consumers rename to canonical names on download (see each
+      # satellite's sync-core/sync-native script).
+      - name: Stage flat release files
+        run: |
+          mkdir -p release
+          cp assets/hakodb-*-x86_64-pc-windows-msvc/hakodb.dll release/hakodb-x86_64-pc-windows-msvc.dll
+          cp assets/hakodb-*-x86_64-pc-windows-msvc/hakodb.lib release/hakodb-x86_64-pc-windows-msvc.lib
+          cp assets/hakodb-*-x86_64-unknown-linux-gnu/libhakodb.so release/libhakodb-x86_64-unknown-linux-gnu.so
+          cp assets/hakodb-*-x86_64-unknown-linux-gnu/libhakodb.rlib release/libhakodb-x86_64-unknown-linux-gnu.rlib
+          cp assets/hakodb-*-aarch64-linux-android/libhakodb.so release/libhakodb-aarch64-linux-android.so
+          cp assets/hakodb-*-x86_64-pc-windows-msvc/hako.h release/hako.h
+          (cd release && sha256sum * > SHA256SUMS)
       - uses: softprops/action-gh-release@v2
         with:
-          files: assets/**/*
+          files: release/*

@@ -47,10 +47,10 @@ fn init_crypto_provider() {
 /// Server-internal collection that stores the room registry. It is
 /// `_`-prefixed so it stays hidden from `list_collections()`, and
 /// sync-excluded by exact name (`SYNC_EXCLUDED_COLLECTIONS`) so it never
-/// leaves the device regardless of naming. (`__firelite_security`, by
+/// leaves the device regardless of naming. (`__hako_security`, by
 /// contrast, replicates by design.)
 #[cfg(feature = "cloud-sync")]
-pub const INTERNAL_ROOMS_COLLECTION: &str = "__firelite_rooms";
+pub const INTERNAL_ROOMS_COLLECTION: &str = "__hako_rooms";
 
 #[cfg(feature = "cloud-sync")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1799,7 +1799,7 @@ kind,
 
                 for col in cols {
                     // Sync-state, room registry, and admin credential stores
-                    // never leave the device. (`__firelite_security` keeps
+                    // never leave the device. (`__hako_security` keeps
                     // flowing — policies replicate.)
                     if db.is_sync_excluded_effective(&col) {
                         continue;
@@ -2134,9 +2134,9 @@ mod tests {
         let (db, _dir) = temp_db("sync-enum");
         put_simple(&db, "users", "a");
         put_simple(&db, "_hidden", "b");
-        put_simple(&db, "__firelite_security", "c");
+        put_simple(&db, "__hako_security", "c");
         put_simple(&db, "__groups", "d");
-        put_simple(&db, "__firelite_system", "e");
+        put_simple(&db, "__hako_system", "e");
 
         let cols = db.sync_collections().unwrap();
         assert!(cols.contains(&"users".to_string()), "plain missing: {cols:?}");
@@ -2145,14 +2145,14 @@ mod tests {
             "hidden non-excluded must sync: {cols:?}"
         );
         assert!(
-            cols.contains(&"__firelite_security".to_string()),
+            cols.contains(&"__hako_security".to_string()),
             "security replicates by design: {cols:?}"
         );
         for excluded in [
             "__groups",
             "__users",
-            "__firelite_rooms",
-            "__firelite_system",
+            "__hako_rooms",
+            "__hako_system",
         ] {
             assert!(
                 !cols.contains(&excluded.to_string()),

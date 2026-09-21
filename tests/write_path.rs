@@ -202,7 +202,7 @@ fn wal_reserve_skipped_for_internal_collections() {
     let mut doc = HakoDoc::default();
     doc.insert("v", Value::Int(1));
     db.put("user_data", "a", &doc).expect("put");
-    db.put("__firelite_system", "probe", &doc).expect("put");
+    db.put("__hako_system", "probe", &doc).expect("put");
     db.flush().ok();
 
     let wal_len = |col: &str| {
@@ -212,9 +212,9 @@ fn wal_reserve_skipped_for_internal_collections() {
     };
     assert!(wal_len("user_data") >= 4 * 1024 * 1024, "user shard lost its reserve");
     assert!(
-        wal_len("__firelite_system") < 1024 * 1024,
+        wal_len("__hako_system") < 1024 * 1024,
         "system shard carries phantom reserve: {} bytes",
-        wal_len("__firelite_system")
+        wal_len("__hako_system")
     );
     std::fs::remove_dir_all(&dir).ok();
 }

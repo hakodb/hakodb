@@ -309,7 +309,7 @@ impl NetSyncer {
         let room_hash: [u8; 32] = hasher.finalize().into();
 
         let mut shard_offsets = HashMap::new();
-        if let Ok(Some(doc)) = db.get("__firelite_system", "sync_checkpoint") {
+        if let Ok(Some(doc)) = db.get("__hako_system", "sync_checkpoint") {
             if let Some(Value::Map(fields)) = doc.get("offsets") {
                 for (name, val) in fields {
                     if let Value::Int(off) = val { shard_offsets.insert(name.to_string(), *off as u64); }
@@ -607,7 +607,7 @@ impl NetSyncer {
                 let mut offsets = offsets_tail.lock().unwrap();
 
                 // Sync enumeration (hidden included, excluded dropped).
-                // `__firelite_security` rides along by enumeration now —
+                // `__hako_security` rides along by enumeration now —
                 // policies replicate — no manual re-add.
                 let cols = db_tail.sync_collections().unwrap_or_default();
 
@@ -720,7 +720,7 @@ impl NetSyncer {
                         .collect();
                     
                     doc.insert("offsets", Value::Map(map));
-                    let _ = db_tail.put("__firelite_system", "sync_checkpoint", &doc);
+                    let _ = db_tail.put("__hako_system", "sync_checkpoint", &doc);
                     last_checkpoint_save = Instant::now();
                 }
 

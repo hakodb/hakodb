@@ -161,13 +161,20 @@ pub struct SecurityRule {
 
 /// Collections that must never leave the device over sync (net or cloud),
 /// in either direction. Sync-state, room registry, and the admin plane's
-/// credential stores. (`__firelite_security` is deliberately NOT here —
+/// credential stores. (`__hako_security` is deliberately NOT here —
 /// policy documents replicate by design.)
 pub const SYNC_EXCLUDED_COLLECTIONS: &[&str] = &[
-    "__firelite_system",
-    "__firelite_rooms",
+    "__hako_system",
+    "__hako_rooms",
     "__users",
     "__groups",
+    // Pre-rebrand on-disk aliases (see migrate_legacy_collections): a
+    // database last opened by FireLite-era binaries still carries these
+    // directories (after a downgrade, a file-level restore, or a peer
+    // that never migrated). They stay excluded so such data can neither
+    // leak nor poison. Remove in the next minor.
+    "__firelite_system",
+    "__firelite_rooms",
 ];
 
 /// True when `col` must be withheld from all sync tailers and catch-up.
@@ -176,6 +183,84 @@ pub const SYNC_EXCLUDED_COLLECTIONS: &[&str] = &[
 /// per-instance set seeded from this list.
 pub fn is_sync_excluded(col: &str) -> bool {
     SYNC_EXCLUDED_COLLECTIONS.contains(&col)
+}
+
+/// Pre-rebrand directory names and their canonical replacements. Applied
+/// once per open by [`migrate_legacy_collections`]; `__users`/`__groups`
+/// never carried the brand and are not migrated.
+const LEGACY_COLLECTION_RENAMES: &[(&str, &str)] = &[
+    ("__firelite_system", "__hako_system"),
+    ("__firelite_rooms", "__hako_rooms"),
+    ("__firelite_security", "__hako_security"),
+];
+
+/// Rename pre-rebrand internal collection directories to their canonical
+/// names. Runs at the top of [`Hako::open`], before any shard opens:
+/// collections are directories, so a filesystem rename migrates both index
+/// and WAL atomically from the engine's point of view.
+///
+/// Policy per pair: old present + new absent (or new present but empty —
+/// see below) → rename. Both with data (downgrade cycle, manual restore)
+/// → keep both, canonical wins for all reads/writes; the orphan stays
+/// excluded by the alias list above, never syncs, never breaks.
+/// Best-effort by design: any I/O error is logged and open continues — a
+/// half-migrated database still opens.
+///
+/// Empty-new subtlety: normal engine operation auto-creates shard
+/// directories on read probes (e.g. every `put` checks the local-only
+/// marks collection), so a fresh old-layout database usually already has
+/// an EMPTY canonical dir by the time migration runs. A directory counts
+/// as empty — safe to replace — when no file inside it has nonzero
+/// length: at open there is no live memory, so an empty WAL plus empty
+/// segments/blobs means no recoverable data (unflushed Manual buffers
+/// die with the process anyway; orphan blob bytes without WAL docs are
+/// unreachable).
+pub(crate) fn migrate_legacy_collections(root: &Path) {
+    for (old, new) in LEGACY_COLLECTION_RENAMES {
+        let old_dir = root.join(old);
+        if !old_dir.is_dir() {
+            continue;
+        }
+        let new_dir = root.join(new);
+        if new_dir.exists() {
+            if dir_has_data(&new_dir) {
+                crate::util::log::info(&format!(
+                    "migration: both '{old}' and '{new}' hold data, keeping canonical '{new}'"
+                ));
+                continue;
+            }
+            // Empty shell from a read probe — remove so the rename lands.
+            let _ = std::fs::remove_dir_all(&new_dir);
+        }
+        match std::fs::rename(&old_dir, &new_dir) {
+            Ok(()) => crate::util::log::info(&format!(
+                "migration: renamed '{old}' to '{new}'"
+            )),
+            Err(e) => crate::util::log::info(&format!(
+                "migration: could not rename '{old}' to '{new}': {e}"
+            )),
+        }
+    }
+}
+
+/// True when a collection directory holds recoverable data: any file with
+/// nonzero length. Shard directories are flat (`wal.log`, `blobs.dat`,
+/// `segment-*`); I/O errors read as empty (best-effort caller retries the
+/// rename, which then either succeeds or logs its own error).
+fn dir_has_data(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .metadata()
+            .map(|m| m.is_file() && m.len() > 0)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -394,7 +479,7 @@ pub struct Hako {
     /// looks "behind" to a handshake); every sync outbound tailer and both
     /// handshake catch-up paths consult `is_local_only` and skip matches.
     /// Key format is `col\0id` (NUL separator — ids may contain anything).
-    /// Persisted best-effort into `__firelite_system/local_only` so a
+    /// Persisted best-effort into `__hako_system/local_only` so a
     /// restart can't re-tail un-checkpointed local-only ops upstream.
     pub(crate) local_only_cols: RwLock<HashSet<String>>,
     pub(crate) local_only_keys: RwLock<HashSet<String>>,
@@ -414,6 +499,11 @@ impl Hako {
 
         let root_path = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&root_path)?;
+
+        // Pre-rebrand internal collections (`__firelite_*`) become their
+        // canonical names before any shard opens. See
+        // migrate_legacy_collections for the both-present policy.
+        migrate_legacy_collections(&root_path);
 
         // 1. Initialize Channels
         let (index_tx, index_rx) = channel::<IndexOp>();
@@ -1367,7 +1457,7 @@ impl Hako {
         Ok(ids.len())
     }
 
-    /// Best-effort durability for the marks. Lives in `__firelite_system`,
+    /// Best-effort durability for the marks. Lives in `__hako_system`,
     /// which net_sync already excludes from its tail and cloud_sync never
     /// routes (no room prefix) — the marker itself never replicates.
     fn persist_local_only(&self) {
@@ -1378,11 +1468,11 @@ impl Hako {
         let mut doc = HakoDoc::default();
         doc.insert("cols", Value::Array(cols));
         doc.insert("keys", Value::Array(keys));
-        let _ = self.put("__firelite_system", "local_only", &doc);
+        let _ = self.put("__hako_system", "local_only", &doc);
     }
 
     fn restore_local_only(&self) -> Result<()> {
-        let doc = match self.get("__firelite_system", "local_only")? {
+        let doc = match self.get("__hako_system", "local_only")? {
             Some(d) => d,
             None => return Ok(()),
         };
@@ -2562,7 +2652,7 @@ impl Hako {
     pub fn get_version_map(&self) -> std::collections::HashMap<String, i64> {
         let mut map = std::collections::HashMap::new();
         // Sync enumeration (hidden included, excluded dropped) — the manual
-        // `__firelite_security` re-add this replaces is gone: enumeration
+        // `__hako_security` re-add this replaces is gone: enumeration
         // covers it now that sync no longer depends on `_` hiding.
         let cols = self.sync_collections().unwrap_or_default();
         for col in cols {
