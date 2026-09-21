@@ -37,23 +37,17 @@ fn main() {
         println!("cargo:warning=refreshed include/hakodb.h from cbindgen output");
     }
 
-// ponytail: the old copy (dll.lib -> lib) was stale-by-design. It ran
-// BEFORE rustc linked, so lib always lagged one build behind — and stayed
-// there whenever cargo skipped the build script (no source changes). A
-// stale .lib SHADOWS the fresh .dll in MinGW ld search order, producing
-// undefined-reference ghosts for new symbols. Delete it instead: MinGW ld
-// falls through to hakodb.dll directly (always fresh), and no current
-// consumer needs an MSVC import lib (benchmark + Go use MinGW; Pascal
-// keeps its own .a). Deterministic, no timing, no silent staleness.
-// MSVC exception: rustc emits the cdylib import library as
-// `hakodb.dll.lib`, which the release workflow ships (renamed to the
-// conventional `hakodb.lib`) — so the delete below runs on GNU/MinGW
-// targets only, never on MSVC.
+// ponytail: a stale unprefixed import lib SHADOWS the fresh .dll in
+// MinGW ld search order (it ran BEFORE rustc linked, so it always lagged
+// a build behind), producing undefined-reference ghosts for new symbols.
+// Delete it — MinGW ld falls through to hakodb.dll directly (always
+// fresh). MSVC consumers link rustc's `hakodb.dll.lib` (shipped renamed
+// as `hakodb.lib`), so the delete below runs on GNU/MinGW targets only.
 let profile = std::env::var("PROFILE").unwrap_or_else(|_| "release".to_string());
-let target = std::env::var("TARGET").unwrap_or_default();
 let target_dir = std::path::Path::new("target").join(&profile);
 #[cfg(windows)]
 {
+let target = std::env::var("TARGET").unwrap_or_default();
 if !target.contains("msvc") {
     let dst = target_dir.join("hakodb.lib");
     let _ = std::fs::remove_file(&dst);

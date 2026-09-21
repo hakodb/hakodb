@@ -3347,7 +3347,7 @@ pub extern "C" fn hk_query_where_or_int(
 
 // --- IN LOGIC ---
 
-/// Adds an IN filter: field IN [array_items]
+/// Adds an IN filter: field IN `[array_items]`
 /// This takes ownership of the HK_Array and frees it.
 #[no_mangle]
 pub extern "C" fn hk_query_where_in(
