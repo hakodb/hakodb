@@ -251,6 +251,15 @@ impl<'a> HakoDocView<'a> {
     pub fn iter(&self) -> HakoDocIter<'a> {
         HakoDocIter { bytes: self.bytes, pos: 12, remaining: self.fields_count }
     }
+    /// Raw framing walk: yields key BYTES without UTF-8 validation, plus
+    /// tag and value slice. For filter matching only — byte-compare keys,
+    /// never materialize. Skipped (non-matching) fields cost pointer bumps
+    /// alone; validation happens exactly once, on the owned-decode path
+    /// that accepted rows take anyway (so corrupt keys still reject: the
+    /// body scan below fails them, same outcome as validating here).
+    pub fn iter_raw(&self) -> HakoDocRawIter<'a> {
+        HakoDocRawIter { bytes: self.bytes, pos: 12, remaining: self.fields_count }
+    }
     /// Field count from the header, without walking the framing.
     pub(crate) fn field_count(&self) -> usize {
         self.fields_count as usize
@@ -350,6 +359,71 @@ impl DocView {
         None
     }
 
+    /// Pull a nested value by dotted path (`profile.sub_03`): descends
+    /// through Map values only, decoding nothing but the terminal —
+    /// siblings, ancestors, and skipped subtrees cost framing skips.
+    /// Single-segment paths behave exactly like [`Self::get`]. Returns
+    /// None on any miss, on descent into a non-Map value, on empty
+    /// segments, or on corrupt framing.
+    pub fn get_path(&self, path: &str) -> Option<Value> {
+        let mut segs = path.split('.');
+        let first = segs.next()?;
+        if first.is_empty() {
+            return None;
+        }
+        // Top level uses the same walk as `get`, but keeps the raw value
+        // span so descent avoids a decode-then-re-encode round trip.
+        let bytes: &[u8] = &self.bytes;
+        let mut pos = 12usize;
+        let mut cur: Option<(u8, &[u8])> = None;
+        for _ in 0..self.fields_count {
+            let k_len = *bytes.get(pos)? as usize;
+            pos += 1;
+            let key = std::str::from_utf8(bytes.get(pos..pos + k_len)?).ok()?;
+            pos += k_len;
+            let tag = *bytes.get(pos)?;
+            pos += 1;
+            let start = pos;
+            skip_value(tag, bytes, &mut pos)?;
+            if key == first {
+                cur = Some((tag, &bytes[start..pos]));
+                break;
+            }
+        }
+        let (mut tag, mut span) = cur?;
+        // One Map level per remaining segment; the terminal decodes once.
+        // Key validation mirrors `get`: every key the traversal touches
+        // must be valid UTF-8, corrupt keys reject.
+        for seg in segs {
+            if seg.is_empty() || tag != 8 {
+                return None;
+            }
+            // Map body: [len u32][count u16][entries].
+            let count = u16::from_le_bytes(span.get(4..6)?.try_into().ok()?) as usize;
+            let mut p = 6usize;
+            let mut hit = None;
+            for _ in 0..count {
+                let k_len = *span.get(p)? as usize;
+                p += 1;
+                let key = span.get(p..p + k_len)?;
+                p += k_len;
+                let t = *span.get(p)?;
+                p += 1;
+                let s = p;
+                let mut q = s;
+                skip_value(t, span, &mut q)?;
+                std::str::from_utf8(key).ok()?;
+                if key == seg.as_bytes() {
+                    hit = Some((t, &span[s..q]));
+                    break;
+                }
+                p = q;
+            }
+            (tag, span) = hit?;
+        }
+        decode_value(tag, span)
+    }
+
     /// Iterate `(key, borrowed value)` pairs without materializing.
     pub fn iter(&self) -> impl Iterator<Item = (&str, BorrowedValue<'_>)> + '_ {
         let bytes: &[u8] = &self.bytes;
@@ -401,21 +475,56 @@ impl<'a> Iterator for HakoDocIter<'a> {
         self.pos += k_len;
         let tag = *self.bytes.get(self.pos)?;
         self.pos += 1;
-        
+
         let start = self.pos;
         skip_value(tag, self.bytes, &mut self.pos)?;
         let data = &self.bytes[start..self.pos];
-        
+
+        self.remaining -= 1;
+        Some((key, tag, data))
+    }
+}
+
+/// Unvalidating framing cursor: identical traversal to [`HakoDocIter`]
+/// minus the per-key UTF-8 check. Match-only callers (filter byte-compare)
+/// use this; any row they accept is validated downstream by the owned
+/// decode, so skipping validation here changes no outcome.
+pub struct HakoDocRawIter<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    remaining: u16,
+}
+
+impl<'a> Iterator for HakoDocRawIter<'a> {
+    type Item = (&'a [u8], u8, &'a [u8]);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 { return None; }
+        let k_len = *self.bytes.get(self.pos)? as usize;
+        self.pos += 1;
+        let key = self.bytes.get(self.pos..self.pos + k_len)?;
+        self.pos += k_len;
+        let tag = *self.bytes.get(self.pos)?;
+        self.pos += 1;
+
+        let start = self.pos;
+        skip_value(tag, self.bytes, &mut self.pos)?;
+        let data = &self.bytes[start..self.pos];
+
         self.remaining -= 1;
         Some((key, tag, data))
     }
 }
 
 pub(crate) fn skip_value(tag: u8, bytes: &[u8], pos: &mut usize) -> Option<()> {
-    if tag >= 0xC0 && tag <= 0xC3 { return Some(()); } 
-    if (tag & 0xF0) == 0x10 { return Some(()); }       
-    if (tag & 0xF8) == 0x40 {                          
+    if tag >= 0xC0 && tag <= 0xC3 { return Some(()); }
+    if (tag & 0xF0) == 0x10 { return Some(()); }
+    if (tag & 0xF8) == 0x40 {
         *pos += (tag & 0x07) as usize;
+        // ponytail: the inline-length arm above is the only unchecked
+        // advance — a corrupt tag can overshoot the buffer, and every
+        // caller slices [start..pos] afterwards. Fail here instead of
+        // panicking there (found via dotted-path fuzzing).
+        if *pos > bytes.len() { return None; }
         return Some(());
     }
 

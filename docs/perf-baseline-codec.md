@@ -70,3 +70,19 @@ in both directions across runs confirms the noise floor dominates.
 GATE RESULT: PASS both runs. Batch/Single moved although the write path
 is untouched — machine variance, not the fix. All relative invariants
 (Qry≥0.85Cmp, Off/Cur within 2x, Get>5xQry, Batch≥0.5Single) hold.
+
+## Batch 2 (lazy validation + dotted pulls)
+
+Baseline (debug, same box): decode/sub25 60555, view+pull/sub25-whole
+51969, q-filtered 41ms, q-gt 96ms.
+
+After: view+pull/sub25-dotted (`get_path("profile.sub_03")`) = **2952ns
+vs 52296ns whole-subtree — 17.7x**. Query-level numbers move within
+noise (paths already optimal there); the win is targeted nested access.
+
+Corrections to the study report: `skip_value` honors len prefixes with
+O(1) jumps (no double-walk exists), so proposal B was withdrawn before
+implementation. Nested cost is allocation + validation volume, and the
+fixed `0x40` short-string arm of `skip_value` could overshoot the buffer
+and panic downstream slicers on corrupt input — now fails closed (found
+by the new truncation fuzz in `tests/codec_paths.rs`).

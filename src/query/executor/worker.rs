@@ -176,12 +176,15 @@ pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::que
     }
 
     if fast {
-        // PASS 1: match on encoded bytes, no decode, no allocation.
+        // PASS 1: match on encoded bytes, no decode, no allocation, no
+        // UTF-8 validation (raw key bytes compared directly; rows this
+        // accepts are validated by the owned body scan below, rejected
+        // rows are discarded either way — same outcomes, less work).
         ENC_SCRATCH.with(|scratch| {
             let mut enc = scratch.borrow_mut();
-            for (key, tag, data) in view.iter() {
+            for (key, tag, data) in view.iter_raw() {
                 for (i, f) in plan.filters.iter().enumerate() {
-                    if and_matches[i] || key != f.field { continue; }
+                    if and_matches[i] || key != f.field.as_bytes() { continue; }
                     enc.clear();
                     HakoDoc::encode_value_to(&f.value, &mut enc);
                     let hit = enc.first().copied() == Some(tag) && &enc[1..] == data;
