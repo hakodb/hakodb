@@ -1,11 +1,13 @@
 fn main() {
+    // (touch: force build-script rerun after OUT_DIR migration)
     let crate_dir = std::env::var("CARGO_MANIFEST_DIR").expect("manifest dir should exist");
-    let output = std::path::Path::new(&crate_dir)
-        .join("include")
-        .join("hako.h");
-
-    std::fs::create_dir_all(output.parent().expect("header parent should exist"))
-        .expect("failed to create include directory");
+    // ponytail: generated header goes to OUT_DIR, never the source tree —
+    // `cargo publish --verify` (and good hygiene generally) forbids build
+    // scripts from touching anything outside OUT_DIR. The checked-in
+    // include/hako.h that C consumers actually use is refreshed explicitly:
+    // HAKODB_REGEN_HEADER=1 cargo build. CI/on-demand diff keeps it honest.
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR should exist");
+    let output = std::path::Path::new(&out_dir).join("hako.h");
 
     // ponytail: absolute path — a relative "cbindgen.toml" silently misses
     // (build-script cwd is not guaranteed to be the package root), and
@@ -19,11 +21,21 @@ fn main() {
         .map_err(|e| format!("read {}: {e}", cbindgen_toml.display()))
         .expect("cbindgen.toml must load — refusing silent-default ABI header");
     cbindgen::Builder::new()
-        .with_crate(crate_dir)
+        .with_crate(crate_dir.clone())
         .with_config(cfg)
         .generate()
         .expect("Unable to generate C header")
-        .write_to_file(output);
+        .write_to_file(&output);
+    // Opt-in refresh of the checked-in header for C consumers + release
+    // assets. Deliberately env-gated so normal builds (and publish verify)
+    // stay side-effect free.
+    if std::env::var("HAKODB_REGEN_HEADER").is_ok() {
+        let checked_in = std::path::Path::new(&crate_dir)
+            .join("include")
+            .join("hako.h");
+        std::fs::copy(&output, &checked_in).expect("refresh checked-in hako.h");
+        println!("cargo:warning=refreshed include/hako.h from cbindgen output");
+    }
 
 // ponytail: the old copy (dll.lib -> lib) was stale-by-design. It ran
 // BEFORE rustc linked, so lib always lagged one build behind — and stayed
