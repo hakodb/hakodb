@@ -92,8 +92,16 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          path: assets
-          merge-multiple: true
+          name: hakodb-${{ github.ref_name }}-x86_64-pc-windows-msvc
+          path: assets/windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: hakodb-${{ github.ref_name }}-x86_64-unknown-linux-gnu
+          path: assets/linux
+      - uses: actions/download-artifact@v4
+        with:
+          name: hakodb-${{ github.ref_name }}-aarch64-linux-android
+          path: assets/android
       # Flat staging with target-qualified names: deterministic download
       # URLs regardless of how the uploader preserves directories.
       # Consumers rename to canonical names on download (see each
@@ -101,12 +109,12 @@ jobs:
       - name: Stage flat release files
         run: |
           mkdir -p release
-          cp assets/hakodb-*-x86_64-pc-windows-msvc/hakodb.dll release/hakodb-x86_64-pc-windows-msvc.dll
-          cp assets/hakodb-*-x86_64-pc-windows-msvc/hakodb.lib release/hakodb-x86_64-pc-windows-msvc.lib
-          cp assets/hakodb-*-x86_64-unknown-linux-gnu/libhakodb.so release/libhakodb-x86_64-unknown-linux-gnu.so
-          cp assets/hakodb-*-x86_64-unknown-linux-gnu/libhakodb.rlib release/libhakodb-x86_64-unknown-linux-gnu.rlib
-          cp assets/hakodb-*-aarch64-linux-android/libhakodb.so release/libhakodb-aarch64-linux-android.so
-          cp assets/hakodb-*-x86_64-pc-windows-msvc/hako.h release/hako.h
+          cp assets/windows/hakodb.dll release/hakodb-x86_64-pc-windows-msvc.dll
+          cp assets/windows/hakodb.lib release/hakodb-x86_64-pc-windows-msvc.lib
+          cp assets/linux/libhakodb.so release/libhakodb-x86_64-unknown-linux-gnu.so
+          cp assets/linux/libhakodb.rlib release/libhakodb-x86_64-unknown-linux-gnu.rlib
+          cp assets/android/libhakodb.so release/libhakodb-aarch64-linux-android.so
+          cp assets/windows/hako.h release/hako.h
           (cd release && sha256sum * > SHA256SUMS)
       - uses: softprops/action-gh-release@v2
         with:
