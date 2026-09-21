@@ -67,10 +67,14 @@ jobs:
       - name: Build cdylib for aarch64-linux-android (API 21)
         run: |
           NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
-          CLANG="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CLANG="$BIN/aarch64-linux-android21-clang"
           export CC_aarch64_linux_android="$CLANG"
           export CXX_aarch64_linux_android="${CLANG}++"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CLANG"
+          # cc-rs (ring, aws-lc-sys) looks for the archiver under the
+          # target-prefixed name; the NDK only ships it as llvm-ar.
+          export AR_aarch64_linux_android="$BIN/llvm-ar"
           cargo build --release --target aarch64-linux-android
       - name: Collect assets
         run: |
