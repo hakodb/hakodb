@@ -251,6 +251,10 @@ impl<'a> HakoDocView<'a> {
     pub fn iter(&self) -> HakoDocIter<'a> {
         HakoDocIter { bytes: self.bytes, pos: 12, remaining: self.fields_count }
     }
+    /// Field count from the header, without walking the framing.
+    pub(crate) fn field_count(&self) -> usize {
+        self.fields_count as usize
+    }
 }
 
 pub struct BorrowedValue<'a> {

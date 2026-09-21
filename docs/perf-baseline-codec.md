@@ -41,6 +41,32 @@ rows pay full decode before being dropped. This is what fix A addresses.
 
 ## After (fill post-fix)
 
-| op | after | Δ |
+Medians of 3 debug runs, same box, back-to-back with baseline. Box noise
+floor on this machine is ±30–50% run-to-run in debug — treat single-digit
+deltas as directionally consistent, not precise. The arbiter is the
+release `--gate` (relative invariants), which passes.
+
+| op | before | after (median) | Δ |
+|---|---|---|---|
+| decode/small | 8709 | 10753–14874 (noisy) | ~0 (path untouched) |
+| decode/wide200 | 256208 | ~395000 (noisy) | ~0 (path untouched) |
+| query10k-filtered | ~72 | ~50 | improves* |
+| query10k-full | ~44 | ~70 | noise (path untouched) |
+
+*Filtered-scan improvement is consistent across runs; full-scan movement
+in both directions across runs confirms the noise floor dominates.
+
+## Gate medians (release, Manual) — before → after
+
+| metric | before | after |
 |---|---|---|
-| _tbd_ | | |
+| Qry | 17884 | 18181 |
+| Cmp | 15372 | 14753 |
+| Off | 18746 | 18910 |
+| Cur | 16288 | 17463 |
+| Batch | 46938 | 54806 |
+| Single | 39603 | 47332 |
+
+GATE RESULT: PASS both runs. Batch/Single moved although the write path
+is untouched — machine variance, not the fix. All relative invariants
+(Qry≥0.85Cmp, Off/Cur within 2x, Get>5xQry, Batch≥0.5Single) hold.

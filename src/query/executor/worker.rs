@@ -199,7 +199,7 @@ pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::que
 
     // 2/3. Body Field Scanning (Decodes every field for the final object).
     // Slow path reaches here directly; fast path only for proven winners.
-    let mut fields = Vec::with_capacity(view.iter().count()); 
+    let mut fields = Vec::with_capacity(view.field_count()); 
     for (key, tag, data) in view.iter() {
         let val = crate::document::hako_doc::decode_value(tag, data)?;
 
@@ -228,9 +228,12 @@ pub(crate) fn unified_match_projected(doc_id: &str, bytes: &[u8], plan: &crate::
 
     let mut extracted = Vec::with_capacity(plan.projection.len());
     for (key, tag, data) in view.iter() {
-        let is_needed_for_filter = plan.filters.iter().any(|f| f.field == key) || 
+        let is_needed_for_filter = plan.filters.iter().any(|f| f.field == key) ||
                                    plan.or_groups.iter().any(|g| g.iter().any(|f| f.field == key));
-        let is_needed_for_proj = plan.projection.contains(&key.to_string());
+        // ponytail: borrow-compare the projection list — the old
+        // `projection.contains(&key.to_string())` allocated one String per
+        // field per row just to compare.
+        let is_needed_for_proj = plan.projection.iter().any(|p| p == key);
 
         if is_needed_for_filter || is_needed_for_proj {
             let val = crate::document::hako_doc::decode_value(tag, data)?;
