@@ -25,7 +25,7 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
 
 ### v0.8.21 — rebrand to HakoDB
 - Crate `hakodb`, main type `Hako` (`HakoConfig`, `HakoDoc`,
-  `HakoError`), FFI prefix `HK_*`/`hk_*`, header `include/hako.h`,
+  `HakoError`), FFI prefix `HK_*`/`hk_*`, header `include/hakodb.h`,
   binaries `hakodb.dll` / `libhakodb.so`.
 - Data plane migrates on open: `__firelite_*` directories become their
   `__hako_*` canonical names with data intact (both-present keeps
@@ -185,12 +185,12 @@ See [`example/rust/basic`](example/rust/basic) for a complete, working example o
 
 ## Multi-language platform support (C ABI)
 
-HakoDB exposes a flat C ABI for Node.js/Python/C++/C# and other integration layers. Opaque handle types are defined in `include/hako.h`.
+HakoDB exposes a flat C ABI for Node.js/Python/C++/C# and other integration layers. Opaque handle types are defined in `include/hakodb.h`.
 
 ### Build artifacts
 
 - Cargo crate types: `cdylib` (dynamic library consumers) and `rlib` (Rust consumers).
-- Auto-generated C header via `build.rs` + `cbindgen.toml`: `include/hako.h`.
+- Auto-generated C header via `build.rs` + `cbindgen.toml`: `include/hakodb.h`.
 
 ```bash
 cargo build --release
@@ -462,7 +462,7 @@ HakoDB lives under the [`hakodb`](https://github.com/hakodb) organization
 
 | Repo | Delivers | Version |
 |---|---|---|
-| [`hakodb/hakodb`](https://github.com/hakodb/hakodb) | Core library: engine, storage, query, FFI (`hako.h`), net/cloud sync | 0.8.21 |
+| [`hakodb/hakodb`](https://github.com/hakodb/hakodb) | Core library: engine, storage, query, FFI (`hakodb.h`), net/cloud sync | 0.8.21 |
 | [`hakodb/hakocli`](https://github.com/hakodb/hakocli) | Command-line manager + serve REPL | 0.2.1 |
 | [`hakodb/hakocloudserver`](https://github.com/hakodb/hakocloudserver) | Managed sync hub + admin console | 0.1.1 |
 | [`hakodb/hakotauri`](https://github.com/hakodb/hakotauri) | Tauri gateway crate (Rust) | 0.1.1 |
@@ -533,7 +533,7 @@ API (HakoDB + FFI + SDKs)
 | Indexing | `src/index/*` | Implemented |
 | Query planner/executor | `src/query/*` | Implemented |
 | Document model | `src/document/*` | Implemented |
-| C-FFI | `src/ffi.rs`, `include/hako.h` | Implemented |
+| C-FFI | `src/ffi.rs`, `include/hakodb.h` | Implemented |
 
 ---
 

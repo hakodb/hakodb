@@ -34,7 +34,7 @@ build_linux() {
     cp "$RELEASE_DIR/libhakodb.so" \
         "$RELEASE_DIR/libhakodb.rlib" \
         "$RELEASE_DIR/libhakodb.d" \
-        "$ROOT_DIR/include/hako.h" \
+        "$ROOT_DIR/include/hakodb.h" \
         "$LINUX_DIR/"
 
     rm -f "$LINUX_ARCHIVE"

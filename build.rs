@@ -7,7 +7,7 @@ fn main() {
     // include/hako.h that C consumers actually use is refreshed explicitly:
     // HAKODB_REGEN_HEADER=1 cargo build. CI/on-demand diff keeps it honest.
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR should exist");
-    let output = std::path::Path::new(&out_dir).join("hako.h");
+    let output = std::path::Path::new(&out_dir).join("hakodb.h");
 
     // ponytail: absolute path — a relative "cbindgen.toml" silently misses
     // (build-script cwd is not guaranteed to be the package root), and
@@ -32,9 +32,9 @@ fn main() {
     if std::env::var("HAKODB_REGEN_HEADER").is_ok() {
         let checked_in = std::path::Path::new(&crate_dir)
             .join("include")
-            .join("hako.h");
-        std::fs::copy(&output, &checked_in).expect("refresh checked-in hako.h");
-        println!("cargo:warning=refreshed include/hako.h from cbindgen output");
+            .join("hakodb.h");
+        std::fs::copy(&output, &checked_in).expect("refresh checked-in hakodb.h");
+        println!("cargo:warning=refreshed include/hakodb.h from cbindgen output");
     }
 
 // ponytail: the old copy (dll.lib -> lib) was stale-by-design. It ran
