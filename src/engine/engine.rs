@@ -168,13 +168,6 @@ pub const SYNC_EXCLUDED_COLLECTIONS: &[&str] = &[
     "__hako_rooms",
     "__users",
     "__groups",
-    // Pre-rebrand on-disk aliases (see migrate_legacy_collections): a
-    // database last opened by pre-rebrand binaries still carries these
-    // directories (after a downgrade, a file-level restore, or a peer
-    // that never migrated). They stay excluded so such data can neither
-    // leak nor poison. Remove in the next minor.
-    "__firelite_system",
-    "__firelite_rooms",
 ];
 
 /// True when `col` must be withheld from all sync tailers and catch-up.
@@ -201,8 +194,9 @@ const LEGACY_COLLECTION_RENAMES: &[(&str, &str)] = &[
 ///
 /// Policy per pair: old present + new absent (or new present but empty —
 /// see below) → rename. Both with data (downgrade cycle, manual restore)
-/// → keep both, canonical wins for all reads/writes; the orphan stays
-/// excluded by the alias list above, never syncs, never breaks.
+/// → keep both, canonical wins for all reads/writes; a leftover orphan is
+/// an operator cleanup item (it is an ordinary collection name now — the
+/// pre-rebrand aliases left SYNC_EXCLUDED in 0.8.22).
 /// Best-effort by design: any I/O error is logged and open continues — a
 /// half-migrated database still opens.
 ///

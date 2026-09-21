@@ -6,11 +6,22 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 HakoDB speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.8.21 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.8.22 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.8.21)
+## What's new (0.7.2 → 0.8.22)
+
+### v0.8.22 — pre-rebrand aliases removed
+- `SYNC_EXCLUDED` no longer recognizes the `__firelite_*` spellings;
+  the open-time migration (`__firelite_*` → `__hako_*`) stays as the
+  upgrade path — databases last opened by ≤0.8.20 migrate on first open
+  with 0.8.21+. Leftover orphans from downgrade cycles are ordinary
+  collection names now: remove them manually.
+- Satellite repos renamed dash-less (`hakocli`, `hakocloudserver`,
+  `hakotauri`, `hakobench`, `hakogo`, `hakojs`, `hakopascal`,
+  `hakotaurits`); `hakodb 0.8.21` published to crates.io,
+  `@hakodb/client` + `@hakodb/tauri` to npm.
 
 ### v0.8.21 — rebrand to HakoDB
 - Crate `hakodb`, main type `Hako` (`HakoConfig`, `HakoDoc`,
@@ -36,25 +47,10 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
   workflow ships `.dll`+`.lib` (Windows), `.so`+`.rlib` (Linux),
   Android `aarch64` `.so`, all with headers + checksums.
 
-### v0.8.19 — excluded-plane enforcement on all cloud paths
-- **Correctness fix (sync)**: a hostile `Replication{collection:"__groups"}`
-  was applied — server planted an `alpha___groups` shard and the relay
-  rebuilt the packet under the plain name, poisoning every room member's
-  real credential store. `flush_ingest_buffer` now drops excluded batches
-  in either namespace (single choke point for client+server ingest, also
-  suppresses relay); server tailer, client catch-up push, and catch-up
-  serve skip excluded names (source-side, protects unpatched peers).
-  Regression test `ingest_drops_sync_excluded_plane` fails without the
-  fix, passes with it.
-
-- Older releases: see [CHANGELOG.md](CHANGELOG.md).
-
----
-
 ## Table of Contents
 
 - [What is HakoDB?](#what-is-hakodb)
-- [What's new (0.7.2 → 0.8.21)](#whats-new-072--0821)
+- [What's new (0.7.2 → 0.8.22)](#whats-new-072--0822)
 - [Changelog (older releases)](CHANGELOG.md)
 - [When to use HakoDB (sync vs non-sync)](#when-to-use-hakodb-sync-vs-non-sync)
 - [Key features](#key-features)

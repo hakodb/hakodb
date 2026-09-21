@@ -70,18 +70,20 @@ fn legacy_dirs_migrate_with_data_intact() {
         assert_eq!(get("__users", "admin"), Some(Value::Int(4)));
         assert_eq!(get("users", "alice"), Some(Value::Int(5)));
 
-        // Exclusion holds on both spellings: canonical and alias alike.
-        for col in [
-            "__hako_system",
-            "__hako_rooms",
-            "__firelite_system",
-            "__firelite_rooms",
-            "__users",
-            "__groups",
-        ] {
+        // Exclusion holds on the canonical plane. Pre-rebrand spellings
+        // are ordinary names since 0.9.0 (aliases removed) — only the
+        // migration renames them, and only when the canonical side is
+        // absent-or-empty.
+        for col in ["__hako_system", "__hako_rooms", "__users", "__groups"] {
             assert!(
                 db.is_sync_excluded_effective(col),
                 "{col} must be sync-excluded"
+            );
+        }
+        for col in ["__firelite_system", "__firelite_rooms"] {
+            assert!(
+                !db.is_sync_excluded_effective(col),
+                "{col} must NOT be excluded anymore"
             );
         }
         assert!(!db.is_sync_excluded_effective("users"));
@@ -102,8 +104,10 @@ fn legacy_dirs_migrate_with_data_intact() {
 #[test]
 fn both_present_keeps_canonical_and_orphan() {
     // Downgrade cycle: canonical exists AND legacy reappears (old binary
-    // ran, file-level restore). Canonical wins; the orphan stays excluded
-    // and inert — never merged, never synced, never deleted.
+    // ran, file-level restore). Canonical wins; the orphan stays on disk
+    // untouched (never merged, never deleted) — since 0.9.0 it is an
+    // ordinary collection name again, so operators should remove such
+    // orphans manually.
     let dir = temp_dir("both");
     {
         let db = open_manual(&dir);
@@ -121,10 +125,8 @@ fn both_present_keeps_canonical_and_orphan() {
             .unwrap()
             .expect("canonical doc missing");
         assert_eq!(keep.get("v").cloned(), Some(Value::Int(10)));
-        // Orphan dir still on disk (never deleted) but excluded.
+        // Orphan dir still on disk (never deleted by the engine).
         assert!(dir.join("__firelite_system").is_dir());
-        assert!(db.is_sync_excluded_effective("__firelite_system"));
-        assert!(!db.sync_collections().unwrap().contains(&"__firelite_system".to_string()));
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
