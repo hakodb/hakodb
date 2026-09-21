@@ -12,13 +12,13 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
 
 ## What's new (0.7.2 → 0.8.21)
 
-### v0.8.21 — rebrand to HakoDB (formerly FireLite)
+### v0.8.21 — rebrand to HakoDB
 - Crate `hakodb`, main type `Hako` (`HakoConfig`, `HakoDoc`,
   `HakoError`), FFI prefix `HK_*`/`hk_*`, header `include/hako.h`,
-  binaries `hakodb.dll` / `libhakodb.so`. Formerly FireLite — old
-  names survive only in the changelog history below.
-- Data plane unchanged: `__firelite_*` on-disk names persist until the
-  migration release, so existing databases open untouched.
+  binaries `hakodb.dll` / `libhakodb.so`.
+- Data plane migrates on open: `__firelite_*` directories become their
+  `__hako_*` canonical names with data intact (both-present keeps
+  canonical; old spellings stay sync-excluded as aliases).
 - Fixed along the way: `cbindgen.toml` never loaded (relative path +
   unknown fields → silent C++ defaults for years); the header is real
   C now, with `extern "C"` guards for C++ consumers.
@@ -31,7 +31,7 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
   (`plan_for_watch`, `matches_watch`, `get_raw_bytes`) carrying the
   exact zero-decode cost of the former in-tree path; the Tauri gateway
   module + `tauri`/`rmpv` deps leave the core.
-- **MSVC-ready build**: `build.rs` keeps `firelite.lib` on MSVC targets
+- **MSVC-ready build**: `build.rs` keeps `hakodb.lib` on MSVC targets
   (GNU/MinGW keeps the stale-shadow delete); the tag-triggered release
   workflow ships `.dll`+`.lib` (Windows), `.so`+`.rlib` (Linux),
   Android `aarch64` `.so`, all with headers + checksums.
@@ -64,7 +64,7 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
   disks; decisive on cloud disks with slow file-growth metadata.
   Internal (`__`) collections still skip it.
 - **Maintenance hold**: `background_maintenance=false` (config +
-  `fl_config_set_background_maintenance` + bench `--no-maintenance`,
+  `hk_config_set_background_maintenance` + bench `--no-maintenance`,
   wired in Go/Pascal/JS) pauses the 5s checkpoint/compaction tick for
   flat bench rounds; engine stays correct.
 - Re-measured Always singles post-fix (local, `--no-maintenance`):
@@ -129,23 +129,23 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
   Covers all four background stages, including async index updates
   (new in-flight counter; std mpsc has no `len`) and a new
   maintenance flag on the 5s system thread.
-- FFI: `fl_engine_await_quiescent` + `fl_engine_quiescence_status`
+- FFI: `hk_engine_await_quiescent` + `hk_engine_quiescence_status`
   (JSON). CLI waits for quiescence after open (was readiness-only —
   cursor queries pre-settle repeat rows). `benchmark.cpp` settles
   before scan stages.
 - Gate: `Batch>=0.5xSingle` (Manual-mode thin margins: batch and
   single do near-identical work per doc without fsync; observed median
   0.82x on load — the tripwire now catches breakage, not noise).
-- Test-link fix: integration tests link `firelite.dll` (fresh import
-  lib) instead of `firelite.lib` (deleted by build.rs to stop shadow
+- Test-link fix: integration tests link `hakodb.dll` (fresh import
+  lib) instead of `hakodb.lib` (deleted by build.rs to stop shadow
   staleness) — the 1181 break this caused, resolved properly.
 
 ### v0.8.13 — views across SDKs; node backend resurrected
 - **Go**: `ViewDoc` (`GetView`, `GetInt/Float/Bool/String/Bytes`,
   `HasField`, `ToDoc`) + `CursorWalkView` via a second cgo trampoline.
   Builds clean under GCC 16.
-- **Pascal** (FPC-clean): view imports, `TFLViewDoc`, `TFLQuery.WalkView`,
-  `TFireLite.GetView`.
+- **Pascal** (FPC-clean): view imports, `THKViewDoc`, `THKQuery.WalkView`,
+  `THako.GetView`.
 - **JS**: point-view numerics + `ViewDocSnapshot`/`viewDoc` on both
   backends and the client (`tsc` clean; koffi verified end-to-end
   against the real DLL). Strings and walk callbacks stay on
@@ -159,8 +159,8 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
   `OnSnapshotCB` vs the registered proto name, and auto-decoded
   `char*` returns that leak + crash on free. Fixed with upfront
   opaques, the proto name, and a disposable string type wired to
-  `fl_string_free` (never C free — Rust allocator). Also caught a
-  glued `#[no_mangle]` that hid `fl_rawdoc_to_doc` from the DLL while
+  `hk_string_free` (never C free — Rust allocator). Also caught a
+  glued `#[no_mangle]` that hid `hk_rawdoc_to_doc` from the DLL while
   rlib tests passed.
 
 ### v0.8.12 — gate margin hardening + stale import lib, fixed
@@ -177,13 +177,13 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
   proven by relink. No consumer needed the MSVC lib.
 
 ### v0.8.11 — FFI views + lazy-vs-lazy benchmark stage
-- `FL_ViewDoc` + 9 functions (`fl_view_get/free`, `field_count`,
+- `HK_ViewDoc` + 9 functions (`hk_view_get/free`, `field_count`,
   `has_field`, typed `get_int/float/bool/str/bytes`, `to_doc`) and
-  `fl_cursor_walk_view` with `FlViewWalkCallback` (borrowed id + view
+  `hk_cursor_walk_view` with `HkViewWalkCallback` (borrowed id + view
   handle, valid for the call only — stack-slot views, no alloc, no
   free protocol). Strict scalar matches; views never inflate (resolve
-  via `to_doc` + `fl_doc_resolve_blobs`).
-- Both harnesses gain the lazy stage: FireLite 2-pull view walk vs
+  via `to_doc` + `hk_doc_resolve_blobs`).
+- Both harnesses gain the lazy stage: HakoDB 2-pull view walk vs
   SQLite narrow id/tenant/age select. Measured at 10k complex docs:
   **893k vs 1.11M (0.8x)** — same work, honestly close; our remainder
   is per-row framing walks (tenant sorts last) + callback hops.
@@ -204,10 +204,10 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
   The lazy-vs-lazy comparison SQLite's shape always deserved is now
   winnable on our side too.
 
-### v0.8.9 — benchmark scan parity (FireLite vs SQLite, 1:1)
+### v0.8.9 — benchmark scan parity (HakoDB vs SQLite, 1:1)
 - Both harnesses grow the same full-scan trio (×5 iters, printed after
   the matrix): decoded forward/reverse over all live docs plus a
-  byte/key-only scan (`fl_cursor_walk` vs id-column select). Same stage
+  byte/key-only scan (`hk_cursor_walk` vs id-column select). Same stage
   order (scans run before bulk delete), same math, row counts printed
   for verification.
 - Measured head-to-head, same box: at 10k complex docs, decoded
@@ -220,14 +220,14 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
   buffers). Raw is where the designs meet, and the walk leads there.
 
 ### v0.8.8 — SDK wiring: raw + walk everywhere it fits
-- **Go** (`go/firelite`): vendored header + `RawDoc`/`RawResultSet`
+- **Go** (`go/hakodb`): vendored header + `RawDoc`/`RawResultSet`
   (`ExecuteQueryRaw`, `Bytes`, `ID`, `StartAfterRaw`, `ToDoc`) and
   `Engine.CursorWalk` via a `cgo.Handle` trampoline (same pattern as the
   watch bridge; builds clean under GCC 16). `IsIndexesReady` already
   existed.
-- **Pascal** (`FireLiteRaw` + `FireLite.pas`, both compile under FPC
-  3.2.2): raw imports, `TFLRawDoc`/`TFLRawResultSet`,
-  `TFLQuery.ExecuteRaw`/`StartAfterRaw`/`Walk` with `TFL_WalkCallback`.
+- **Pascal** (`HakoDBRaw` + `HakoDB.pas`, both compile under FPC
+  3.2.2): raw imports, `THKRawDoc`/`THKRawResultSet`,
+  `THKQuery.ExecuteRaw`/`StartAfterRaw`/`Walk` with `THK_WalkCallback`.
 - **JS** (`native.ts` both backends + `client.ts`, `tsc` clean):
   `queryExecuteRaw`, raw set accessors, `queryStartAfterRaw`,
   `rawDocToDoc`, plus `RawQuerySnapshot`/`getRaw`/`startAfterRaw` at the
@@ -265,7 +265,7 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
   matrix (changing it needs per-blob type tags — separate decision).
 
 ### v0.8.6 — FFI walk: 1.64M docs/s over the ABI
-- `fl_cursor_walk(engine, query, cb, userdata)` + `FlWalkCallback`
+- `hk_cursor_walk(engine, query, cb, userdata)` + `HkWalkCallback`
   typedef (header-regenerated): one FFI call per scan, borrowed
   `(id, id_len, bytes, bytes_len)` per row, `false` stops early,
   returns rows visited / -1 on error. C cannot unwind so the trampoline
@@ -302,15 +302,15 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
   the design review, cleared with room to spare.
 
 ### v0.8.3 — raw FFI surface for byte-fair benchmarks
-- `FL_RawDoc` / `FL_RawResultSet` + 7 functions (`fl_query_execute_raw`,
-  `fl_rawresult_{count,get,free}`, `fl_rawdoc_{bytes,id}`,
-  `fl_query_start_after_raw`, `fl_rawdoc_to_doc`). Same slab + borrowed
-  contract as the decoded path; same `FL_Query` builders (raw forced
+- `HK_RawDoc` / `HK_RawResultSet` + 7 functions (`hk_query_execute_raw`,
+  `hk_rawresult_{count,get,free}`, `hk_rawdoc_{bytes,id}`,
+  `hk_query_start_after_raw`, `hk_rawdoc_to_doc`). Same slab + borrowed
+  contract as the decoded path; same `HK_Query` builders (raw forced
   internally). Measured in-process: **~670k docs/s** over the ABI vs
   ~1.03M native raw (the gap is per-row id copies on the caller side)
   vs MDBX 3.66M pointer bumps — remaining 5x is per-row allocs + HashMap
   that only a zero-alloc cursor-callback API would remove. Honest
-  raw-vs-raw comparison is now possible; `t_firelite.cc` needs its raw
+  raw-vs-raw comparison is now possible; `t_hakodb.cc` needs its raw
   branch (caller side).
 
 ### v0.8.2 — inline-at-write + raw scans: 1M+ docs/s
@@ -318,7 +318,7 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
   `db.query_raw()` stops after the index walk and shares buffers
   (`read_pointer_shared`, zero copies for inlined docs) — no decode, no
   rayon. Requires index-satisfied filters/ordering; bytes are opaque
-  storage encoding (decode with `FireLiteDoc::decode`).
+  storage encoding (decode with `HakoDoc::decode`).
 - **Inline-at-write** (the bigger lever): every put used to land as
   `BlobPending` and re-encode on *every read* until background
   conversion — small docs in Manual mode never converted at all. Writes
@@ -342,11 +342,11 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
   (`sorted_key_range_reverse`, O(log N + limit)) — same path as forward.
 - **Point-get 46.8k → ~80k (harness-equivalent).** Split measured:
   engine floor ~105-140k (vs MDBX 136k raw memcpy — competitive given
-  full doc decode), FFI wrapper tax ~2x, `fl_doc_to_json` Binary arm
+  full doc decode), FFI wrapper tax ~2x, `hk_doc_to_json` Binary arm
   ~11µs (100 boxed Numbers per 100-byte value). Fixes, all
   byte-identical output: streaming JSON serializer (digits need no
   escaping; keys still via serde_json; sorted order kept), borrowed C
-  strings in `fl_engine_get`, single version lookup + audit-gated allocs
+  strings in `hk_engine_get`, single version lookup + audit-gated allocs
   in `get()`. Remainder is real work-per-row (decode + JSON text vs
   pointer bumps) — see `tests/cursor_parity.rs`.
 
@@ -370,7 +370,7 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
 
 ### v0.7.13 — net-sync + cloud-sync in default features
 - The release DLL now exports the full mesh + cloud surface
-  (`fl_net_syncer_*`, `fl_cloud_sync_*`), matching what the Go/JS/Pascal
+  (`hk_net_syncer_*`, `hk_cloud_sync_*`), matching what the Go/JS/Pascal
   SDKs already wrap. Previously those symbols existed only with explicit
   features — SDK calls against the default DLL failed at runtime, not at
   compile time. `tauri-gateway` stays opt-in.
@@ -382,7 +382,7 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
   metadata is unmeasurable at this scale.
 - Default `wal_reserve_bytes` is now 0 (was 4 MB): no phantom size per
   shard, no surprise floors on mobile storage. Opt back in per workload
-  via `fl_config_set_wal_reserve_bytes` if a long-soak test ever shows
+  via `hk_config_set_wal_reserve_bytes` if a long-soak test ever shows
   fragmentation-driven fsync decay.
 
 ### v0.7.11 — WAL history compaction for hot-small collections
@@ -397,15 +397,15 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
   Existing `compact` CLI/FFI/app paths reclaim automatically.
 
 ### v0.7.10 — Pascal SDK install fixes + component polish
-- Canonical runtime/designtime split (`FireLitePkg` + `FireLiteDesign`);
+- Canonical runtime/designtime split (`HakoDBPkg` + `HakoDBDesign`);
   the single mixed package would not install.
-- Package renamed `FireLite` → `FireLitePkg`: the IDE auto-generates a
+- Package renamed `HakoDB` → `HakoDBPkg`: the IDE auto-generates a
   `<PackageName>.pas` stub that had overwritten the engine unit, causing a
   phantom circular reference.
-- Palette icon (`tfirelitecomponent.lrs`, built from `.xpm` via `lazres`).
+- Palette icon (`thakodbcomponent.lrs`, built from `.xpm` via `lazres`).
 - `NetSyncEnabled` / `CloudSyncEnabled` master switches (default off);
   sync properties are inert until enabled.
-- `TFLDiscoveryMode` + `SetDiscoveryMode` + component `NetSyncDiscovery`
+- `THKDiscoveryMode` + `SetDiscoveryMode` + component `NetSyncDiscovery`
   property surface the net_sync discovery choice.
 
 ### v0.7.9 — developer-chosen discovery: mDNS / broadcast / both
@@ -446,7 +446,7 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
   now filters local-only tombstones and collections, matching the live tailer
   and both cloud catch-up paths. No handshake path can transmit a local mark.
 - **Vacuum.** `vacuum_collection` purges a collection's tombstones from the
-  index with zero WAL traffic (FFI `fl_engine_vacuum_collection`, CLI `vacuum`,
+  index with zero WAL traffic (FFI `hk_engine_vacuum_collection`, CLI `vacuum`,
   Tauri `vacuum` op). Version drops to the newest live doc, so the next
   handshake pulls peer state instead of defending local deletes.
 - **Rejoin recipe (reset now, restore later, wipe nothing):**
@@ -463,11 +463,11 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
 
 ### v0.7.6 — local-only deletes + tombstone catch-up fix
 - **Local-only signal.** `delete_local` / `delete_where_local` / `delete_ids_local`
-  (FFI `fl_engine_delete_local`, `fl_query_delete_local`, CLI `--local`) mark keys
+  (FFI `hk_engine_delete_local`, `hk_query_delete_local`, CLI `--local`) mark keys
   so no sync tailer or handshake ever transmits them — the app owns the deletion.
   `set_collection_local` scopes whole collections (CLI `collection-local`, shown in
   `collections`); `replicate_key` opts a key back in. Marks persist in
-  `__firelite_system/local_only` across restarts.
+  `__hako_system/local_only` across restarts.
 - **Handshake-stability rule.** Local-only ops keep fresh tombstone timestamps, so
   the deleter's version clock advances and no ping/catch-up can push the doc back.
   Resurrect rule: a genuinely *newer* remote put still applies (LWW); stale
@@ -483,11 +483,11 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
 
 ### v0.7.5 — deferred blobs, parallel inflation, bulk JSON
 - **`defer_blobs` query flag** — queries can skip blob inflation and return a `{"__blob__": {"len", "offset"}}` placeholder per blob field instead of the bytes. A 20-doc query over 50 KB images drops from ~1.2 ms to ~240 µs (~5×; more for larger blobs).
-- **`fl_doc_resolve_blobs`** — fetch the real blob bytes for a deferred doc on demand (point-get path, stays fast).
+- **`hk_doc_resolve_blobs`** — fetch the real blob bytes for a deferred doc on demand (point-get path, stays fast).
 - **Parallel blob inflation** — multi-blob docs inflate link targets on the rayon pool; link-free docs skip the scan entirely.
-- **`fl_result_set_to_json`** — stream a whole result set to one JSON array in a single call (~1.92× vs per-doc `fl_doc_to_json`).
+- **`hk_result_set_to_json`** — stream a whole result set to one JSON array in a single call (~1.92× vs per-doc `hk_doc_to_json`).
 - **CLI `--defer-blobs`** on `query` (one-shot and serve mode); `get` stays eager. Tauri `QueryInput.defer_blobs` supported end to end.
-- SDK surface: Go `DeferBlobs`/`ToJSON`/`ResolveBlobs`, JS `query.deferBlobs()`, Pascal `TFLQuery.DeferBlobs`.
+- SDK surface: Go `DeferBlobs`/`ToJSON`/`ResolveBlobs`, JS `query.deferBlobs()`, Pascal `THKQuery.DeferBlobs`.
 - `build.rs` refreshes the Windows import lib on every build (stale `.lib` after header regen is gone).
 
 ### v0.7.4 — durability fix + perf gate
@@ -500,16 +500,16 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
 - **Limit pushdown** — `range_scan_limit` and unordered single-`Eq` yield to the secondary index instead of the composite path; empty-`ORDER BY` limit pushdown with offset-safe limits.
 - **Id-cursor fast path** — `start_at`/`start_after` on document id resolves to a `SortedKeys` Vec range instead of a composite scan.
 - **Plan-cache key fix** — cursor bound tags (`start_at` vs `start_after`) included in the key; previously colliding plans could return wrong pages.
-- **Write fast path** — `put_owned` / `fl_engine_insert_take` (no clone on owned docs), shard-lookup hoist, `ChangeEvent.path: Arc<str>`, 8192-entry version-stamped hot doc cache.
+- **Write fast path** — `put_owned` / `hk_engine_insert_take` (no clone on owned docs), shard-lookup hoist, `ChangeEvent.path: Arc<str>`, 8192-entry version-stamped hot doc cache.
 - **WAL headroom** — `wal_reserve_bytes` (default 4MB since v0.8.18, was
   opt-in 0 since v0.7.12; sparse, internal collections skip it) via
-  `FireLiteConfig::wal_reserve_bytes` / `fl_config_set_wal_reserve_bytes`.
-- **Write-phase timers** — `WRITE_STATS` + `write_stats_report()` / `fl_debug_write_stats()`; `benchmark --profile=<mode> --wstats` attributes write latency (Manual ~11.7 µs after shard hoist, −24%).
+  `HakoConfig::wal_reserve_bytes` / `hk_config_set_wal_reserve_bytes`.
+- **Write-phase timers** — `WRITE_STATS` + `write_stats_report()` / `hk_debug_write_stats()`; `benchmark --profile=<mode> --wstats` attributes write latency (Manual ~11.7 µs after shard hoist, −24%).
 
 ### v0.7.2 — pagination, WAL hardening, FFI slab
 - **O(1) offset pagination** — `sorted_key_range` slice + `offset_to_apply_later`; descending order via `SortedKeys` reverse ranges.
 - **WAL decoder + recovery fixes** — padding-safe replay/tail/reset, Manual-mode double-size fix, recovery-vs-write race fix (`entry().or_insert`).
-- **FFI slab allocator** — `Vec<FL_Doc>` slab refactor for result sets; `eprintln!` → log sink; `tests/ffi_roundtrip.rs` + `tests/write_path.rs`.
+- **FFI slab allocator** — `Vec<HK_Doc>` slab refactor for result sets; `eprintln!` → log sink; `tests/ffi_roundtrip.rs` + `tests/write_path.rs`.
 - **Fair benchmark** — all four query shapes decode the same 20 docs (limits raised 5 → 20), so Qry/Cmp vs Off/Cur numbers are comparable.
 
 ---
@@ -669,32 +669,32 @@ Platform outputs:
 
 ### Opaque handle types
 
-- `FL_Engine` — main database instance
-- `FL_Doc` — document builder / result handle
-- `FL_Batch` — atomic write-batch container
-- `FL_Query` — query definition builder
-- `FL_Config` — advanced configuration builder
-- `FL_Watch` — real-time subscription handle
-- `FL_Transaction` — serializable transaction handle
-- `FL_ResultSet` — query result handle set
-- `FL_NetSyncer` — LAN net-sync handle
-- `FL_CloudSync` — cloud-sync handle
+- `HK_Engine` — main database instance
+- `HK_Doc` — document builder / result handle
+- `HK_Batch` — atomic write-batch container
+- `HK_Query` — query definition builder
+- `HK_Config` — advanced configuration builder
+- `HK_Watch` — real-time subscription handle
+- `HK_Transaction` — serializable transaction handle
+- `HK_ResultSet` — query result handle set
+- `HK_NetSyncer` — LAN net-sync handle
+- `HK_CloudSync` — cloud-sync handle
 
 ### C API highlights
 
-- **Engine / memory:** `fl_engine_open`, `fl_engine_open_with_config`, `fl_engine_is_indexes_ready`, `fl_engine_free`, `fl_engine_backup`, `fl_engine_compact`, `fl_engine_list_collections`, `fl_engine_list_indexes`, `fl_engine_get_stats`, `fl_engine_get_audit_log`, `fl_engine_snapshot_indices`, `fl_last_error`, `fl_string_free`.
-- **Configuration:** `fl_config_new/free`, `fl_config_set_durability`, `fl_config_set_encryption_key`, `fl_config_set_encrypted_collections`, `fl_config_set_audit_log`, `fl_config_set_query_workers`, `fl_config_set_memory_limits`, `fl_config_set_storage_tuning`, `fl_config_set_blob_threshold`, `fl_config_set_compression`, `fl_config_set_wal_reserve_bytes`.
-- **Real-time:** `fl_engine_watch`, `fl_watch_free`.
-- **Documents:** `fl_doc_new/free`, `fl_doc_insert_str/int/float/bool/null/bin/timestamp/server_timestamp/doc/array/reference`, `fl_doc_to_json`, `fl_doc_resolve_blobs` (materialize deferred `__blob__` placeholders).
-- **CRUD:** `fl_engine_insert`, `fl_engine_insert_take` (owned doc, no clone), `fl_engine_get`, `fl_engine_delete`, `fl_engine_patch`, `fl_engine_get_by_ref`, `fl_engine_insert_subdoc`.
-- **Batches:** `fl_batch_new/free`, `fl_batch_set`, `fl_batch_delete`, `fl_batch_commit`.
-- **Transactions:** `fl_transaction_begin/get/set/commit/free`.
-- **Queries:** `fl_query_new/free`, all `fl_query_where_*` filters, `fl_query_order_by`, `fl_query_limit/offset`, `fl_query_select_field`, `fl_query_defer_blobs`, cursor functions (`start_at/start_after/end_at/end_before`), `fl_query_execute`, `fl_query_execute_to_handles`, `fl_query_delete`, `fl_query_patch`, aggregates (`fl_query_aggregate_count/sum/avg`, `fl_query_execute_aggregation`).
-- **Result sets:** `fl_result_set_count/get_doc/free`, `fl_result_set_to_json` (bulk single-call export).
-- **Diagnostics:** `fl_debug_write_stats` (write-phase timing breakdown; see `--wstats`).
-- **Indexing:** `fl_engine_create_index` (composite JSON), `fl_engine_create_simple_index`, `fl_engine_create_fts_index`.
-- **Net Sync:** `fl_net_syncer_new/start/status/free`.
-- **Cloud Sync:** `fl_cloud_sync_new/start/status/stop/free`, plus the room-agnostic `fl_cloud_sync_server_new` and the room-bound `fl_cloud_sync_client_new`.
+- **Engine / memory:** `hk_engine_open`, `hk_engine_open_with_config`, `hk_engine_is_indexes_ready`, `hk_engine_free`, `hk_engine_backup`, `hk_engine_compact`, `hk_engine_list_collections`, `hk_engine_list_indexes`, `hk_engine_get_stats`, `hk_engine_get_audit_log`, `hk_engine_snapshot_indices`, `hk_last_error`, `hk_string_free`.
+- **Configuration:** `hk_config_new/free`, `hk_config_set_durability`, `hk_config_set_encryption_key`, `hk_config_set_encrypted_collections`, `hk_config_set_audit_log`, `hk_config_set_query_workers`, `hk_config_set_memory_limits`, `hk_config_set_storage_tuning`, `hk_config_set_blob_threshold`, `hk_config_set_compression`, `hk_config_set_wal_reserve_bytes`.
+- **Real-time:** `hk_engine_watch`, `hk_watch_free`.
+- **Documents:** `hk_doc_new/free`, `hk_doc_insert_str/int/float/bool/null/bin/timestamp/server_timestamp/doc/array/reference`, `hk_doc_to_json`, `hk_doc_resolve_blobs` (materialize deferred `__blob__` placeholders).
+- **CRUD:** `hk_engine_insert`, `hk_engine_insert_take` (owned doc, no clone), `hk_engine_get`, `hk_engine_delete`, `hk_engine_patch`, `hk_engine_get_by_ref`, `hk_engine_insert_subdoc`.
+- **Batches:** `hk_batch_new/free`, `hk_batch_set`, `hk_batch_delete`, `hk_batch_commit`.
+- **Transactions:** `hk_transaction_begin/get/set/commit/free`.
+- **Queries:** `hk_query_new/free`, all `hk_query_where_*` filters, `hk_query_order_by`, `hk_query_limit/offset`, `hk_query_select_field`, `hk_query_defer_blobs`, cursor functions (`start_at/start_after/end_at/end_before`), `hk_query_execute`, `hk_query_execute_to_handles`, `hk_query_delete`, `hk_query_patch`, aggregates (`hk_query_aggregate_count/sum/avg`, `hk_query_execute_aggregation`).
+- **Result sets:** `hk_result_set_count/get_doc/free`, `hk_result_set_to_json` (bulk single-call export).
+- **Diagnostics:** `hk_debug_write_stats` (write-phase timing breakdown; see `--wstats`).
+- **Indexing:** `hk_engine_create_index` (composite JSON), `hk_engine_create_simple_index`, `hk_engine_create_fts_index`.
+- **Net Sync:** `hk_net_syncer_new/start/status/free`.
+- **Cloud Sync:** `hk_cloud_sync_new/start/status/stop/free`, plus the room-agnostic `hk_cloud_sync_server_new` and the room-bound `hk_cloud_sync_client_new`.
 
 All FFI gateways (Go / JS-TS / Pascal) wrap these APIs.
 
@@ -710,7 +710,7 @@ The `net-sync` feature provides peer-to-peer replication over the local network:
 - Live node status telemetry (`idle` / `connected` / `syncing`, peer count, known peers).
 - Relay/mesh fan-out controls for multi-hop LAN topologies.
 
-Core FFI functions: `fl_net_syncer_new`, `fl_net_syncer_start`, `fl_net_syncer_status`, `fl_net_syncer_free`. All FFI-based gateways include wrappers for these APIs.
+Core FFI functions: `hk_net_syncer_new`, `hk_net_syncer_start`, `hk_net_syncer_status`, `hk_net_syncer_free`. All FFI-based gateways include wrappers for these APIs.
 
 ### Enable the feature
 
@@ -780,7 +780,7 @@ different rooms, so their data is fully isolated on the server.
   clients as plain `<collection>`, so data never mixes across rooms even when
   clients use identical collection names.
 - The room→prefix mapping is kept in the internal, hidden
-  `__firelite_rooms` collection and is re-read periodically by the server, so
+  `__hako_rooms` collection and is re-read periodically by the server, so
   new rooms are picked up without a restart.
 - Peer routing on the server is keyed by `(room, client_id)`, so two clients in
   different rooms may safely reuse the same `client_id` without clobbering each

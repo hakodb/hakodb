@@ -35,7 +35,7 @@ fn legacy_dirs_migrate_with_data_intact() {
     let dir = temp_dir("basic");
     {
         let db = open_manual(&dir);
-        // Old-binary layout, as FireLite-era versions left it.
+        // Old-binary layout, as pre-rebrand versions left it.
         put_simple(&db, "__firelite_system", "probe", 1);
         put_simple(&db, "__firelite_rooms", "room1", 2);
         put_simple(&db, "__firelite_security", "policy", 3);

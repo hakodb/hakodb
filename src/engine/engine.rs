@@ -169,7 +169,7 @@ pub const SYNC_EXCLUDED_COLLECTIONS: &[&str] = &[
     "__users",
     "__groups",
     // Pre-rebrand on-disk aliases (see migrate_legacy_collections): a
-    // database last opened by FireLite-era binaries still carries these
+    // database last opened by pre-rebrand binaries still carries these
     // directories (after a downgrade, a file-level restore, or a peer
     // that never migrated). They stay excluded so such data can neither
     // leak nor poison. Remove in the next minor.
