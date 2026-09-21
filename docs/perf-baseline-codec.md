@@ -86,3 +86,15 @@ implementation. Nested cost is allocation + validation volume, and the
 fixed `0x40` short-string arm of `skip_value` could overshoot the buffer
 and panic downstream slicers on corrupt input — now fails closed (found
 by the new truncation fuzz in `tests/codec_paths.rs`).
+
+## Batch 3 (C3: thread-local match scratch)
+
+`unified_match_decode` + `unified_match_projected` allocated 2 small
+Vecs per row (~20k allocs per 10k-row scan). Now borrowed from a
+thread-local slot via a Drop guard (all exits recycle; `try_with`
+fallback degrades to fresh Vecs, never panics).
+
+Measured (debug medians): q-filtered ~66ms (prior ~50–72), q-gt ~96
+(prior 96–113) — inside the box noise floor, as predicted (~1–3%
+constructional gain, unresolvable here). Correctness over speed claim:
+cursor_parity 9/9 + full suite green.

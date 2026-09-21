@@ -8,6 +8,59 @@ thread_local! {
     /// Scratch buffer for encoding filter values during byte-compare matching.
     /// Reused across rows so the fast match pass allocates nothing.
     static ENC_SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(256));
+    /// Scratch per-row match flags. Reused across rows so filtering
+    /// allocates nothing after warmup (~2 small Vecs per row otherwise,
+    /// i.e. ~20k allocs per 10k-row scan).
+    static MATCH_SCRATCH: RefCell<(Vec<bool>, Vec<bool>)> =
+        RefCell::new((Vec::new(), Vec::new()));
+}
+
+/// Per-row match buffers borrowed from [`MATCH_SCRATCH`]. Parked back on
+/// drop, so every exit path (including `?` and early returns) recycles.
+/// Falls back to fresh Vecs if the scratch is busy or gone — never
+/// panics, never leaks correctness, at worst one throwaway allocation.
+struct MatchScratch {
+    and_matches: Vec<bool>,
+    or_group_results: Vec<bool>,
+}
+
+impl MatchScratch {
+    fn take(n_and: usize, n_or: usize) -> Self {
+        // `try_with` (not `with`): a reentrant caller degrades to fresh
+        // Vecs instead of panicking on an outstanding borrow. Same in Drop.
+        if let Ok(scratch) = MATCH_SCRATCH.try_with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let mut and_matches = std::mem::take(&mut slot.0);
+            let mut or_group_results = std::mem::take(&mut slot.1);
+            and_matches.clear();
+            and_matches.resize(n_and, false);
+            or_group_results.clear();
+            or_group_results.resize(n_or, false);
+            Self { and_matches, or_group_results }
+        }) {
+            return scratch;
+        }
+        Self {
+            and_matches: vec![false; n_and],
+            or_group_results: vec![false; n_or],
+        }
+    }
+}
+
+impl Drop for MatchScratch {
+    fn drop(&mut self) {
+        let _ = MATCH_SCRATCH.try_with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let mut and_matches = std::mem::take(&mut self.and_matches);
+            and_matches.clear();
+            slot.0 = and_matches;
+            let mut or_group_results = std::mem::take(&mut self.or_group_results);
+            or_group_results.clear();
+            slot.1 = or_group_results;
+        });
+        // On failure the locals simply drop: correctness never depends
+        // on the cache hitting.
+    }
 }
 
 /// Value types with canonical byte encoding: same value <=> same bytes.
@@ -154,12 +207,14 @@ pub(crate) fn prepare_optimized_plan(plan: &crate::query::plan::QueryPlan) -> cr
 /// a full decode (~15 allocs) just to be discarded.
 pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::query::plan::QueryPlan) -> Option<HakoDoc> {
     let view = HakoDocView::new(bytes)?;
-    
-    let mut and_matches = vec![false; plan.filters.len()];
-    let mut or_group_results = vec![false; plan.or_groups.len()];
+
+    let mut match_bufs = MatchScratch::take(plan.filters.len(), plan.or_groups.len());
+    // NOTE: fields are addressed as `match_bufs.and/or_...` (not
+    // destructured) so call sites keep their `&mut Vec -> &mut [bool]`
+    // coercions. (The name avoids the inner `scratch` used below.)
 
     // 1. Metadata check (id and _time)
-    if !check_metadata_filters(doc_id, view._time, plan, &mut and_matches, &mut or_group_results) {
+    if !check_metadata_filters(doc_id, view._time, plan, &mut match_bufs.and_matches, &mut match_bufs.or_group_results) {
         return None; 
     }
 
@@ -167,7 +222,7 @@ pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::que
     let mut fast = plan.or_groups.is_empty();
     if fast {
         for (i, f) in plan.filters.iter().enumerate() {
-            if and_matches[i] || f.field == "id" || f.field == "_time" { continue; }
+            if match_bufs.and_matches[i] || f.field == "id" || f.field == "_time" { continue; }
             if !(matches!(f.op, Operator::Eq | Operator::Ne) && byte_safe(&f.value)) {
                 fast = false;
                 break;
@@ -184,18 +239,18 @@ pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::que
             let mut enc = scratch.borrow_mut();
             for (key, tag, data) in view.iter_raw() {
                 for (i, f) in plan.filters.iter().enumerate() {
-                    if and_matches[i] || key != f.field.as_bytes() { continue; }
+                    if match_bufs.and_matches[i] || key != f.field.as_bytes() { continue; }
                     enc.clear();
                     HakoDoc::encode_value_to(&f.value, &mut enc);
                     let hit = enc.first().copied() == Some(tag) && &enc[1..] == data;
                     if (hit && f.op == Operator::Eq) || (!hit && f.op == Operator::Ne) {
-                        and_matches[i] = true;
+                        match_bufs.and_matches[i] = true;
                     }
                 }
             }
         });
         // Missing field => stays false => rejected, same as the old path.
-        if !validate_final_match(plan, &and_matches, &or_group_results) {
+        if !validate_final_match(plan, &match_bufs.and_matches, &match_bufs.or_group_results) {
             return None;
         }
     }
@@ -207,12 +262,12 @@ pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::que
         let val = crate::document::hako_doc::decode_value(tag, data)?;
 
         if !fast {
-            apply_filter_logic(key, &val, plan, &mut and_matches, &mut or_group_results);
+            apply_filter_logic(key, &val, plan, &mut match_bufs.and_matches, &mut match_bufs.or_group_results);
         }
         fields.push((crate::document::hako_doc::intern_field(key), val));
     }
 
-    if fast || validate_final_match(plan, &and_matches, &or_group_results) {
+    if fast || validate_final_match(plan, &match_bufs.and_matches, &match_bufs.or_group_results) {
         Some(HakoDoc { fields, _time: view._time })
     } else {
         None
@@ -222,10 +277,9 @@ pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::que
 /// Unified decoder for projected queries. Only decodes fields needed for filters or results.
 pub(crate) fn unified_match_projected(doc_id: &str, bytes: &[u8], plan: &crate::query::plan::QueryPlan) -> Option<Vec<(String, Value)>> {
     let view = HakoDocView::new(bytes)?;
-    let mut and_matches = vec![false; plan.filters.len()];
-    let mut or_group_results = vec![false; plan.or_groups.len()];
+    let mut match_bufs = MatchScratch::take(plan.filters.len(), plan.or_groups.len());
 
-    if !check_metadata_filters(doc_id, view._time, plan, &mut and_matches, &mut or_group_results) {
+    if !check_metadata_filters(doc_id, view._time, plan, &mut match_bufs.and_matches, &mut match_bufs.or_group_results) {
         return None;
     }
 
@@ -240,14 +294,14 @@ pub(crate) fn unified_match_projected(doc_id: &str, bytes: &[u8], plan: &crate::
 
         if is_needed_for_filter || is_needed_for_proj {
             let val = crate::document::hako_doc::decode_value(tag, data)?;
-            apply_filter_logic(key, &val, plan, &mut and_matches, &mut or_group_results);
+            apply_filter_logic(key, &val, plan, &mut match_bufs.and_matches, &mut match_bufs.or_group_results);
             if is_needed_for_proj {
                 extracted.push((key.to_string(), val));
             }
         }
     }
 
-    if validate_final_match(plan, &and_matches, &or_group_results) {
+    if validate_final_match(plan, &match_bufs.and_matches, &match_bufs.or_group_results) {
         Some(extracted)
     } else {
         None
