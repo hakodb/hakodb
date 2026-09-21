@@ -527,6 +527,7 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
 - [Cloud Sync (centralized replication)](#cloud-sync-centralized-replication)
 - [Sync encryption posture (read this before encrypting)](#sync-encryption-posture-read-this-before-encrypting)
 - [Guide: choosing a read path](docs/reads.md)
+- [Repositories](#repositories)
 - [Architecture](#architecture)
 - [Implementation status](#implementation-status)
 - [Contribution notes](#contribution-notes)
@@ -917,6 +918,30 @@ by every caps announcement).
 4. There is intentionally **no override flag**: a downgrade switch would
    reintroduce the exact silent leak this removes. Mixed-version rooms
    keep working for plaintext collections throughout the upgrade.
+
+---
+
+## Repositories
+
+HakoDB lives under the [`hakodb`](https://github.com/hakodb) organization
+— one repo per deliverable, each versioned independently:
+
+| Repo | Delivers | Version |
+|---|---|---|
+| [`hakodb/hakodb`](https://github.com/hakodb/hakodb) | Core library: engine, storage, query, FFI (`hako.h`), net/cloud sync | 0.8.21 |
+| [`hakodb/hako-cli`](https://github.com/hakodb/hako-cli) | Command-line manager + serve REPL | 0.2.1 |
+| [`hakodb/hako-cloudserver`](https://github.com/hakodb/hako-cloudserver) | Managed sync hub + admin console | 0.1.1 |
+| [`hakodb/hako-tauri`](https://github.com/hakodb/hako-tauri) | Tauri gateway crate (Rust) | 0.1.1 |
+| [`hakodb/hako-tauri-ts`](https://github.com/hakodb/hako-tauri-ts) | Tauri client (`@hakodb/tauri`) | 0.1.1 |
+| [`hakodb/hako-bench`](https://github.com/hakodb/hako-bench) | C++ benchmark harnesses + SQLite duel | 0.1.1 |
+| [`hakodb/hako-go`](https://github.com/hakodb/hako-go) | Go SDK (cgo) | 0.1.1 |
+| [`hakodb/hako-js`](https://github.com/hakodb/hako-js) | JS/TS SDK (`@hakodb/client`, Node + Bun) | 0.5.12 |
+| [`hakodb/hako-pascal`](https://github.com/hakodb/hako-pascal) | Lazarus/FPC wrapper + components | 0.1.1 |
+
+Branches: **`main`** (stable — merged releases only) and **`cloud_sync`**
+(active development). The pre-rebrand history remains archived, read-only,
+at [`rizaptk/firelite`](https://github.com/rizaptk/firelite) for existing
+consumers (v0.8.19 and below).
 
 ---
 
