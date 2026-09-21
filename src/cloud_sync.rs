@@ -8,15 +8,15 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "cloud-sync")]
-use crate::document::firelite_doc::FireLiteDoc;
+use crate::document::hako_doc::HakoDoc;
 #[cfg(feature = "cloud-sync")]
 use crate::document::value::Value;
 #[cfg(feature = "cloud-sync")]
 use crate::engine::engine::IndexOp;
 #[cfg(feature = "cloud-sync")]
-use crate::engine::{BatchMutation, ChangeEvent, ChangeKind, FireLite};
+use crate::engine::{BatchMutation, ChangeEvent, ChangeKind, Hako};
 #[cfg(feature = "cloud-sync")]
-use crate::error::{FireLiteError, Result as FLResult};
+use crate::error::{HakoError, Result as FLResult};
 #[cfg(feature = "cloud-sync")]
 use crate::query::query::Query;
 #[cfg(feature = "cloud-sync")]
@@ -45,10 +45,12 @@ fn init_crypto_provider() {
 }
 
 /// Server-internal collection that stores the room registry. It is
-/// `_`-prefixed so it stays hidden from `list_collections()`, the WAL
-/// tailers and the version maps, exactly like `__firelite_security`.
+/// `_`-prefixed so it stays hidden from `list_collections()`, and
+/// sync-excluded by exact name (`SYNC_EXCLUDED_COLLECTIONS`) so it never
+/// leaves the device regardless of naming. (`__hako_security`, by
+/// contrast, replicates by design.)
 #[cfg(feature = "cloud-sync")]
-pub const INTERNAL_ROOMS_COLLECTION: &str = "__firelite_rooms";
+pub const INTERNAL_ROOMS_COLLECTION: &str = "__hako_rooms";
 
 #[cfg(feature = "cloud-sync")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,7 +155,7 @@ struct RoomRegistryState {
 
 #[cfg(feature = "cloud-sync")]
 pub struct RoomRegistry {
-    db: Arc<FireLite>,
+    db: Arc<Hako>,
     state: StdRwLock<RoomRegistryState>,
     alloc_lock: StdMutex<()>,
     loaded: std::sync::atomic::AtomicBool,
@@ -207,7 +209,7 @@ fn timing_safe_eq(a: &str, b: &str) -> bool {
 /// key, client id) — unit-tested without sockets.
 #[cfg(feature = "cloud-sync")]
 pub(crate) fn check_group_access(
-    db: &FireLite,
+    db: &Hako,
     room_name: &str,
     api_key: Option<&str>,
     client_id: &str,
@@ -291,7 +293,7 @@ fn echo_key(prefix: &str, plain_col: &str, key: &str) -> String {
 
 #[cfg(feature = "cloud-sync")]
 impl RoomRegistry {
-    pub fn new(db: Arc<FireLite>) -> Self {
+    pub fn new(db: Arc<Hako>) -> Self {
         Self {
             db,
             state: StdRwLock::new(RoomRegistryState::default()),
@@ -381,7 +383,7 @@ impl RoomRegistry {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let mut doc = FireLiteDoc::default();
+        let mut doc = HakoDoc::default();
         doc.insert("room_name", Value::String(room_name.to_string()));
         doc.insert("key_hash", Value::String(hash_room_id(room_name, room_key)));
         doc.insert("prefix", Value::String(prefix.clone()));
@@ -443,7 +445,7 @@ impl RoomRegistry {
 
 #[cfg(feature = "cloud-sync")]
 pub struct CloudSync {
-    db: Arc<FireLite>,
+    db: Arc<Hako>,
     mode: CloudSyncMode,
     room_name: String,
     room_key: String,
@@ -500,7 +502,7 @@ impl CloudSync {
     /// ask for. Prefer the dedicated [`CloudSync::server`] / [`CloudSync::client`]
     /// constructors for clarity.
     pub fn new(
-        db: Arc<FireLite>,
+        db: Arc<Hako>,
         mode: CloudSyncMode,
         client_id: &str,
         room_name: &str,
@@ -518,7 +520,7 @@ impl CloudSync {
     /// server accepts and persists any (room_name, room_key) pair, storing each
     /// room's collections under its own storage prefix and relaying sync only to
     /// the members of that room.
-    pub fn server(db: Arc<FireLite>, server_id: &str, auth_token: &str) -> Self {
+    pub fn server(db: Arc<Hako>, server_id: &str, auth_token: &str) -> Self {
         let (tx, rx) = mpsc::channel(100_000);
         let registry = Arc::new(RoomRegistry::new(db.clone()));
 
@@ -547,7 +549,7 @@ impl CloudSync {
     /// sync with via [`CloudSync::start`]; every other client/peer using the
     /// same (room_name, room_key) on the same server forms the sync group.
     pub fn client(
-        db: Arc<FireLite>,
+        db: Arc<Hako>,
         client_id: &str,
         room_name: &str,
         room_key: &str,
@@ -708,7 +710,7 @@ impl CloudSync {
     }
 
     async fn flush_ingest_buffer(
-        db: &Arc<FireLite>,
+        db: &Arc<Hako>,
         buffer: &mut HashMap<String, Vec<IngestItem>>,
         echo_cache: &Arc<StdMutex<HashMap<String, i64>>>,
         peers: &Arc<AsyncRwLock<HashMap<String, PeerInfo>>>,
@@ -743,6 +745,21 @@ impl CloudSync {
                 continue;
             }
 
+            // Sync-excluded plane (inbound): credential stores, sync state,
+            // and the room registry never arrive over the wire — in EITHER
+            // namespace (client-plain or server-prefixed), builtin or
+            // per-deployment extra. Without this, a hostile
+            // Replication{collection:"__groups"} would plant a same-named
+            // shard AND get relayed back out under the plain name,
+            // poisoning every room member's real store. The outbound
+            // tailers already skip these; this is the receipt-side choke
+            // point both directions route through.
+            if db.is_sync_excluded_effective(&plain_col)
+                || db.is_sync_excluded_effective(&storage_col)
+            {
+                continue;
+            }
+
             // Encryption fail-closed (inbound): when THIS node encrypts the
             // collection at rest, ops are accepted only from senders that
             // proved the same key. Namespaces: server shards are storage
@@ -755,7 +772,7 @@ impl CloudSync {
                 crate::sync_guard::local_fingerprint(db.config.encryption_key.as_deref());
 
             let mut apply_ops: Vec<WalOp> = Vec::with_capacity(items.len());
-            let mut index_puts: Vec<(String, Arc<FireLiteDoc>)> = Vec::new();
+            let mut index_puts: Vec<(String, Arc<HakoDoc>)> = Vec::new();
             let mut sender_relays: HashMap<Option<String>, Vec<WalOp>> = HashMap::new();
 
             for item in &items {
@@ -783,7 +800,7 @@ impl CloudSync {
                 }
                 match &item.op {
                     WalOp::PutInlined { key, value } => {
-                        let ts = FireLiteDoc::decode(value)
+                        let ts = HakoDoc::decode(value)
                             .map(|d| d.get_logical_time())
                             .unwrap_or(0);
                         if ts == 0 {
@@ -805,7 +822,7 @@ impl CloudSync {
                             key: key.clone(),
                             value: value.clone(),
                         });
-                        if let Some(doc) = FireLiteDoc::decode(value) {
+                        if let Some(doc) = HakoDoc::decode(value) {
                             index_puts.push((key.clone(), Arc::new(doc)));
                         }
                         sender_relays
@@ -920,10 +937,10 @@ impl CloudSync {
     /// defeats LWW conflict resolution and breaks the echo cache used by the
     /// outbound tailers (causing replication amplification loops).
     fn apply_timestamped(
-        db: &Arc<FireLite>,
+        db: &Arc<Hako>,
         collection: &str,
         ops: Vec<WalOp>,
-        index_puts: Vec<(String, Arc<FireLiteDoc>)>,
+        index_puts: Vec<(String, Arc<HakoDoc>)>,
         keys: Vec<Arc<str>>,
     ) {
         let shard_arc = match db.get_shard(collection) {
@@ -984,7 +1001,7 @@ kind,
     async fn start_server_mode(&self, bind_addr: &str) -> FLResult<()> {
         let listener = tokio::net::TcpListener::bind(bind_addr)
             .await
-            .map_err(|e| FireLiteError::Io(e))?;
+            .map_err(|e| HakoError::Io(e))?;
 
         let ingest_tx = self.ingest_tx.clone();
         let db = self.db.clone();
@@ -1055,9 +1072,12 @@ kind,
 
     /// Server-side version map restricted to one room, keyed by the
     /// client-facing (unprefixed) collection names.
-    fn server_room_version_map(db: &Arc<FireLite>, prefix: &str) -> HashMap<String, i64> {
+    fn server_room_version_map(db: &Arc<Hako>, prefix: &str) -> HashMap<String, i64> {
         let mut map = HashMap::new();
-        if let Ok(cols) = db.list_collections() {
+        // Sync enumeration: hidden room collections (e.g. "_secret") take
+        // part; the excluded plane never appears (dropped by enumeration,
+        // double-checked at serve time).
+        if let Ok(cols) = db.sync_collections() {
             let marker = format!("{}_", prefix);
             for col in cols {
                 if let Some(plain) = col.strip_prefix(&marker) {
@@ -1075,7 +1095,7 @@ kind,
     async fn handle_server_client<S>(
         ws_stream: tokio_tungstenite::WebSocketStream<S>,
         ingest_tx: mpsc::Sender<IngestItem>,
-        db: Arc<FireLite>,
+        db: Arc<Hako>,
         rooms: Arc<RoomRegistry>,
         peers: Arc<AsyncRwLock<HashMap<String, PeerInfo>>>,
         seen_messages: Arc<AsyncMutex<Vec<u128>>>,
@@ -1291,7 +1311,7 @@ kind,
     /// non-existent, so re-applying the same delete is a harmless no-op.
     #[cfg(feature = "cloud-sync")]
     fn is_stale_remote_delete(
-        db: &Arc<FireLite>,
+        db: &Arc<Hako>,
         storage_col: &str,
         key: &str,
         timestamp: i64,
@@ -1312,7 +1332,7 @@ kind,
     /// check — the handshake must not leak what the tailers withhold.
     #[cfg(feature = "cloud-sync")]
     fn collect_catchup_ops(
-        db: &Arc<FireLite>,
+        db: &Arc<Hako>,
         storage_col: &str,
         filter_col: &str,
         since_ts: i64,
@@ -1371,7 +1391,7 @@ kind,
     }
 
     async fn send_catchup_deltas(
-        db: &Arc<FireLite>,
+        db: &Arc<Hako>,
         storage_col: &str,
         plain_col: &str,
         since_ts: i64,
@@ -1382,6 +1402,14 @@ kind,
         // Sender rule: a locally-encrypted room (storage namespace on the
         // server) only replays to a fingerprint-verified peer. Old/silent
         // peers pause here loudly instead of leaking on catch-up.
+        // Sync-excluded plane is never served, in either namespace: a room
+        // collection unfortunately named like an excluded store must not
+        // reach members that would apply it unprefixed.
+        if db.is_sync_excluded_effective(plain_col)
+            || db.is_sync_excluded_effective(storage_col)
+        {
+            return;
+        }
         if db.is_collection_encrypted(storage_col) {
             let local_fp =
                 crate::sync_guard::local_fingerprint(db.config.encryption_key.as_deref());
@@ -1430,13 +1458,23 @@ kind,
             let mut offsets: HashMap<String, u64> = HashMap::new();
 
             while running.load(Ordering::Relaxed) {
-                let cols = db.list_collections().unwrap_or_default();
+                // Sync enumeration: hidden room collections take part; the
+                // excluded plane is dropped by the enumerator itself.
+                let cols = db.sync_collections().unwrap_or_default();
 
                 for col in cols {
                     // Skip collections that don't belong to any registered room.
                     let Some((prefix, plain_col)) = rooms.prefix_of(&col) else {
                         continue;
                     };
+                    // Never broadcast a room collection whose plain name is
+                    // sync-excluded (e.g. a room collection unfortunately
+                    // named "__groups"): recipients apply it unprefixed and
+                    // would poison their real store. Receipt-side drops it
+                    // too — this stops it at the source for unpatched peers.
+                    if db.is_sync_excluded_effective(&plain_col) {
+                        continue;
+                    }
 
                     if let Ok(shard_arc) = db.get_shard(&col) {
                         let last_pos = *offsets.get(&col).unwrap_or(&0);
@@ -1485,7 +1523,7 @@ kind,
                                         }
                                         let final_op = match op {
                                             WalOp::PutInlined { ref key, ref value } => {
-                                                if let Some(mut doc) = FireLiteDoc::decode(value) {
+                                                if let Some(mut doc) = HakoDoc::decode(value) {
                                                     let has_blobs = doc.fields.iter().any(|(_, v)| matches!(v, Value::BlobLink { .. }));
                                                     if has_blobs {
                                                         let enc_key = db.config.encryption_key.as_deref();
@@ -1624,7 +1662,7 @@ kind,
                             db.config.encryption_key.as_deref(),
                         )),
                         enc_cols: db
-                            .list_collections()
+                            .sync_collections()
                             .unwrap_or_default()
                             .into_iter()
                             .filter(|c| db.is_collection_encrypted(c))
@@ -1711,13 +1749,19 @@ kind,
     }
 
     async fn push_client_deltas_upstream(
-        db: &Arc<FireLite>,
+        db: &Arc<Hako>,
         collection: &str,
         server_ts: i64,
         outbound_tx: &mpsc::Sender<CloudPacket>,
     ) {
         // NOTE: no encryption gate here by design (see client tailer above):
         // the hub enforces on receipt and relay.
+        // Sync-excluded plane never pushes upstream (defense in depth:
+        // enumeration already drops it, but an explicit check keeps it
+        // true if collection routing ever bypasses enumeration).
+        if db.is_sync_excluded_effective(collection) {
+            return;
+        }
         let ops = Self::collect_catchup_ops(db, collection, collection, server_ts);
 
         if !ops.is_empty() {
@@ -1749,13 +1793,15 @@ kind,
                     continue;
                 };
 
-                let cols = db.list_collections().unwrap_or_default();
+                // Sync enumeration (hidden included, excluded dropped) —
+                // the explicit skip below stays as defense in depth.
+                let cols = db.sync_collections().unwrap_or_default();
 
                 for col in cols {
                     // Sync-state, room registry, and admin credential stores
-                    // never leave the device. (`__firelite_security` keeps
+                    // never leave the device. (`__hako_security` keeps
                     // flowing — policies replicate.)
-                    if crate::engine::engine::is_sync_excluded(&col) {
+                    if db.is_sync_excluded_effective(&col) {
                         continue;
                     }
                     // NOTE: no encryption gate here by design. This client
@@ -1809,7 +1855,7 @@ kind,
                                         }
                                         let final_op = match op {
                                             WalOp::PutInlined { ref key, ref value } => {
-                                                if let Some(mut doc) = FireLiteDoc::decode(value) {
+                                                if let Some(mut doc) = HakoDoc::decode(value) {
                                                     let has_blobs = doc.fields.iter().any(|(_, v)| matches!(v, Value::BlobLink { .. }));
                                                     if has_blobs {
                                                         let enc_key = db.config.encryption_key.as_deref();
@@ -1859,19 +1905,19 @@ kind,
 #[cfg(all(test, feature = "cloud-sync"))]
 mod tests {
     use super::*;
-    use crate::config::{DurabilityMode, FireLiteConfig};
+    use crate::config::{DurabilityMode, HakoConfig};
 
-    fn temp_db(tag: &str) -> (Arc<FireLite>, std::path::PathBuf) {
+    fn temp_db(tag: &str) -> (Arc<Hako>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
-            "firelite-rooms-{}-{}",
+            "hakodb-rooms-{}-{}",
             std::process::id(),
             tag
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut cfg = FireLiteConfig::default();
+        let mut cfg = HakoConfig::default();
         cfg.durability_mode = DurabilityMode::Manual;
-        let db = Arc::new(FireLite::open(&dir, cfg).unwrap());
+        let db = Arc::new(Hako::open(&dir, cfg).unwrap());
         (db, dir)
     }
 
@@ -1955,8 +2001,8 @@ mod tests {
         assert_eq!(sanitize_room_name("___"), "room");
     }
 
-    fn put_simple(db: &Arc<FireLite>, col: &str, id: &str) {
-        let mut doc = FireLiteDoc::default();
+    fn put_simple(db: &Arc<Hako>, col: &str, id: &str) {
+        let mut doc = HakoDoc::default();
         doc.insert("v", Value::Int(1));
         db.put(col, id, &doc).unwrap();
     }
@@ -2015,14 +2061,141 @@ mod tests {
         assert!(!CloudSync::is_stale_remote_delete(&db, "c", "missing", ts));
     }
 
+    #[tokio::test]
+    async fn ingest_drops_sync_excluded_plane() {        // A hostile Replication{collection:"__groups"} must neither plant a
+        // same-named shard nor poison the real credential store — in either
+        // namespace — while legit room traffic still applies.
+        let (db, _dir) = temp_db("excluded-ingest");
+        put_simple(&db, "seed", "k");
+        let hostile_value = db
+            .get("seed", "k")
+            .unwrap()
+            .unwrap()
+            .encode_buffered();
+        let hostile = |collection: &str, prefix: &str| IngestItem {
+            collection: collection.to_string(),
+            prefix: prefix.to_string(),
+            op: WalOp::PutInlined {
+                key: "evil".to_string(),
+                value: hostile_value.clone(),
+            },
+            sender_client_id: Some("mallory".to_string()),
+        };
+        let legit = IngestItem {
+            collection: "users".to_string(),
+            prefix: "alpha".to_string(),
+            op: WalOp::PutInlined {
+                key: "ok".to_string(),
+                value: hostile_value.clone(),
+            },
+            sender_client_id: Some("mallory".to_string()),
+        };
+        let mut buffer: std::collections::HashMap<String, Vec<IngestItem>> =
+            std::collections::HashMap::new();
+        buffer.insert(
+            "alpha___groups".to_string(),
+            vec![hostile("__groups", "alpha")],
+        );
+        buffer.insert("__groups".to_string(), vec![hostile("__groups", "")]);
+        buffer.insert("__users".to_string(), vec![hostile("__users", "")]);
+        buffer.insert("users".to_string(), vec![legit]);
+        let echo_cache = Arc::new(StdMutex::new(
+            std::collections::HashMap::<String, i64>::new(),
+        ));
+        let peers = Arc::new(AsyncRwLock::new(
+            std::collections::HashMap::<String, PeerInfo>::new(),
+        ));
+        let caps = Arc::new(crate::sync_guard::CapsMap::default());
+        CloudSync::flush_ingest_buffer(&db, &mut buffer, &echo_cache, &peers, &caps)
+            .await;
+
+        assert!(
+            db.get("alpha___groups", "evil").unwrap().is_none(),
+            "hostile server-namespace batch planted a shard"
+        );
+        assert!(
+            db.get("__groups", "evil").unwrap().is_none(),
+            "hostile packet poisoned the real credential store"
+        );
+        assert!(
+            db.get("__users", "evil").unwrap().is_none(),
+            "hostile packet poisoned the user store"
+        );
+        assert!(
+            db.get("users", "ok").unwrap().is_some(),
+            "legit room traffic must still apply"
+        );
+    }
+
+    #[test]
+    fn sync_enumeration_is_opt_out_not_underscore() {
+        // Sync enumeration includes `_`-hidden collections and drops only
+        // the explicit excluded plane (builtin + per-deployment extras).
+        let (db, _dir) = temp_db("sync-enum");
+        put_simple(&db, "users", "a");
+        put_simple(&db, "_hidden", "b");
+        put_simple(&db, "__hako_security", "c");
+        put_simple(&db, "__groups", "d");
+        put_simple(&db, "__hako_system", "e");
+
+        let cols = db.sync_collections().unwrap();
+        assert!(cols.contains(&"users".to_string()), "plain missing: {cols:?}");
+        assert!(
+            cols.contains(&"_hidden".to_string()),
+            "hidden non-excluded must sync: {cols:?}"
+        );
+        assert!(
+            cols.contains(&"__hako_security".to_string()),
+            "security replicates by design: {cols:?}"
+        );
+        for excluded in [
+            "__groups",
+            "__users",
+            "__hako_rooms",
+            "__hako_system",
+        ] {
+            assert!(
+                !cols.contains(&excluded.to_string()),
+                "excluded plane leaked into enumeration: {cols:?}"
+            );
+        }
+        // User listing keeps `_` hiding (unchanged behavior).
+        let listed = db.list_collections().unwrap();
+        assert!(!listed.contains(&"_hidden".to_string()));
+
+        // Per-deployment extras ride along.
+        let dir2 = std::env::temp_dir().join(format!(
+            "hakodb-rooms-{}-sync-enum-extra",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::create_dir_all(&dir2).unwrap();
+        let mut cfg = HakoConfig::default();
+        cfg.durability_mode = DurabilityMode::Manual;
+        cfg.sync_excluded = vec!["_hidden".to_string()];
+        let db2 = Arc::new(Hako::open(&dir2, cfg).unwrap());
+        put_simple(&db2, "users", "a");
+        put_simple(&db2, "_hidden", "b");
+        let cols2 = db2.sync_collections().unwrap();
+        assert!(cols2.contains(&"users".to_string()));
+        assert!(
+            !cols2.contains(&"_hidden".to_string()),
+            "config extra must drop: {cols2:?}"
+        );
+        assert!(db2.is_sync_excluded_effective("_hidden"));
+        assert!(db2.is_sync_excluded_effective("__groups"));
+        assert!(!db2.is_sync_excluded_effective("users"));
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
     fn put_group(
-        db: &Arc<FireLite>,
+        db: &Arc<Hako>,
         room: &str,
         mode: &str,
         key_hash: Option<String>,
         members: Vec<String>,
     ) {
-        let mut doc = FireLiteDoc::default();
+        let mut doc = HakoDoc::default();
         doc.insert("mode", Value::String(mode.to_string()));
         if let Some(h) = key_hash {
             doc.insert("api_key_hash", Value::String(h));

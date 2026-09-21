@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use smallvec::SmallVec;
 use std::sync::Arc;
 
-use crate::document::firelite_doc::FireLiteDoc;
+use crate::document::hako_doc::HakoDoc;
 use crate::document::value::Value;
 
 use super::definition::CompositeIndexDefinition;
@@ -23,7 +23,7 @@ impl CompositeIndex {
         }
     }
 
-    pub fn document_values(&self, doc_id: &str, doc: &FireLiteDoc) -> Option<Vec<Value>> {
+    pub fn document_values(&self, doc_id: &str, doc: &HakoDoc) -> Option<Vec<Value>> {
         let mut values = Vec::with_capacity(self.definition.fields.len());
 
         for f in &self.definition.fields {
@@ -39,7 +39,7 @@ impl CompositeIndex {
         Some(values)
     }
 
-    // pub fn index_document(&mut self, doc_id: &str, doc: &FireLiteDoc) {
+    // pub fn index_document(&mut self, doc_id: &str, doc: &HakoDoc) {
     //     if let Some(values) = self.document_values(&doc_id, doc) {
     //         self.tree.insert(
     //             encode_composite_key(&self.definition, &values, doc_id),
@@ -48,7 +48,7 @@ impl CompositeIndex {
     //         );
     //     }
     // }
-    pub fn index_document(&mut self, doc_id: &str, doc: &FireLiteDoc) {
+    pub fn index_document(&mut self, doc_id: &str, doc: &HakoDoc) {
         if let Some(values) = self.document_values(doc_id, doc) {
             // Use the doc_id exactly as provided
             self.tree.insert(
@@ -60,7 +60,7 @@ impl CompositeIndex {
 
     pub fn index_batch<'a, I>(&mut self, docs: I)
     where
-        I: IntoIterator<Item = (&'a str, &'a FireLiteDoc)>,
+        I: IntoIterator<Item = (&'a str, &'a HakoDoc)>,
     {
         let new_entries = docs
             .into_iter()
@@ -75,7 +75,7 @@ impl CompositeIndex {
         self.tree.extend(new_entries);
     }
 
-    pub fn remove_document(&mut self, doc_id: &str, doc: &FireLiteDoc) {
+    pub fn remove_document(&mut self, doc_id: &str, doc: &HakoDoc) {
         if let Some(values) = self.document_values(&doc_id, doc) {
             self.tree
                 .remove(&encode_composite_key(&self.definition, &values, doc_id));
@@ -84,7 +84,7 @@ impl CompositeIndex {
 
     pub fn remove_batch<'a, I>(&mut self, docs: I)
     where
-        I: IntoIterator<Item = (&'a str, &'a FireLiteDoc)>,
+        I: IntoIterator<Item = (&'a str, &'a HakoDoc)>,
     {
         for (doc_id, doc) in docs {
             if let Some(values) = self.document_values(&doc_id, doc) {

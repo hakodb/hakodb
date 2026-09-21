@@ -34,12 +34,12 @@ pub(crate) fn intern_field(key: &str) -> Arc<str> {
 }
 
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
-pub struct FireLiteDoc {
+pub struct HakoDoc {
     pub fields: Vec<(Arc<str>, Value)>,
     pub _time: i64,
 }
 
-impl FireLiteDoc {
+impl HakoDoc {
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.fields.binary_search_by(|(k, _)| k.as_ref().cmp(key))
             .ok()
@@ -83,11 +83,11 @@ impl FireLiteDoc {
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let view = FireLiteDocView::new(bytes)?;
+        let view = HakoDocView::new(bytes)?;
         // ponytail: size the vec from the header count — the old push-grown
         // vec always paid one backing alloc (+ regrow for wide docs) per
         // decode. The count is right there in the view.
-        let mut doc = FireLiteDoc::default();
+        let mut doc = HakoDoc::default();
         doc._time = view._time;
         doc.fields = Vec::with_capacity(view.fields_count as usize);
         let mut it = view.iter();
@@ -105,8 +105,8 @@ impl FireLiteDoc {
     }
 
     pub fn decode_projected(bytes: &[u8], projection: &[String]) -> Option<Self> {
-        let view = FireLiteDocView::new(bytes)?;
-        let mut doc = FireLiteDoc::default();
+        let view = HakoDocView::new(bytes)?;
+        let mut doc = HakoDoc::default();
         doc._time = view._time;
         doc.fields = Vec::with_capacity(view.fields_count as usize);
         let mut it = view.iter();
@@ -235,21 +235,21 @@ impl FireLiteDoc {
     }
 }
 
-pub struct FireLiteDocView<'a> {
+pub struct HakoDocView<'a> {
     bytes: &'a [u8],
     fields_count: u16,
     pub _time: i64,
 }
 
-impl<'a> FireLiteDocView<'a> {
+impl<'a> HakoDocView<'a> {
     pub fn new(bytes: &'a [u8]) -> Option<Self> {
         if bytes.len() < 12 || bytes[0] != MAGIC || bytes[1] != VERSION { return None; }
         let _time = i64::from_le_bytes(bytes[2..10].try_into().ok()?);
         let fields_count = u16::from_le_bytes(bytes[10..12].try_into().ok()?);
         Some(Self { bytes, fields_count, _time })
     }
-    pub fn iter(&self) -> FireLiteDocIter<'a> {
-        FireLiteDocIter { bytes: self.bytes, pos: 12, remaining: self.fields_count }
+    pub fn iter(&self) -> HakoDocIter<'a> {
+        HakoDocIter { bytes: self.bytes, pos: 12, remaining: self.fields_count }
     }
 }
 
@@ -273,7 +273,7 @@ impl<'a> BorrowedValue<'a> {
     }
 }
 
-pub struct FireLiteDocIter<'a> {
+pub struct HakoDocIter<'a> {
     bytes: &'a [u8],
     pos: usize,
     remaining: u16,
@@ -285,7 +285,7 @@ pub struct FireLiteDocIter<'a> {
 /// owned-decode cost (no fields Vec, no interning, no value allocs until
 /// a field is actually pulled).
 ///
-/// Get one via `FireLite::get_view` (point read) or `FireLite::walk_view`
+/// Get one via `Hako::get_view` (point read) or `Hako::walk_view`
 /// (scan). `get` walks the framing with `skip_value` (no decode of
 /// skipped fields); `to_owned_doc` fully decodes when you want it all.
 #[derive(Clone)]
@@ -302,7 +302,7 @@ impl DocView {
     /// (A full up-front validation pass cost a second framing walk per
     /// row, ~2x on scans, for corrupt data storage never holds.)
     pub fn new(bytes: Arc<Vec<u8>>) -> Option<Self> {
-        let view = FireLiteDocView::new(&bytes)?;
+        let view = HakoDocView::new(&bytes)?;
         Some(Self { time: view._time, fields_count: view.fields_count, bytes })
     }
 
@@ -369,12 +369,12 @@ impl DocView {
     }
 
     /// Escape hatch: full owned decode.
-    pub fn to_owned_doc(&self) -> Option<FireLiteDoc> {
-        FireLiteDoc::decode(&self.bytes)
+    pub fn to_owned_doc(&self) -> Option<HakoDoc> {
+        HakoDoc::decode(&self.bytes)
     }
 }
 
-impl<'a> FireLiteDocIter<'a> {
+impl<'a> HakoDocIter<'a> {
     /// Fields not yet consumed. After a full pass this must be 0 —
     /// `decode` rejects buffers that end mid-document instead of
     /// returning a silently short doc.
@@ -388,7 +388,7 @@ impl<'a> FireLiteDocIter<'a> {
     }
 }
 
-impl<'a> Iterator for FireLiteDocIter<'a> {
+impl<'a> Iterator for HakoDocIter<'a> {
     type Item = (&'a str, u8, &'a [u8]);    fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == 0 { return None; }
         let k_len = *self.bytes.get(self.pos)? as usize;

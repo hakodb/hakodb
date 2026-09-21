@@ -1,7 +1,7 @@
-use firelite::config::{DurabilityMode, FireLiteConfig};
-use firelite::document::firelite_doc::FireLiteDoc;
-use firelite::document::value::Value;
-use firelite::engine::{BatchMutation, FireLite};
+use hakodb::config::{DurabilityMode, HakoConfig};
+use hakodb::document::hako_doc::HakoDoc;
+use hakodb::document::value::Value;
+use hakodb::engine::{BatchMutation, Hako};
 
 #[test]
 fn write_path_nofsync_modes() {
@@ -21,13 +21,13 @@ fn write_path_nofsync_modes() {
                 .unwrap()
                 .as_nanos()
         ));
-        let mut cfg = FireLiteConfig::default();
+        let mut cfg = HakoConfig::default();
         cfg.durability_mode = mode;
-        let db = FireLite::open(&dir, cfg).expect("open");
+        let db = Hako::open(&dir, cfg).expect("open");
 
         let mut mutations = Vec::with_capacity(100);
         for i in 0..100 {
-            let mut doc = FireLiteDoc::default();
+            let mut doc = HakoDoc::default();
             doc.insert("v", Value::Int(i as i64));
             mutations.push(BatchMutation::Put {
                 collection: "bench".into(),
@@ -53,12 +53,12 @@ fn blob_write_path() {
             .unwrap()
             .as_nanos()
     ));
-    let mut cfg = FireLiteConfig::default();
+    let mut cfg = HakoConfig::default();
     cfg.durability_mode = DurabilityMode::Manual;
     cfg.value_blob_threshold_bytes = 1024;
-    let db = FireLite::open(&dir, cfg).expect("open");
+    let db = Hako::open(&dir, cfg).expect("open");
 
-    let mut small = FireLiteDoc::default();
+    let mut small = HakoDoc::default();
     small.insert("k", Value::Int(1));
     db.write_batch(vec![BatchMutation::Put {
         collection: "bench".into(),
@@ -68,7 +68,7 @@ fn blob_write_path() {
     .expect("small write");
     assert!(db.get("bench", "small_doc").expect("get").is_some(), "small_doc visible");
 
-    let mut doc = FireLiteDoc::default();
+    let mut doc = HakoDoc::default();
     doc.insert("blob", Value::String("x".repeat(4096)));
     db.write_batch(vec![BatchMutation::Put {
         collection: "bench".into(),
@@ -107,11 +107,11 @@ fn tx_get_put_commit() {
             .unwrap()
             .as_nanos()
     ));
-    let mut cfg = FireLiteConfig::default();
+    let mut cfg = HakoConfig::default();
     cfg.durability_mode = DurabilityMode::Manual;
-    let db = FireLite::open(&dir, cfg).expect("open");
+    let db = Hako::open(&dir, cfg).expect("open");
 
-    let mut initial = FireLiteDoc::default();
+    let mut initial = HakoDoc::default();
     initial.insert("counter", Value::Int(0));
     db.write_batch(vec![BatchMutation::Put {
         collection: "bench".into(),
@@ -143,7 +143,7 @@ fn wal_snapshot_reclaims_stale_history() {
             .unwrap()
             .as_nanos()
     ));
-    let mut cfg = FireLiteConfig::default();
+    let mut cfg = HakoConfig::default();
     // Interval (not Manual): Manual buffers everything in RAM and the WAL
     // file stays empty until flush — history must reach disk for this test.
     cfg.durability_mode = DurabilityMode::Interval;
@@ -151,11 +151,11 @@ fn wal_snapshot_reclaims_stale_history() {
     // Small reserve: file length only reflects real content once writes
     // overflow the headroom (length never moves inside the reservation).
     cfg.wal_reserve_bytes = 65536;
-    let db = FireLite::open(&dir, cfg).expect("open");
+    let db = Hako::open(&dir, cfg).expect("open");
 
     for round in 0..200 {
         for i in 0..20 {
-            let mut doc = FireLiteDoc::default();
+            let mut doc = HakoDoc::default();
             doc.insert("v", Value::Int(round));
             doc.insert("pad", Value::String("x".repeat(500)));
             db.put("bench", &format!("k_{i}"), &doc).expect("put");
@@ -193,16 +193,16 @@ fn wal_reserve_skipped_for_internal_collections() {
             .unwrap()
             .as_nanos()
     ));
-    let mut cfg = FireLiteConfig::default();
+    let mut cfg = HakoConfig::default();
     cfg.durability_mode = DurabilityMode::Always;
     // Exercise the reserve mechanism explicitly (default is off/0).
     cfg.wal_reserve_bytes = 4 * 1024 * 1024;
-    let db = FireLite::open(&dir, cfg).expect("open");
+    let db = Hako::open(&dir, cfg).expect("open");
 
-    let mut doc = FireLiteDoc::default();
+    let mut doc = HakoDoc::default();
     doc.insert("v", Value::Int(1));
     db.put("user_data", "a", &doc).expect("put");
-    db.put("__firelite_system", "probe", &doc).expect("put");
+    db.put("__hako_system", "probe", &doc).expect("put");
     db.flush().ok();
 
     let wal_len = |col: &str| {
@@ -212,9 +212,9 @@ fn wal_reserve_skipped_for_internal_collections() {
     };
     assert!(wal_len("user_data") >= 4 * 1024 * 1024, "user shard lost its reserve");
     assert!(
-        wal_len("__firelite_system") < 1024 * 1024,
+        wal_len("__hako_system") < 1024 * 1024,
         "system shard carries phantom reserve: {} bytes",
-        wal_len("__firelite_system")
+        wal_len("__hako_system")
     );
     std::fs::remove_dir_all(&dir).ok();
 }

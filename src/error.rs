@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum FireLiteError {
+pub enum HakoError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("lock poisoned: {0}")]  // <--- ADD THIS
@@ -18,4 +18,4 @@ pub enum FireLiteError {
     InvalidInput(String),
 }
 
-pub type Result<T> = std::result::Result<T, FireLiteError>;
+pub type Result<T> = std::result::Result<T, HakoError>;

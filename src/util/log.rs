@@ -27,7 +27,7 @@ pub fn info(msg: &str) {
         return;
     }
     if STDERR_ON.load(Ordering::Acquire) {
-        eprintln!("[firelite] {msg}");
+        eprintln!("[hakodb] {msg}");
     }
 }
 

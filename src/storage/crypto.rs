@@ -4,7 +4,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use sha2::{Digest, Sha256};
 use rand::RngCore; 
 use std::sync::Arc;
-use crate::error::{FireLiteError, Result};
+use crate::error::{HakoError, Result};
 
 const NONCE_LEN: usize = 12;
 
@@ -46,7 +46,7 @@ impl EncryptionContext {
         let ciphertext = self
             .cipher
             .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
-            .map_err(|_| FireLiteError::StorageError("encryption failed".into()))?;
+            .map_err(|_| HakoError::StorageError("encryption failed".into()))?;
 
         // Pre-allocate to avoid multiple small re-allocations
         let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
@@ -57,13 +57,13 @@ impl EncryptionContext {
 
     pub fn decrypt(&self, input: &[u8]) -> Result<Vec<u8>> {
         if input.len() < NONCE_LEN {
-            return Err(FireLiteError::Corrupt(
+            return Err(HakoError::Corrupt(
                 "ciphertext shorter than nonce".into(),
             ));
         }
         let (nonce, ciphertext) = input.split_at(NONCE_LEN);
         self.cipher
             .decrypt(Nonce::from_slice(nonce), ciphertext)
-            .map_err(|_| FireLiteError::Corrupt("decryption failed".into()))
+            .map_err(|_| HakoError::Corrupt("decryption failed".into()))
     }
 }

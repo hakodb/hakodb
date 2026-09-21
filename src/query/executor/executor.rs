@@ -3,7 +3,7 @@ use rayon::prelude::*;
 use std::sync::{Arc, RwLock};
 use std::thread;
 
-use crate::document::firelite_doc::{BorrowedValue, DocView, FireLiteDoc, FireLiteDocView};
+use crate::document::hako_doc::{BorrowedValue, DocView, HakoDoc, HakoDocView};
 use crate::document::value::Value;
 use crate::error::Result;
 use crate::index::manager::IndexManager;
@@ -35,7 +35,7 @@ impl ParallelQueryExecutor {
         storage_arc: Arc<RwLock<StorageEngine>>,
         indexes: &IndexManager,
         plan: QueryPlan,
-    ) -> Result<Vec<(String, FireLiteDoc)>> {
+    ) -> Result<Vec<(String, HakoDoc)>> {
         // 1. PHASE 1: INDEX SCAN
         // Fetch physical pointers from the RAM Index
         let keys_from_index = {
@@ -90,9 +90,9 @@ impl ParallelQueryExecutor {
             // thread-safe). With plan.defer_blobs the placeholders are
             // returned as-is; resolve later per doc if needed.
             let defer = plan.defer_blobs;
-            let push_row = |id: String, bytes: &[u8], results: &mut Vec<(String, FireLiteDoc)>| {
+            let push_row = |id: String, bytes: &[u8], results: &mut Vec<(String, HakoDoc)>| {
                 if plan.filters_satisfied_by_index {
-                    if let Some(doc) = FireLiteDoc::decode(bytes) {
+                    if let Some(doc) = HakoDoc::decode(bytes) {
                         results.push((id, doc));
                     }
                 } else if let Some(doc) = crate::query::executor::worker::unified_match_decode(&id, bytes, &optimized_plan) {
@@ -211,7 +211,7 @@ impl ParallelQueryExecutor {
             Some(storage_arc.clone()),
         );
 
-        let processed_docs: Vec<(String, FireLiteDoc)> = if target_workers == 1 {
+        let processed_docs: Vec<(String, HakoDoc)> = if target_workers == 1 {
             // SHORT-CIRCUIT: Avoid Rayon task-scheduling overhead for small results.
             // This ensures a query for 50 docs is as fast as 50 individual Get calls.
             tasks.into_iter().flat_map(|task| run_task(task)).collect()
@@ -224,7 +224,7 @@ impl ParallelQueryExecutor {
         };
 
         // 5. PHASE 5: LOGICAL ORDER RESTORATION
-        let mut processed_map: HashMap<String, FireLiteDoc> = processed_docs.into_iter().collect();
+        let mut processed_map: HashMap<String, HakoDoc> = processed_docs.into_iter().collect();
         let mut ordered_results = Vec::with_capacity(doc_count);
 
         for (original_pos, key, _) in work_items {
@@ -236,7 +236,7 @@ impl ParallelQueryExecutor {
         // Restore the order provided by the index (or original insertion order)
         ordered_results.sort_by_key(|(pos, _, _)| *pos);
 
-        let mut results: Vec<(String, FireLiteDoc)> = ordered_results
+        let mut results: Vec<(String, HakoDoc)> = ordered_results
             .into_iter()
             .map(|(_, k, d)| (k, d))
             .collect();
@@ -279,7 +279,7 @@ impl ParallelQueryExecutor {
     /// no filter re-verify, no blob inflation, no rayon. `Inlined` docs
     /// share the RAM buffer (Arc bump, zero copies); segment/blob pointers
     /// do one positional read each. Returns storage-encoded bytes: opaque
-    /// and version-scoped — decode with `FireLiteDoc::decode`, do not
+    /// and version-scoped — decode with `HakoDoc::decode`, do not
     /// persist or compare across versions.
     ///
     /// Requires index-satisfied filters AND ordering (raw cannot match or
@@ -292,16 +292,16 @@ impl ParallelQueryExecutor {
         indexes: &IndexManager,
         plan: QueryPlan,
     ) -> Result<Vec<(String, Arc<Vec<u8>>)>> {
-        use crate::error::FireLiteError;
+        use crate::error::HakoError;
         if (!plan.filters.is_empty() || !plan.or_groups.is_empty())
             && !plan.filters_satisfied_by_index
         {
-            return Err(FireLiteError::QueryError(
+            return Err(HakoError::QueryError(
                 "raw queries require index-satisfied filters (decode to match)".into(),
             ));
         }
         if !plan.order_by_satisfied && !plan.order_by.is_empty() {
-            return Err(FireLiteError::QueryError(
+            return Err(HakoError::QueryError(
                 "raw queries require index-satisfied ordering (decode to sort)".into(),
             ));
         }
@@ -365,19 +365,19 @@ impl ParallelQueryExecutor {
     where
         F: FnMut(&str, &[u8]) -> bool,
     {
-        use crate::error::FireLiteError;
+        use crate::error::HakoError;
         // ponytail: reserved for the non-SortedKeys arms when the walk
         // grows beyond order-by-id (underscore until then, not dead).
         let _ = indexes;
         if (!plan.filters.is_empty() || !plan.or_groups.is_empty())
             && !plan.filters_satisfied_by_index
         {
-            return Err(FireLiteError::QueryError(
+            return Err(HakoError::QueryError(
                 "walk requires index-satisfied filters (decode to match)".into(),
             ));
         }
         if !plan.order_by_satisfied && !plan.order_by.is_empty() {
-            return Err(FireLiteError::QueryError(
+            return Err(HakoError::QueryError(
                 "walk requires index-satisfied ordering (decode to sort)".into(),
             ));
         }
@@ -386,7 +386,7 @@ impl ParallelQueryExecutor {
                 (*reverse, start_key.clone(), *start_exclusive)
             }
             _ => {
-                return Err(FireLiteError::QueryError(
+                return Err(HakoError::QueryError(
                     "walk supports SortedKeys scans only (order by id)".into(),
                 ))
             }
@@ -440,17 +440,17 @@ impl ParallelQueryExecutor {
     where
         F: FnMut(&str, &DocView) -> bool,
     {
-        use crate::error::FireLiteError;
+        use crate::error::HakoError;
         let _ = indexes;
         if (!plan.filters.is_empty() || !plan.or_groups.is_empty())
             && !plan.filters_satisfied_by_index
         {
-            return Err(FireLiteError::QueryError(
+            return Err(HakoError::QueryError(
                 "view walk requires index-satisfied filters (decode to match)".into(),
             ));
         }
         if !plan.order_by_satisfied && !plan.order_by.is_empty() {
-            return Err(FireLiteError::QueryError(
+            return Err(HakoError::QueryError(
                 "view walk requires index-satisfied ordering (decode to sort)".into(),
             ));
         }
@@ -459,7 +459,7 @@ impl ParallelQueryExecutor {
                 (*reverse, start_key.clone(), *start_exclusive)
             }
             _ => {
-                return Err(FireLiteError::QueryError(
+                return Err(HakoError::QueryError(
                     "view walk supports SortedKeys scans only (order by id)".into(),
                 ))
             }
@@ -583,7 +583,7 @@ impl ParallelQueryExecutor {
         _indexes: &IndexManager,
         plan: QueryPlan,
         keys_from_index: Vec<(String, Pointer)>,
-    ) -> Result<Vec<(String, FireLiteDoc)>> {
+    ) -> Result<Vec<(String, HakoDoc)>> {
         use crate::query::executor::worker::{doc_has_links, inflate_blobs};
         let (staged, blob_manager) = {
             let storage = storage_arc.read().unwrap();
@@ -595,9 +595,9 @@ impl ParallelQueryExecutor {
             }
             (v, storage.blob_manager.clone())
         };
-        let mut results: Vec<(String, FireLiteDoc)> = staged
+        let mut results: Vec<(String, HakoDoc)> = staged
             .into_par_iter()
-            .filter_map(|(id, bytes)| FireLiteDoc::decode(&bytes).map(|doc| (id, doc)))
+            .filter_map(|(id, bytes)| HakoDoc::decode(&bytes).map(|doc| (id, doc)))
             .collect();
         if !plan.defer_blobs {
             if let Some(bm) = blob_manager.as_ref() {
@@ -749,7 +749,7 @@ impl ParallelQueryExecutor {
                 if let Ok(Some(bytes)) = storage_engine.read_pointer(&pointer) {
                     // Check if the document matches the WHERE filters first
                     if matches_filters_view(&id, &bytes, &task.plan) {
-                        if let Some(view) = FireLiteDocView::new(&bytes) {
+                        if let Some(view) = HakoDocView::new(&bytes) {
                             for op in &thread_ops {
                                 match op {
                                     AggregateOp::Count => {

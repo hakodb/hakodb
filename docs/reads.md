@@ -1,13 +1,13 @@
 # Reading data: choosing the right path
 
-FireLite offers four read granularities for the same stored bytes. They
+HakoDB offers four read granularities for the same stored bytes. They
 differ in per-row cost by orders of magnitude, so picking by habit leaves
 5–50x on the table. Rule of thumb: **return the least materialization
 that answers the question.**
 
 | Path | Per-row work | Use when |
 |---|---|---|
-| `get` / `query` (decoded) | Full owned `FireLiteDoc` (~1–7µs, size-dependent) | You need whole documents as values |
+| `get` / `query` (decoded) | Full owned `HakoDoc` (~1–7µs, size-dependent) | You need whole documents as values |
 | `query_raw` | Pinned bytes, no decode (~1µs) | Export, hash, relay, count bytes |
 | `walk` | Borrowed bytes, zero allocs (~0.4µs) | Full scans: count, filter, copy out |
 | `get_view` / `walk_view` | Borrow + pull only touched fields (~0.2µs + ~0.2µs/pull) | Sparse reads: 2 fields out of 20 |
@@ -19,12 +19,12 @@ methodology). All four agree field-for-field — see `tests/codec_integrity.rs`.
 
 ```rust
 // Whole document, owned. Hot repeats skip decode via an internal cache.
-let doc: Option<FireLiteDoc> = db.get("orders", "id-123")?;
+let doc: Option<HakoDoc> = db.get("orders", "id-123")?;
 
 // Borrowed view: no decode, no interning, no cache churn. Pull fields lazily.
 if let Some(view) = db.get_view("orders", "id-123")? {
     if let Some(Value::Int(total)) = view.get("total") { /* ... */ }
-    let full: FireLiteDoc = view.to_owned_doc().expect("valid");
+    let full: HakoDoc = view.to_owned_doc().expect("valid");
 }
 ```
 
@@ -32,11 +32,10 @@ Views never inflate blobs: a blob-backed field reads back as its link
 placeholder. Resolve through a full decode when you need the bytes
 (`to_owned_doc` + `resolve_document_blobs`, or plain `get`).
 
-FFI mirrors both: `fl_engine_get` / `fl_doc_to_json` for owned docs,
-`fl_view_get` + typed `fl_view_get_int/float/bool/str/bytes` for lazy
-pulls, `fl_view_to_doc` as the escape hatch. SDKs: Go (`GetView`),
-Pascal (`TFireLite.GetView`), JS (`viewDoc` — numerics/bool only, no
-backend memory reads by design), Tauri (`view_get_field` op).
+FFI mirrors both: `hk_engine_get` / `hk_doc_to_json` for owned docs,
+`hk_view_get` + typed `hk_view_get_int/float/bool/str/bytes` for lazy
+pulls, `hk_view_to_doc` as the escape hatch. SDKs expose the same
+shapes (point views with lazy numeric/bool pulls, no decode).
 
 ## Scans
 
@@ -59,9 +58,9 @@ let n = db.walk_view(q, &mut |id: &str, view: &DocView| { /* ... */ true })?;
 Raw and walk require index-satisfied filters and ordering (they cannot
 match or sort without decoding) and return errors otherwise — loud, not
 silent. Bytes are **opaque storage encoding**: hash/count/export them,
-decode with `FireLiteDoc::decode`, never persist or compare across
-versions. FFI: `fl_query_execute_raw` + result-set fns,
-`fl_cursor_walk` / `fl_cursor_walk_view` with C callbacks.
+decode with `HakoDoc::decode`, never persist or compare across
+versions. FFI: `hk_query_execute_raw` + result-set fns,
+`hk_cursor_walk` / `hk_cursor_walk_view` with C callbacks.
 
 ## Pagination
 
@@ -82,7 +81,7 @@ linearly with depth — see the deep-pagination duel in
 
 ## Before you measure or paginate: readiness
 
-`FireLite::open` returns while index recovery still runs in the
+`Hako::open` returns while index recovery still runs in the
 background. Queries issued first silently plan full scans (cursor bounds
 ignored, pages repeat). Poll before scanning:
 
@@ -94,8 +93,9 @@ db.await_quiescent(Duration::from_secs(30)); // indexes + index worker + blobs +
 
 `await_quiescent` (and `quiescence_status()` for diagnostics) is the
 difference between benchmarking the engine and benchmarking contention.
-FFI: `fl_engine_await_quiescent` / `fl_engine_quiescence_status`. The CLI
-waits for readiness on every open; `benchmark.cpp` settles before scans.
+FFI: `hk_engine_await_quiescent` / `hk_engine_quiescence_status`. Settle
+before scans — quiescence is what separates benchmarking the engine from
+benchmarking contention.
 
 ## Blob semantics (the fine print)
 

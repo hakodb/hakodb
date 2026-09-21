@@ -1,9 +1,9 @@
 #[cfg(feature = "net-sync")]
-use crate::engine::FireLite;
+use crate::engine::Hako;
 #[cfg(feature = "net-sync")]
 use crate::document::value::Value;
 #[cfg(feature = "net-sync")]
-use crate::document::firelite_doc::FireLiteDoc;
+use crate::document::hako_doc::HakoDoc;
 #[cfg(feature = "net-sync")]
 use crate::storage::wal::WalOp;
 #[cfg(feature = "net-sync")]
@@ -218,7 +218,7 @@ async fn beacon_listener_task(
 
 #[cfg(feature = "net-sync")]
 pub struct NetSyncer {
-    db: Arc<FireLite>,
+    db: Arc<Hako>,
     self_id: String,
     room_hash: [u8; 32],
     excluded_collections: HashSet<String>,
@@ -299,7 +299,7 @@ fn transports_for(mode: DiscoveryMode) -> (bool, bool) {
 
 #[cfg(feature = "net-sync")]
 impl NetSyncer {
-    pub fn new(db: Arc<FireLite>, name: &str, room_key: &str, mut excluded: Vec<String>) -> Self {
+    pub fn new(db: Arc<Hako>, name: &str, room_key: &str, mut excluded: Vec<String>) -> Self {
         let (tx, rx) = watch::channel(NetworkStatus {
             status: SyncStatus::Idle, self_id: name.to_string(), peer_count: 0, known_peers: Vec::new(),
         });
@@ -309,7 +309,7 @@ impl NetSyncer {
         let room_hash: [u8; 32] = hasher.finalize().into();
 
         let mut shard_offsets = HashMap::new();
-        if let Ok(Some(doc)) = db.get("__firelite_system", "sync_checkpoint") {
+        if let Ok(Some(doc)) = db.get("__hako_system", "sync_checkpoint") {
             if let Some(Value::Map(fields)) = doc.get("offsets") {
                 for (name, val) in fields {
                     if let Value::Int(off) = val { shard_offsets.insert(name.to_string(), *off as u64); }
@@ -322,6 +322,9 @@ impl NetSyncer {
                 .iter()
                 .map(|s| s.to_string()),
         );
+        // Per-deployment extras ride along too, so mesh honors the same
+        // explicit plane as cloud sync.
+        excluded.extend(db.config.sync_excluded.iter().cloned());
 
         Self {
             db: db.clone(), 
@@ -329,7 +332,7 @@ impl NetSyncer {
             room_hash,
             excluded_collections: excluded.into_iter().collect(),
             // service_type: format!("_{}._tcp.local.", db.db_name().to_lowercase().replace('.', "_")),
-            service_type: "_firelite._tcp.local.".to_string(),
+            service_type: "_hakodb._tcp.local.".to_string(),
             status_tx: tx,
             status_rx: rx,
             peers: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -603,9 +606,10 @@ impl NetSyncer {
                 let mut overall_changed = false;
                 let mut offsets = offsets_tail.lock().unwrap();
 
-                // Adding hidden internal firelite security collection into sync
-                let mut cols = db_tail.list_collections().unwrap_or_default();
-                cols.extend(vec!["__firelite_security".to_string()]);
+                // Sync enumeration (hidden included, excluded dropped).
+                // `__hako_security` rides along by enumeration now —
+                // policies replicate — no manual re-add.
+                let cols = db_tail.sync_collections().unwrap_or_default();
 
                 // Encryption fail-closed set for this pass: collections WE
                 // encrypt at rest. Empty in unencrypted deployments, in which
@@ -710,13 +714,13 @@ impl NetSyncer {
 
                 // --- RESTORED: Periodically save offsets to the database ---
                 if overall_changed && last_checkpoint_save.elapsed() > Duration::from_secs(5) {
-                    let mut doc = FireLiteDoc::default();
+                    let mut doc = HakoDoc::default();
                     let map: Vec<(Arc<str>, Value)> = offsets.iter()
                         .map(|(k, v)| (Arc::from(k.as_str()), Value::Int(*v as i64)))
                         .collect();
                     
                     doc.insert("offsets", Value::Map(map));
-                    let _ = db_tail.put("__firelite_system", "sync_checkpoint", &doc);
+                    let _ = db_tail.put("__hako_system", "sync_checkpoint", &doc);
                     last_checkpoint_save = Instant::now();
                 }
 
@@ -801,21 +805,16 @@ impl NetSyncer {
 // --- Logic Helpers ---
 
 /// This node's capability advertisement: key fingerprint + the collections
-/// it encrypts at rest (including the force-synced security collection,
-/// which `list_collections` omits).
+/// it encrypts at rest (sync enumeration already includes the hidden
+/// security collection, so no manual re-add).
 #[cfg(feature = "net-sync")]
-fn local_caps(db: &Arc<FireLite>) -> PeerCaps {
-    let mut cols: Vec<String> = db
-        .list_collections()
+fn local_caps(db: &Arc<Hako>) -> PeerCaps {
+    let cols: Vec<String> = db
+        .sync_collections()
         .unwrap_or_default()
         .into_iter()
         .filter(|c| db.is_collection_encrypted(c))
         .collect();
-    if db.is_collection_encrypted("__firelite_security")
-        && !cols.iter().any(|c| c == "__firelite_security")
-    {
-        cols.push("__firelite_security".to_string());
-    }
     PeerCaps {
         key_fp: sync_guard::local_fingerprint(db.config.encryption_key.as_deref()),
         encrypted_cols: cols,
@@ -837,7 +836,7 @@ fn caps_warn_msg(dir: &str, peer: &str, col: &str, local_fp: [u8; 32]) -> String
 /// may leave this node toward that peer. Warns (throttled) on refusal.
 #[cfg(feature = "net-sync")]
 fn peer_may_send(
-    db: &Arc<FireLite>,
+    db: &Arc<Hako>,
     caps: &Arc<CapsMap>,
     peer_id: &str,
     col: &str,
@@ -857,7 +856,7 @@ fn peer_may_send(
 
 async fn handle_peer(
     stream: TcpStream, 
-    db: Arc<FireLite>, 
+    db: Arc<Hako>, 
     peers_map: Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>,
     seen_cache: Arc<AsyncMutex<Vec<u128>>>, 
     status_tx: watch::Sender<NetworkStatus>,
@@ -1061,7 +1060,7 @@ async fn handle_peer(
 }
 
 
-fn resolve_op_to_bytes(shard_arc: &Arc<RwLock<crate::storage::engine::StorageEngine>>, db: &Arc<FireLite>, op: &WalOp) -> Option<Vec<u8>> {
+fn resolve_op_to_bytes(shard_arc: &Arc<RwLock<crate::storage::engine::StorageEngine>>, db: &Arc<Hako>, op: &WalOp) -> Option<Vec<u8>> {
     // 1. Resolve the raw bytes (Skeleton) from the WAL op
     let bytes = match op {
         WalOp::PutInlined { value, .. } => value.clone(),
@@ -1077,7 +1076,7 @@ fn resolve_op_to_bytes(shard_arc: &Arc<RwLock<crate::storage::engine::StorageEng
     };
 
     // 2. Decode to check for BlobLinks
-    if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
+    if let Some(mut doc) = HakoDoc::decode(&bytes) {
         let has_links = doc.fields.iter().any(|(_, v)| matches!(v, Value::BlobLink { .. }));
         
         if has_links {
@@ -1094,11 +1093,12 @@ fn resolve_op_to_bytes(shard_arc: &Arc<RwLock<crate::storage::engine::StorageEng
     Some(bytes)
 }
 
-async fn handle_bootstrap(db: &Arc<FireLite>, peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, peer_id: &str, excluded: &HashSet<String>, caps: &Arc<CapsMap>) {
+async fn handle_bootstrap(db: &Arc<Hako>, peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, peer_id: &str, excluded: &HashSet<String>, caps: &Arc<CapsMap>) {
     let encryption_key = db.config.encryption_key.as_deref();
 
-    let mut cols = db.list_collections().unwrap_or_default();
-    cols.extend(vec!["__firelite_security".to_string()]);
+    // Sync enumeration covers hidden collections; the excluded plane is
+    // dropped by the enumerator, `excluded` double-checks per instance.
+    let cols = db.sync_collections().unwrap_or_default();
 
     // Sender rule, evaluated once per collection (before any disk reads,
     // so refused rooms also skip the inflation work).
@@ -1133,7 +1133,7 @@ async fn handle_bootstrap(db: &Arc<FireLite>, peers: &Arc<AsyncMutex<HashMap<Str
                     Ok(Some(bytes)) => {
                         let mut final_bytes = bytes;
                         // Check if we need to inflate the skeleton
-                        if let Some(mut doc) = FireLiteDoc::decode(&final_bytes) {
+                        if let Some(mut doc) = HakoDoc::decode(&final_bytes) {
                             if doc.fields.iter().any(|(_, v)| matches!(v, Value::BlobLink { .. })) {
                                 // Drop this specific read guard because resolve_doc_static will acquire its own
                                 drop(guard); 
@@ -1174,7 +1174,7 @@ async fn handle_bootstrap(db: &Arc<FireLite>, peers: &Arc<AsyncMutex<HashMap<Str
 /// tailer withholds — the pre-v0.7.7 code sent local tombstones here.
 #[cfg(feature = "net-sync")]
 fn collect_delta_ops(
-    db: &Arc<FireLite>,
+    db: &Arc<Hako>,
     collection: &str,
     since_time: i64,
 ) -> Vec<WalOp> {
@@ -1232,7 +1232,7 @@ fn collect_delta_ops(
                 };
 
                 if let Some(bytes) = raw_res {
-                    if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
+                    if let Some(mut doc) = HakoDoc::decode(&bytes) {
                         // INFLATE: If document has blobs, resolve them.
                         let has_blobs = doc.fields.iter().any(|(_, v)| matches!(v, Value::BlobLink { .. }));
 
@@ -1256,7 +1256,7 @@ fn collect_delta_ops(
 }
 
 async fn handle_delta_send(
-    db: &Arc<FireLite>,
+    db: &Arc<Hako>,
     peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>,
     peer_id: &str,
     collection: &str,
@@ -1312,7 +1312,7 @@ async fn send_replication_packet(
 }
 
 #[cfg(feature = "net-sync")]
-async fn apply_replication_batch(db: Arc<FireLite>, collection: String, ops: Vec<WalOp>, echo_cache: Arc<Mutex<HashMap<String, i64>>>,) {
+async fn apply_replication_batch(db: Arc<Hako>, collection: String, ops: Vec<WalOp>, echo_cache: Arc<Mutex<HashMap<String, i64>>>,) {
     // Local-only signal (inbound): a locally-scoped collection refuses
     // everything the mesh offers. Per-key marks do NOT filter inbound —
     // a genuinely newer remote put still resurrects (documented rule).
@@ -1345,13 +1345,13 @@ async fn apply_replication_batch(db: Arc<FireLite>, collection: String, ops: Vec
         for op in ops {
             let (key, mut doc, is_delete, remote_ts) = match op {
                 WalOp::PutInlined { ref key, ref value } => {
-                    if let Some(d) = FireLiteDoc::decode(value) { 
+                    if let Some(d) = HakoDoc::decode(value) { 
                         let ts = d.get_logical_time();
                         (key.clone(), d, false, ts) 
                     } else { continue; }
                 }
                 WalOp::Delete { ref key, timestamp } => {
-                    (key.clone(), FireLiteDoc::default(), true, timestamp)
+                    (key.clone(), HakoDoc::default(), true, timestamp)
                 }
                 _ => continue,
             };
@@ -1366,7 +1366,7 @@ async fn apply_replication_batch(db: Arc<FireLite>, collection: String, ops: Vec
                         // otherwise decode the disk header.
                         shard_read.read_pointer_internal(local_ptr, false)
                             .ok().flatten()
-                            .and_then(|b| FireLiteDoc::decode(&b))
+                            .and_then(|b| HakoDoc::decode(&b))
                             .map(|d| d.get_logical_time())
                             .unwrap_or(0)
                     }
@@ -1458,7 +1458,7 @@ async fn apply_replication_batch(db: Arc<FireLite>, collection: String, ops: Vec
     
     // 4. PHASE 4: Hand to Indexer
     // update search indexes.
-    let index_docs: Vec<(String, Arc<FireLiteDoc>)> = accepted_ops.iter().filter_map(|op| {
+    let index_docs: Vec<(String, Arc<HakoDoc>)> = accepted_ops.iter().filter_map(|op| {
         if let WalOp::PutInlined { key, value } = op {
             // Attempt to extract naked ID if using "col:id" format, else use key as is
             let doc_id = key.split_once(':')
@@ -1466,7 +1466,7 @@ async fn apply_replication_batch(db: Arc<FireLite>, collection: String, ops: Vec
                 .unwrap_or_else(|| key.clone());
 
             // Decode the bytes and wrap the resulting document in an Arc immediately
-            FireLiteDoc::decode(value).map(|d| (doc_id, Arc::new(d)))
+            HakoDoc::decode(value).map(|d| (doc_id, Arc::new(d)))
         } else { 
             None 
         }
@@ -1625,22 +1625,22 @@ async fn send_packet(writer: &mut OwnedWriteHalf, packet: NetPacket) -> tokio::i
 #[cfg(all(test, feature = "net-sync"))]
 mod tests {
     use super::*;
-    use crate::config::{DurabilityMode, FireLiteConfig};
+    use crate::config::{DurabilityMode, HakoConfig};
 
-    fn temp_db(tag: &str) -> (Arc<FireLite>, std::path::PathBuf) {
+    fn temp_db(tag: &str) -> (Arc<Hako>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
-            "firelite-netsync-{tag}-{}",
+            "hakodb-netsync-{tag}-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut cfg = FireLiteConfig::default();
+        let mut cfg = HakoConfig::default();
         cfg.durability_mode = DurabilityMode::Manual;
-        let db = Arc::new(FireLite::open(&dir, cfg).unwrap());
+        let db = Arc::new(Hako::open(&dir, cfg).unwrap());
         (db, dir)
     }
 
-    fn put_simple(db: &Arc<FireLite>, col: &str, id: &str) {
-        let mut doc = FireLiteDoc::default();
+    fn put_simple(db: &Arc<Hako>, col: &str, id: &str) {
+        let mut doc = HakoDoc::default();
         doc.insert("v", Value::Int(1));
         db.put(col, id, &doc).unwrap();
     }
@@ -1814,17 +1814,17 @@ mod tests {
         assert_eq!(addr, "127.0.0.1:7070");
     }
 
-    fn temp_enc_db(tag: &str, key: &str) -> (Arc<FireLite>, std::path::PathBuf) {
+    fn temp_enc_db(tag: &str, key: &str) -> (Arc<Hako>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
-            "firelite-netsync-enc-{tag}-{}",
+            "hakodb-netsync-enc-{tag}-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut cfg = FireLiteConfig::default();
+        let mut cfg = HakoConfig::default();
         cfg.durability_mode = DurabilityMode::Manual;
         cfg.encryption_key = Some(key.to_string());
         // No encrypted_cols list: encryption is global on this node.
-        let db = Arc::new(FireLite::open(&dir, cfg).unwrap());
+        let db = Arc::new(Hako::open(&dir, cfg).unwrap());
         (db, dir)
     }
 

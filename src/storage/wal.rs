@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 // use rayon::string;
 
 use crate::config::DurabilityMode;
-use crate::error::{FireLiteError, Result};
+use crate::error::{HakoError, Result};
 
 use super::crypto::EncryptionContext;
 
@@ -426,7 +426,7 @@ impl Wal {
                     Err(_) => {
                         // Decryption failed but CRC was correct! 
                         // This means the KEY is wrong. Do NOT truncate.
-                        return Err(FireLiteError::Corrupt("Decryption failed. Wrong encryption key?".into()));
+                        return Err(HakoError::Corrupt("Decryption failed. Wrong encryption key?".into()));
                     }
                 }
             } else {
@@ -443,7 +443,7 @@ impl Wal {
                     // CRC was valid, but we can't read the data.
                     // If we are NOT in encryption mode, this might be encrypted data we're trying to read as plain.
                     if self.encryption.is_none() {
-                        return Err(FireLiteError::Corrupt("Recognized valid data but failed to decode. Is this collection encrypted?".into()));
+                        return Err(HakoError::Corrupt("Recognized valid data but failed to decode. Is this collection encrypted?".into()));
                     }
                     // Otherwise, this is a logical corruption, stop but don't truncate.
                     break;
@@ -664,14 +664,14 @@ fn encode_into(buf: &mut Vec<u8>, op: &WalOp) {
 fn decode(payload: &[u8]) -> Result<WalOp> {
     let tag = *payload
         .first()
-        .ok_or_else(|| FireLiteError::Corrupt("empty wal record".into()))?;
+        .ok_or_else(|| HakoError::Corrupt("empty wal record".into()))?;
     let mut pos = 1;
     match tag {
         0 => {
             let tx_id = u64::from_le_bytes(
                 payload[pos..pos + 8]
                     .try_into()
-                    .map_err(|_| FireLiteError::Corrupt("bad begin tx id".into()))?,
+                    .map_err(|_| HakoError::Corrupt("bad begin tx id".into()))?,
             );
             Ok(WalOp::BeginTx { tx_id })
         }
@@ -679,31 +679,31 @@ fn decode(payload: &[u8]) -> Result<WalOp> {
             let key_len = u16::from_le_bytes(
                 payload[pos..pos + 2]
                     .try_into()
-                    .map_err(|_| FireLiteError::Corrupt("bad wal key len".into()))?,
+                    .map_err(|_| HakoError::Corrupt("bad wal key len".into()))?,
             ) as usize;
             pos += 2;
             if pos + key_len > payload.len() {
-                return Err(FireLiteError::Corrupt("wal put key overruns record".into()));
+                return Err(HakoError::Corrupt("wal put key overruns record".into()));
             }
             let key = String::from_utf8(payload[pos..pos + key_len].to_vec())
-                .map_err(|_| FireLiteError::Corrupt("bad wal key".into()))?;
+                .map_err(|_| HakoError::Corrupt("bad wal key".into()))?;
             pos += key_len;
             let segment_id = u64::from_le_bytes(
                 payload[pos..pos + 8]
                     .try_into()
-                    .map_err(|_| FireLiteError::Corrupt("bad wal segment id".into()))?,
+                    .map_err(|_| HakoError::Corrupt("bad wal segment id".into()))?,
             );
             pos += 8;
             let offset = u64::from_le_bytes(
                 payload[pos..pos + 8]
                     .try_into()
-                    .map_err(|_| FireLiteError::Corrupt("bad wal offset".into()))?,
+                    .map_err(|_| HakoError::Corrupt("bad wal offset".into()))?,
             );
             pos += 8;
             let len = u32::from_le_bytes(
                 payload[pos..pos + 4]
                     .try_into()
-                    .map_err(|_| FireLiteError::Corrupt("bad wal len".into()))?,
+                    .map_err(|_| HakoError::Corrupt("bad wal len".into()))?,
             );
             Ok(WalOp::Put {
                 key,
@@ -716,21 +716,21 @@ fn decode(payload: &[u8]) -> Result<WalOp> {
             let key_len = u16::from_le_bytes(
                 payload[pos..pos + 2]
                     .try_into()
-                    .map_err(|_| FireLiteError::Corrupt("bad wal key len".into()))?,
+                    .map_err(|_| HakoError::Corrupt("bad wal key len".into()))?,
             ) as usize;
             pos += 2;
             if pos + key_len > payload.len() {
-                return Err(FireLiteError::Corrupt("wal delete key overruns record".into()));
+                return Err(HakoError::Corrupt("wal delete key overruns record".into()));
             }
             let key = String::from_utf8(payload[pos..pos + key_len].to_vec())
-                .map_err(|_| FireLiteError::Corrupt("bad wal key".into()))?;
+                .map_err(|_| HakoError::Corrupt("bad wal key".into()))?;
             pos += key_len;
             // FIX: was reading timestamp from key bytes (missing pos += key_len);
             // would silently misread timestamps for any key >= 8 bytes.
             let timestamp = i64::from_le_bytes(
                 payload[pos..pos + 8]
                     .try_into()
-                    .map_err(|_| FireLiteError::Corrupt("bad wal delete timestamp".into()))?,
+                    .map_err(|_| HakoError::Corrupt("bad wal delete timestamp".into()))?,
             );
             Ok(WalOp::Delete { key, timestamp })
         }
@@ -738,7 +738,7 @@ fn decode(payload: &[u8]) -> Result<WalOp> {
             let tx_id = u64::from_le_bytes(
                 payload[pos..pos + 8]
                     .try_into()
-                    .map_err(|_| FireLiteError::Corrupt("bad commit tx id".into()))?,
+                    .map_err(|_| HakoError::Corrupt("bad commit tx id".into()))?,
             );
             Ok(WalOp::CommitTx { tx_id })
         }
@@ -746,23 +746,23 @@ fn decode(payload: &[u8]) -> Result<WalOp> {
             let key_len = u16::from_le_bytes(
                 payload[pos..pos + 2]
                     .try_into()
-                    .map_err(|_| FireLiteError::Corrupt("bad wal key len".into()))?,
+                    .map_err(|_| HakoError::Corrupt("bad wal key len".into()))?,
             ) as usize;
             pos += 2;
             if pos + key_len > payload.len() {
-                return Err(FireLiteError::Corrupt("wal putinlined key overruns record".into()));
+                return Err(HakoError::Corrupt("wal putinlined key overruns record".into()));
             }
             let key = String::from_utf8(payload[pos..pos + key_len].to_vec())
-                .map_err(|_| FireLiteError::Corrupt("bad key".into()))?;
+                .map_err(|_| HakoError::Corrupt("bad key".into()))?;
             pos += key_len;
             let val_len = u32::from_le_bytes(
                 payload[pos..pos + 4]
                     .try_into()
-                    .map_err(|_| FireLiteError::Corrupt("bad wal putinlined val len".into()))?,
+                    .map_err(|_| HakoError::Corrupt("bad wal putinlined val len".into()))?,
             ) as usize;
             pos += 4;
             if pos + val_len > payload.len() {
-                return Err(FireLiteError::Corrupt("wal putinlined val overruns record".into()));
+                return Err(HakoError::Corrupt("wal putinlined val overruns record".into()));
             }
             let value = payload[pos..pos + val_len].to_vec();
             Ok(WalOp::PutInlined { key, value })
@@ -771,29 +771,29 @@ fn decode(payload: &[u8]) -> Result<WalOp> {
             let key_len = u16::from_le_bytes(
                 payload[pos..pos + 2]
                     .try_into()
-                    .map_err(|_| FireLiteError::Corrupt("bad wal key len".into()))?,
+                    .map_err(|_| HakoError::Corrupt("bad wal key len".into()))?,
             ) as usize;
             pos += 2;
             if pos + key_len > payload.len() {
-                return Err(FireLiteError::Corrupt("wal putblob key overruns record".into()));
+                return Err(HakoError::Corrupt("wal putblob key overruns record".into()));
             }
             let key = String::from_utf8(payload[pos..pos + key_len].to_vec())
-                .map_err(|_| FireLiteError::Corrupt("bad key".into()))?;
+                .map_err(|_| HakoError::Corrupt("bad key".into()))?;
             pos += key_len;
             let offset = u64::from_le_bytes(
                 payload[pos..pos + 8]
                     .try_into()
-                    .map_err(|_| FireLiteError::Corrupt("bad wal putblob offset".into()))?,
+                    .map_err(|_| HakoError::Corrupt("bad wal putblob offset".into()))?,
             );
             pos += 8;
             let len = u32::from_le_bytes(
                 payload[pos..pos + 4]
                     .try_into()
-                    .map_err(|_| FireLiteError::Corrupt("bad wal putblob len".into()))?,
+                    .map_err(|_| HakoError::Corrupt("bad wal putblob len".into()))?,
             );
             Ok(WalOp::PutBlob { key, offset, len })
         }
-        _ => Err(FireLiteError::Corrupt("unknown wal op".into())),
+        _ => Err(HakoError::Corrupt("unknown wal op".into())),
     }
 }
 
@@ -808,7 +808,7 @@ mod tests {
     #[test]
     fn replay_ignores_uncommitted_transaction() {
         let path = std::env::temp_dir().join(format!(
-            "firelite-wal-{}.log",
+            "hako-wal-{}.log",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
@@ -843,7 +843,7 @@ mod tests {
         // public Wal API and check the recovered timestamp matches what we
         // wrote.
         let path = std::env::temp_dir().join(format!(
-            "firelite-wal-rt-{}.log",
+            "hako-wal-rt-{}.log",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
@@ -888,7 +888,7 @@ mod tests {
         // into it replay fully, the padding is never truncated, and appends
         // after a reopen continue exactly at end-of-records (not EOF).
         let path = std::env::temp_dir().join(format!(
-            "firelite-wal-prealloc-{}.log",
+            "hako-wal-prealloc-{}.log",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")

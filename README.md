@@ -1,16 +1,51 @@
-# FireLite
+# HakoDB
 
-**FireLite is an embedded, Firestore-style document database written in Rust.**
+**HakoDB is an embedded, Firestore-style document database written in Rust.**
 
 It stores typed JSON-like documents in binary form, runs **fully in-process** like SQLite (no server process, no daemon, no network config), and exposes a **flat C ABI** so it can be embedded in applications written in Rust, C/C++, Go, JavaScript/TypeScript (Node.js + Bun), Pascal/Lazarus, and more.
 
-FireLite speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
+HakoDB speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.7.13 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.8.21 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.8.18)
+## What's new (0.7.2 → 0.8.21)
+
+### v0.8.21 — rebrand to HakoDB
+- Crate `hakodb`, main type `Hako` (`HakoConfig`, `HakoDoc`,
+  `HakoError`), FFI prefix `HK_*`/`hk_*`, header `include/hako.h`,
+  binaries `hakodb.dll` / `libhakodb.so`.
+- Data plane migrates on open: `__firelite_*` directories become their
+  `__hako_*` canonical names with data intact (both-present keeps
+  canonical; old spellings stay sync-excluded as aliases).
+- Fixed along the way: `cbindgen.toml` never loaded (relative path +
+  unknown fields → silent C++ defaults for years); the header is real
+  C now, with `extern "C"` guards for C++ consumers.
+
+### v0.8.20 — repo split phase 1: core ships alone
+- **Removed `fsync/`** (5-line re-export wrapper, zero references —
+  redundant since FFI + sync live in one crate) and narrowed the
+  workspace to the library crate alone.
+- **Watch API for out-of-tree gateways**: new narrow public methods
+  (`plan_for_watch`, `matches_watch`, `get_raw_bytes`) carrying the
+  exact zero-decode cost of the former in-tree path; the Tauri gateway
+  module + `tauri`/`rmpv` deps leave the core.
+- **MSVC-ready build**: `build.rs` keeps `hakodb.lib` on MSVC targets
+  (GNU/MinGW keeps the stale-shadow delete); the tag-triggered release
+  workflow ships `.dll`+`.lib` (Windows), `.so`+`.rlib` (Linux),
+  Android `aarch64` `.so`, all with headers + checksums.
+
+### v0.8.19 — excluded-plane enforcement on all cloud paths
+- **Correctness fix (sync)**: a hostile `Replication{collection:"__groups"}`
+  was applied — server planted an `alpha___groups` shard and the relay
+  rebuilt the packet under the plain name, poisoning every room member's
+  real credential store. `flush_ingest_buffer` now drops excluded batches
+  in either namespace (single choke point for client+server ingest, also
+  suppresses relay); server tailer, client catch-up push, and catch-up
+  serve skip excluded names (source-side, protects unpatched peers).
+  Regression test `ingest_drops_sync_excluded_plane` fails without the
+  fix, passes with it.
 
 ### v0.8.18 — sync-saving WAL fixes, 4MB reserve default, maintenance hold
 - **Correctness fix (sync)**: `Wal::tail` opened a fresh read handle per
@@ -29,7 +64,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
   disks; decisive on cloud disks with slow file-growth metadata.
   Internal (`__`) collections still skip it.
 - **Maintenance hold**: `background_maintenance=false` (config +
-  `fl_config_set_background_maintenance` + bench `--no-maintenance`,
+  `hk_config_set_background_maintenance` + bench `--no-maintenance`,
   wired in Go/Pascal/JS) pauses the 5s checkpoint/compaction tick for
   flat bench rounds; engine stays correct.
 - Re-measured Always singles post-fix (local, `--no-maintenance`):
@@ -94,23 +129,23 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
   Covers all four background stages, including async index updates
   (new in-flight counter; std mpsc has no `len`) and a new
   maintenance flag on the 5s system thread.
-- FFI: `fl_engine_await_quiescent` + `fl_engine_quiescence_status`
+- FFI: `hk_engine_await_quiescent` + `hk_engine_quiescence_status`
   (JSON). CLI waits for quiescence after open (was readiness-only —
   cursor queries pre-settle repeat rows). `benchmark.cpp` settles
   before scan stages.
 - Gate: `Batch>=0.5xSingle` (Manual-mode thin margins: batch and
   single do near-identical work per doc without fsync; observed median
   0.82x on load — the tripwire now catches breakage, not noise).
-- Test-link fix: integration tests link `firelite.dll` (fresh import
-  lib) instead of `firelite.lib` (deleted by build.rs to stop shadow
+- Test-link fix: integration tests link `hakodb.dll` (fresh import
+  lib) instead of `hakodb.lib` (deleted by build.rs to stop shadow
   staleness) — the 1181 break this caused, resolved properly.
 
 ### v0.8.13 — views across SDKs; node backend resurrected
 - **Go**: `ViewDoc` (`GetView`, `GetInt/Float/Bool/String/Bytes`,
   `HasField`, `ToDoc`) + `CursorWalkView` via a second cgo trampoline.
   Builds clean under GCC 16.
-- **Pascal** (FPC-clean): view imports, `TFLViewDoc`, `TFLQuery.WalkView`,
-  `TFireLite.GetView`.
+- **Pascal** (FPC-clean): view imports, `THKViewDoc`, `THKQuery.WalkView`,
+  `THako.GetView`.
 - **JS**: point-view numerics + `ViewDocSnapshot`/`viewDoc` on both
   backends and the client (`tsc` clean; koffi verified end-to-end
   against the real DLL). Strings and walk callbacks stay on
@@ -124,8 +159,8 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
   `OnSnapshotCB` vs the registered proto name, and auto-decoded
   `char*` returns that leak + crash on free. Fixed with upfront
   opaques, the proto name, and a disposable string type wired to
-  `fl_string_free` (never C free — Rust allocator). Also caught a
-  glued `#[no_mangle]` that hid `fl_rawdoc_to_doc` from the DLL while
+  `hk_string_free` (never C free — Rust allocator). Also caught a
+  glued `#[no_mangle]` that hid `hk_rawdoc_to_doc` from the DLL while
   rlib tests passed.
 
 ### v0.8.12 — gate margin hardening + stale import lib, fixed
@@ -142,13 +177,13 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
   proven by relink. No consumer needed the MSVC lib.
 
 ### v0.8.11 — FFI views + lazy-vs-lazy benchmark stage
-- `FL_ViewDoc` + 9 functions (`fl_view_get/free`, `field_count`,
+- `HK_ViewDoc` + 9 functions (`hk_view_get/free`, `field_count`,
   `has_field`, typed `get_int/float/bool/str/bytes`, `to_doc`) and
-  `fl_cursor_walk_view` with `FlViewWalkCallback` (borrowed id + view
+  `hk_cursor_walk_view` with `HkViewWalkCallback` (borrowed id + view
   handle, valid for the call only — stack-slot views, no alloc, no
   free protocol). Strict scalar matches; views never inflate (resolve
-  via `to_doc` + `fl_doc_resolve_blobs`).
-- Both harnesses gain the lazy stage: FireLite 2-pull view walk vs
+  via `to_doc` + `hk_doc_resolve_blobs`).
+- Both harnesses gain the lazy stage: HakoDB 2-pull view walk vs
   SQLite narrow id/tenant/age select. Measured at 10k complex docs:
   **893k vs 1.11M (0.8x)** — same work, honestly close; our remainder
   is per-row framing walks (tenant sorts last) + callback hops.
@@ -169,10 +204,10 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
   The lazy-vs-lazy comparison SQLite's shape always deserved is now
   winnable on our side too.
 
-### v0.8.9 — benchmark scan parity (FireLite vs SQLite, 1:1)
+### v0.8.9 — benchmark scan parity (HakoDB vs SQLite, 1:1)
 - Both harnesses grow the same full-scan trio (×5 iters, printed after
   the matrix): decoded forward/reverse over all live docs plus a
-  byte/key-only scan (`fl_cursor_walk` vs id-column select). Same stage
+  byte/key-only scan (`hk_cursor_walk` vs id-column select). Same stage
   order (scans run before bulk delete), same math, row counts printed
   for verification.
 - Measured head-to-head, same box: at 10k complex docs, decoded
@@ -185,14 +220,14 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
   buffers). Raw is where the designs meet, and the walk leads there.
 
 ### v0.8.8 — SDK wiring: raw + walk everywhere it fits
-- **Go** (`go/firelite`): vendored header + `RawDoc`/`RawResultSet`
+- **Go** (`go/hakodb`): vendored header + `RawDoc`/`RawResultSet`
   (`ExecuteQueryRaw`, `Bytes`, `ID`, `StartAfterRaw`, `ToDoc`) and
   `Engine.CursorWalk` via a `cgo.Handle` trampoline (same pattern as the
   watch bridge; builds clean under GCC 16). `IsIndexesReady` already
   existed.
-- **Pascal** (`FireLiteRaw` + `FireLite.pas`, both compile under FPC
-  3.2.2): raw imports, `TFLRawDoc`/`TFLRawResultSet`,
-  `TFLQuery.ExecuteRaw`/`StartAfterRaw`/`Walk` with `TFL_WalkCallback`.
+- **Pascal** (`HakoDBRaw` + `HakoDB.pas`, both compile under FPC
+  3.2.2): raw imports, `THKRawDoc`/`THKRawResultSet`,
+  `THKQuery.ExecuteRaw`/`StartAfterRaw`/`Walk` with `THK_WalkCallback`.
 - **JS** (`native.ts` both backends + `client.ts`, `tsc` clean):
   `queryExecuteRaw`, raw set accessors, `queryStartAfterRaw`,
   `rawDocToDoc`, plus `RawQuerySnapshot`/`getRaw`/`startAfterRaw` at the
@@ -230,7 +265,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
   matrix (changing it needs per-blob type tags — separate decision).
 
 ### v0.8.6 — FFI walk: 1.64M docs/s over the ABI
-- `fl_cursor_walk(engine, query, cb, userdata)` + `FlWalkCallback`
+- `hk_cursor_walk(engine, query, cb, userdata)` + `HkWalkCallback`
   typedef (header-regenerated): one FFI call per scan, borrowed
   `(id, id_len, bytes, bytes_len)` per row, `false` stops early,
   returns rows visited / -1 on error. C cannot unwind so the trampoline
@@ -267,15 +302,15 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
   the design review, cleared with room to spare.
 
 ### v0.8.3 — raw FFI surface for byte-fair benchmarks
-- `FL_RawDoc` / `FL_RawResultSet` + 7 functions (`fl_query_execute_raw`,
-  `fl_rawresult_{count,get,free}`, `fl_rawdoc_{bytes,id}`,
-  `fl_query_start_after_raw`, `fl_rawdoc_to_doc`). Same slab + borrowed
-  contract as the decoded path; same `FL_Query` builders (raw forced
+- `HK_RawDoc` / `HK_RawResultSet` + 7 functions (`hk_query_execute_raw`,
+  `hk_rawresult_{count,get,free}`, `hk_rawdoc_{bytes,id}`,
+  `hk_query_start_after_raw`, `hk_rawdoc_to_doc`). Same slab + borrowed
+  contract as the decoded path; same `HK_Query` builders (raw forced
   internally). Measured in-process: **~670k docs/s** over the ABI vs
   ~1.03M native raw (the gap is per-row id copies on the caller side)
   vs MDBX 3.66M pointer bumps — remaining 5x is per-row allocs + HashMap
   that only a zero-alloc cursor-callback API would remove. Honest
-  raw-vs-raw comparison is now possible; `t_firelite.cc` needs its raw
+  raw-vs-raw comparison is now possible; `t_hakodb.cc` needs its raw
   branch (caller side).
 
 ### v0.8.2 — inline-at-write + raw scans: 1M+ docs/s
@@ -283,7 +318,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
   `db.query_raw()` stops after the index walk and shares buffers
   (`read_pointer_shared`, zero copies for inlined docs) — no decode, no
   rayon. Requires index-satisfied filters/ordering; bytes are opaque
-  storage encoding (decode with `FireLiteDoc::decode`).
+  storage encoding (decode with `HakoDoc::decode`).
 - **Inline-at-write** (the bigger lever): every put used to land as
   `BlobPending` and re-encode on *every read* until background
   conversion — small docs in Manual mode never converted at all. Writes
@@ -307,16 +342,16 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
   (`sorted_key_range_reverse`, O(log N + limit)) — same path as forward.
 - **Point-get 46.8k → ~80k (harness-equivalent).** Split measured:
   engine floor ~105-140k (vs MDBX 136k raw memcpy — competitive given
-  full doc decode), FFI wrapper tax ~2x, `fl_doc_to_json` Binary arm
+  full doc decode), FFI wrapper tax ~2x, `hk_doc_to_json` Binary arm
   ~11µs (100 boxed Numbers per 100-byte value). Fixes, all
   byte-identical output: streaming JSON serializer (digits need no
   escaping; keys still via serde_json; sorted order kept), borrowed C
-  strings in `fl_engine_get`, single version lookup + audit-gated allocs
+  strings in `hk_engine_get`, single version lookup + audit-gated allocs
   in `get()`. Remainder is real work-per-row (decode + JSON text vs
   pointer bumps) — see `tests/cursor_parity.rs`.
 
 ### v0.8.0 — sync hub/server release
-- The sync batch graduates to minor: `firelite-cloudserver` managed hub
+- The sync batch graduates to minor: managed hub
   (auth, groups, data plane, SSE, admin console, TLS, systemd + Windows
   Service), mesh discovery modes (mDNS / broadcast / both), rejoin-safe
   local-only deletes, and fail-closed encrypted sync (Layer 0 handshake
@@ -335,7 +370,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ### v0.7.13 — net-sync + cloud-sync in default features
 - The release DLL now exports the full mesh + cloud surface
-  (`fl_net_syncer_*`, `fl_cloud_sync_*`), matching what the Go/JS/Pascal
+  (`hk_net_syncer_*`, `hk_cloud_sync_*`), matching what the Go/JS/Pascal
   SDKs already wrap. Previously those symbols existed only with explicit
   features — SDK calls against the default DLL failed at runtime, not at
   compile time. `tauri-gateway` stays opt-in.
@@ -347,7 +382,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
   metadata is unmeasurable at this scale.
 - Default `wal_reserve_bytes` is now 0 (was 4 MB): no phantom size per
   shard, no surprise floors on mobile storage. Opt back in per workload
-  via `fl_config_set_wal_reserve_bytes` if a long-soak test ever shows
+  via `hk_config_set_wal_reserve_bytes` if a long-soak test ever shows
   fragmentation-driven fsync decay.
 
 ### v0.7.11 — WAL history compaction for hot-small collections
@@ -362,15 +397,15 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
   Existing `compact` CLI/FFI/app paths reclaim automatically.
 
 ### v0.7.10 — Pascal SDK install fixes + component polish
-- Canonical runtime/designtime split (`FireLitePkg` + `FireLiteDesign`);
+- Canonical runtime/designtime split (`HakoDBPkg` + `HakoDBDesign`);
   the single mixed package would not install.
-- Package renamed `FireLite` → `FireLitePkg`: the IDE auto-generates a
+- Package renamed `HakoDB` → `HakoDBPkg`: the IDE auto-generates a
   `<PackageName>.pas` stub that had overwritten the engine unit, causing a
   phantom circular reference.
-- Palette icon (`tfirelitecomponent.lrs`, built from `.xpm` via `lazres`).
+- Palette icon (`thakodbcomponent.lrs`, built from `.xpm` via `lazres`).
 - `NetSyncEnabled` / `CloudSyncEnabled` master switches (default off);
   sync properties are inert until enabled.
-- `TFLDiscoveryMode` + `SetDiscoveryMode` + component `NetSyncDiscovery`
+- `THKDiscoveryMode` + `SetDiscoveryMode` + component `NetSyncDiscovery`
   property surface the net_sync discovery choice.
 
 ### v0.7.9 — developer-chosen discovery: mDNS / broadcast / both
@@ -411,7 +446,7 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
   now filters local-only tombstones and collections, matching the live tailer
   and both cloud catch-up paths. No handshake path can transmit a local mark.
 - **Vacuum.** `vacuum_collection` purges a collection's tombstones from the
-  index with zero WAL traffic (FFI `fl_engine_vacuum_collection`, CLI `vacuum`,
+  index with zero WAL traffic (FFI `hk_engine_vacuum_collection`, CLI `vacuum`,
   Tauri `vacuum` op). Version drops to the newest live doc, so the next
   handshake pulls peer state instead of defending local deletes.
 - **Rejoin recipe (reset now, restore later, wipe nothing):**
@@ -428,11 +463,11 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ### v0.7.6 — local-only deletes + tombstone catch-up fix
 - **Local-only signal.** `delete_local` / `delete_where_local` / `delete_ids_local`
-  (FFI `fl_engine_delete_local`, `fl_query_delete_local`, CLI `--local`) mark keys
+  (FFI `hk_engine_delete_local`, `hk_query_delete_local`, CLI `--local`) mark keys
   so no sync tailer or handshake ever transmits them — the app owns the deletion.
   `set_collection_local` scopes whole collections (CLI `collection-local`, shown in
   `collections`); `replicate_key` opts a key back in. Marks persist in
-  `__firelite_system/local_only` across restarts.
+  `__hako_system/local_only` across restarts.
 - **Handshake-stability rule.** Local-only ops keep fresh tombstone timestamps, so
   the deleter's version clock advances and no ping/catch-up can push the doc back.
   Resurrect rule: a genuinely *newer* remote put still applies (LWW); stale
@@ -448,11 +483,11 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ### v0.7.5 — deferred blobs, parallel inflation, bulk JSON
 - **`defer_blobs` query flag** — queries can skip blob inflation and return a `{"__blob__": {"len", "offset"}}` placeholder per blob field instead of the bytes. A 20-doc query over 50 KB images drops from ~1.2 ms to ~240 µs (~5×; more for larger blobs).
-- **`fl_doc_resolve_blobs`** — fetch the real blob bytes for a deferred doc on demand (point-get path, stays fast).
+- **`hk_doc_resolve_blobs`** — fetch the real blob bytes for a deferred doc on demand (point-get path, stays fast).
 - **Parallel blob inflation** — multi-blob docs inflate link targets on the rayon pool; link-free docs skip the scan entirely.
-- **`fl_result_set_to_json`** — stream a whole result set to one JSON array in a single call (~1.92× vs per-doc `fl_doc_to_json`).
+- **`hk_result_set_to_json`** — stream a whole result set to one JSON array in a single call (~1.92× vs per-doc `hk_doc_to_json`).
 - **CLI `--defer-blobs`** on `query` (one-shot and serve mode); `get` stays eager. Tauri `QueryInput.defer_blobs` supported end to end.
-- SDK surface: Go `DeferBlobs`/`ToJSON`/`ResolveBlobs`, JS `query.deferBlobs()`, Pascal `TFLQuery.DeferBlobs`.
+- SDK surface: Go `DeferBlobs`/`ToJSON`/`ResolveBlobs`, JS `query.deferBlobs()`, Pascal `THKQuery.DeferBlobs`.
 - `build.rs` refreshes the Windows import lib on every build (stale `.lib` after header regen is gone).
 
 ### v0.7.4 — durability fix + perf gate
@@ -465,40 +500,34 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 - **Limit pushdown** — `range_scan_limit` and unordered single-`Eq` yield to the secondary index instead of the composite path; empty-`ORDER BY` limit pushdown with offset-safe limits.
 - **Id-cursor fast path** — `start_at`/`start_after` on document id resolves to a `SortedKeys` Vec range instead of a composite scan.
 - **Plan-cache key fix** — cursor bound tags (`start_at` vs `start_after`) included in the key; previously colliding plans could return wrong pages.
-- **Write fast path** — `put_owned` / `fl_engine_insert_take` (no clone on owned docs), shard-lookup hoist, `ChangeEvent.path: Arc<str>`, 8192-entry version-stamped hot doc cache.
+- **Write fast path** — `put_owned` / `hk_engine_insert_take` (no clone on owned docs), shard-lookup hoist, `ChangeEvent.path: Arc<str>`, 8192-entry version-stamped hot doc cache.
 - **WAL headroom** — `wal_reserve_bytes` (default 4MB since v0.8.18, was
   opt-in 0 since v0.7.12; sparse, internal collections skip it) via
-  `FireLiteConfig::wal_reserve_bytes` / `fl_config_set_wal_reserve_bytes`.
-- **Write-phase timers** — `WRITE_STATS` + `write_stats_report()` / `fl_debug_write_stats()`; `benchmark --profile=<mode> --wstats` attributes write latency (Manual ~11.7 µs after shard hoist, −24%).
+  `HakoConfig::wal_reserve_bytes` / `hk_config_set_wal_reserve_bytes`.
+- **Write-phase timers** — `WRITE_STATS` + `write_stats_report()` / `hk_debug_write_stats()`; `benchmark --profile=<mode> --wstats` attributes write latency (Manual ~11.7 µs after shard hoist, −24%).
 
 ### v0.7.2 — pagination, WAL hardening, FFI slab
 - **O(1) offset pagination** — `sorted_key_range` slice + `offset_to_apply_later`; descending order via `SortedKeys` reverse ranges.
 - **WAL decoder + recovery fixes** — padding-safe replay/tail/reset, Manual-mode double-size fix, recovery-vs-write race fix (`entry().or_insert`).
-- **FFI slab allocator** — `Vec<FL_Doc>` slab refactor for result sets; `eprintln!` → log sink; `tests/ffi_roundtrip.rs` + `tests/write_path.rs`.
+- **FFI slab allocator** — `Vec<HK_Doc>` slab refactor for result sets; `eprintln!` → log sink; `tests/ffi_roundtrip.rs` + `tests/write_path.rs`.
 - **Fair benchmark** — all four query shapes decode the same 20 docs (limits raised 5 → 20), so Qry/Cmp vs Off/Cur numbers are comparable.
 
 ---
 
 ## Table of Contents
 
-- [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.18)](#whats-new-072--0818)
-- [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
+- [What is HakoDB?](#what-is-hakodb)
+- [What's new (0.7.2 → 0.8.21)](#whats-new-072--0821)
+- [When to use HakoDB (sync vs non-sync)](#when-to-use-hakodb-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)
-- [Command-line tool (firelite-cli)](#command-line-tool-firelite-cli)
 - [Rust usage](#rust-usage)
-- [Go SDK](#go-sdk)
-- [JavaScript / TypeScript SDK](#javascript--typescript-sdk)
-- [Lazarus / Free Pascal wrapper](#lazarus--free-pascal-wrapper)
 - [Multi-language platform support (C ABI)](#multi-language-platform-support-c-abi)
 - [Net Sync (LAN replication)](#net-sync-lan-replication)
 - [Cloud Sync (centralized replication)](#cloud-sync-centralized-replication)
 - [Sync encryption posture (read this before encrypting)](#sync-encryption-posture-read-this-before-encrypting)
-- [firelite-cloudserver (managed sync hub + admin console)](#firelite-cloudserver-managed-sync-hub--admin-console)
-- [Benchmark (official tool)](#benchmark-official-tool)
 - [Guide: choosing a read path](docs/reads.md)
-- [Guide: benchmarking methodology](docs/benchmarking.md)
+- [Repositories](#repositories)
 - [Architecture](#architecture)
 - [Implementation status](#implementation-status)
 - [Contribution notes](#contribution-notes)
@@ -506,9 +535,9 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What is FireLite?
+## What is HakoDB?
 
-FireLite is a **document-oriented embedded database** for applications that want:
+HakoDB is a **document-oriented embedded database** for applications that want:
 
 - **Firestore-like ergonomics** — collections, documents, `set/get/delete`, fluent queries, real-time change streams.
 - **SQLite-style embedding** — link a library into your process and open a database file; there is nothing to install or operate.
@@ -519,11 +548,11 @@ FireLite is a **document-oriented embedded database** for applications that want
   - **Net Sync** (`net-sync` feature): peer-to-peer mesh replication over LAN with mDNS discovery.
   - **Cloud Sync** (`cloud-sync` feature): centralized client-server replication over WebSockets + MessagePack.
 
-Because it is a library, FireLite has no "database server" to manage. Your app *is* the database host. This makes it ideal for local-first and offline-first products, desktop and CLI tooling, edge devices, games, and apps that occasionally need to sync with the cloud or with each other.
+Because it is a library, HakoDB has no "database server" to manage. Your app *is* the database host. This makes it ideal for local-first and offline-first products, desktop and CLI tooling, edge devices, games, and apps that occasionally need to sync with the cloud or with each other.
 
 ---
 
-## When to use FireLite (sync vs non-sync)
+## When to use HakoDB (sync vs non-sync)
 
 | Scenario | Recommended mode | Why |
 |---|---|---|
@@ -534,7 +563,7 @@ Because it is a library, FireLite has no "database server" to manage. Your app *
 | Local app that must *also* be reachable by other processes/languages | **Embedded + FFI** | C ABI with Go/JS/Pascal gateways; watch streams for reactive UIs. |
 | Analytics / ad-hoc queries over large datasets | **Embedded** | Composite indexes, FTS, aggregates, zero-copy projection, parallel scans. |
 
-**In short:** use FireLite **without sync** when your data is local to one process. Turn on **Net Sync** when you need peer-to-peer replication across devices on a network you control. Turn on **Cloud Sync** when you need offline-first clients to converge through a central server (or to build a real-time multi-client hub).
+**In short:** use HakoDB **without sync** when your data is local to one process. Turn on **Net Sync** when you need peer-to-peer replication across devices on a network you control. Turn on **Cloud Sync** when you need offline-first clients to converge through a central server (or to build a real-time multi-client hub).
 
 ---
 
@@ -558,18 +587,18 @@ Because it is a library, FireLite has no "database server" to manage. Your app *
 ## Quick Start (Rust)
 
 ```rust
-use firelite::config::FireLiteConfig;
-use firelite::document::firelite_doc::FireLiteDoc;
-use firelite::document::value::Value;
-use firelite::engine::{BatchMutation, FireLite};
+use hakodb::config::HakoConfig;
+use hakodb::document::hako_doc::HakoDoc;
+use hakodb::document::value::Value;
+use hakodb::engine::{BatchMutation, Hako};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cfg = FireLiteConfig::default();
+    let mut cfg = HakoConfig::default();
     cfg.encryption_key = Some("change-me-secret".to_string());
 
-    let db = FireLite::open(".firelite-example", cfg)?;
+    let db = Hako::open(".hakodb-example", cfg)?;
 
-    let mut doc = FireLiteDoc::default();
+    let mut doc = HakoDoc::default();
     doc.insert("name", Value::String("alice".to_string()));
     doc.insert("age", Value::Int(30));
 
@@ -581,158 +610,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ---
 
-## Command-line tool (firelite-cli)
-
-FireLite ships with a full-featured CLI under `cli/`. It can be used in two ways:
-
-1. **Non-serve mode (one-shot commands)** — run a single command against a database and exit. Ideal for scripting, debugging, and shell pipelines.
-2. **Serve mode (interactive REPL + networking)** — starts a server loop with an interactive prompt, optionally enabling **Net Sync** (LAN mesh) and/or **Cloud Sync** (server or client).
-
-### Build
-
-```bash
-cargo build --release -p firelite-cli
-# binary: target/release/firelite-cli
-```
-
-The CLI is compiled with `net-sync` and `cloud-sync` enabled by default.
-
-### Global options
-
-| Flag | Description |
-|---|---|
-| `--db <path>` | Database path (default `./firelite.db`) |
-| `--durability <mode>` | `always` \| `interval` \| `manual` \| `on-commit` (default `on-commit`) |
-| `--encryption-key <key>` | Enables storage encryption with the given master key |
-| `--encrypted-cols <list>` | Comma-separated collections to encrypt (empty = all) |
-| `--time` | Print execution time for the operation |
-| `--count` | Print the number of results (queries and collections) |
-
-### Non-serve mode: one-shot commands
-
-Seed a collection with sample data, then run typical operations:
-
-```bash
-# seed 100 documents with a few sample indexes (simple + FTS + composite)
-firelite-cli --db ./demo.db seed users 100
-
-# write / read / update / delete a document
-firelite-cli --db ./demo.db set users/alice --data '{"name":"Alice","age":30,"active":true}'
-firelite-cli --db ./demo.db get users/alice
-firelite-cli --db ./demo.db update users/alice --data '{"age":31}'
-firelite-cli --db ./demo.db delete users/alice
-
-# batch write from a JSON array (path is the collection name)
-firelite-cli --db ./demo.db set users --batch --data '[
-  {"id":"a","data":{"name":"Alice","age":30}},
-  {"id":"b","data":{"name":"Bob","age":25}}
-]'
-
-# query with filters, ordering, and pagination
-firelite-cli --db ./demo.db query users --where age:gte:21 --order name:asc --limit 10 --offset 5
-firelite-cli --db ./demo.db query users --or status:eq:active --or status:eq:pending --count
-
-# deferred blobs: skip blob inflation, return {"__blob__": {"len","offset"}} placeholders
-firelite-cli --db ./demo.db query bench --where active:eq:true --defer-blobs --limit 20
-# resolve later with a point get (always eager):
-firelite-cli --db ./demo.db get bench/b_121
-
-# full-text search (match) and projections
-firelite-cli --db ./demo.db query users --fts description:seeded
-# prefix / autocomplete search (matches "seeded" from "seed")
-firelite-cli --db ./demo.db query users --where description:matchPrefix:seed
-firelite-cli --db ./demo.db query users --select name,age
-
-# aggregates
-firelite-cli --db ./demo.db aggregate users count
-firelite-cli --db ./demo.db aggregate users sum --field age --where active:eq:true
-firelite-cli --db ./demo.db query users --aggregate count --aggregate avg:age
-
-# mass update / mass delete from a query
-firelite-cli --db ./demo.db query users --where status:eq:trial --set --data '{"tier":"pro"}'
-firelite-cli --db ./demo.db query users --where active:eq:false --delete
-
-# index management
-firelite-cli --db ./demo.db index create users age
-firelite-cli --db ./demo.db index create-composite users --fields age:asc,name:asc
-firelite-cli --db ./demo.db index create-fts users description
-firelite-cli --db ./demo.db index list users
-
-# real-time watch (blocks and prints change events until Ctrl+C)
-firelite-cli --db ./demo.db watch users
-
-# database maintenance and inspection
-firelite-cli --db ./demo.db collections
-firelite-cli --db ./demo.db stats
-firelite-cli --db ./demo.db compact
-
-# REST-like one-shot surface: METHOD PATH [--data JSON]
-firelite-cli --db ./demo.db rest GET users/alice
-firelite-cli --db ./demo.db rest PATCH users/alice --data '{"age":32}'
-```
-
-Query filter syntax is `field:op:value` where `op` is one of `eq, ne, gt, gte, lt, lte, in, notIn, match, matchPrefix, contains, startsWith, arrayContains, arrayContainsAny`. Array values use JSON, e.g. `tags:in:["a","b"]`. Ordering uses `field:asc` / `field:desc`. `match` runs a full-text (inverted-index) word search; `matchPrefix` is autocomplete-style prefix search over the same index (e.g. `"indom"` matches `"indomie"`).
-
-> **Windows PowerShell note:** when passing inline JSON to `--data`, use `--fromfile payload.json` (or `cmd.exe`) instead of `'{"key":"value"}'` — PowerShell 5.1 strips the inner double quotes when invoking native executables.
-
-### Serve mode: interactive REPL + networking
-
-`serve` opens the database and drops you into an interactive prompt where every CLI command keeps working (type `collections`, `query users --where ...`, `peers`, `exit`):
-
-```bash
-# 1) Plain standalone server (interactive shell only)
-firelite-cli --db ./demo.db serve
-
-# 2) LAN Net Sync mesh node (mDNS discovery, room-key isolated)
-firelite-cli --db ./demo.db serve --port 7070 --node-id node-1 --key my-room-key
-
-# 3) Cloud Sync SERVER (central WebSocket hub on 0.0.0.0:8080)
-firelite-cli --db ./cloud.db serve \
-  --node-id cloud-1 --key room-key \
-  --bind 0.0.0.0:8080 --token s3cret-token
-
-# 4) Cloud Sync CLIENT (connects to the central server, offline-first)
-firelite-cli --db ./local.db serve \
-  --node-id device-1 --key room-key --room-name game \
-  --server ws://cloud-host:8080 --token s3cret-token
-```
-
-The prompt shows the live sync status, e.g.:
-
-```text
-firelite(node-1 | LAN:Online (Peers:2)) > query users --where active:eq:true --limit 10
-firelite(node-1 | LAN:Online (Peers:2)) > peers
-firelite(node-1 | LAN:Online (Peers:2)) > exit
-```
-
-#### Serve flags
-
-| Flag | Purpose |
-|---|---|
-| `--port <u16>` | Enable **Net Sync**; start LAN mesh listener on this port |
-| `--node-id <id>` | Unique node identifier |
-| `--key <key>` | Room key (SHA-256 hashed for room isolation) |
-| `--bind <addr>` | Enable **Cloud Sync server** on this bind address (e.g. `0.0.0.0:8080`) |
-| `--server <url>` | Enable **Cloud Sync client**; connect to this server (`ws://`, `wss://`, or `https://`) |
-| `--room-name <name>` | Room name for Cloud Sync clients (defaults to `default`); the server hosts any room |
-| `--token <token>` | Auth token shared with the cloud server |
-
----
-
 ## Rust usage
 
 ```rust
-use firelite::config::FireLiteConfig;
-use firelite::engine::{BatchMutation, FireLite};
+use hakodb::config::HakoConfig;
+use hakodb::engine::{BatchMutation, Hako};
 
-let db = FireLite::open("./data", FireLiteConfig::default())?;
+let db = Hako::open("./data", HakoConfig::default())?;
 
 // atomic batch write
 db.write_batch(vec![
     BatchMutation::Put {
         collection: "users".into(),
         doc_id: "1".into(),
-        doc: /* FireLiteDoc */ doc1,
+        doc: /* HakoDoc */ doc1,
     },
     BatchMutation::Delete { collection: "users".into(), doc_id: "2".into() },
 ])?;
@@ -750,7 +641,7 @@ while let Ok(event) = rx.recv() {
 }
 ```
 
-See `cli/src/main.rs` for a complete, working example of the engine API.
+See [`example/rust/basic`](example/rust/basic) for a complete, working example of the engine API.
 
 > More Rust examples: [`example/rust/basic`](example/rust/basic) — a runnable
 > Cargo project (`cargo run`) covering open, CRUD, query, aggregation, batch,
@@ -758,206 +649,14 @@ See `cli/src/main.rs` for a complete, working example of the engine API.
 
 ---
 
-## Go SDK
-
-A complete cgo gateway lives in `go/firelite/` with typed wrappers for every C-ABI function, plus a Firestore-style facade.
-
-```go
-package main
-
-import (
-    "fmt"
-
-    "github.com/firelite-db/firelite-go/firelite"
-)
-
-func main() {
-    db, err := firelite.Open("./data.firelite")
-    if err != nil {
-        panic(err)
-    }
-    defer db.Close()
-
-    doc := db.NewDoc().
-        SetString("name", "alice").
-        SetInt("age", 30)
-    if err := db.Put("users", "alice", doc); err != nil {
-        panic(err)
-    }
-
-    got, err := db.Get("users", "alice")
-    if err != nil {
-        panic(err)
-    }
-    fmt.Println(got.JSON())
-
-    // Firestore-style client facade
-    c := db.Client()
-    _ = c.Collection("users").Doc("bob").Set(map[string]any{"name": "Bob"})
-}
-```
-
-Coverage includes `Engine`, `Config`, `Doc`, `Array`, `Query`, `Batch`, `Transaction`, `Watch` (native cgo callback bridge), `ResultSet`, `NetSyncer` and `CloudSync` — plus `DeferBlobs`/`ResolveBlobs` (deferred blob fetching), `ToJSON` (bulk result export), `InsertTake` (owned insert) and `SetWALReserveBytes`.
-
-> Run it: [`example/go`](example/go) is a complete Go program (`go run ./example/go`)
-> that also demonstrates NetSync and CloudSync setup.
-
----
-
-## JavaScript / TypeScript SDK
-
-A high-level SDK is available under `js/`, built over the C-FFI layer with dual loaders for **Node.js (koffi)** and **Bun (dlopen)**.
-
-```bash
-cd js
-npm install
-```
-
-```ts
-import { FireLiteClient } from "@firelite/client";
-
-const db = await FireLiteClient.open("./data.firelite", {
-  libraryPath: "./target/release/libfirelite.so", // optional override
-});
-
-await db.collection("users").doc("alice").set({
-  name: "Alice",
-  age: 30,
-  active: true,
-});
-
-const snap = await db.collection("users").doc("alice").get();
-if (snap.exists) {
-  console.log(snap.data());
-}
-
-const rows = await db
-  .collection("users")
-  .where("age", "==", 30)
-  .orderBy("name", "asc")
-  .limit(10)
-  .select("name", "age")
-  .get();
-
-// deferred blobs: large binary fields come back as { __blob__: { len, offset } }
-// placeholders; resolve per-doc only when the bytes are actually needed
-const deferred = await db
-  .collection("bench")
-  .where("active", "==", true)
-  .deferBlobs()
-  .limit(20)
-  .get();
-
-const batch = db.batch();
-batch
-  .set(db.collection("users").doc("bob"), { name: "Bob", age: 31 })
-  .delete(db.collection("users").doc("alice"));
-await batch.commit();
-
-// cloud sync + real-time snapshots
-// room-agnostic server (not bound to any room):
-const server = db.createCloudSyncServer("server-1", "master-token");
-await server.start("0.0.0.0:8080");
-// offline-first client that picks its room + server:
-const cs = db.createCloudSyncClient("device-1", "game", "room-key", "token");
-await cs.start("ws://host:8080");
-
-const stop = await db.collection("users").onSnapshot((rows) => {
-  console.log("live rows", rows);
-});
-// later: await stop();
-
-await db.close();
-```
-
-Value mapping to the FFI builder: `string` → `fl_doc_insert_str`, integer/float → `fl_doc_insert_int`/`fl_doc_insert_float`, `boolean` → `fl_doc_insert_bool`, `null` → `fl_doc_insert_null`, `Uint8Array` → `fl_doc_insert_bin`, document references → `fl_doc_insert_reference`. The SDK also includes a `TauriFireLite` gateway client (see `js/src/tauri.ts`).
-
-> Run it: [`example/js/node`](example/js/node) (koffi backend, run with tsx) and
-> [`example/js/bun`](example/js/bun) (`bun example/js/bun/index.ts`, uses
-> `bun:ffi`, no install step) are complete runnable TypeScript examples.
-
----
-
-## Lazarus / Free Pascal wrapper
-
-A production-focused Pascal wrapper is available under `pascal/`:
-
-- `pascal/FireLiteRaw.pas` — C-ABI translation with opaque handles (`PFL_Engine`, `PFL_Doc`, `PFL_Batch`, `PFL_Query`, `PFL_ResultSet`, `PFL_CloudSync`, …) and `cdecl` imports for Windows/Linux/macOS.
-- `pascal/FireLite.pas` — object-oriented API: `TFireLite`, `TFLCollection`, `TFLDocument`, `TFLQuery`, `TFLBatch`, `TFLTransaction`, `TFLCloudSync`.
-  - fluent Firestore-like flow (`Collection(...).Doc(...).SetDoc/Get/Delete`, query chaining)
-  - deferred blobs (`TFLQuery.DeferBlobs`) returning `__blob__` placeholders for list views
-  - projection pushdown (`Select([...])`) wired to `fl_query_select_field`
-  - advanced filters (`WhereNotIn`, `ArrayContains`, `ArrayContainsAny`, `WhereOr*`) mapped to FFI
-  - callback-based `OnSnapshot` via a polling thread with optional main-thread queue dispatch.
-
-```pascal
-var
-  DB: TFireLite;
-  Col: TFLCollection;
-  Doc: TFLDocument;
-begin
-  DB := TFireLite.Create('./data.firelite');
-  try
-    Col := DB.Collection('users');
-    Doc := TFLDocument.Create.InsertStr('name', 'alice').InsertInt('age', 30);
-    try
-      Col.Doc('u1').SetDoc(Doc);
-    finally
-      Doc.Free;
-    end;
-  finally
-    DB.Free;
-  end;
-end;
-```
-
-The wrapper ships as two Lazarus packages (the standard runtime/designtime
-split — a single mixed package will not install):
-
-- `pascal/FireLitePkg.lpk` — **runtime** (`Type=RunTime`): `FireLiteRaw`,
-  `FireLite`, `FireLiteComponent`. Add it via Project Inspector → Add → New
-  Requirement to use the SDK from code. Never install this one (Install stays
-  grey by design — there is nothing design-time in it).
-- `pascal/FireLiteDesign.lpk` — **designtime** (`Type=DesignTime`, requires
-  `FireLitePkg`): `FireLitePkgReg` with the `Register` procedure. Open it via
-  `Package > Open Package File (.lpk)`, Compile, then **Install** — the IDE
-  rebuilds and a **FireLite** tab with `TFireLiteComponent` appears on the
-  component palette.
-- `pascal/FireLiteComponent.pas` — the drop-on-form component (palette icon
-  included via `tfirelitecomponent.lrs`, built from `tfirelitecomponent.xpm`
-  with `lazres`). Sync is opt-in: `NetSyncEnabled` / `CloudSyncEnabled`
-  default to False and the remaining sync properties are inert until enabled
-  (`StartNetSync` / `StartCloudSync` raise otherwise). NetSync and CloudSync
-  options when enabled:
-  `NetSyncName`, `NetSyncRoomKey`, `NetSyncPort`, `NetSyncDiscovery`,
-  `CloudSyncMode`, `CloudSyncClientID`, `CloudSyncRoomName`, `CloudSyncRoomKey`,
-  `CloudSyncAuthToken`, `CloudSyncAddress`, with one-call `StartNetSync` / `StartCloudSync` methods.
-- `pascal/FireLitePkgReg.pas` — design-time registration unit (belongs to the
-  design package only).
-
-> Contributing to the Lazarus ecosystem (Online Package Manager,
-> `packages.lazarus-ide.org`) expects exactly this split: a runtime package
-> projects depend on, plus a designtime package the IDE installs. Keep
-> engine units out of the design package and registration out of the runtime
-> one, and keep the package `Name` different from every unit name (the IDE
-> auto-generates a `<PackageName>.pas` stub that would otherwise shadow a
-> same-named unit).
-
-> Run it: [`example/pascal/console`](example/pascal/console) is a plain FPC
-> program (`fpc -Fu..\..\..\pascal console_demo.lpr`), and
-> [`example/pascal/lazarus`](example/pascal/lazarus) is a minimal Lazarus GUI
-> demo (`example.lpi`) using a `TFireLiteComponent` dropped on a form.
-
----
-
 ## Multi-language platform support (C ABI)
 
-FireLite exposes a flat C ABI for Node.js/Python/C++/C# and other integration layers. Opaque handle types are defined in `include/firelite.h`.
+HakoDB exposes a flat C ABI for Node.js/Python/C++/C# and other integration layers. Opaque handle types are defined in `include/hako.h`.
 
 ### Build artifacts
 
 - Cargo crate types: `cdylib` (dynamic library consumers) and `rlib` (Rust consumers).
-- Auto-generated C header via `build.rs` + `cbindgen.toml`: `include/firelite.h`.
+- Auto-generated C header via `build.rs` + `cbindgen.toml`: `include/hako.h`.
 
 ```bash
 cargo build --release
@@ -965,38 +664,38 @@ cargo build --release
 
 Platform outputs:
 
-- Linux: `target/release/libfirelite.so`
-- macOS: `target/release/libfirelite.dylib`
-- Windows: `target\release\firelite.dll`
+- Linux: `target/release/libhakodb.so`
+- macOS: `target/release/libhakodb.dylib`
+- Windows: `target\release\hakodb.dll`
 
 ### Opaque handle types
 
-- `FL_Engine` — main database instance
-- `FL_Doc` — document builder / result handle
-- `FL_Batch` — atomic write-batch container
-- `FL_Query` — query definition builder
-- `FL_Config` — advanced configuration builder
-- `FL_Watch` — real-time subscription handle
-- `FL_Transaction` — serializable transaction handle
-- `FL_ResultSet` — query result handle set
-- `FL_NetSyncer` — LAN net-sync handle
-- `FL_CloudSync` — cloud-sync handle
+- `HK_Engine` — main database instance
+- `HK_Doc` — document builder / result handle
+- `HK_Batch` — atomic write-batch container
+- `HK_Query` — query definition builder
+- `HK_Config` — advanced configuration builder
+- `HK_Watch` — real-time subscription handle
+- `HK_Transaction` — serializable transaction handle
+- `HK_ResultSet` — query result handle set
+- `HK_NetSyncer` — LAN net-sync handle
+- `HK_CloudSync` — cloud-sync handle
 
 ### C API highlights
 
-- **Engine / memory:** `fl_engine_open`, `fl_engine_open_with_config`, `fl_engine_is_indexes_ready`, `fl_engine_free`, `fl_engine_backup`, `fl_engine_compact`, `fl_engine_list_collections`, `fl_engine_list_indexes`, `fl_engine_get_stats`, `fl_engine_get_audit_log`, `fl_engine_snapshot_indices`, `fl_last_error`, `fl_string_free`.
-- **Configuration:** `fl_config_new/free`, `fl_config_set_durability`, `fl_config_set_encryption_key`, `fl_config_set_encrypted_collections`, `fl_config_set_audit_log`, `fl_config_set_query_workers`, `fl_config_set_memory_limits`, `fl_config_set_storage_tuning`, `fl_config_set_blob_threshold`, `fl_config_set_compression`, `fl_config_set_wal_reserve_bytes`.
-- **Real-time:** `fl_engine_watch`, `fl_watch_free`.
-- **Documents:** `fl_doc_new/free`, `fl_doc_insert_str/int/float/bool/null/bin/timestamp/server_timestamp/doc/array/reference`, `fl_doc_to_json`, `fl_doc_resolve_blobs` (materialize deferred `__blob__` placeholders).
-- **CRUD:** `fl_engine_insert`, `fl_engine_insert_take` (owned doc, no clone), `fl_engine_get`, `fl_engine_delete`, `fl_engine_patch`, `fl_engine_get_by_ref`, `fl_engine_insert_subdoc`.
-- **Batches:** `fl_batch_new/free`, `fl_batch_set`, `fl_batch_delete`, `fl_batch_commit`.
-- **Transactions:** `fl_transaction_begin/get/set/commit/free`.
-- **Queries:** `fl_query_new/free`, all `fl_query_where_*` filters, `fl_query_order_by`, `fl_query_limit/offset`, `fl_query_select_field`, `fl_query_defer_blobs`, cursor functions (`start_at/start_after/end_at/end_before`), `fl_query_execute`, `fl_query_execute_to_handles`, `fl_query_delete`, `fl_query_patch`, aggregates (`fl_query_aggregate_count/sum/avg`, `fl_query_execute_aggregation`).
-- **Result sets:** `fl_result_set_count/get_doc/free`, `fl_result_set_to_json` (bulk single-call export).
-- **Diagnostics:** `fl_debug_write_stats` (write-phase timing breakdown; see `--wstats`).
-- **Indexing:** `fl_engine_create_index` (composite JSON), `fl_engine_create_simple_index`, `fl_engine_create_fts_index`.
-- **Net Sync:** `fl_net_syncer_new/start/status/free`.
-- **Cloud Sync:** `fl_cloud_sync_new/start/status/stop/free`, plus the room-agnostic `fl_cloud_sync_server_new` and the room-bound `fl_cloud_sync_client_new`.
+- **Engine / memory:** `hk_engine_open`, `hk_engine_open_with_config`, `hk_engine_is_indexes_ready`, `hk_engine_free`, `hk_engine_backup`, `hk_engine_compact`, `hk_engine_list_collections`, `hk_engine_list_indexes`, `hk_engine_get_stats`, `hk_engine_get_audit_log`, `hk_engine_snapshot_indices`, `hk_last_error`, `hk_string_free`.
+- **Configuration:** `hk_config_new/free`, `hk_config_set_durability`, `hk_config_set_encryption_key`, `hk_config_set_encrypted_collections`, `hk_config_set_audit_log`, `hk_config_set_query_workers`, `hk_config_set_memory_limits`, `hk_config_set_storage_tuning`, `hk_config_set_blob_threshold`, `hk_config_set_compression`, `hk_config_set_wal_reserve_bytes`.
+- **Real-time:** `hk_engine_watch`, `hk_watch_free`.
+- **Documents:** `hk_doc_new/free`, `hk_doc_insert_str/int/float/bool/null/bin/timestamp/server_timestamp/doc/array/reference`, `hk_doc_to_json`, `hk_doc_resolve_blobs` (materialize deferred `__blob__` placeholders).
+- **CRUD:** `hk_engine_insert`, `hk_engine_insert_take` (owned doc, no clone), `hk_engine_get`, `hk_engine_delete`, `hk_engine_patch`, `hk_engine_get_by_ref`, `hk_engine_insert_subdoc`.
+- **Batches:** `hk_batch_new/free`, `hk_batch_set`, `hk_batch_delete`, `hk_batch_commit`.
+- **Transactions:** `hk_transaction_begin/get/set/commit/free`.
+- **Queries:** `hk_query_new/free`, all `hk_query_where_*` filters, `hk_query_order_by`, `hk_query_limit/offset`, `hk_query_select_field`, `hk_query_defer_blobs`, cursor functions (`start_at/start_after/end_at/end_before`), `hk_query_execute`, `hk_query_execute_to_handles`, `hk_query_delete`, `hk_query_patch`, aggregates (`hk_query_aggregate_count/sum/avg`, `hk_query_execute_aggregation`).
+- **Result sets:** `hk_result_set_count/get_doc/free`, `hk_result_set_to_json` (bulk single-call export).
+- **Diagnostics:** `hk_debug_write_stats` (write-phase timing breakdown; see `--wstats`).
+- **Indexing:** `hk_engine_create_index` (composite JSON), `hk_engine_create_simple_index`, `hk_engine_create_fts_index`.
+- **Net Sync:** `hk_net_syncer_new/start/status/free`.
+- **Cloud Sync:** `hk_cloud_sync_new/start/status/stop/free`, plus the room-agnostic `hk_cloud_sync_server_new` and the room-bound `hk_cloud_sync_client_new`.
 
 All FFI gateways (Go / JS-TS / Pascal) wrap these APIs.
 
@@ -1012,17 +711,15 @@ The `net-sync` feature provides peer-to-peer replication over the local network:
 - Live node status telemetry (`idle` / `connected` / `syncing`, peer count, known peers).
 - Relay/mesh fan-out controls for multi-hop LAN topologies.
 
-Core FFI functions: `fl_net_syncer_new`, `fl_net_syncer_start`, `fl_net_syncer_status`, `fl_net_syncer_free`. All FFI-based gateways include wrappers for these APIs.
+Core FFI functions: `hk_net_syncer_new`, `hk_net_syncer_start`, `hk_net_syncer_status`, `hk_net_syncer_free`. All FFI-based gateways include wrappers for these APIs.
 
 ### Enable the feature
 
 ```toml
 [dependencies]
-firelite = { version = "0.7.5", features = ["net-sync"] }
+hakodb = { version = "0.7.5", features = ["net-sync"] }
 tokio = { version = "1", features = ["full"] }
 ```
-
-See [Serve mode](#serve-mode-interactive-repl--networking) for the CLI workflow, or `cli/src/main.rs` for the Rust `NetSyncer` usage.
 
 ### Android notes
 
@@ -1039,13 +736,13 @@ broadcast-only mobile peers. The core library needs no Java glue.
 
 ## Cloud Sync (centralized replication)
 
-The `cloud-sync` feature provides cloud-level, **bi-directional synchronization** over WebSockets and MessagePack. FireLite instances can act as a **central cloud server** or as an **offline-first cloud client**.
+The `cloud-sync` feature provides cloud-level, **bi-directional synchronization** over WebSockets and MessagePack. HakoDB instances can act as a **central cloud server** or as an **offline-first cloud client**.
 
 ### Enable the feature
 
 ```toml
 [dependencies]
-firelite = { version = "0.7.5", features = ["cloud-sync"] }
+hakodb = { version = "0.7.5", features = ["cloud-sync"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -1055,7 +752,7 @@ tokio = { version = "1", features = ["full"] }
 - **Client mode (`CloudSyncMode::Client`)** — connects to the cloud server over `ws://` or `wss://` (with automatic `https://` → `wss://` conversion). An outbound WAL tailer streams local embedded changes upstream; incoming remote changes are applied locally using LWW (last-write-wins) timestamp filtering.
 - **Symmetrical 2-way handshake (`VersionPing`)** — exchanged automatically on connection so that either side (server or client) catches up any deltas missed while offline or restarting.
 - **TLS-friendly URLs** — `https://`/`wss://` connect seamlessly through cloud proxies (GitHub Codespaces, Cloudflare Tunnels, AWS ALB, Heroku).
-- **High-throughput flusher** — drains and coalesces incoming client mutations every 5ms or 512 ops, reducing FireLite write-lock acquisitions by ~500x.
+- **High-throughput flusher** — drains and coalesces incoming client mutations every 5ms or 512 ops, reducing HakoDB write-lock acquisitions by ~500x.
 - **Anti-echo & deduplication** — self-pruning echo cache plus `msg_id` deduplication prevents infinite loopbacks and stale re-transmissions.
 
 ### Rooms and storage layout
@@ -1084,7 +781,7 @@ different rooms, so their data is fully isolated on the server.
   clients as plain `<collection>`, so data never mixes across rooms even when
   clients use identical collection names.
 - The room→prefix mapping is kept in the internal, hidden
-  `__firelite_rooms` collection and is re-read periodically by the server, so
+  `__hako_rooms` collection and is re-read periodically by the server, so
   new rooms are picked up without a restart.
 - Peer routing on the server is keyed by `(room, client_id)`, so two clients in
   different rooms may safely reuse the same `client_id` without clobbering each
@@ -1094,19 +791,19 @@ different rooms, so their data is fully isolated on the server.
 
 ```rust
 use std::sync::Arc;
-use firelite::config::FireLiteConfig;
-use firelite::engine::FireLite;
-use firelite::cloud_sync::CloudSync;
+use hakodb::config::HakoConfig;
+use hakodb::engine::Hako;
+use hakodb::cloud_sync::CloudSync;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = Arc::new(FireLite::open("./data/cloud_server_db", FireLiteConfig::default())?);
+    let db = Arc::new(Hako::open("./data/cloud_server_db", HakoConfig::default())?);
 
     // Room-agnostic server: not bound to any room, hosts any (room, key).
     let cloud_server = CloudSync::server(db.clone(), "server_node_01", "master_jwt_secret");
 
     cloud_server.start("0.0.0.0:8080").await?;
-    println!("FireLite Cloud Sync Server listening on ws://0.0.0.0:8080");
+    println!("HakoDB Cloud Sync Server listening on ws://0.0.0.0:8080");
 
     tokio::signal::ctrl_c().await?;
     cloud_server.stop();
@@ -1118,15 +815,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust
 use std::sync::Arc;
-use firelite::config::FireLiteConfig;
-use firelite::document::firelite_doc::FireLiteDoc;
-use firelite::document::value::Value;
-use firelite::engine::FireLite;
-use firelite::cloud_sync::CloudSync;
+use hakodb::config::HakoConfig;
+use hakodb::document::hako_doc::HakoDoc;
+use hakodb::document::value::Value;
+use hakodb::engine::Hako;
+use hakodb::cloud_sync::CloudSync;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = Arc::new(FireLite::open("./data/client_db", FireLiteConfig::default())?);
+    let db = Arc::new(Hako::open("./data/client_db", HakoConfig::default())?);
 
     // The client picks its room (room_name + room_key) and the server URL.
     let cloud_client = CloudSync::client(
@@ -1141,7 +838,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connected to Cloud Sync Server");
 
     // Local writes are synced to the server in the background.
-    let mut doc = FireLiteDoc::default();
+    let mut doc = HakoDoc::default();
     doc.insert("username", Value::String("player_one".to_string()));
     doc.insert("score", Value::Int(9500));
     db.put("players", "user_42", &doc)?;
@@ -1224,171 +921,34 @@ by every caps announcement).
 
 ---
 
-## firelite-cloudserver (managed sync hub + admin console)
+## Repositories
 
-`cloudserver/` is a standalone console binary for operators who outgrow
-`firelite-cli serve`: a room-agnostic sync hub plus an admin web console
-(no JS framework — embedded HTML + SSE), in one process, two ports.
+HakoDB lives under the [`hakodb`](https://github.com/hakodb) organization
+— one repo per deliverable, each versioned independently:
 
-```bash
-cargo run -p firelite-cloudserver -- \
-  --db-path /var/lib/firelite-cloud/db \
-  --admin-bind 127.0.0.1:8081 \
-  --sync-bind 0.0.0.0:8080
-```
+| Repo | Delivers | Version |
+|---|---|---|
+| [`hakodb/hakodb`](https://github.com/hakodb/hakodb) | Core library: engine, storage, query, FFI (`hako.h`), net/cloud sync | 0.8.21 |
+| [`hakodb/hako-cli`](https://github.com/hakodb/hako-cli) | Command-line manager + serve REPL | 0.2.1 |
+| [`hakodb/hako-cloudserver`](https://github.com/hakodb/hako-cloudserver) | Managed sync hub + admin console | 0.1.1 |
+| [`hakodb/hako-tauri`](https://github.com/hakodb/hako-tauri) | Tauri gateway crate (Rust) | 0.1.1 |
+| [`hakodb/hako-tauri-ts`](https://github.com/hakodb/hako-tauri-ts) | Tauri client (`@hakodb/tauri`) | 0.1.1 |
+| [`hakodb/hako-bench`](https://github.com/hakodb/hako-bench) | C++ benchmark harnesses + SQLite duel | 0.1.1 |
+| [`hakodb/hako-go`](https://github.com/hakodb/hako-go) | Go SDK (cgo) | 0.1.1 |
+| [`hakodb/hako-js`](https://github.com/hakodb/hako-js) | JS/TS SDK (`@hakodb/client`, Node + Bun) | 0.5.12 |
+| [`hakodb/hako-pascal`](https://github.com/hakodb/hako-pascal) | Lazarus/FPC wrapper + components | 0.1.1 |
 
-Configuration layers (lowest wins last): compiled defaults <
-`./firelite-cloud.toml` (auto-loaded when present) < `FL_*` env
-(`FL_DB_PATH`, `FL_ADMIN_BIND`, `FL_SYNC_BIND`, `FL_LOG_LEVEL`,
-`FL_SECURE_COOKIES=1`, `FL_SERVER_ID`, `FL_SYNC_TOKEN`, `FL_TLS_CERT`,
-`FL_TLS_KEY`) < CLI flags. A minimal TOML:
-
-```toml
-db_path = "/var/lib/firelite-cloud/db"
-admin_bind = "127.0.0.1:8081"
-sync_bind = "0.0.0.0:8080"
-log_level = "info"
-```
-
-### First run
-
-Open the console (`http://127.0.0.1:8081`). With no admin account present,
-only the setup wizard is reachable — create the initial administrator and
-the wizard disables itself permanently. Roles: `viewer` (read),
-`operator` (read + write data), `admin` (everything incl. users, groups,
-maintenance).
-
-### Groups: open by default, registered when you mean it
-
-Rooms accept anonymous peers unless you create a **group** for the room
-name (Groups view): `registered` mode issues an API key (shown once —
-only its hash persists) that peers present at handshake; an optional
-member list pins allowed `client_id`s. Absent groups stay open, so
-existing deployments keep working untouched. Rotating a key is one click;
-switching a group back to `open` destroys the stored hash.
-
-### Topology advice: hub 1–2 peers, mesh the rest
-
-Point one (two for redundancy) always-on peer per site at the cloud hub;
-let the remaining devices sync peer-to-peer over net_sync locally. The
-hubs converge through the server; LAN traffic never leaves the site.
-The dashboard's room/peer view shows whether the topology holds.
-
-### TLS and services
-
-Direct TLS for the admin console: `--tls-cert fullchain.pem --tls-key
-privkey.pem` (session cookies flip `Secure` automatically; HSTS follows).
-The sync plane stays `ws://` behind a reverse proxy, or terminate there
-too — both are documented deployments. Refusing to start with only half
-the TLS pair is deliberate (fail-closed).
-
-- Linux: `cloudserver/contrib/firelite-cloudserver.service` (hardened
-  systemd unit — `NoNewPrivileges`, `ProtectSystem=strict`, `PrivateTmp`,
-  `ReadWritePaths` scoped to the DB dir).
-- Windows: `--install-service [--service-name NAME]` (requires absolute
-  `--db-path`; auto-starts at boot), `--uninstall-service`; Stop from the
-  SCM drains cleanly. NSSM remains a valid fallback.
-- Never bind the console to `0.0.0.0` without TLS — the server logs a loud
-  warning when it sees that combination.
-
----
-
-## Benchmark (official tool)
-
-> Start with [benchmarking methodology](docs/benchmarking.md) (settle
-> before measuring, compare equal work) and [choosing a read
-> path](docs/reads.md) (which API for which question) before running
-> anything below.
-
-The official benchmark harness is **`benchmark.cpp`** — a C++ program that drives the engine exclusively through the public C ABI (`include/firelite.h`). It is the reference tool for measuring and reporting FireLite performance.
-
-### What it measures
-
-For each profile it reports throughput (operations per second) and system metrics:
-
-| Metric | Description |
-|---|---|
-| `WPS (Sgl/Btc)` | Single writes/sec and batch writes/sec |
-| `RPS (Seq/Par)` | Sequential and multi-threaded point-reads/sec |
-| `STRESS (Get/Qry/Cmp)` | Mixed point-get, indexed-query, and composite-query throughput |
-| `QPS (Off/Cur)` | Offset-pagination and cursor-pagination queries/sec |
-| `Agg QPS` | Aggregate queries/sec (`sum`) |
-| `Tx WPS` | Serializable transactions/sec |
-| `Bulk Upd/Del` | Bulk update and bulk delete ops/sec |
-| `Scan (Fwd/Rev)` | Full-table decoded scans both directions, docs/s |
-| `ScanRaw` (FireLite) / `ScanKey` (SQLite) | Byte/key-only full scans, docs/s |
-| `Startup/Flush` | Engine open (ms) and clean shutdown (ms) |
-| `Size` | On-disk database size |
-
-It runs six profiles across durability and workload mixes: `Always`, `Interval`, `Manual`, `OnCommit`, `Enc_Comp` (encrypted + compressed), and `Gaming` (large documents, parallel workers).
-
-### Build the cdylib first
-
-```bash
-cargo build --release
-```
-
-### Compile the benchmark
-
-**Linux / macOS:**
-
-```bash
-g++ -O2 -std=c++17 -Iinclude benchmark.cpp -Ltarget/release -lfirelite -o benchmark
-```
-
-**Windows (MinGW / MSYS2):**
-
-```bash
-g++ -O2 -std=c++17 -Iinclude benchmark.cpp -Ltarget/release -lfirelite -o benchmark.exe
-```
-
-On Windows, ensure `target\release\firelite.dll` is on `PATH` when running.
-
-### Run
-
-```bash
-# default dataset (1,000 docs per profile)
-./benchmark --docs=1000
-
-# larger dataset
-./benchmark --docs=10000
-
-# single-profile write-phase breakdown (encode / wal / index / flush timings)
-./benchmark --profile=Always --wstats
-
-# CI regression gate: Qry>=Cmp, Off/Cur within 2x, Get>5xQry, Batch>=Single + smoke floors
-./benchmark --gate
-
-# if the shared library is not on the default loader path (Linux/macOS)
-LD_LIBRARY_PATH=target/release ./benchmark --docs=1000
-```
-
-### Full-scan block (both harnesses, 1:1)
-
-After the matrix, both `benchmark` and `sqlite_bench` print a scan trio
-over all live docs ×5 iters: decoded forward/reverse (keyset pages /
-`ORDER BY`, owned full materialization both sides — SQLite copies every
-column per row, the fair analog of owned full-doc decode) and byte/key-only
-(`fl_cursor_walk` vs id-column scan). Head-to-head at 10k complex docs,
-same box: decoded ~130–220k vs ~430k (owned-construction efficiency),
-raw walk ~6.0M vs key scan ~6–7M (parity).
-
-Timing guidance: the suites print one line per profile/mode and go quiet
-through all stages — that is normal. Full `--docs=10000` runs take
-several minutes (durable profiles fsync per write; Gaming moves 500MB).
-For quick scan numbers use `./benchmark --profile=Manual --docs=10000`
-or `sqlite_bench --docs=10000 --sync=OFF --journal=MEMORY`.
-
-> `--docs` controls how many documents each profile inserts (batch-written documents are `--docs - 100`). Use `--docs >= 1000` for meaningful numbers; very small values (e.g. `100`) leave too little data for the batch/query stages.
-
-The program prints a per-profile progress line followed by a full markdown-style matrix report. Each run creates and destroys temporary `bench_data_*` directories — no existing database is touched.
+Branches: **`main`** (stable — merged releases only) and **`cloud_sync`**
+(active development). The pre-rebrand history remains archived, read-only,
+at [`rizaptk/firelite`](https://github.com/rizaptk/firelite) for existing
+consumers (v0.8.19 and below).
 
 ---
 
 ## Architecture
 
 ```text
-API (FireLite + FFI + SDKs)
+API (HakoDB + FFI + SDKs)
   -> Query (Parallel sharded executor + projection pushdown)
     -> Index (Async background manager + lock-free metadata)
       -> Storage (WAL Inlining + RAM-to-Disk Checkpointing + Tiered Segments)
@@ -1414,7 +974,7 @@ API (FireLite + FFI + SDKs)
 
 ### Feature status vs Firestore-style target
 
-| Area | FireLite status | Notes |
+| Area | HakoDB status | Notes |
 |---|---|---|
 | Embedded engine | Implemented | High-concurrency Rust runtime with FFI bridge |
 | Durable WAL + recovery | Implemented | Fully encrypted WAL with committed-op filter and crash recovery |
@@ -1439,12 +999,7 @@ API (FireLite + FFI + SDKs)
 | Indexing | `src/index/*` | Implemented |
 | Query planner/executor | `src/query/*` | Implemented |
 | Document model | `src/document/*` | Implemented |
-| C-FFI | `src/ffi.rs`, `include/firelite.h` | Implemented |
-| CLI | `cli/src/main.rs` | Implemented |
-| JS/TS SDK | `js/src/*` | Implemented |
-| Lazarus/FPC wrapper | `pascal/FireLiteRaw.pas`, `pascal/FireLite.pas` | Implemented |
-| Tauri gateway | `src/tauri_gateway.rs`, `js/src/tauri.ts` | Implemented |
-| Benchmark harness | `benchmark.cpp` | Implemented |
+| C-FFI | `src/ffi.rs`, `include/hako.h` | Implemented |
 
 ---
 
@@ -1454,8 +1009,6 @@ API (FireLite + FFI + SDKs)
 - Add recovery tests when touching storage/WAL/indexing.
 - Document binary format or compatibility-impacting changes.
 - Keep C ABI additions reflected in cbindgen config + the generated header.
-- Keep SDK API changes reflected in this README and examples.
-- When changing the benchmark, update `benchmark.cpp` and the CI workflow (`.github/workflows/perf.yml`).
 
 ---
 

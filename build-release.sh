@@ -12,7 +12,7 @@ fi
 
 VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
 if [[ -z "$VERSION" ]]; then
-    echo "Unable to determine the FireLite version" >&2
+    echo "Unable to determine the HakoDB version" >&2
     exit 1
 fi
 
@@ -25,28 +25,17 @@ LINUX_ARCHIVE="$RELEASE_DIR/linux-build-$VERSION.tar.gz"
 ANDROID_ARCHIVE="$RELEASE_DIR/android-build-$VERSION.tar.gz"
 
 build_linux() {
-    echo "Building FireLite v$VERSION for Linux..."
+    echo "Building HakoDB v$VERSION for Linux (library only)..."
     cargo build --release
-    cargo build --release -p firelite-cli
-    cargo build --release -p firelite-cloudserver
-
-    echo "Compiling benchmark..."
-    g++ -O2 -std=c++17 -Iinclude benchmark.cpp -L"$RELEASE_DIR" -Wl,-rpath,'$ORIGIN' -lfirelite -o "$RELEASE_DIR/benchmark"
-    g++ -O2 -std=c++17 -pthread sqlite_bench.cpp -lsqlite3 -o "$RELEASE_DIR/sqlite_bench"
 
     echo "Refreshing Linux bundle..."
     rm -rf "$LINUX_DIR"
     mkdir -p "$LINUX_DIR"
-    cp "$RELEASE_DIR/benchmark" \
-        "$RELEASE_DIR/sqlite_bench" \
-       "$RELEASE_DIR/firelite-cli" \
-       "$RELEASE_DIR/firelite-cli.d" \
-       "$RELEASE_DIR/firelite-cloudserver" \
-       "$RELEASE_DIR/firelite-cloudserver.d" \
-       "$RELEASE_DIR/libfirelite.so" \
-       "$RELEASE_DIR/libfirelite.rlib" \
-       "$RELEASE_DIR/libfirelite.d" \
-       "$LINUX_DIR/"
+    cp "$RELEASE_DIR/libhakodb.so" \
+        "$RELEASE_DIR/libhakodb.rlib" \
+        "$RELEASE_DIR/libhakodb.d" \
+        "$ROOT_DIR/include/hako.h" \
+        "$LINUX_DIR/"
 
     rm -f "$LINUX_ARCHIVE"
     echo "Creating Linux archive..."
@@ -54,7 +43,7 @@ build_linux() {
 }
 
 build_android() {
-    echo "Building FireLite for Android ($ANDROID_TARGET)..."
+    echo "Building HakoDB for Android ($ANDROID_TARGET)..."
     ANDROID_API_LEVEL="${ANDROID_API_LEVEL:-21}"
     ANDROID_CLANG=""
     for ndk_root in "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK_ROOT:-}" /home/codespace/android-ndk/android-ndk-r26c; do
@@ -78,7 +67,7 @@ build_android() {
     echo "Refreshing Android bundle..."
     rm -rf "$ANDROID_DIR"
     mkdir -p "$ANDROID_DIR"
-    cp "$ROOT_DIR/target/$ANDROID_TARGET/release/libfirelite.so" "$ANDROID_DIR/"
+    cp "$ROOT_DIR/target/$ANDROID_TARGET/release/libhakodb.so" "$ANDROID_DIR/"
 
     rm -f "$ANDROID_ARCHIVE"
     echo "Creating Android archive..."

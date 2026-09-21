@@ -1,36 +1,36 @@
-//! FireLite embedded document database - minimal example.
+//! Hako embedded document database - minimal example.
 //!
 //! Build & run from this directory:
 //!
 //!   cargo run            (debug)
 //!   cargo run --release  (release)
 //!
-//! The first build compiles the FireLite engine crate as a dependency, so it
+//! The first build compiles the Hako engine crate as a dependency, so it
 //! can take a couple of minutes.
 
-use firelite::config::{DurabilityMode, FireLiteConfig};
-use firelite::document::firelite_doc::FireLiteDoc;
-use firelite::document::value::Value;
-use firelite::engine::{BatchMutation, FireLite};
-use firelite::error::Result;
-use firelite::query::query::Query;
+use hakodb::config::{DurabilityMode, HakoConfig};
+use hakodb::document::hako_doc::HakoDoc;
+use hakodb::document::value::Value;
+use hakodb::engine::{BatchMutation, Hako};
+use hakodb::error::Result;
+use hakodb::query::query::Query;
 
 fn main() -> Result<()> {
     // ---- Open the database (file is created on first use) ----
-    let mut config = FireLiteConfig::default();
+    let mut config = HakoConfig::default();
     config.durability_mode = DurabilityMode::Always;
     config.query_workers = 4;
-    let db = FireLite::open("demo.db", config)?;
+    let db = Hako::open("demo.db", config)?;
     println!("opened demo.db ({} collections)", db.list_collections()?.len());
 
     // ---- Insert documents ----
-    let mut alice = FireLiteDoc::default();
+    let mut alice = HakoDoc::default();
     alice.insert("name", Value::String("Alice".into()));
     alice.insert("age", Value::Int(32));
     alice.insert("active", Value::Bool(true));
     db.put("users", "u1", &alice)?;
 
-    let mut bob = FireLiteDoc::default();
+    let mut bob = HakoDoc::default();
     bob.insert("name", Value::String("Bob".into()));
     bob.insert("age", Value::Int(27));
     bob.insert("tags", Value::Array(vec![Value::String("admin".into())]));
@@ -54,12 +54,12 @@ fn main() -> Result<()> {
 
     // ---- Aggregation ----
     let agg = db.execute_aggregation(
-        Query::new("users").aggregate(firelite::query::query::AggregateOp::Avg("age".into())),
+        Query::new("users").aggregate(hakodb::query::query::AggregateOp::Avg("age".into())),
     )?;
     println!("avg(age) -> {:?}", agg);
 
     // ---- Atomic batch ----
-    let mut carol = FireLiteDoc::default();
+    let mut carol = HakoDoc::default();
     carol.insert("name", Value::String("Carol".into()));
     carol.insert("age", Value::Int(41));
     let written = db.write_batch(vec![
@@ -88,7 +88,7 @@ fn main() -> Result<()> {
 
     // ---- Real-time watch (non-blocking poll) ----
     let rx = db.watch_collection("users");
-    let mut probe = FireLiteDoc::default();
+    let mut probe = HakoDoc::default();
     probe.insert("probe", Value::Bool(true));
     db.put("users", "u_probe", &probe)?;
     while let Ok(event) = rx.try_recv() {

@@ -1,0 +1,133 @@
+name: release
+
+# Core library releases only. Satellites (cli, cloudserver, SDKs, bench,
+# tauri) version independently and carry no workflows; FFI consumers pin
+# these assets by tag: hakodb-<version>-<target>.<ext> + headers.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  VERSION: ${{ github.ref_name }}
+
+jobs:
+  windows-msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build cdylib (MSVC import lib is a release artifact)
+        run: cargo build --release
+      - name: Collect assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/hakodb.dll dist/
+          Copy-Item target/release/hakodb.dll.lib dist/hakodb.lib
+          Copy-Item include/hako.h dist/
+          (Get-FileHash dist/hakodb.dll -Algorithm SHA256).Hash | Out-File dist/SHA256SUMS
+          (Get-FileHash dist/hakodb.lib -Algorithm SHA256).Hash | Out-File dist/SHA256SUMS -Append
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hakodb-${{ github.ref_name }}-x86_64-pc-windows-msvc
+          path: dist/
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build cdylib + rlib
+        run: cargo build --release
+      - name: Collect assets
+        run: |
+          mkdir -p dist
+          cp target/release/libhakodb.so target/release/libhakodb.rlib include/hako.h dist/
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hakodb-${{ github.ref_name }}-x86_64-unknown-linux-gnu
+          path: dist/
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26c
+      - name: Build cdylib for aarch64-linux-android (API 21)
+        run: |
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CLANG="$BIN/aarch64-linux-android21-clang"
+          export CC_aarch64_linux_android="$CLANG"
+          export CXX_aarch64_linux_android="${CLANG}++"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CLANG"
+          # cc-rs (ring, aws-lc-sys) looks for the archiver under the
+          # target-prefixed name; the NDK only ships it as llvm-ar.
+          export AR_aarch64_linux_android="$BIN/llvm-ar"
+          cargo build --release --target aarch64-linux-android
+      - name: Collect assets
+        run: |
+          mkdir -p dist
+          cp target/aarch64-linux-android/release/libhakodb.so include/hako.h dist/
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hakodb-${{ github.ref_name }}-aarch64-linux-android
+          path: dist/
+
+  publish:
+    needs: [windows-msvc, linux, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: hakodb-${{ github.ref_name }}-x86_64-pc-windows-msvc
+          path: assets/windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: hakodb-${{ github.ref_name }}-x86_64-unknown-linux-gnu
+          path: assets/linux
+      - uses: actions/download-artifact@v4
+        with:
+          name: hakodb-${{ github.ref_name }}-aarch64-linux-android
+          path: assets/android
+      # Flat staging with target-qualified names: deterministic download
+      # URLs regardless of how the uploader preserves directories.
+      # Consumers rename to canonical names on download (see each
+      # satellite's sync-core/sync-native script). Per-target bundles
+      # (.zip for Windows, .tar.gz elsewhere) carry the same payload for
+      # one-click installs; individual files stay for script consumers.
+      - name: Stage flat release files and bundles
+        run: |
+          mkdir -p release pkg/win pkg/linux pkg/android
+          cp assets/windows/hakodb.dll release/hakodb-x86_64-pc-windows-msvc.dll
+          cp assets/windows/hakodb.lib release/hakodb-x86_64-pc-windows-msvc.lib
+          cp assets/linux/libhakodb.so release/libhakodb-x86_64-unknown-linux-gnu.so
+          cp assets/linux/libhakodb.rlib release/libhakodb-x86_64-unknown-linux-gnu.rlib
+          cp assets/android/libhakodb.so release/libhakodb-aarch64-linux-android.so
+          cp assets/windows/hako.h release/hako.h
+          cp assets/windows/hakodb.dll assets/windows/hakodb.lib assets/windows/hako.h pkg/win/
+          cp assets/linux/libhakodb.so assets/linux/libhakodb.rlib assets/windows/hako.h pkg/linux/
+          cp assets/android/libhakodb.so assets/windows/hako.h pkg/android/
+          (cd release && sha256sum * > SHA256SUMS)
+          (cd pkg/win && sha256sum * > SHA256SUMS)
+          (cd pkg/linux && sha256sum * > SHA256SUMS)
+          (cd pkg/android && sha256sum * > SHA256SUMS)
+          (cd pkg/win && zip -q ../hakodb-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip *)
+          (cd pkg/linux && tar -czf ../hakodb-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz *)
+          (cd pkg/android && tar -czf ../hakodb-${{ github.ref_name }}-aarch64-linux-android.tar.gz *)
+          mv pkg/*.zip pkg/*.tar.gz release/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*

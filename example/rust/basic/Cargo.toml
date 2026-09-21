@@ -1,11 +1,11 @@
 [package]
-name = "firelite-basic"
+name = "hakodb-basic"
 version = "0.1.0"
 edition = "2021"
-description = "Minimal FireLite Rust example: open, CRUD, query, batch, transaction, watch"
+description = "Minimal Hako Rust example: open, CRUD, query, batch, transaction, watch"
 
 [dependencies]
-firelite = { path = "../../.." }
+hakodb = { path = "../../.." }
 
 [profile.release]
 opt-level = 3

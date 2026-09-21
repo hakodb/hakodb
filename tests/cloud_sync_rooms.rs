@@ -15,23 +15,23 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use firelite::cloud_sync::{CloudSync, CloudSyncMode, RoomRegistry};
-use firelite::config::{DurabilityMode, FireLiteConfig};
-use firelite::document::firelite_doc::FireLiteDoc;
-use firelite::document::value::Value;
-use firelite::engine::FireLite;
+use hakodb::cloud_sync::{CloudSync, CloudSyncMode, RoomRegistry};
+use hakodb::config::{DurabilityMode, HakoConfig};
+use hakodb::document::hako_doc::HakoDoc;
+use hakodb::document::value::Value;
+use hakodb::engine::Hako;
 
-fn temp_db(tag: &str) -> (Arc<FireLite>, PathBuf) {
+fn temp_db(tag: &str) -> (Arc<Hako>, PathBuf) {
     let dir = std::env::temp_dir().join(format!(
-        "firelite-synctest-{}-{}",
+        "hakodb-synctest-{}-{}",
         std::process::id(),
         tag
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let mut cfg = FireLiteConfig::default();
+    let mut cfg = HakoConfig::default();
     cfg.durability_mode = DurabilityMode::OnCommit;
-    let db = Arc::new(FireLite::open(&dir, cfg).unwrap());
+    let db = Arc::new(Hako::open(&dir, cfg).unwrap());
     (db, dir)
 }
 
@@ -53,8 +53,8 @@ async fn wait_until(what: &str, mut cond: impl FnMut() -> bool, timeout_ms: u64)
     panic!("timed out waiting for: {what}");
 }
 
-fn make_doc(name: &str, owner: &str) -> FireLiteDoc {
-    let mut doc = FireLiteDoc::default();
+fn make_doc(name: &str, owner: &str) -> HakoDoc {
+    let mut doc = HakoDoc::default();
     doc.insert("name", Value::String(name.to_string()));
     doc.insert("owner", Value::String(owner.to_string()));
     doc

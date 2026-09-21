@@ -9,7 +9,7 @@ pub enum DurabilityMode {
 }
 
 #[derive(Debug, Clone)]
-pub struct FireLiteConfig {
+pub struct HakoConfig {
     pub mmap_size: usize,
     pub page_size: usize,
     pub page_cache_capacity: usize,
@@ -37,7 +37,7 @@ pub replication_collections: Option<Vec<String>>,
 /// (782us) while no-reserve never broke 800 across 5-6 runs. The effect
 /// is presence-not-size, so 4MB covers typical runs for ~4MB logical
 /// size (internal collections still skip it). Override per workload
-/// with `--wal-reserve-mb` (benchmark) / `fl_config_set_wal_reserve_bytes`.
+/// with `--wal-reserve-mb` (benchmark) / `hk_config_set_wal_reserve_bytes`.
 /// Re-measured after the single-write flush fix (local Windows, fast disk,
 /// --no-maintenance, 3 runs/arm): no reserve delta locally, consistent
 /// with v0.7.12 — the Codespace figures above are cloud-disk-specific
@@ -50,9 +50,16 @@ pub wal_reserve_bytes: u64,
 /// (writes/reads never depend on it), but the WAL/blob files grow until
 /// re-enabled and maintenance runs. Default true.
 pub background_maintenance: bool,
+/// Extra sync-excluded collection names for this deployment, merged over
+/// the builtin `SYNC_EXCLUDED_COLLECTIONS`. Sync is opt-OUT, not opt-in:
+/// every collection on disk (including `_`-hidden ones) replicates unless
+/// it is excluded here or builtin-excluded. Use this to pin down server
+/// planes (e.g. cloudserver declares its room/user/group stores here so
+/// the guarantee never depends on naming conventions). Default empty.
+pub sync_excluded: Vec<String>,
 }
 
-impl Default for FireLiteConfig {
+impl Default for HakoConfig {
     fn default() -> Self {
         Self {
             mmap_size: 256 * 1024 * 1024,
@@ -73,6 +80,7 @@ value_blob_threshold_bytes: 16 * 1024,
 replication_collections: None,
 wal_reserve_bytes: 4 * 1024 * 1024,
 background_maintenance: true,
+sync_excluded: Vec::new(),
         }
     }
 }
