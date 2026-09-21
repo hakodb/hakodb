@@ -6,11 +6,21 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 HakoDB speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.8.22 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.8.23 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.8.22)
+## What's new (0.7.2 → 0.8.23)
+
+### v0.8.23 — header rename + query-decode micro-opts
+- C header renamed `hako.h` → `hakodb.h` (guard `HAKODB_H`); release
+  bundles and satellite sync scripts follow the new filename.
+- Query decode paths shed per-row allocs (projection borrow-compare,
+  header-sized output Vec, thread-local match scratch) plus lazy filter
+  key matching and dotted-path pulls (`DocView::get_path`, ~18× vs
+  whole-subtree decode on nested fixtures).
+- `cbindgen.toml` actually loads now (absolute path, valid keys); the
+  generated header is real C with `extern "C"` guards.
 
 ### v0.8.22 — pre-rebrand aliases removed
 - `SYNC_EXCLUDED` no longer recognizes the `__firelite_*` spellings;
@@ -34,23 +44,10 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
   unknown fields → silent C++ defaults for years); the header is real
   C now, with `extern "C"` guards for C++ consumers.
 
-### v0.8.20 — repo split phase 1: core ships alone
-- **Removed `fsync/`** (5-line re-export wrapper, zero references —
-  redundant since FFI + sync live in one crate) and narrowed the
-  workspace to the library crate alone.
-- **Watch API for out-of-tree gateways**: new narrow public methods
-  (`plan_for_watch`, `matches_watch`, `get_raw_bytes`) carrying the
-  exact zero-decode cost of the former in-tree path; the Tauri gateway
-  module + `tauri`/`rmpv` deps leave the core.
-- **MSVC-ready build**: `build.rs` keeps `hakodb.lib` on MSVC targets
-  (GNU/MinGW keeps the stale-shadow delete); the tag-triggered release
-  workflow ships `.dll`+`.lib` (Windows), `.so`+`.rlib` (Linux),
-  Android `aarch64` `.so`, all with headers + checksums.
-
 ## Table of Contents
 
 - [What is HakoDB?](#what-is-hakodb)
-- [What's new (0.7.2 → 0.8.22)](#whats-new-072--0822)
+- [What's new (0.7.2 → 0.8.23)](#whats-new-072--0823)
 - [Changelog (older releases)](CHANGELOG.md)
 - [When to use HakoDB (sync vs non-sync)](#when-to-use-hakodb-sync-vs-non-sync)
 - [Key features](#key-features)
