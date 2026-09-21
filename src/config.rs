@@ -9,7 +9,7 @@ pub enum DurabilityMode {
 }
 
 #[derive(Debug, Clone)]
-pub struct FireLiteConfig {
+pub struct HakoConfig {
     pub mmap_size: usize,
     pub page_size: usize,
     pub page_cache_capacity: usize,
@@ -37,7 +37,7 @@ pub replication_collections: Option<Vec<String>>,
 /// (782us) while no-reserve never broke 800 across 5-6 runs. The effect
 /// is presence-not-size, so 4MB covers typical runs for ~4MB logical
 /// size (internal collections still skip it). Override per workload
-/// with `--wal-reserve-mb` (benchmark) / `fl_config_set_wal_reserve_bytes`.
+/// with `--wal-reserve-mb` (benchmark) / `hk_config_set_wal_reserve_bytes`.
 /// Re-measured after the single-write flush fix (local Windows, fast disk,
 /// --no-maintenance, 3 runs/arm): no reserve delta locally, consistent
 /// with v0.7.12 — the Codespace figures above are cloud-disk-specific
@@ -59,7 +59,7 @@ pub background_maintenance: bool,
 pub sync_excluded: Vec<String>,
 }
 
-impl Default for FireLiteConfig {
+impl Default for HakoConfig {
     fn default() -> Self {
         Self {
             mmap_size: 256 * 1024 * 1024,

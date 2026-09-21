@@ -8,10 +8,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH, Instant};
 
 use hashbrown::{HashMap, HashSet};
 
-use crate::config::{DurabilityMode, FireLiteConfig};
-use crate::document::firelite_doc::FireLiteDoc;
+use crate::config::{DurabilityMode, HakoConfig};
+use crate::document::hako_doc::HakoDoc;
 use crate::document::value::Value;
-use crate::error::{FireLiteError, Result};
+use crate::error::{HakoError, Result};
 use crate::index::composite::definition::{CompositeIndexDefinition, SortDirection};
 use crate::index::manager::IndexManager;
 use crate::index::service::IndexingService;
@@ -43,7 +43,7 @@ thread_local! {
 // --- Write-path phase accounting (ponytail) ---
 // Always-on accumulators: a handful of Instant reads + Relaxed adds per
 // batch (~0.1µs against 20µs+ batches). Read via `write_stats_report()`
-// (resets), e.g. from the `fl_debug_write_stats` FFI hook or a test.
+// (resets), e.g. from the `hk_debug_write_stats` FFI hook or a test.
 pub(crate) struct WritePhaseStats {
     pub batches: AtomicU64,
     pub mutations: AtomicU64,
@@ -115,7 +115,7 @@ pub enum BatchMutation {
     Put {
         collection: String,
         doc_id: String,
-        doc: FireLiteDoc,
+        doc: HakoDoc,
     },
     Delete {
         collection: String,
@@ -229,13 +229,13 @@ struct ShardWork {
     ops: Vec<WalOp>,
     keys: Vec<Arc<str>>,
     events: Vec<(String, ChangeEvent)>,
-    index_puts: Vec<(String, Arc<FireLiteDoc>)>, 
-    index_deletes: Vec<(String, FireLiteDoc)>,
+    index_puts: Vec<(String, Arc<HakoDoc>)>, 
+    index_deletes: Vec<(String, HakoDoc)>,
     blob_queue_items: Vec<BlobWork>,
 }
 
 impl Transaction {
-    pub fn put(&mut self, collection: &str, doc_id: &str, doc: FireLiteDoc) {
+    pub fn put(&mut self, collection: &str, doc_id: &str, doc: HakoDoc) {
         self.mutations.push(BatchMutation::Put {
             collection: collection.to_string(),
             doc_id: doc_id.to_string(),
@@ -248,7 +248,7 @@ impl Transaction {
             doc_id: doc_id.to_string(),
         });
     }
-    pub fn commit(self, db: &FireLite) -> Result<Vec<String>> {
+    pub fn commit(self, db: &Hako) -> Result<Vec<String>> {
         Ok(db.write_batch(self.mutations)?)
     }
 }
@@ -261,17 +261,17 @@ pub struct SerializableTransaction {
 impl SerializableTransaction {
     pub fn get(
         &mut self,
-        db: &FireLite,
+        db: &Hako,
         collection: &str,
         doc_id: &str,
-    ) -> Result<Option<FireLiteDoc>> {
+    ) -> Result<Option<HakoDoc>> {
         let key = doc_id.to_string();
         let doc = db.get(collection, doc_id)?;
         let version = db.current_version(&key);
         self.reads.insert(key, version);
         Ok(doc)
     }
-    pub fn put(&mut self, collection: &str, doc_id: &str, doc: FireLiteDoc) {
+    pub fn put(&mut self, collection: &str, doc_id: &str, doc: HakoDoc) {
         self.mutations.push(BatchMutation::Put {
             collection: collection.to_string(),
             doc_id: doc_id.to_string(),
@@ -284,7 +284,7 @@ impl SerializableTransaction {
             doc_id: doc_id.to_string(),
         });
     }
-    pub fn commit(&self, db: &FireLite) -> Result<Vec<String>> {
+    pub fn commit(&self, db: &Hako) -> Result<Vec<String>> {
         Ok(db.commit_serializable(self.reads.clone(), self.mutations.clone())?)
     }
 }
@@ -292,13 +292,13 @@ impl SerializableTransaction {
 pub(crate) enum IndexOp {
     Update {
         collection: String,
-        // puts: Arc<Vec<(String, FireLiteDoc)>>, 
-        puts: Arc<Vec<(String, Arc<FireLiteDoc>)>>, 
-        deletes: Vec<(String, FireLiteDoc)>,
+        // puts: Arc<Vec<(String, HakoDoc)>>, 
+        puts: Arc<Vec<(String, Arc<HakoDoc>)>>, 
+        deletes: Vec<(String, HakoDoc)>,
     },
 }
 
-/// Snapshot of background activity behind `FireLite::await_quiescent`.
+/// Snapshot of background activity behind `Hako::await_quiescent`.
 /// Fresh writes settle through four stages — open-time index recovery,
 /// async index updates, blob persistence, periodic maintenance — and a
 /// read benchmarked mid-flight measures contention, not the engine.
@@ -343,8 +343,8 @@ impl Drop for BackfillGuard {
     }
 }
 
-pub struct FireLite {
-    root_path: PathBuf,    pub(crate) config: FireLiteConfig,
+pub struct Hako {
+    root_path: PathBuf,    pub(crate) config: HakoConfig,
     pub(crate) shards: Arc<RwLock<HashMap<String, Arc<RwLock<StorageEngine>>>>>, // The only storage
     index_storage: Arc<Mutex<IndexStorage>>,
     pub(crate) indexes: Arc<RwLock<IndexManager>>,
@@ -357,7 +357,6 @@ pub struct FireLite {
     security_rules: RwLock<Vec<SecurityRule>>,
     audit_data: Arc<RwLock<Vec<AuditEntry>>>,
     audit_tx: Sender<AuditEntry>,
-    #[allow(dead_code)]
     pub(crate) index_tx: Sender<IndexOp>,
     /// ponytail: ops sent to the async index worker but not yet applied.
     /// Quiescence reads this instead of channel len (std mpsc has none).
@@ -388,7 +387,7 @@ pub struct FireLite {
     /// lookup + full decode for one Arc clone. Versions only increase and
     /// every write bumps, so a version match is exact; writes also remove
     /// the key outright so stale entries can't linger.
-    pub(crate) doc_cache: RwLock<HashMap<String, (u64, Arc<FireLiteDoc>)>>,
+    pub(crate) doc_cache: RwLock<HashMap<String, (u64, Arc<HakoDoc>)>>,
     /// Local-only replication scope ("the signal"): collections and keys
     /// whose writes must never leave this device. Advancing clocks is
     /// untouched (tombstones keep fresh timestamps, so the deleter never
@@ -401,8 +400,8 @@ pub struct FireLite {
     pub(crate) local_only_keys: RwLock<HashSet<String>>,
 }
 
-impl FireLite {
-    pub fn open(path: impl AsRef<Path>, config: FireLiteConfig) -> Result<Self> {
+impl Hako {
+    pub fn open(path: impl AsRef<Path>, config: HakoConfig) -> Result<Self> {
 
         let query_threads = config.query_workers.max(1).min(8);
         RAYON_INIT.call_once(|| {
@@ -443,7 +442,7 @@ impl FireLite {
         let index_log_path = index_dir.join("index.log").to_string_lossy().to_string();
         let snapshot_dir = index_dir.join("snapshots").to_string_lossy().to_string();
         let index_storage = Arc::new(Mutex::new(
-            IndexStorage::open(&index_log_path, &snapshot_dir).map_err(|e| FireLiteError::Io(e))?,
+            IndexStorage::open(&index_log_path, &snapshot_dir).map_err(|e| HakoError::Io(e))?,
         ));
 
         // --- WORKER 1: PERSISTENT INDEX WORKER ---
@@ -718,7 +717,7 @@ impl FireLite {
                         if let Ok(data) = storage.scan_prefix("") {
                             let mut mgr = indexes_ptr.write().unwrap();
                             for (doc_id, bytes) in data {
-                                if let Some(doc) = FireLiteDoc::decode(&bytes) {
+                                if let Some(doc) = HakoDoc::decode(&bytes) {
                                     // doc_id is already the naked ID
                                     mgr.index_document(&col_name, &doc_id, &doc);
                                 }
@@ -779,7 +778,7 @@ impl FireLite {
     pub(crate) fn get_shard(&self, collection: &str) -> Result<Arc<RwLock<StorageEngine>>> {
         // 1. Check with Read Lock (Fast Path)
         {
-            let shards = self.shards.read().map_err(|_| FireLiteError::LockPoisoned("shards".into()))?;
+            let shards = self.shards.read().map_err(|_| HakoError::LockPoisoned("shards".into()))?;
             if let Some(s) = shards.get(collection) {
                 return Ok(Arc::clone(s));
             }
@@ -801,7 +800,7 @@ impl FireLite {
         let shard_arc = Arc::new(RwLock::new(storage));
 
         // 3. Insert into map with Write Lock
-        let mut shards = self.shards.write().map_err(|_| FireLiteError::LockPoisoned("shards".into()))?;
+        let mut shards = self.shards.write().map_err(|_| HakoError::LockPoisoned("shards".into()))?;
         Ok(shards.entry(collection.to_string()).or_insert(shard_arc).clone())
     }
 
@@ -847,7 +846,7 @@ impl FireLite {
 
         for (key, expected) in reads {
             if self.current_version(&key) != expected {
-                return Err(FireLiteError::Corrupt("Transaction Conflict".into()));
+                return Err(HakoError::Corrupt("Transaction Conflict".into()));
             }
         }
 
@@ -860,7 +859,7 @@ impl FireLite {
         // 1. Security Check
         if !mutations.iter().all(|m| self.allowed(self.get_col(m), AccessOp::Batch)) {
             self.record_audit(AuditEntry { op: AccessOp::Batch, collection: "<sharded>".into(), doc_id: None, ok: false });
-            return Err(FireLiteError::Corrupt("Security Denied".into()));
+            return Err(HakoError::Corrupt("Security Denied".into()));
         }
 
         let res = self.write_batch_internal(mutations);
@@ -882,7 +881,7 @@ impl FireLite {
         let mut assigned_ids = Vec::with_capacity(mutations.len());
 
         // Simple local tracker to avoid changing ShardWork
-        // let mut deletes_for_indexer: Vec<(String, String, FireLiteDoc)> = Vec::new();
+        // let mut deletes_for_indexer: Vec<(String, String, HakoDoc)> = Vec::new();
 
         let t_encode = Instant::now();
         // ponytail: last-collection cache — consecutive mutations usually hit
@@ -898,7 +897,7 @@ impl FireLite {
                     let current_doc = {
                         let guard = shard_arc.read().unwrap();
                         guard.get(&doc_id)?
-                            .and_then(|b| FireLiteDoc::decode(&b))
+                            .and_then(|b| HakoDoc::decode(&b))
                             .unwrap_or_default()
                     };
                     let mut updated = current_doc;
@@ -906,7 +905,7 @@ impl FireLite {
                     (collection, doc_id, updated, false)
                 }
                 BatchMutation::Delete { collection, doc_id } => {
-                    (collection, doc_id, FireLiteDoc::default(), true)
+                    (collection, doc_id, HakoDoc::default(), true)
                 }
             };
 
@@ -988,7 +987,7 @@ impl FireLite {
                         if let WalOp::Delete { key, .. } = op {
                             if let Some(ptr) = shard.index.get(key) {
                                 if let Ok(Some(bytes)) = shard.read_pointer_internal(ptr, false) {
-                                    if let Some(old_doc) = FireLiteDoc::decode(&bytes) {
+                                    if let Some(old_doc) = HakoDoc::decode(&bytes) {
                                         work.index_deletes.push((key.clone(), old_doc));
                                     }
                                 }
@@ -1107,14 +1106,14 @@ impl FireLite {
         &self, 
         collection: &str,
         key: &str, // Added key
-        doc: &mut FireLiteDoc, 
+        doc: &mut HakoDoc, 
         blob_manager: &BlobManager,
         threshold: usize, 
     ) -> Vec<BlobWork> {
         blob_manager.extract_blobs(collection, key, doc, threshold)
     }
 
-    pub fn get(&self, collection: &str, doc_id: &str) -> Result<Option<FireLiteDoc>> {
+    pub fn get(&self, collection: &str, doc_id: &str) -> Result<Option<HakoDoc>> {
         if !self.allowed(collection, AccessOp::Get) {
             // ponytail: gate entry construction (two String allocs) on the
             // toggle — record_audit already no-ops when disabled.
@@ -1126,7 +1125,7 @@ impl FireLite {
                     ok: false,
                 });
             }
-            return Err(FireLiteError::Corrupt("Denied".into()));
+            return Err(HakoError::Corrupt("Denied".into()));
         }
 
         // ponytail: hot-cache probe. Hit skips storage lookup, full decode
@@ -1154,7 +1153,7 @@ impl FireLite {
         // the alloc census). Identical output, zero copies.
         let res = storage
             .get_shared(doc_id)?
-            .and_then(|b| FireLiteDoc::decode(&b));
+            .and_then(|b| HakoDoc::decode(&b));
 
         // AUDIT SUCCESS
         if self.config.enable_audit_log {
@@ -1188,7 +1187,7 @@ impl FireLite {
     /// hot-cache interaction. The sqlite3 `SELECT` + typed-accessor analog:
     /// pull only the fields you touch. Deleted/missing reads None, same as
     /// [`Self::get`]; framing-invalid rows also read None (strict views).
-    pub fn get_view(&self, collection: &str, doc_id: &str) -> Result<Option<crate::document::firelite_doc::DocView>> {
+    pub fn get_view(&self, collection: &str, doc_id: &str) -> Result<Option<crate::document::hako_doc::DocView>> {
         if !self.allowed(collection, AccessOp::Get) {
             if self.config.enable_audit_log {
                 self.record_audit(AuditEntry {
@@ -1198,13 +1197,13 @@ impl FireLite {
                     ok: false,
                 });
             }
-            return Err(FireLiteError::Corrupt("Denied".into()));
+            return Err(HakoError::Corrupt("Denied".into()));
         }
 
         let shard = self.get_shard(collection)?;
         let storage = shard.safe_read()?;
         let res = storage.get_shared(doc_id)?.and_then(|b| {
-            crate::document::firelite_doc::DocView::new(b)
+            crate::document::hako_doc::DocView::new(b)
         });
 
         if self.config.enable_audit_log {
@@ -1219,14 +1218,14 @@ impl FireLite {
         Ok(res)
     }
 
-    pub fn put(&self, col: &str, id: &str, doc: &FireLiteDoc) -> Result<String> {
+    pub fn put(&self, col: &str, id: &str, doc: &HakoDoc) -> Result<String> {
         self.put_owned(col, id, doc.clone())
     }
 
     /// ponytail: owned-doc variant — skips the full deep clone that `put`
     /// pays (every String field). Use whenever the caller already owns the
     /// doc (FFI take-handles, Tauri JSON builds, subdocument assembly).
-    pub fn put_owned(&self, col: &str, id: &str, doc: FireLiteDoc) -> Result<String> {
+    pub fn put_owned(&self, col: &str, id: &str, doc: HakoDoc) -> Result<String> {
         let res = self.write_batch(vec![BatchMutation::Put {
             collection: col.into(),
             doc_id: id.into(),
@@ -1376,7 +1375,7 @@ impl FireLite {
             .map(|c| Value::String(c.clone())).collect();
         let keys: Vec<Value> = self.local_only_keys.read().unwrap().iter()
             .map(|k| Value::String(k.clone())).collect();
-        let mut doc = FireLiteDoc::default();
+        let mut doc = HakoDoc::default();
         doc.insert("cols", Value::Array(cols));
         doc.insert("keys", Value::Array(keys));
         let _ = self.put("__firelite_system", "local_only", &doc);
@@ -1406,7 +1405,7 @@ impl FireLite {
         Collection::new(self, name)
     }
 
-    pub fn query(&self, query: Query) -> Result<Vec<(String, FireLiteDoc)>> {
+    pub fn query(&self, query: Query) -> Result<Vec<(String, HakoDoc)>> {
         if !self.allowed(&query.collection, AccessOp::Query) {
             self.record_audit(AuditEntry {
                 op: AccessOp::Query,
@@ -1414,7 +1413,7 @@ impl FireLite {
                 doc_id: None,
                 ok: false,
             });
-            return Err(FireLiteError::Corrupt("Denied".into()));
+            return Err(HakoError::Corrupt("Denied".into()));
         }
 
         let shard_arc = self.get_shard(&query.collection)?;
@@ -1454,7 +1453,7 @@ impl FireLite {
                 doc_id: None,
                 ok: false,
             });
-            return Err(FireLiteError::Corrupt("Denied".into()));
+            return Err(HakoError::Corrupt("Denied".into()));
         }
 
         let shard_arc = self.get_shard(&query.collection)?;
@@ -1494,7 +1493,7 @@ impl FireLite {
                 doc_id: None,
                 ok: false,
             });
-            return Err(FireLiteError::Corrupt("Denied".into()));
+            return Err(HakoError::Corrupt("Denied".into()));
         }
 
         let shard_arc = self.get_shard(&query.collection)?;
@@ -1522,7 +1521,7 @@ impl FireLite {
     /// `ParallelQueryExecutor::execute_walk_view` for the contract.
     pub fn walk_view<F>(&self, mut query: Query, callback: &mut F) -> Result<usize>
     where
-        F: FnMut(&str, &crate::document::firelite_doc::DocView) -> bool,
+        F: FnMut(&str, &crate::document::hako_doc::DocView) -> bool,
     {
         query.raw = true;
         if !self.allowed(&query.collection, AccessOp::Query) {
@@ -1532,7 +1531,7 @@ impl FireLite {
                 doc_id: None,
                 ok: false,
             });
-            return Err(FireLiteError::Corrupt("Denied".into()));
+            return Err(HakoError::Corrupt("Denied".into()));
         }
 
         let shard_arc = self.get_shard(&query.collection)?;
@@ -1568,7 +1567,7 @@ impl FireLite {
                 doc_id: None,
                 ok: false,
             });
-            return Err(FireLiteError::Corrupt("Denied".into()));
+            return Err(HakoError::Corrupt("Denied".into()));
         }
 
         let mut q = query.clone();
@@ -1603,7 +1602,7 @@ impl FireLite {
                 doc_id: Some(id.into()),
                 ok: false,
             });
-            return Err(FireLiteError::Corrupt("Denied".into()));
+            return Err(HakoError::Corrupt("Denied".into()));
         }
 
         let data = self.write_batch(vec![BatchMutation::Patch {
@@ -1819,7 +1818,7 @@ impl FireLite {
 
     /// True when `col` must be withheld from all sync paths: builtin
     /// `SYNC_EXCLUDED_COLLECTIONS` plus this deployment's
-    /// `FireLiteConfig::sync_excluded` extras.
+    /// `HakoConfig::sync_excluded` extras.
     pub fn is_sync_excluded_effective(&self, col: &str) -> bool {
         is_sync_excluded(col) || self.config.sync_excluded.iter().any(|c| c == col)
     }
@@ -1846,10 +1845,10 @@ impl FireLite {
         Ok(cols)
     }
 
-    pub fn get_by_reference(&self, reference: &Value) -> Result<Option<FireLiteDoc>> {
+    pub fn get_by_reference(&self, reference: &Value) -> Result<Option<HakoDoc>> {
         match reference {
             Value::Reference { collection, doc_id } => self.get(collection, doc_id),
-            _ => Err(FireLiteError::Corrupt("Not ref".into())),
+            _ => Err(HakoError::Corrupt("Not ref".into())),
         }
     }
     
@@ -1865,7 +1864,7 @@ impl FireLite {
                 doc_id: None,
                 ok: false,
             });
-            return Err(FireLiteError::Corrupt("Denied".into()));
+            return Err(HakoError::Corrupt("Denied".into()));
         }
 
         let shard_arc = self.get_shard(&query.collection)?;
@@ -1898,7 +1897,7 @@ impl FireLite {
         id: &str,
         subcol: &str,
         subid: &str,
-        doc: &FireLiteDoc,
+        doc: &HakoDoc,
     ) -> Result<String> {
         let res = self.put(&subcollection_prefix(col, id, subcol), subid, doc)?;
         Ok(res)
@@ -1951,7 +1950,7 @@ impl FireLite {
         let state = PersistedIndexState { secondary, fts, composite };
         let path = self.index_defs_path();
         if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
-        let json = serde_json::to_vec_pretty(&state).map_err(|e| FireLiteError::Corrupt(e.to_string()))?;
+        let json = serde_json::to_vec_pretty(&state).map_err(|e| HakoError::Corrupt(e.to_string()))?;
         std::fs::write(path, json)?;
         Ok(())
     }
@@ -2106,7 +2105,7 @@ impl FireLite {
                 let mut mgr = idx_mgr.write().unwrap();
                 let mut decoded_docs = Vec::new();
                 for (full_key, bytes) in resolved_docs {
-                    if let Some(doc) = FireLiteDoc::decode(&bytes) {
+                    if let Some(doc) = HakoDoc::decode(&bytes) {
                         decoded_docs.push((full_key, doc));
                     }
                 }
@@ -2175,7 +2174,7 @@ impl FireLite {
                 let mut mgr = idx_mgr.write().unwrap();
                 let mut decoded_docs = Vec::new();
                 for (full_key, bytes) in resolved_docs {
-                    if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
+                    if let Some(mut doc) = HakoDoc::decode(&bytes) {
                         let _ = resolve_doc_static(&mut doc, &shard_arc, enc_key.as_deref());
                         decoded_docs.push((full_key, doc));
                     }
@@ -2248,7 +2247,7 @@ impl FireLite {
 
                 if let Some(composite_idx) = mgr.composite.get_mut(index_id) {
                     for (doc_id, bytes) in resolved_data {
-                        if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
+                        if let Some(mut doc) = HakoDoc::decode(&bytes) {
                             let _ = resolve_doc_static(&mut doc, &shard_arc, enc_key.as_deref());
                             composite_idx.index_document(&doc_id, &doc);
 
@@ -2286,7 +2285,7 @@ impl FireLite {
     pub fn save_index_snapshots(&self) -> Result<()> {
         let persist = self.index_storage.lock().unwrap();
         // Snapshot the primary composite index (ID 1)
-        persist.snapshot(1).map_err(|e| FireLiteError::Io(e))?;
+        persist.snapshot(1).map_err(|e| HakoError::Io(e))?;
         Ok(())
     }
 
@@ -2326,7 +2325,7 @@ impl FireLite {
         entries
     }
 
-    pub fn resolve_document_blobs(&self, doc: &mut FireLiteDoc, collection: &str) -> Result<()> {
+    pub fn resolve_document_blobs(&self, doc: &mut HakoDoc, collection: &str) -> Result<()> {
         self.resolve_doc(doc, collection)
     }
 
@@ -2339,7 +2338,7 @@ impl FireLite {
                 .blob_manager
                 .as_ref()
                 .cloned()
-                .ok_or_else(|| FireLiteError::StorageError("Blob manager missing".into()))?
+                .ok_or_else(|| HakoError::StorageError("Blob manager missing".into()))?
         };
         let data = blob_manager.read_at(offset, len)?;
 
@@ -2350,7 +2349,7 @@ impl FireLite {
         }
     }
 
-    fn resolve_doc(&self, doc: &mut FireLiteDoc, collection: &str) -> Result<()> {
+    fn resolve_doc(&self, doc: &mut HakoDoc, collection: &str) -> Result<()> {
         // PASS 1: Collect mutable references once. 
         let blob_values: Vec<&mut Value> = doc.fields.iter_mut()
             .map(|(_, v)| v)
@@ -2373,7 +2372,7 @@ impl FireLite {
             (shard.blob_manager.clone(), in_memory)
         };
 
-        let bm = blob_manager.ok_or(FireLiteError::StorageError("No blob manager".into()))?;
+        let bm = blob_manager.ok_or(HakoError::StorageError("No blob manager".into()))?;
 
         for val in blob_values {
             if let Value::BlobLink { offset, len } = *val {
@@ -2415,7 +2414,7 @@ impl FireLite {
         for (key, pointer) in &shard.index {
             // We need to read the document to find BlobLinks inside it
             if let Some(bytes) = shard.read_pointer(pointer)? {
-                if let Some(mut doc) = FireLiteDoc::decode(&bytes) {
+                if let Some(mut doc) = HakoDoc::decode(&bytes) {
                     let doc_changed = false;
                     
                     for (_, value) in &mut doc.fields {
@@ -2463,13 +2462,13 @@ impl FireLite {
         self.root_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "firelite_default".to_string())
+            .unwrap_or_else(|| "hakodb_default".to_string())
     }
 
     /// True once the background open-recovery pass has rebuilt indexes.
     /// Queries issued before this silently plan `FullCollection` (the
     /// planner's `index_ready` gate) — poll after open/seed in benchmarks
-    /// and tests before measuring. Mirrors `fl_engine_is_indexes_ready`.
+    /// and tests before measuring. Mirrors `hk_engine_is_indexes_ready`.
     pub fn is_indexes_ready(&self) -> bool {
         self.indexes_ready.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -2598,7 +2597,7 @@ impl FireLite {
 
 }
 
-impl Drop for FireLite {
+impl Drop for Hako {
     fn drop(&mut self) {
         // 1. Stop Audit/Maintenance
         if let Some(tx) = self.system_stop.lock().unwrap().take() { let _ = tx.send(()); }
@@ -2641,7 +2640,7 @@ impl Drop for FireLite {
 
 // --- Internal Helper Functions ---
 pub(crate) fn resolve_doc_static(
-    doc: &mut FireLiteDoc, 
+    doc: &mut HakoDoc, 
     shard_arc: &Arc<RwLock<StorageEngine>>, 
     _enc_secret: Option<&str>
 ) -> Result<()> {
@@ -2664,7 +2663,7 @@ pub(crate) fn resolve_doc_static(
         (shard.blob_manager.clone(), in_memory)
     };
 
-    let bm = blob_manager.ok_or(FireLiteError::StorageError("No blob manager".into()))?;
+    let bm = blob_manager.ok_or(HakoError::StorageError("No blob manager".into()))?;
 
     for val in blob_values {
         if let Value::BlobLink { offset, len } = *val {
@@ -2692,8 +2691,8 @@ mod profile_tests {
     use super::*;
     use crate::config::DurabilityMode;
 
-    fn test_doc(i: usize) -> FireLiteDoc {
-        let mut d = FireLiteDoc::default();
+    fn test_doc(i: usize) -> HakoDoc {
+        let mut d = HakoDoc::default();
         d.insert("tenant", Value::String(format!("tenant-{}", i % 32)));
         d.insert("age", Value::Int(18 + (i % 70) as i64));
         d.insert("active", Value::Bool(i % 3 != 0));
@@ -2709,9 +2708,9 @@ mod profile_tests {
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("fl-wprof-{nanos}"));
-        let mut cfg = FireLiteConfig::default();
+        let mut cfg = HakoConfig::default();
         cfg.durability_mode = mode;
-        let db = FireLite::open(&dir, cfg).expect("open");
+        let db = Hako::open(&dir, cfg).expect("open");
         // Reset first: open() itself writes (recovery/index setup paths).
         write_stats_report();
         // Warmup outside measurement: cold start (page faults, allocator,
@@ -2742,7 +2741,7 @@ mod profile_tests {
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("fl-wprof-blob-{nanos}"));
-        let db = FireLite::open(&dir, FireLiteConfig::default()).expect("open");
+        let db = Hako::open(&dir, HakoConfig::default()).expect("open");
         // Warm up everything (locks, allocator, code pages).
         for i in 0..50 {
             db.put_owned("bench", &format!("w_{i}"), test_doc(i)).expect("put");

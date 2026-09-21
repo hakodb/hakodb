@@ -12,7 +12,7 @@ fi
 
 VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
 if [[ -z "$VERSION" ]]; then
-    echo "Unable to determine the FireLite version" >&2
+    echo "Unable to determine the HakoDB version" >&2
     exit 1
 fi
 
@@ -25,16 +25,16 @@ LINUX_ARCHIVE="$RELEASE_DIR/linux-build-$VERSION.tar.gz"
 ANDROID_ARCHIVE="$RELEASE_DIR/android-build-$VERSION.tar.gz"
 
 build_linux() {
-    echo "Building FireLite v$VERSION for Linux (library only)..."
+    echo "Building HakoDB v$VERSION for Linux (library only)..."
     cargo build --release
 
     echo "Refreshing Linux bundle..."
     rm -rf "$LINUX_DIR"
     mkdir -p "$LINUX_DIR"
-    cp "$RELEASE_DIR/libfirelite.so" \
-        "$RELEASE_DIR/libfirelite.rlib" \
-        "$RELEASE_DIR/libfirelite.d" \
-        "$ROOT_DIR/include/firelite.h" \
+    cp "$RELEASE_DIR/libhakodb.so" \
+        "$RELEASE_DIR/libhakodb.rlib" \
+        "$RELEASE_DIR/libhakodb.d" \
+        "$ROOT_DIR/include/hako.h" \
         "$LINUX_DIR/"
 
     rm -f "$LINUX_ARCHIVE"
@@ -43,7 +43,7 @@ build_linux() {
 }
 
 build_android() {
-    echo "Building FireLite for Android ($ANDROID_TARGET)..."
+    echo "Building HakoDB for Android ($ANDROID_TARGET)..."
     ANDROID_API_LEVEL="${ANDROID_API_LEVEL:-21}"
     ANDROID_CLANG=""
     for ndk_root in "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK_ROOT:-}" /home/codespace/android-ndk/android-ndk-r26c; do
@@ -67,7 +67,7 @@ build_android() {
     echo "Refreshing Android bundle..."
     rm -rf "$ANDROID_DIR"
     mkdir -p "$ANDROID_DIR"
-    cp "$ROOT_DIR/target/$ANDROID_TARGET/release/libfirelite.so" "$ANDROID_DIR/"
+    cp "$ROOT_DIR/target/$ANDROID_TARGET/release/libhakodb.so" "$ANDROID_DIR/"
 
     rm -f "$ANDROID_ARCHIVE"
     echo "Creating Android archive..."

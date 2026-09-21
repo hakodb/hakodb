@@ -1,1 +1,1 @@
-pub type QueryResults = Vec<(String, crate::document::firelite_doc::FireLiteDoc)>;
+pub type QueryResults = Vec<(String, crate::document::hako_doc::HakoDoc)>;

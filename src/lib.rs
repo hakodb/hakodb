@@ -20,5 +20,5 @@ pub mod cloud_sync;
 #[cfg(feature = "cloud-sync")]
 pub use cloud_sync::{CloudPacket, CloudStatus, CloudSync, CloudSyncMode};
 
-pub use engine::FireLite;
+pub use engine::Hako;
 pub use engine::QuiescenceStatus;

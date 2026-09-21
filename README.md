@@ -1,16 +1,27 @@
-# FireLite
+# HakoDB
 
-**FireLite is an embedded, Firestore-style document database written in Rust.**
+**HakoDB is an embedded, Firestore-style document database written in Rust.**
 
 It stores typed JSON-like documents in binary form, runs **fully in-process** like SQLite (no server process, no daemon, no network config), and exposes a **flat C ABI** so it can be embedded in applications written in Rust, C/C++, Go, JavaScript/TypeScript (Node.js + Bun), Pascal/Lazarus, and more.
 
-FireLite speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
+HakoDB speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.7.13 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.8.21 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.8.20)
+## What's new (0.7.2 → 0.8.21)
+
+### v0.8.21 — rebrand to HakoDB (formerly FireLite)
+- Crate `hakodb`, main type `Hako` (`HakoConfig`, `HakoDoc`,
+  `HakoError`), FFI prefix `HK_*`/`hk_*`, header `include/hako.h`,
+  binaries `hakodb.dll` / `libhakodb.so`. Formerly FireLite — old
+  names survive only in the changelog history below.
+- Data plane unchanged: `__firelite_*` on-disk names persist until the
+  migration release, so existing databases open untouched.
+- Fixed along the way: `cbindgen.toml` never loaded (relative path +
+  unknown fields → silent C++ defaults for years); the header is real
+  C now, with `extern "C"` guards for C++ consumers.
 
 ### v0.8.20 — repo split phase 1: core ships alone
 - **Removed `fsync/`** (5-line re-export wrapper, zero references —
@@ -505,9 +516,9 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ## Table of Contents
 
-- [What is FireLite?](#what-is-firelite)
-- [What's new (0.7.2 → 0.8.20)](#whats-new-072--0820)
-- [When to use FireLite (sync vs non-sync)](#when-to-use-firelite-sync-vs-non-sync)
+- [What is HakoDB?](#what-is-hakodb)
+- [What's new (0.7.2 → 0.8.21)](#whats-new-072--0821)
+- [When to use HakoDB (sync vs non-sync)](#when-to-use-hakodb-sync-vs-non-sync)
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)
 - [Rust usage](#rust-usage)
@@ -523,9 +534,9 @@ FireLite speaks "documents", not tables: collections of flexible, schemaless obj
 
 ---
 
-## What is FireLite?
+## What is HakoDB?
 
-FireLite is a **document-oriented embedded database** for applications that want:
+HakoDB is a **document-oriented embedded database** for applications that want:
 
 - **Firestore-like ergonomics** — collections, documents, `set/get/delete`, fluent queries, real-time change streams.
 - **SQLite-style embedding** — link a library into your process and open a database file; there is nothing to install or operate.
@@ -536,11 +547,11 @@ FireLite is a **document-oriented embedded database** for applications that want
   - **Net Sync** (`net-sync` feature): peer-to-peer mesh replication over LAN with mDNS discovery.
   - **Cloud Sync** (`cloud-sync` feature): centralized client-server replication over WebSockets + MessagePack.
 
-Because it is a library, FireLite has no "database server" to manage. Your app *is* the database host. This makes it ideal for local-first and offline-first products, desktop and CLI tooling, edge devices, games, and apps that occasionally need to sync with the cloud or with each other.
+Because it is a library, HakoDB has no "database server" to manage. Your app *is* the database host. This makes it ideal for local-first and offline-first products, desktop and CLI tooling, edge devices, games, and apps that occasionally need to sync with the cloud or with each other.
 
 ---
 
-## When to use FireLite (sync vs non-sync)
+## When to use HakoDB (sync vs non-sync)
 
 | Scenario | Recommended mode | Why |
 |---|---|---|
@@ -551,7 +562,7 @@ Because it is a library, FireLite has no "database server" to manage. Your app *
 | Local app that must *also* be reachable by other processes/languages | **Embedded + FFI** | C ABI with Go/JS/Pascal gateways; watch streams for reactive UIs. |
 | Analytics / ad-hoc queries over large datasets | **Embedded** | Composite indexes, FTS, aggregates, zero-copy projection, parallel scans. |
 
-**In short:** use FireLite **without sync** when your data is local to one process. Turn on **Net Sync** when you need peer-to-peer replication across devices on a network you control. Turn on **Cloud Sync** when you need offline-first clients to converge through a central server (or to build a real-time multi-client hub).
+**In short:** use HakoDB **without sync** when your data is local to one process. Turn on **Net Sync** when you need peer-to-peer replication across devices on a network you control. Turn on **Cloud Sync** when you need offline-first clients to converge through a central server (or to build a real-time multi-client hub).
 
 ---
 
@@ -575,18 +586,18 @@ Because it is a library, FireLite has no "database server" to manage. Your app *
 ## Quick Start (Rust)
 
 ```rust
-use firelite::config::FireLiteConfig;
-use firelite::document::firelite_doc::FireLiteDoc;
-use firelite::document::value::Value;
-use firelite::engine::{BatchMutation, FireLite};
+use hakodb::config::HakoConfig;
+use hakodb::document::hako_doc::HakoDoc;
+use hakodb::document::value::Value;
+use hakodb::engine::{BatchMutation, Hako};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cfg = FireLiteConfig::default();
+    let mut cfg = HakoConfig::default();
     cfg.encryption_key = Some("change-me-secret".to_string());
 
-    let db = FireLite::open(".firelite-example", cfg)?;
+    let db = Hako::open(".hakodb-example", cfg)?;
 
-    let mut doc = FireLiteDoc::default();
+    let mut doc = HakoDoc::default();
     doc.insert("name", Value::String("alice".to_string()));
     doc.insert("age", Value::Int(30));
 
@@ -601,17 +612,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Rust usage
 
 ```rust
-use firelite::config::FireLiteConfig;
-use firelite::engine::{BatchMutation, FireLite};
+use hakodb::config::HakoConfig;
+use hakodb::engine::{BatchMutation, Hako};
 
-let db = FireLite::open("./data", FireLiteConfig::default())?;
+let db = Hako::open("./data", HakoConfig::default())?;
 
 // atomic batch write
 db.write_batch(vec![
     BatchMutation::Put {
         collection: "users".into(),
         doc_id: "1".into(),
-        doc: /* FireLiteDoc */ doc1,
+        doc: /* HakoDoc */ doc1,
     },
     BatchMutation::Delete { collection: "users".into(), doc_id: "2".into() },
 ])?;
@@ -639,12 +650,12 @@ See [`example/rust/basic`](example/rust/basic) for a complete, working example o
 
 ## Multi-language platform support (C ABI)
 
-FireLite exposes a flat C ABI for Node.js/Python/C++/C# and other integration layers. Opaque handle types are defined in `include/firelite.h`.
+HakoDB exposes a flat C ABI for Node.js/Python/C++/C# and other integration layers. Opaque handle types are defined in `include/hako.h`.
 
 ### Build artifacts
 
 - Cargo crate types: `cdylib` (dynamic library consumers) and `rlib` (Rust consumers).
-- Auto-generated C header via `build.rs` + `cbindgen.toml`: `include/firelite.h`.
+- Auto-generated C header via `build.rs` + `cbindgen.toml`: `include/hako.h`.
 
 ```bash
 cargo build --release
@@ -652,9 +663,9 @@ cargo build --release
 
 Platform outputs:
 
-- Linux: `target/release/libfirelite.so`
-- macOS: `target/release/libfirelite.dylib`
-- Windows: `target\release\firelite.dll`
+- Linux: `target/release/libhakodb.so`
+- macOS: `target/release/libhakodb.dylib`
+- Windows: `target\release\hakodb.dll`
 
 ### Opaque handle types
 
@@ -705,7 +716,7 @@ Core FFI functions: `fl_net_syncer_new`, `fl_net_syncer_start`, `fl_net_syncer_s
 
 ```toml
 [dependencies]
-firelite = { version = "0.7.5", features = ["net-sync"] }
+hakodb = { version = "0.7.5", features = ["net-sync"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -724,13 +735,13 @@ broadcast-only mobile peers. The core library needs no Java glue.
 
 ## Cloud Sync (centralized replication)
 
-The `cloud-sync` feature provides cloud-level, **bi-directional synchronization** over WebSockets and MessagePack. FireLite instances can act as a **central cloud server** or as an **offline-first cloud client**.
+The `cloud-sync` feature provides cloud-level, **bi-directional synchronization** over WebSockets and MessagePack. HakoDB instances can act as a **central cloud server** or as an **offline-first cloud client**.
 
 ### Enable the feature
 
 ```toml
 [dependencies]
-firelite = { version = "0.7.5", features = ["cloud-sync"] }
+hakodb = { version = "0.7.5", features = ["cloud-sync"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -740,7 +751,7 @@ tokio = { version = "1", features = ["full"] }
 - **Client mode (`CloudSyncMode::Client`)** — connects to the cloud server over `ws://` or `wss://` (with automatic `https://` → `wss://` conversion). An outbound WAL tailer streams local embedded changes upstream; incoming remote changes are applied locally using LWW (last-write-wins) timestamp filtering.
 - **Symmetrical 2-way handshake (`VersionPing`)** — exchanged automatically on connection so that either side (server or client) catches up any deltas missed while offline or restarting.
 - **TLS-friendly URLs** — `https://`/`wss://` connect seamlessly through cloud proxies (GitHub Codespaces, Cloudflare Tunnels, AWS ALB, Heroku).
-- **High-throughput flusher** — drains and coalesces incoming client mutations every 5ms or 512 ops, reducing FireLite write-lock acquisitions by ~500x.
+- **High-throughput flusher** — drains and coalesces incoming client mutations every 5ms or 512 ops, reducing HakoDB write-lock acquisitions by ~500x.
 - **Anti-echo & deduplication** — self-pruning echo cache plus `msg_id` deduplication prevents infinite loopbacks and stale re-transmissions.
 
 ### Rooms and storage layout
@@ -779,19 +790,19 @@ different rooms, so their data is fully isolated on the server.
 
 ```rust
 use std::sync::Arc;
-use firelite::config::FireLiteConfig;
-use firelite::engine::FireLite;
-use firelite::cloud_sync::CloudSync;
+use hakodb::config::HakoConfig;
+use hakodb::engine::Hako;
+use hakodb::cloud_sync::CloudSync;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = Arc::new(FireLite::open("./data/cloud_server_db", FireLiteConfig::default())?);
+    let db = Arc::new(Hako::open("./data/cloud_server_db", HakoConfig::default())?);
 
     // Room-agnostic server: not bound to any room, hosts any (room, key).
     let cloud_server = CloudSync::server(db.clone(), "server_node_01", "master_jwt_secret");
 
     cloud_server.start("0.0.0.0:8080").await?;
-    println!("FireLite Cloud Sync Server listening on ws://0.0.0.0:8080");
+    println!("HakoDB Cloud Sync Server listening on ws://0.0.0.0:8080");
 
     tokio::signal::ctrl_c().await?;
     cloud_server.stop();
@@ -803,15 +814,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust
 use std::sync::Arc;
-use firelite::config::FireLiteConfig;
-use firelite::document::firelite_doc::FireLiteDoc;
-use firelite::document::value::Value;
-use firelite::engine::FireLite;
-use firelite::cloud_sync::CloudSync;
+use hakodb::config::HakoConfig;
+use hakodb::document::hako_doc::HakoDoc;
+use hakodb::document::value::Value;
+use hakodb::engine::Hako;
+use hakodb::cloud_sync::CloudSync;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = Arc::new(FireLite::open("./data/client_db", FireLiteConfig::default())?);
+    let db = Arc::new(Hako::open("./data/client_db", HakoConfig::default())?);
 
     // The client picks its room (room_name + room_key) and the server URL.
     let cloud_client = CloudSync::client(
@@ -826,7 +837,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connected to Cloud Sync Server");
 
     // Local writes are synced to the server in the background.
-    let mut doc = FireLiteDoc::default();
+    let mut doc = HakoDoc::default();
     doc.insert("username", Value::String("player_one".to_string()));
     doc.insert("score", Value::Int(9500));
     db.put("players", "user_42", &doc)?;
@@ -912,7 +923,7 @@ by every caps announcement).
 ## Architecture
 
 ```text
-API (FireLite + FFI + SDKs)
+API (HakoDB + FFI + SDKs)
   -> Query (Parallel sharded executor + projection pushdown)
     -> Index (Async background manager + lock-free metadata)
       -> Storage (WAL Inlining + RAM-to-Disk Checkpointing + Tiered Segments)
@@ -938,7 +949,7 @@ API (FireLite + FFI + SDKs)
 
 ### Feature status vs Firestore-style target
 
-| Area | FireLite status | Notes |
+| Area | HakoDB status | Notes |
 |---|---|---|
 | Embedded engine | Implemented | High-concurrency Rust runtime with FFI bridge |
 | Durable WAL + recovery | Implemented | Fully encrypted WAL with committed-op filter and crash recovery |
@@ -963,7 +974,7 @@ API (FireLite + FFI + SDKs)
 | Indexing | `src/index/*` | Implemented |
 | Query planner/executor | `src/query/*` | Implemented |
 | Document model | `src/document/*` | Implemented |
-| C-FFI | `src/ffi.rs`, `include/firelite.h` | Implemented |
+| C-FFI | `src/ffi.rs`, `include/hako.h` | Implemented |
 
 ---
 

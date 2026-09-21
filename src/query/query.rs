@@ -21,12 +21,12 @@ pub struct Query {
     /// ponytail: when true, blob-backed fields come back as `Value::BlobLink`
     /// (offset/len placeholders) instead of being inflated from the blob
     /// file. List views over docs with images skip MBs of reads per query;
-    /// resolve on demand via `resolve_doc` / `fl_doc_resolve_blobs`.
+    /// resolve on demand via `resolve_doc` / `hk_doc_resolve_blobs`.
     /// Default false — current eager behavior, zero risk to existing apps.
     pub defer_blobs: bool,
     /// ponytail: raw mode — `db.query_raw` returns storage-encoded bytes
     /// instead of decoded docs (opaque, version-scoped: decode with
-    /// `FireLiteDoc::decode`, do not persist). Skips decode, filter
+    /// `HakoDoc::decode`, do not persist). Skips decode, filter
     /// re-verify and rayon dispatch; requires index-satisfied filters and
     /// ordering, else `query_raw` errors. Default false.
     pub raw: bool,

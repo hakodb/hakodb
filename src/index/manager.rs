@@ -1,4 +1,4 @@
-use crate::document::firelite_doc::FireLiteDoc;
+use crate::document::hako_doc::HakoDoc;
 use crate::document::value::Value;
 // use std::collections::HashMap;
 use hashbrown::HashMap;
@@ -10,7 +10,7 @@ use super::inverted_index::InvertedIndex;
 use crate::index::composite::composite_index::CompositeIndex;
 use crate::index::secondary_index::SecondaryIndex;
 
-use crate::error::FireLiteError;
+use crate::error::HakoError;
 
 #[derive(Default)]
 pub struct IndexManager {
@@ -72,7 +72,7 @@ impl IndexManager {
             .exact_match_doc_ids(collection, fields, values)
     }
 
-    pub fn index_document(&mut self, collection: &str, doc_id: &str, doc: &FireLiteDoc) {
+    pub fn index_document(&mut self, collection: &str, doc_id: &str, doc: &HakoDoc) {
         // 1. Update Composite
         self.composite.index_document(collection, doc_id, doc);
 
@@ -114,14 +114,14 @@ impl IndexManager {
 
     pub fn index_batch<'a, I>(&mut self, collection: &str, docs: I)
     where
-        I: IntoIterator<Item = (&'a str, &'a FireLiteDoc)> + Clone,
+        I: IntoIterator<Item = (&'a str, &'a HakoDoc)> + Clone,
     {
         for (doc_id, doc) in docs {
             self.index_document(collection, doc_id, doc);
         }
     }
 
-    pub fn remove_document(&mut self, collection: &str, doc_id: &str, doc: &FireLiteDoc) {
+    pub fn remove_document(&mut self, collection: &str, doc_id: &str, doc: &HakoDoc) {
         self.composite.remove_document(collection, doc_id, doc);
 
         if let Some(fields) = self.fts.get_mut(collection) {
@@ -143,7 +143,7 @@ impl IndexManager {
 
     pub fn remove_batch<'a, I>(&mut self, collection: &str, docs: I)
     where
-        I: IntoIterator<Item = (&'a str, &'a FireLiteDoc)> + Clone,
+        I: IntoIterator<Item = (&'a str, &'a HakoDoc)> + Clone,
     {
         for (doc_id, doc) in docs {
             self.remove_document(collection, doc_id, doc);
@@ -172,30 +172,30 @@ impl IndexManager {
             .into()
     }
 
-    pub fn export_state(&self) -> Result<Vec<u8>, FireLiteError> {
+    pub fn export_state(&self) -> Result<Vec<u8>, HakoError> {
         bincode::serialize(&(&self.secondary, &self.fts))
-            .map_err(|e| FireLiteError::Corrupt(format!("Index export failed: {}", e)))
+            .map_err(|e| HakoError::Corrupt(format!("Index export failed: {}", e)))
     }
 
-    // pub fn import_state(&mut self, bytes: &[u8]) -> Result<(), FireLiteError> {
+    // pub fn import_state(&mut self, bytes: &[u8]) -> Result<(), HakoError> {
     //     // By importing hashbrown::HashMap at the top, 'HashMap' here 
     //     // now correctly refers to the hashbrown version.
     //     let (sec, fts): (
     //         HashMap<String, HashMap<String, crate::index::secondary_index::SecondaryIndex>>,
     //         HashMap<String, HashMap<String, crate::index::inverted_index::InvertedIndex>>
     //     ) = bincode::deserialize(bytes)
-    //         .map_err(|e| FireLiteError::Corrupt(format!("Index import failed: {}", e)))?;
+    //         .map_err(|e| HakoError::Corrupt(format!("Index import failed: {}", e)))?;
         
     //     self.secondary = sec;
     //     self.fts = fts;
     //     Ok(())
     // }
-     pub fn import_state(&mut self, bytes: &[u8]) -> Result<(), FireLiteError> {
+     pub fn import_state(&mut self, bytes: &[u8]) -> Result<(), HakoError> {
         let (sec, fts): (
             HashMap<String, HashMap<String, crate::index::secondary_index::SecondaryIndex>>,
             HashMap<String, HashMap<String, crate::index::inverted_index::InvertedIndex>>
         ) = bincode::deserialize(bytes)
-            .map_err(|e| FireLiteError::Corrupt(format!("Index import failed: {}", e)))?;
+            .map_err(|e| HakoError::Corrupt(format!("Index import failed: {}", e)))?;
         
         // Merge the RAM data into existing definitions instead of blindly overwriting
         for (col, fields) in sec {

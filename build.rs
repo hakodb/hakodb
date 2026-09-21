@@ -2,7 +2,7 @@ fn main() {
     let crate_dir = std::env::var("CARGO_MANIFEST_DIR").expect("manifest dir should exist");
     let output = std::path::Path::new(&crate_dir)
         .join("include")
-        .join("firelite.h");
+        .join("hako.h");
 
     std::fs::create_dir_all(output.parent().expect("header parent should exist"))
         .expect("failed to create include directory");
@@ -30,12 +30,12 @@ fn main() {
 // there whenever cargo skipped the build script (no source changes). A
 // stale .lib SHADOWS the fresh .dll in MinGW ld search order, producing
 // undefined-reference ghosts for new symbols. Delete it instead: MinGW ld
-// falls through to firelite.dll directly (always fresh), and no current
+// falls through to hakodb.dll directly (always fresh), and no current
 // consumer needs an MSVC import lib (benchmark + Go use MinGW; Pascal
 // keeps its own .a). Deterministic, no timing, no silent staleness.
 // MSVC exception: rustc emits the cdylib import library as
-// `firelite.dll.lib`, which the release workflow ships (renamed to the
-// conventional `firelite.lib`) — so the delete below runs on GNU/MinGW
+// `hakodb.dll.lib`, which the release workflow ships (renamed to the
+// conventional `hakodb.lib`) — so the delete below runs on GNU/MinGW
 // targets only, never on MSVC.
 let profile = std::env::var("PROFILE").unwrap_or_else(|_| "release".to_string());
 let target = std::env::var("TARGET").unwrap_or_default();
@@ -43,10 +43,10 @@ let target_dir = std::path::Path::new("target").join(&profile);
 #[cfg(windows)]
 {
 if !target.contains("msvc") {
-    let dst = target_dir.join("firelite.lib");
+    let dst = target_dir.join("hakodb.lib");
     let _ = std::fs::remove_file(&dst);
 }
 }
-    // Allow integration tests to find firelite.dll when invoked from anywhere.
+    // Allow integration tests to find hakodb.dll when invoked from anywhere.
     println!("cargo:rustc-link-search=native={}", target_dir.display());
 }

@@ -11,34 +11,34 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use firelite::config::{DurabilityMode, FireLiteConfig};
-use firelite::document::firelite_doc::FireLiteDoc;
-use firelite::document::value::Value;
-use firelite::engine::FireLite;
-use firelite::query::filter::Operator;
-use firelite::query::query::Query;
+use hakodb::config::{DurabilityMode, HakoConfig};
+use hakodb::document::hako_doc::HakoDoc;
+use hakodb::document::value::Value;
+use hakodb::engine::Hako;
+use hakodb::query::filter::Operator;
+use hakodb::query::query::Query;
 
-fn temp_db(tag: &str) -> (Arc<FireLite>, PathBuf) {
+fn temp_db(tag: &str) -> (Arc<Hako>, PathBuf) {
     let dir = std::env::temp_dir().join(format!(
-        "firelite-ftsprefix-{}-{}",
+        "hakodb-ftsprefix-{}-{}",
         std::process::id(),
         tag
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let mut cfg = FireLiteConfig::default();
+    let mut cfg = HakoConfig::default();
     cfg.durability_mode = DurabilityMode::OnCommit;
-    let db = Arc::new(FireLite::open(&dir, cfg).unwrap());
+    let db = Arc::new(Hako::open(&dir, cfg).unwrap());
     (db, dir)
 }
 
-fn food_doc(name: &str) -> FireLiteDoc {
-    let mut doc = FireLiteDoc::default();
+fn food_doc(name: &str) -> HakoDoc {
+    let mut doc = HakoDoc::default();
     doc.insert("name", Value::String(name.to_string()));
     doc
 }
 
-fn names_of(results: &[(String, FireLiteDoc)]) -> Vec<String> {
+fn names_of(results: &[(String, HakoDoc)]) -> Vec<String> {
     let mut names: Vec<String> = results
         .iter()
         .map(|(_, doc)| match doc.get("name") {

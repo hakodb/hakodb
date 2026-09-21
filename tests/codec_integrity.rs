@@ -1,8 +1,8 @@
-use firelite::config::{DurabilityMode, FireLiteConfig};
-use firelite::document::firelite_doc::FireLiteDoc;
-use firelite::document::value::Value;
-use firelite::engine::{BatchMutation, FireLite};
-use firelite::query::query::Query;
+use hakodb::config::{DurabilityMode, HakoConfig};
+use hakodb::document::hako_doc::HakoDoc;
+use hakodb::document::value::Value;
+use hakodb::engine::{BatchMutation, Hako};
+use hakodb::query::query::Query;
 use std::collections::HashMap;
 
 /// Codec-level identity (no engine): every Value arm round-trips through
@@ -11,7 +11,7 @@ use std::collections::HashMap;
 /// that is tested separately below with inflated reads).
 #[test]
 fn codec_roundtrip_identity() {
-    let mut doc = FireLiteDoc::default();
+    let mut doc = HakoDoc::default();
     doc._time = 1_700_000_000_000_001;
     doc.insert("null", Value::Null);
     doc.insert("sts", Value::ServerTimestamp);
@@ -41,22 +41,22 @@ fn codec_roundtrip_identity() {
     );
 
     let bytes = doc.encode();
-    let back = FireLiteDoc::decode(&bytes).expect("decode own encoding");
+    let back = HakoDoc::decode(&bytes).expect("decode own encoding");
     assert_eq!(back, doc, "codec must be an identity");
     assert_eq!(back.encode(), bytes, "re-encode must be byte-stable");
-    assert!(FireLiteDoc::decode(&bytes[..bytes.len() - 1]).is_none() || bytes.len() < 12);
-    assert!(FireLiteDoc::decode(b"short").is_none());
-    assert!(FireLiteDoc::decode(&[]).is_none());
+    assert!(HakoDoc::decode(&bytes[..bytes.len() - 1]).is_none() || bytes.len() < 12);
+    assert!(HakoDoc::decode(b"short").is_none());
+    assert!(HakoDoc::decode(&[]).is_none());
 }
 
 type Expected = HashMap<String, Vec<(String, Value)>>;
 
-fn fields_of(doc: &FireLiteDoc) -> Vec<(String, Value)> {
+fn fields_of(doc: &HakoDoc) -> Vec<(String, Value)> {
     doc.fields.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
 }
 
-fn test_config() -> FireLiteConfig {
-    let mut cfg = FireLiteConfig::default();
+fn test_config() -> HakoConfig {
+    let mut cfg = HakoConfig::default();
     cfg.durability_mode = DurabilityMode::Manual;
     // Force every pointer state at test scale: blob links above 64B,
     // segment spill above 8KB of inlined bytes.
@@ -65,12 +65,12 @@ fn test_config() -> FireLiteConfig {
     cfg
 }
 
-fn seed_mixed(db: &FireLite) -> (Expected, Vec<String>) {
+fn seed_mixed(db: &Hako) -> (Expected, Vec<String>) {
     let mut expected: Expected = HashMap::new();
     let mut puts: Vec<BatchMutation> = Vec::new();
     // `fields` is the EXPECTED post-write shape (usually the doc itself;
     // the blob doc below expects its inflated shape).
-    let mut put = |id: &str, doc: FireLiteDoc, fields: Vec<(String, Value)>| {
+    let mut put = |id: &str, doc: HakoDoc, fields: Vec<(String, Value)>| {
         expected.insert(id.to_string(), fields);
         puts.push(BatchMutation::Put {
             collection: "docs".into(),
@@ -79,17 +79,17 @@ fn seed_mixed(db: &FireLite) -> (Expected, Vec<String>) {
         });
     };
 
-    let mut d = FireLiteDoc::default();
+    let mut d = HakoDoc::default();
     put("empty", d.clone(), fields_of(&d));
 
-    d = FireLiteDoc::default();
+    d = HakoDoc::default();
     d.insert("n", Value::Int(3));
     d.insert("s", Value::String("hi".into()));
     d.insert("b", Value::Bool(false));
     d.insert("z", Value::Null);
     put("small", d.clone(), fields_of(&d));
 
-    d = FireLiteDoc::default();
+    d = HakoDoc::default();
     d.insert("big", Value::Int(i64::MIN));
     d.insert("f", Value::Float(-0.25));
     d.insert("ts", Value::Timestamp(-5));
@@ -100,7 +100,7 @@ fn seed_mixed(db: &FireLite) -> (Expected, Vec<String>) {
     );
     put("scalars", d.clone(), fields_of(&d));
 
-    d = FireLiteDoc::default();
+    d = HakoDoc::default();
     d.insert(
         "nested",
         Value::Map(vec![
@@ -115,35 +115,35 @@ fn seed_mixed(db: &FireLite) -> (Expected, Vec<String>) {
     // String iff the bytes are valid UTF-8, else Binary. Lock BOTH sides:
     // invalid-UTF-8 bytes round-trip as Binary, big text as String.
     let big: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
-    d = FireLiteDoc::default();
+    d = HakoDoc::default();
     d.insert("data", Value::Binary(big.clone()));
     d.insert("name", Value::String("blobdoc".into()));
-    let mut inflated = FireLiteDoc::default();
+    let mut inflated = HakoDoc::default();
     inflated.insert("data", Value::Binary(big));
     inflated.insert("name", Value::String("blobdoc".into()));
     put("blobdoc", d, fields_of(&inflated));
 
     let bigtext = format!("PHOTO_{}", "y".repeat(4096));
-    d = FireLiteDoc::default();
+    d = HakoDoc::default();
     d.insert("photo", Value::String(bigtext.clone()));
-    let mut inflated_t = FireLiteDoc::default();
+    let mut inflated_t = HakoDoc::default();
     inflated_t.insert("photo", Value::String(bigtext));
     put("textblob", d, fields_of(&inflated_t));
 
     // Volume for scan paths.
     for i in 0..300 {
-        let mut v = FireLiteDoc::default();
+        let mut v = HakoDoc::default();
         v.insert("idx", Value::Int(i as i64));
         v.insert("tag", Value::String(format!("t{}", i % 7)));
         put(&format!("v_{i:04}"), v.clone(), fields_of(&v));
     }
 
     // Overwrite: latest wins everywhere.
-    let mut o = FireLiteDoc::default();
+    let mut o = HakoDoc::default();
     o.insert("ver", Value::Int(1));
     let of = fields_of(&o);
     put("over", o, of);
-    let mut o2 = FireLiteDoc::default();
+    let mut o2 = HakoDoc::default();
     o2.insert("ver", Value::Int(2));
     o2.insert("extra", Value::String("second".into()));
     let o2f = fields_of(&o2);
@@ -167,7 +167,7 @@ fn seed_mixed(db: &FireLite) -> (Expected, Vec<String>) {
 
 /// Every read path must agree with `expected` field-for-field (_time is
 /// engine-assigned and excluded by construction: fields_of skips it).
-fn verify_all(db: &FireLite, expected: &Expected, blob_ids: &[String]) {
+fn verify_all(db: &Hako, expected: &Expected, blob_ids: &[String]) {
     // ponytail: queries issued before background index recovery plan
     // FullCollection (bounds ignored, pages repeat) — poll first. Same
     // race the cursor tests guard with wait_ready.
@@ -261,7 +261,7 @@ fn verify_all(db: &FireLite, expected: &Expected, blob_ids: &[String]) {
     let mut q = Query::new("docs");
     q = q.where_filter(
         "tag",
-        firelite::query::filter::Operator::Eq,
+        hakodb::query::filter::Operator::Eq,
         Value::String("t3".into()),
     );
     q.limit = Some(7);
@@ -282,7 +282,7 @@ fn verify_all(db: &FireLite, expected: &Expected, blob_ids: &[String]) {
     let rows = db.query_raw(q).expect("raw scan");
     assert_eq!(rows.len(), expected.len());
     for (id, bytes) in &rows {
-        let doc = FireLiteDoc::decode(bytes).expect("raw bytes decode");
+        let doc = HakoDoc::decode(bytes).expect("raw bytes decode");
         if blob_ids.iter().any(|b| b == id) {
             // Skeleton shape: links, not data (inflation covered in 6).
             assert!(
@@ -311,7 +311,7 @@ fn verify_all(db: &FireLite, expected: &Expected, blob_ids: &[String]) {
     assert_eq!(count, expected.len());
     assert_eq!(walked.len(), expected.len());
     for (id, bytes) in &walked {
-        let doc = FireLiteDoc::decode(bytes).expect("walk bytes decode");
+        let doc = HakoDoc::decode(bytes).expect("walk bytes decode");
         let mut full = doc;
         db.resolve_document_blobs(&mut full, "docs").expect("resolve");
         assert_eq!(&fields_of(&full), &expected[id], "walk mismatch for {id}");
@@ -345,7 +345,7 @@ fn codec_integrity_matrix() {
             .as_nanos()
     ));
     let cfg = test_config();
-    let db = FireLite::open(&dir, cfg.clone()).expect("open");
+    let db = Hako::open(&dir, cfg.clone()).expect("open");
     let (expected, blob_ids) = seed_mixed(&db);
 
     // Force every pointer state: spill Inlined->Segment, drain blob queue,
@@ -355,7 +355,7 @@ fn codec_integrity_matrix() {
     verify_all(&db, &expected, &blob_ids);
     drop(db);
 
-    let db2 = FireLite::open(&dir, cfg).expect("reopen");
+    let db2 = Hako::open(&dir, cfg).expect("reopen");
     let t0 = std::time::Instant::now();
     while !db2.is_indexes_ready() {
         assert!(t0.elapsed() < std::time::Duration::from_secs(30), "indexes never ready");
@@ -379,9 +379,9 @@ fn quiescence_settles() {
             .unwrap()
             .as_nanos()
     ));
-    let mut cfg = FireLiteConfig::default();
+    let mut cfg = HakoConfig::default();
     cfg.durability_mode = DurabilityMode::Manual;
-    let db = FireLite::open(&dir, cfg).expect("open");
+    let db = Hako::open(&dir, cfg).expect("open");
 
     assert!(db.await_quiescent(Duration::from_secs(10)), "idle engine settles");
     let s = db.quiescence_status();
@@ -393,9 +393,9 @@ fn quiescence_settles() {
     assert!(!s.maintenance_running);
 
     // Writes (one blob-bearing doc to exercise the blob queue) then settle.
-    let mut doc = FireLiteDoc::default();
+    let mut doc = HakoDoc::default();
     doc.insert("n", Value::Int(1));
-    let mut big = FireLiteDoc::default();
+    let mut big = HakoDoc::default();
     big.insert("data", Value::Binary(vec![7u8; 2048]));
     db.write_batch(vec![
         BatchMutation::Put { collection: "q".into(), doc_id: "a".into(), doc },

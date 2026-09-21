@@ -2,7 +2,7 @@ name: release
 
 # Core library releases only. Satellites (cli, cloudserver, SDKs, bench,
 # tauri) version independently and carry no workflows; FFI consumers pin
-# these assets by tag: firelite-<version>-<target>.<ext> + headers.
+# these assets by tag: hakodb-<version>-<target>.<ext> + headers.
 on:
   push:
     tags:
@@ -26,14 +26,14 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/release/firelite.dll dist/
-          Copy-Item target/release/firelite.dll.lib dist/firelite.lib
-          Copy-Item include/firelite.h dist/
-          (Get-FileHash dist/firelite.dll -Algorithm SHA256).Hash | Out-File dist/SHA256SUMS
-          (Get-FileHash dist/firelite.lib -Algorithm SHA256).Hash | Out-File dist/SHA256SUMS -Append
+          Copy-Item target/release/hakodb.dll dist/
+          Copy-Item target/release/hakodb.dll.lib dist/hakodb.lib
+          Copy-Item include/hakodb.h dist/
+          (Get-FileHash dist/hakodb.dll -Algorithm SHA256).Hash | Out-File dist/SHA256SUMS
+          (Get-FileHash dist/hakodb.lib -Algorithm SHA256).Hash | Out-File dist/SHA256SUMS -Append
       - uses: actions/upload-artifact@v4
         with:
-          name: firelite-${{ github.ref_name }}-x86_64-pc-windows-msvc
+          name: hakodb-${{ github.ref_name }}-x86_64-pc-windows-msvc
           path: dist/
 
   linux:
@@ -46,11 +46,11 @@ jobs:
       - name: Collect assets
         run: |
           mkdir -p dist
-          cp target/release/libfirelite.so target/release/libfirelite.rlib include/firelite.h dist/
+          cp target/release/libhakodb.so target/release/libhakodb.rlib include/hakodb.h dist/
           (cd dist && sha256sum * > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:
-          name: firelite-${{ github.ref_name }}-x86_64-unknown-linux-gnu
+          name: hakodb-${{ github.ref_name }}-x86_64-unknown-linux-gnu
           path: dist/
 
   android:
@@ -75,11 +75,11 @@ jobs:
       - name: Collect assets
         run: |
           mkdir -p dist
-          cp target/aarch64-linux-android/release/libfirelite.so include/firelite.h dist/
+          cp target/aarch64-linux-android/release/libhakodb.so include/hakodb.h dist/
           (cd dist && sha256sum * > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:
-          name: firelite-${{ github.ref_name }}-aarch64-linux-android
+          name: hakodb-${{ github.ref_name }}-aarch64-linux-android
           path: dist/
 
   publish:

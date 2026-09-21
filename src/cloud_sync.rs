@@ -8,15 +8,15 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "cloud-sync")]
-use crate::document::firelite_doc::FireLiteDoc;
+use crate::document::hako_doc::HakoDoc;
 #[cfg(feature = "cloud-sync")]
 use crate::document::value::Value;
 #[cfg(feature = "cloud-sync")]
 use crate::engine::engine::IndexOp;
 #[cfg(feature = "cloud-sync")]
-use crate::engine::{BatchMutation, ChangeEvent, ChangeKind, FireLite};
+use crate::engine::{BatchMutation, ChangeEvent, ChangeKind, Hako};
 #[cfg(feature = "cloud-sync")]
-use crate::error::{FireLiteError, Result as FLResult};
+use crate::error::{HakoError, Result as FLResult};
 #[cfg(feature = "cloud-sync")]
 use crate::query::query::Query;
 #[cfg(feature = "cloud-sync")]
@@ -155,7 +155,7 @@ struct RoomRegistryState {
 
 #[cfg(feature = "cloud-sync")]
 pub struct RoomRegistry {
-    db: Arc<FireLite>,
+    db: Arc<Hako>,
     state: StdRwLock<RoomRegistryState>,
     alloc_lock: StdMutex<()>,
     loaded: std::sync::atomic::AtomicBool,
@@ -209,7 +209,7 @@ fn timing_safe_eq(a: &str, b: &str) -> bool {
 /// key, client id) — unit-tested without sockets.
 #[cfg(feature = "cloud-sync")]
 pub(crate) fn check_group_access(
-    db: &FireLite,
+    db: &Hako,
     room_name: &str,
     api_key: Option<&str>,
     client_id: &str,
@@ -293,7 +293,7 @@ fn echo_key(prefix: &str, plain_col: &str, key: &str) -> String {
 
 #[cfg(feature = "cloud-sync")]
 impl RoomRegistry {
-    pub fn new(db: Arc<FireLite>) -> Self {
+    pub fn new(db: Arc<Hako>) -> Self {
         Self {
             db,
             state: StdRwLock::new(RoomRegistryState::default()),
@@ -383,7 +383,7 @@ impl RoomRegistry {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let mut doc = FireLiteDoc::default();
+        let mut doc = HakoDoc::default();
         doc.insert("room_name", Value::String(room_name.to_string()));
         doc.insert("key_hash", Value::String(hash_room_id(room_name, room_key)));
         doc.insert("prefix", Value::String(prefix.clone()));
@@ -445,7 +445,7 @@ impl RoomRegistry {
 
 #[cfg(feature = "cloud-sync")]
 pub struct CloudSync {
-    db: Arc<FireLite>,
+    db: Arc<Hako>,
     mode: CloudSyncMode,
     room_name: String,
     room_key: String,
@@ -502,7 +502,7 @@ impl CloudSync {
     /// ask for. Prefer the dedicated [`CloudSync::server`] / [`CloudSync::client`]
     /// constructors for clarity.
     pub fn new(
-        db: Arc<FireLite>,
+        db: Arc<Hako>,
         mode: CloudSyncMode,
         client_id: &str,
         room_name: &str,
@@ -520,7 +520,7 @@ impl CloudSync {
     /// server accepts and persists any (room_name, room_key) pair, storing each
     /// room's collections under its own storage prefix and relaying sync only to
     /// the members of that room.
-    pub fn server(db: Arc<FireLite>, server_id: &str, auth_token: &str) -> Self {
+    pub fn server(db: Arc<Hako>, server_id: &str, auth_token: &str) -> Self {
         let (tx, rx) = mpsc::channel(100_000);
         let registry = Arc::new(RoomRegistry::new(db.clone()));
 
@@ -549,7 +549,7 @@ impl CloudSync {
     /// sync with via [`CloudSync::start`]; every other client/peer using the
     /// same (room_name, room_key) on the same server forms the sync group.
     pub fn client(
-        db: Arc<FireLite>,
+        db: Arc<Hako>,
         client_id: &str,
         room_name: &str,
         room_key: &str,
@@ -710,7 +710,7 @@ impl CloudSync {
     }
 
     async fn flush_ingest_buffer(
-        db: &Arc<FireLite>,
+        db: &Arc<Hako>,
         buffer: &mut HashMap<String, Vec<IngestItem>>,
         echo_cache: &Arc<StdMutex<HashMap<String, i64>>>,
         peers: &Arc<AsyncRwLock<HashMap<String, PeerInfo>>>,
@@ -772,7 +772,7 @@ impl CloudSync {
                 crate::sync_guard::local_fingerprint(db.config.encryption_key.as_deref());
 
             let mut apply_ops: Vec<WalOp> = Vec::with_capacity(items.len());
-            let mut index_puts: Vec<(String, Arc<FireLiteDoc>)> = Vec::new();
+            let mut index_puts: Vec<(String, Arc<HakoDoc>)> = Vec::new();
             let mut sender_relays: HashMap<Option<String>, Vec<WalOp>> = HashMap::new();
 
             for item in &items {
@@ -800,7 +800,7 @@ impl CloudSync {
                 }
                 match &item.op {
                     WalOp::PutInlined { key, value } => {
-                        let ts = FireLiteDoc::decode(value)
+                        let ts = HakoDoc::decode(value)
                             .map(|d| d.get_logical_time())
                             .unwrap_or(0);
                         if ts == 0 {
@@ -822,7 +822,7 @@ impl CloudSync {
                             key: key.clone(),
                             value: value.clone(),
                         });
-                        if let Some(doc) = FireLiteDoc::decode(value) {
+                        if let Some(doc) = HakoDoc::decode(value) {
                             index_puts.push((key.clone(), Arc::new(doc)));
                         }
                         sender_relays
@@ -937,10 +937,10 @@ impl CloudSync {
     /// defeats LWW conflict resolution and breaks the echo cache used by the
     /// outbound tailers (causing replication amplification loops).
     fn apply_timestamped(
-        db: &Arc<FireLite>,
+        db: &Arc<Hako>,
         collection: &str,
         ops: Vec<WalOp>,
-        index_puts: Vec<(String, Arc<FireLiteDoc>)>,
+        index_puts: Vec<(String, Arc<HakoDoc>)>,
         keys: Vec<Arc<str>>,
     ) {
         let shard_arc = match db.get_shard(collection) {
@@ -1001,7 +1001,7 @@ kind,
     async fn start_server_mode(&self, bind_addr: &str) -> FLResult<()> {
         let listener = tokio::net::TcpListener::bind(bind_addr)
             .await
-            .map_err(|e| FireLiteError::Io(e))?;
+            .map_err(|e| HakoError::Io(e))?;
 
         let ingest_tx = self.ingest_tx.clone();
         let db = self.db.clone();
@@ -1072,7 +1072,7 @@ kind,
 
     /// Server-side version map restricted to one room, keyed by the
     /// client-facing (unprefixed) collection names.
-    fn server_room_version_map(db: &Arc<FireLite>, prefix: &str) -> HashMap<String, i64> {
+    fn server_room_version_map(db: &Arc<Hako>, prefix: &str) -> HashMap<String, i64> {
         let mut map = HashMap::new();
         // Sync enumeration: hidden room collections (e.g. "_secret") take
         // part; the excluded plane never appears (dropped by enumeration,
@@ -1095,7 +1095,7 @@ kind,
     async fn handle_server_client<S>(
         ws_stream: tokio_tungstenite::WebSocketStream<S>,
         ingest_tx: mpsc::Sender<IngestItem>,
-        db: Arc<FireLite>,
+        db: Arc<Hako>,
         rooms: Arc<RoomRegistry>,
         peers: Arc<AsyncRwLock<HashMap<String, PeerInfo>>>,
         seen_messages: Arc<AsyncMutex<Vec<u128>>>,
@@ -1311,7 +1311,7 @@ kind,
     /// non-existent, so re-applying the same delete is a harmless no-op.
     #[cfg(feature = "cloud-sync")]
     fn is_stale_remote_delete(
-        db: &Arc<FireLite>,
+        db: &Arc<Hako>,
         storage_col: &str,
         key: &str,
         timestamp: i64,
@@ -1332,7 +1332,7 @@ kind,
     /// check — the handshake must not leak what the tailers withhold.
     #[cfg(feature = "cloud-sync")]
     fn collect_catchup_ops(
-        db: &Arc<FireLite>,
+        db: &Arc<Hako>,
         storage_col: &str,
         filter_col: &str,
         since_ts: i64,
@@ -1391,7 +1391,7 @@ kind,
     }
 
     async fn send_catchup_deltas(
-        db: &Arc<FireLite>,
+        db: &Arc<Hako>,
         storage_col: &str,
         plain_col: &str,
         since_ts: i64,
@@ -1523,7 +1523,7 @@ kind,
                                         }
                                         let final_op = match op {
                                             WalOp::PutInlined { ref key, ref value } => {
-                                                if let Some(mut doc) = FireLiteDoc::decode(value) {
+                                                if let Some(mut doc) = HakoDoc::decode(value) {
                                                     let has_blobs = doc.fields.iter().any(|(_, v)| matches!(v, Value::BlobLink { .. }));
                                                     if has_blobs {
                                                         let enc_key = db.config.encryption_key.as_deref();
@@ -1749,7 +1749,7 @@ kind,
     }
 
     async fn push_client_deltas_upstream(
-        db: &Arc<FireLite>,
+        db: &Arc<Hako>,
         collection: &str,
         server_ts: i64,
         outbound_tx: &mpsc::Sender<CloudPacket>,
@@ -1855,7 +1855,7 @@ kind,
                                         }
                                         let final_op = match op {
                                             WalOp::PutInlined { ref key, ref value } => {
-                                                if let Some(mut doc) = FireLiteDoc::decode(value) {
+                                                if let Some(mut doc) = HakoDoc::decode(value) {
                                                     let has_blobs = doc.fields.iter().any(|(_, v)| matches!(v, Value::BlobLink { .. }));
                                                     if has_blobs {
                                                         let enc_key = db.config.encryption_key.as_deref();
@@ -1905,19 +1905,19 @@ kind,
 #[cfg(all(test, feature = "cloud-sync"))]
 mod tests {
     use super::*;
-    use crate::config::{DurabilityMode, FireLiteConfig};
+    use crate::config::{DurabilityMode, HakoConfig};
 
-    fn temp_db(tag: &str) -> (Arc<FireLite>, std::path::PathBuf) {
+    fn temp_db(tag: &str) -> (Arc<Hako>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
-            "firelite-rooms-{}-{}",
+            "hakodb-rooms-{}-{}",
             std::process::id(),
             tag
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut cfg = FireLiteConfig::default();
+        let mut cfg = HakoConfig::default();
         cfg.durability_mode = DurabilityMode::Manual;
-        let db = Arc::new(FireLite::open(&dir, cfg).unwrap());
+        let db = Arc::new(Hako::open(&dir, cfg).unwrap());
         (db, dir)
     }
 
@@ -2001,8 +2001,8 @@ mod tests {
         assert_eq!(sanitize_room_name("___"), "room");
     }
 
-    fn put_simple(db: &Arc<FireLite>, col: &str, id: &str) {
-        let mut doc = FireLiteDoc::default();
+    fn put_simple(db: &Arc<Hako>, col: &str, id: &str) {
+        let mut doc = HakoDoc::default();
         doc.insert("v", Value::Int(1));
         db.put(col, id, &doc).unwrap();
     }
@@ -2165,15 +2165,15 @@ mod tests {
 
         // Per-deployment extras ride along.
         let dir2 = std::env::temp_dir().join(format!(
-            "firelite-rooms-{}-sync-enum-extra",
+            "hakodb-rooms-{}-sync-enum-extra",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir2);
         std::fs::create_dir_all(&dir2).unwrap();
-        let mut cfg = FireLiteConfig::default();
+        let mut cfg = HakoConfig::default();
         cfg.durability_mode = DurabilityMode::Manual;
         cfg.sync_excluded = vec!["_hidden".to_string()];
-        let db2 = Arc::new(FireLite::open(&dir2, cfg).unwrap());
+        let db2 = Arc::new(Hako::open(&dir2, cfg).unwrap());
         put_simple(&db2, "users", "a");
         put_simple(&db2, "_hidden", "b");
         let cols2 = db2.sync_collections().unwrap();
@@ -2189,13 +2189,13 @@ mod tests {
     }
 
     fn put_group(
-        db: &Arc<FireLite>,
+        db: &Arc<Hako>,
         room: &str,
         mode: &str,
         key_hash: Option<String>,
         members: Vec<String>,
     ) {
-        let mut doc = FireLiteDoc::default();
+        let mut doc = HakoDoc::default();
         doc.insert("mode", Value::String(mode.to_string()));
         if let Some(h) = key_hash {
             doc.insert("api_key_hash", Value::String(h));

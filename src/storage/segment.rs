@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::memory::mmap_store::MmapStore;
 use crate::memory::page_cache::{BlockKey, PageCache};
-use crate::error::{FireLiteError, Result};
+use crate::error::{HakoError, Result};
 use super::crypto::EncryptionContext;
 
 #[cfg(unix)]
@@ -129,7 +129,7 @@ impl Segment {
             self.store.read_slice(offset as usize, total_to_read)
         } else {
             let mut buf = vec![0u8; total_to_read];
-            let f = self.file.as_ref().ok_or_else(|| FireLiteError::StorageError("File closed".into()))?;
+            let f = self.file.as_ref().ok_or_else(|| HakoError::StorageError("File closed".into()))?;
             #[cfg(windows)] f.seek_read(&mut buf, offset)?;
             #[cfg(unix)] f.read_at(&mut buf, offset)?;
             buf
@@ -139,7 +139,7 @@ impl Segment {
         if let Some(enc) = &self.encryption { out = enc.decrypt(&out)?; }
         if is_compressed {
             out = zstd::decode_all(&out[..])
-                .map_err(|e| FireLiteError::StorageError(format!("Zstd fail: {}", e)))?;
+                .map_err(|e| HakoError::StorageError(format!("Zstd fail: {}", e)))?;
         }
 
         // 3. Only populate cache if this isn't a one-time analytical scan

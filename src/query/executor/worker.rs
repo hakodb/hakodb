@@ -1,4 +1,4 @@
-use crate::document::firelite_doc::{FireLiteDoc, FireLiteDocView};
+use crate::document::hako_doc::{HakoDoc, HakoDocView};
 use crate::document::value::Value;
 use super::task::QueryTask;
 use crate::query::filter::Operator;
@@ -17,7 +17,7 @@ fn byte_safe(v: &Value) -> bool {
     !matches!(v, Value::Float(_) | Value::Map(_) | Value::Array(_))
 }
 
-pub fn run_task(task: QueryTask) -> Vec<(String, FireLiteDoc)> {
+pub fn run_task(task: QueryTask) -> Vec<(String, HakoDoc)> {
     let mut out = Vec::new();
     let storage_guard = task.storage.as_ref().unwrap().read().unwrap();
     let blob_manager = storage_guard.blob_manager.as_ref();
@@ -63,12 +63,12 @@ fn decode_row(
     bytes: &[u8],
     plan: &crate::query::plan::QueryPlan,
     optimized_plan: &crate::query::plan::QueryPlan,
-    out: &mut Vec<(String, FireLiteDoc)>,
+    out: &mut Vec<(String, HakoDoc)>,
 ) {
     // CRITICAL FIX: If index handled everything, bypass `unified_match_decode` completely.
     // Skeletons only — the caller inflates once, concurrently (see above).
     if plan.filters_satisfied_by_index {
-        if let Some(doc) = FireLiteDoc::decode(bytes) {
+        if let Some(doc) = HakoDoc::decode(bytes) {
             out.push((id.to_string(), doc));
         }
     } else {
@@ -121,7 +121,7 @@ pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)
 /// entirely for link-free rows (the common small-doc case) instead of
 /// paying per-doc scan+Vec overhead inside `inflate_blobs`.
 #[inline]
-pub(crate) fn doc_has_links(doc: &FireLiteDoc) -> bool {
+pub(crate) fn doc_has_links(doc: &HakoDoc) -> bool {
     doc.fields.iter().any(|(_, v)| matches!(v, Value::BlobLink { .. }))
 }
 
@@ -152,8 +152,8 @@ pub(crate) fn prepare_optimized_plan(plan: &crate::query::plan::QueryPlan) -> cr
 /// bytes against the filter's encoding — zero allocation — and only rows
 /// that match pay for pass 2 (full decode). Non-matching rows previously paid
 /// a full decode (~15 allocs) just to be discarded.
-pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::query::plan::QueryPlan) -> Option<FireLiteDoc> {
-    let view = FireLiteDocView::new(bytes)?;
+pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::query::plan::QueryPlan) -> Option<HakoDoc> {
+    let view = HakoDocView::new(bytes)?;
     
     let mut and_matches = vec![false; plan.filters.len()];
     let mut or_group_results = vec![false; plan.or_groups.len()];
@@ -183,7 +183,7 @@ pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::que
                 for (i, f) in plan.filters.iter().enumerate() {
                     if and_matches[i] || key != f.field { continue; }
                     enc.clear();
-                    FireLiteDoc::encode_value_to(&f.value, &mut enc);
+                    HakoDoc::encode_value_to(&f.value, &mut enc);
                     let hit = enc.first().copied() == Some(tag) && &enc[1..] == data;
                     if (hit && f.op == Operator::Eq) || (!hit && f.op == Operator::Ne) {
                         and_matches[i] = true;
@@ -201,16 +201,16 @@ pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::que
     // Slow path reaches here directly; fast path only for proven winners.
     let mut fields = Vec::with_capacity(view.iter().count()); 
     for (key, tag, data) in view.iter() {
-        let val = crate::document::firelite_doc::decode_value(tag, data)?;
+        let val = crate::document::hako_doc::decode_value(tag, data)?;
 
         if !fast {
             apply_filter_logic(key, &val, plan, &mut and_matches, &mut or_group_results);
         }
-        fields.push((crate::document::firelite_doc::intern_field(key), val));
+        fields.push((crate::document::hako_doc::intern_field(key), val));
     }
 
     if fast || validate_final_match(plan, &and_matches, &or_group_results) {
-        Some(FireLiteDoc { fields, _time: view._time })
+        Some(HakoDoc { fields, _time: view._time })
     } else {
         None
     }
@@ -218,7 +218,7 @@ pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::que
 
 /// Unified decoder for projected queries. Only decodes fields needed for filters or results.
 pub(crate) fn unified_match_projected(doc_id: &str, bytes: &[u8], plan: &crate::query::plan::QueryPlan) -> Option<Vec<(String, Value)>> {
-    let view = FireLiteDocView::new(bytes)?;
+    let view = HakoDocView::new(bytes)?;
     let mut and_matches = vec![false; plan.filters.len()];
     let mut or_group_results = vec![false; plan.or_groups.len()];
 
@@ -233,7 +233,7 @@ pub(crate) fn unified_match_projected(doc_id: &str, bytes: &[u8], plan: &crate::
         let is_needed_for_proj = plan.projection.contains(&key.to_string());
 
         if is_needed_for_filter || is_needed_for_proj {
-            let val = crate::document::firelite_doc::decode_value(tag, data)?;
+            let val = crate::document::hako_doc::decode_value(tag, data)?;
             apply_filter_logic(key, &val, plan, &mut and_matches, &mut or_group_results);
             if is_needed_for_proj {
                 extracted.push((key.to_string(), val));
@@ -368,7 +368,7 @@ fn compare_default_filter (doc_id: &str, op: &Operator, filter_val: &Value) -> b
 
 /// Remaining logic (inflate_blobs, matches_filters_view, etc.) kept for internal use...
 
-pub(crate) fn inflate_blobs(doc: &mut FireLiteDoc, blob_manager: &crate::storage::blob::BlobManager) -> Result<(), crate::error::FireLiteError> {
+pub(crate) fn inflate_blobs(doc: &mut HakoDoc, blob_manager: &crate::storage::blob::BlobManager) -> Result<(), crate::error::HakoError> {
     let links: Vec<&mut Value> = doc.fields.iter_mut()
         .map(|(_, v)| v)
         .filter(|v| matches!(v, Value::BlobLink { .. }))
@@ -396,7 +396,7 @@ pub(crate) fn matches_filters_view(doc_id: &str, bytes: &[u8], plan: &crate::que
         return false;
     }
     
-    let Some(view) = FireLiteDocView::new(bytes) else { return false; };
+    let Some(view) = HakoDocView::new(bytes) else { return false; };
     for (key, tag, data) in view.iter() {
         for (i, f) in plan.filters.iter().enumerate() {
             if !and_matches[i] && key == f.field {
@@ -466,7 +466,7 @@ pub(crate) fn matches_filters_view(doc_id: &str, bytes: &[u8], plan: &crate::que
 //         }
 //         _ => {
 //             // Fallback for complex types (Map, Array, Reference)
-//             if let Some(v) = crate::document::firelite_doc::decode_value(tag, data) {
+//             if let Some(v) = crate::document::hako_doc::decode_value(tag, data) {
 //                 return crate::query::filter::compare_values(&v, op, b);
 //             }
 //         }
@@ -529,7 +529,7 @@ fn compare_raw_bytes(tag: u8, data: &[u8], op: &Operator, b: &Value) -> bool {
         }
         _ => {
             // Fallback for complex types (Map, Array, Reference, BlobLink)
-            crate::document::firelite_doc::decode_value(tag, data)
+            crate::document::hako_doc::decode_value(tag, data)
         }
     };
 

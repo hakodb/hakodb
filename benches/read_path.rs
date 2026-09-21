@@ -18,14 +18,14 @@
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
-use firelite::config::{DurabilityMode, FireLiteConfig};
-use firelite::document::firelite_doc::FireLiteDoc;
-use firelite::document::value::Value;
-use firelite::engine::{BatchMutation, FireLite};
-use firelite::index::composite::definition::SortDirection;
-use firelite::query::filter::Operator;
-use firelite::query::order::OrderBy;
-use firelite::query::query::Query;
+use hakodb::config::{DurabilityMode, HakoConfig};
+use hakodb::document::hako_doc::HakoDoc;
+use hakodb::document::value::Value;
+use hakodb::engine::{BatchMutation, Hako};
+use hakodb::index::composite::definition::SortDirection;
+use hakodb::query::filter::Operator;
+use hakodb::query::order::OrderBy;
+use hakodb::query::query::Query;
 
 const N: usize = 1000;
 
@@ -37,15 +37,15 @@ fn temp_dir(label: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("fl-bench-{label}-{nanos}"))
 }
 
-fn make_doc(i: usize) -> FireLiteDoc {
-    let mut doc = FireLiteDoc::default();
+fn make_doc(i: usize) -> HakoDoc {
+    let mut doc = HakoDoc::default();
     doc.insert("tenant", Value::String(format!("tenant-{}", i % 32)));
     doc.insert("age", Value::Int(18 + (i % 70) as i64));
     doc.insert("active", Value::Bool(i % 3 != 0));
     doc.insert("score", Value::Float(((i % 10000) as f64) / 7.0 + 0.5));
     doc.insert(
         "description",
-        Value::String(format!("firelite v0.7.1 bench payload {i}")),
+        Value::String(format!("hakodb v0.7.1 bench payload {i}")),
     );
     doc.insert(
         "tags",
@@ -58,14 +58,14 @@ fn make_doc(i: usize) -> FireLiteDoc {
 }
 
 /// Seed N docs into a fresh engine. Returns the open handle.
-fn build_engine(label: &str) -> FireLite {
+fn build_engine(label: &str) -> Hako {
     let dir = temp_dir(label);
-    let mut cfg = FireLiteConfig::default();
+    let mut cfg = HakoConfig::default();
     cfg.durability_mode = DurabilityMode::Manual; // group commit off → all writes hit disk once
     cfg.page_cache_capacity = 4096;
     cfg.mmap_size = 64 * 1024 * 1024;
     cfg.value_blob_threshold_bytes = 16 * 1024;
-    let db = FireLite::open(&dir, cfg).expect("open");
+    let db = Hako::open(&dir, cfg).expect("open");
 
     let mut mutations = Vec::with_capacity(N);
     for i in 0..N {
@@ -135,7 +135,7 @@ fn bench_query_eq(c: &mut Criterion) {
     group.bench_function("active_eq", |b| {
         b.iter(|| {
             let mut q = Query::new("bench");
-            q.filters.push(firelite::query::filter::Filter {
+            q.filters.push(hakodb::query::filter::Filter {
                 field: "active".into(),
                 op: Operator::Eq,
                 value: Value::Bool(true),
@@ -163,7 +163,7 @@ fn bench_query_composite(c: &mut Criterion) {
     group.bench_function("tenant_eq_score_desc", |b| {
         b.iter(|| {
             let mut q = Query::new("bench");
-            q.filters.push(firelite::query::filter::Filter {
+            q.filters.push(hakodb::query::filter::Filter {
                 field: "tenant".into(),
                 op: Operator::Eq,
                 value: Value::String("tenant-2".into()),
@@ -250,14 +250,14 @@ fn bench_query_cursor(c: &mut Criterion) {
 
 const BIG_N: usize = 10_000;
 
-fn build_engine_big(label: &str) -> FireLite {
+fn build_engine_big(label: &str) -> Hako {
     let dir = temp_dir(label);
-    let mut cfg = FireLiteConfig::default();
+    let mut cfg = HakoConfig::default();
     cfg.durability_mode = DurabilityMode::Manual;
     cfg.page_cache_capacity = 1024;
     cfg.mmap_size = 64 * 1024 * 1024;
     cfg.value_blob_threshold_bytes = 16 * 1024;
-    let db = FireLite::open(&dir, cfg).expect("open");
+    let db = Hako::open(&dir, cfg).expect("open");
 
     let mut mutations = Vec::with_capacity(BIG_N);
     for i in 0..BIG_N {

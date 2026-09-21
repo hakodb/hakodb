@@ -1,10 +1,10 @@
-use firelite::config::{DurabilityMode, FireLiteConfig};
-use firelite::document::firelite_doc::FireLiteDoc;
-use firelite::document::value::Value;
-use firelite::engine::FireLite;
-use firelite::query::query::Query;
+use hakodb::config::{DurabilityMode, HakoConfig};
+use hakodb::document::hako_doc::HakoDoc;
+use hakodb::document::value::Value;
+use hakodb::engine::Hako;
+use hakodb::query::query::Query;
 
-fn temp_db(tag: &str) -> (FireLite, std::path::PathBuf) {
+fn temp_db(tag: &str) -> (Hako, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!(
         "fl-test-localonly-{tag}-{}",
         std::time::SystemTime::now()
@@ -12,14 +12,14 @@ fn temp_db(tag: &str) -> (FireLite, std::path::PathBuf) {
             .unwrap()
             .as_nanos()
     ));
-    let mut cfg = FireLiteConfig::default();
+    let mut cfg = HakoConfig::default();
     cfg.durability_mode = DurabilityMode::Manual;
-    let db = FireLite::open(&dir, cfg).expect("open");
+    let db = Hako::open(&dir, cfg).expect("open");
     (db, dir)
 }
 
-fn put_doc(db: &FireLite, col: &str, id: &str) {
-    let mut doc = FireLiteDoc::default();
+fn put_doc(db: &Hako, col: &str, id: &str) {
+    let mut doc = HakoDoc::default();
     doc.insert("v", Value::Int(1));
     db.put(col, id, &doc).expect("put");
 }
@@ -102,17 +102,17 @@ fn local_only_marks_survive_reopen() {    let dir = std::env::temp_dir().join(fo
             .unwrap()
             .as_nanos()
     ));
-    let mut cfg = FireLiteConfig::default();
+    let mut cfg = HakoConfig::default();
     cfg.durability_mode = DurabilityMode::Manual;
     {
-        let db = FireLite::open(&dir, cfg.clone()).expect("open");
+        let db = Hako::open(&dir, cfg.clone()).expect("open");
         put_doc(&db, "c", "a");
         db.delete_local("c", "a").expect("delete_local");
         db.set_collection_local("priv", true);
         db.flush().ok();
     }
     {
-        let db = FireLite::open(&dir, cfg).expect("reopen");
+        let db = Hako::open(&dir, cfg).expect("reopen");
         assert!(db.is_local_only("c", "a"), "key mark lost across reopen");
         assert!(db.is_collection_local("priv"), "col flag lost across reopen");
     }

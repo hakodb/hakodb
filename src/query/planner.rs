@@ -95,7 +95,7 @@ impl QueryPlanner {
             // sorted by id. We can slice it directly (O(log N + limit))
             // instead of walking any index — including for cursor queries
             // (`start_at`/`start_after` resolve to a binary search + slice
-            // in the executor). fl_engine_create_index("id") registers `id`
+            // in the executor). hk_engine_create_index("id") registers `id`
             // as a composite index with one field, so this short-circuit has
             // to live BEFORE the composite-index loop below or it never
             // fires. Only shapes we can't express here (end bounds) fall

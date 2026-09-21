@@ -2,9 +2,9 @@ use std::fs::File;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::document::firelite_doc::FireLiteDoc;
+use crate::document::hako_doc::HakoDoc;
 use crate::document::value::Value;
-use crate::error::{FireLiteError, Result};
+use crate::error::{HakoError, Result};
 
 pub struct BlobManager {
     file: Arc<File>,
@@ -64,14 +64,14 @@ impl BlobManager {
             use std::os::unix::fs::FileExt;
             self.file
                 .write_all_at(buf, offset)
-                .map_err(|e| FireLiteError::StorageError(format!("Blob IO fail: {e}")))?;
+                .map_err(|e| HakoError::StorageError(format!("Blob IO fail: {e}")))?;
         }
         #[cfg(windows)]
         {
             use std::os::windows::fs::FileExt;
             self.file
                 .seek_write(buf, offset)
-                .map_err(|e| FireLiteError::StorageError(format!("Blob IO fail: {e}")))?;
+                .map_err(|e| HakoError::StorageError(format!("Blob IO fail: {e}")))?;
         }
         Ok(())
     }
@@ -80,7 +80,7 @@ impl BlobManager {
         &self,
         collection: &str,
         key: &str,
-        doc: &mut FireLiteDoc,
+        doc: &mut HakoDoc,
         threshold: usize,
     ) -> Vec<BlobWork> {
         let mut work_items = Vec::new();
@@ -124,7 +124,7 @@ impl BlobManager {
         &self,
         collection: &str,
         key: &str,
-        doc: &mut FireLiteDoc,
+        doc: &mut HakoDoc,
         threshold: usize,
     ) -> Vec<BlobWork> {
         // Functionally identical to extract_blobs but distinct for raw integrations
@@ -134,7 +134,7 @@ impl BlobManager {
     pub fn extract_patch_blobs(
         &self,
         collection: &str,
-        doc: &mut FireLiteDoc,
+        doc: &mut HakoDoc,
         updates: Vec<(String, Value)>,
         threshold: usize,
     ) -> Vec<BlobWork> {
@@ -167,7 +167,7 @@ impl BlobManager {
         work_items
     }
 
-    pub fn extract_blobs_placeholder(&self, _col: &str, doc: &mut FireLiteDoc, threshold: usize) -> Vec<BlobWork> {
+    pub fn extract_blobs_placeholder(&self, _col: &str, doc: &mut HakoDoc, threshold: usize) -> Vec<BlobWork> {
         for (_, value) in &mut doc.fields {
             if value.len_bytes() > threshold {
                 *value = Value::BlobLink { offset: u64::MAX, len: value.len_bytes() as u32 }; 

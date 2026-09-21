@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crc32fast::Hasher;
 
-use crate::error::{FireLiteError, Result};
+use crate::error::{HakoError, Result};
 
 #[derive(Debug, Clone)]
 pub enum WalOp {
@@ -63,7 +63,7 @@ impl Wal {
             let mut hasher = Hasher::new();
             hasher.update(&payload);
             if hasher.finalize() != expected {
-                return Err(FireLiteError::Corrupt("wal crc mismatch".into()));
+                return Err(HakoError::Corrupt("wal crc mismatch".into()));
             }
             out.push(decode_op(&payload)?);
         }
@@ -104,29 +104,29 @@ fn encode_op(op: &WalOp) -> Vec<u8> {
 fn decode_op(payload: &[u8]) -> Result<WalOp> {
     let tag = *payload
         .first()
-        .ok_or_else(|| FireLiteError::Corrupt("empty wal payload".into()))?;
+        .ok_or_else(|| HakoError::Corrupt("empty wal payload".into()))?;
     let mut pos = 1;
     let key_len = u16::from_le_bytes(
         payload[pos..pos + 2]
             .try_into()
-            .map_err(|_| FireLiteError::Corrupt("wal key len".into()))?,
+            .map_err(|_| HakoError::Corrupt("wal key len".into()))?,
     ) as usize;
     pos += 2;
     let key = String::from_utf8(payload[pos..pos + key_len].to_vec())
-        .map_err(|_| FireLiteError::Corrupt("wal utf8".into()))?;
+        .map_err(|_| HakoError::Corrupt("wal utf8".into()))?;
     pos += key_len;
     Ok(match tag {
         1 => {
             let offset = u64::from_le_bytes(
                 payload[pos..pos + 8]
                     .try_into()
-                    .map_err(|_| FireLiteError::Corrupt("wal put offset".into()))?,
+                    .map_err(|_| HakoError::Corrupt("wal put offset".into()))?,
             );
             pos += 8;
             let len = u32::from_le_bytes(
                 payload[pos..pos + 4]
                     .try_into()
-                    .map_err(|_| FireLiteError::Corrupt("wal put len".into()))?,
+                    .map_err(|_| HakoError::Corrupt("wal put len".into()))?,
             );
             WalOp::Put {
                 key,
@@ -135,6 +135,6 @@ fn decode_op(payload: &[u8]) -> Result<WalOp> {
             }
         }
         2 => WalOp::Delete { key },
-        _ => return Err(FireLiteError::Corrupt("wal unknown op".into())),
+        _ => return Err(HakoError::Corrupt("wal unknown op".into())),
     })
 }

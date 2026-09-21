@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::document::firelite_doc::FireLiteDoc;
+use crate::document::hako_doc::HakoDoc;
 use crate::document::value::Value;
 
 use super::composite_index::CompositeIndex;
@@ -47,7 +47,7 @@ impl CompositeIndexManager {
             .filter_map(|id| self.by_id.get(id))
     }
 
-    pub fn index_document(&mut self, collection: &str, doc_id: &str, doc: &FireLiteDoc) {
+    pub fn index_document(&mut self, collection: &str, doc_id: &str, doc: &HakoDoc) {
         let ids = self
             .by_collection
             .get(collection)
@@ -74,7 +74,7 @@ impl CompositeIndexManager {
 
     pub fn index_batch<'a, I>(&mut self, collection: &str, docs: I)
     where
-        I: IntoIterator<Item = (&'a str, &'a FireLiteDoc)> + Clone,
+        I: IntoIterator<Item = (&'a str, &'a HakoDoc)> + Clone,
     {
         let ids = self.by_collection.get(collection).cloned().unwrap_or_default();
         for id in ids {
@@ -84,7 +84,7 @@ impl CompositeIndexManager {
         }
     }
 
-    pub fn remove_document(&mut self, collection: &str, doc_id: &str, doc: &FireLiteDoc) {
+    pub fn remove_document(&mut self, collection: &str, doc_id: &str, doc: &HakoDoc) {
         let ids = self
             .by_collection
             .get(collection)
@@ -99,7 +99,7 @@ impl CompositeIndexManager {
 
     pub fn remove_batch<'a, I>(&mut self, collection: &str, docs: I)
     where
-        I: IntoIterator<Item = (&'a str, &'a FireLiteDoc)> + Clone,
+        I: IntoIterator<Item = (&'a str, &'a HakoDoc)> + Clone,
     {
         let ids = self.by_collection.get(collection).cloned().unwrap_or_default();
         for id in ids {

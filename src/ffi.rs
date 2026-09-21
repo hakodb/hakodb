@@ -11,10 +11,10 @@ use std::collections::HashSet;
 // use std::sync::Arc;
 use hashbrown::HashMap;
 
-use crate::config::{DurabilityMode, FireLiteConfig};
-use crate::document::firelite_doc::FireLiteDoc;
+use crate::config::{DurabilityMode, HakoConfig};
+use crate::document::hako_doc::HakoDoc;
 use crate::document::value::Value;
-use crate::engine::{BatchMutation, FireLite};
+use crate::engine::{BatchMutation, Hako};
 use crate::index::composite::definition::SortDirection;
 use crate::query::filter::Operator;
 use crate::query::query::{AggregateOp, Query};
@@ -34,42 +34,42 @@ macro_rules! safety_shield {
 }
 
 #[allow(non_camel_case_types)]
-pub struct FL_Engine {
-    // db: FireLite,
-    db: std::sync::Arc<FireLite>,
+pub struct HK_Engine {
+    // db: Hako,
+    db: std::sync::Arc<Hako>,
 }
 
 #[allow(non_camel_case_types)]
-pub struct FL_Doc {
+pub struct HK_Doc {
     pub id: String,
-    doc: FireLiteDoc,
+    doc: HakoDoc,
 }
 
 #[allow(non_camel_case_types)]
-pub struct FL_Batch {
+pub struct HK_Batch {
     ops: Vec<BatchMutation>,
 }
 
 #[allow(non_camel_case_types)]
-pub struct FL_Query {
+pub struct HK_Query {
     query: Query,
 }
 
 // config
 #[allow(non_camel_case_types)]
-pub struct FL_Config {
-    pub inner: FireLiteConfig,
+pub struct HK_Config {
+    pub inner: HakoConfig,
 }
 
 #[allow(non_camel_case_types)]
-pub struct FL_Watch {
+pub struct HK_Watch {
     stop_tx: Sender<()>,
     thread_handle: Option<thread::JoinHandle<()>>,
 }
 
 // 1. Fixed type naming warning with #[allow]
 #[allow(non_camel_case_types)]
-pub type FL_OnSnapshotCallback = unsafe extern "C" fn(
+pub type HK_OnSnapshotCallback = unsafe extern "C" fn(
     collection: *const c_char,
     path: *const c_char,
     kind: i32,
@@ -77,40 +77,40 @@ pub type FL_OnSnapshotCallback = unsafe extern "C" fn(
 );
 
 #[allow(non_camel_case_types)]
-pub struct FL_Array {
+pub struct HK_Array {
     pub items: Vec<Value>,
 }
 
 #[allow(non_camel_case_types)]
-pub struct FL_Transaction {
+pub struct HK_Transaction {
     pub tx: crate::engine::SerializableTransaction,
 }
 
 #[allow(non_camel_case_types)]
-pub struct FL_ResultSet {
-    pub docs: Vec<FL_Doc>,
+pub struct HK_ResultSet {
+    pub docs: Vec<HK_Doc>,
 }
 
 /// Raw (undecoded) document handle. `bytes` pins the storage-encoded
 /// buffer (zero copies for inlined docs); decode on demand with
-/// `fl_rawdoc_to_doc`. Bytes are opaque storage encoding — do not persist
+/// `hk_rawdoc_to_doc`. Bytes are opaque storage encoding — do not persist
 /// or compare across versions.
 #[allow(non_camel_case_types)]
-pub struct FL_RawDoc {
+pub struct HK_RawDoc {
     pub id: String,
     pub bytes: std::sync::Arc<Vec<u8>>,
 }
 
-/// Slab of raw docs. Borrowed-handle contract mirrors FL_ResultSet:
-/// `fl_rawresult_get` pointers die with `fl_rawresult_free`.
+/// Slab of raw docs. Borrowed-handle contract mirrors HK_ResultSet:
+/// `hk_rawresult_get` pointers die with `hk_rawresult_free`.
 #[allow(non_camel_case_types)]
-pub struct FL_RawResultSet {
-    pub docs: Vec<FL_RawDoc>,
+pub struct HK_RawResultSet {
+    pub docs: Vec<HK_RawDoc>,
 }
 
 #[cfg(feature = "net-sync")]
 #[allow(non_camel_case_types)]
-pub struct FL_NetSyncer {
+pub struct HK_NetSyncer {
     inner: std::sync::Arc<crate::net_sync::NetSyncer>,
 }
 
@@ -120,7 +120,7 @@ pub struct FL_NetSyncer {
 
 #[cfg(feature = "cloud-sync")]
 #[allow(non_camel_case_types)]
-pub struct FL_CloudSync {
+pub struct HK_CloudSync {
     inner: std::sync::Arc<crate::cloud_sync::CloudSync>,
 }
 
@@ -169,7 +169,7 @@ fn push_u8(out: &mut String, b: u8) {
     out.push((b % 10 + b'0') as char);
 }
 
-fn doc_to_json(doc: &FireLiteDoc) -> Result<String, String> {
+fn doc_to_json(doc: &HakoDoc) -> Result<String, String> {
     safety_shield!(Err("Internal Panic".into()), {
         // ponytail: stream instead of boxing every value into
         // serde_json::Value first. A 100-byte Binary used to become 100
@@ -219,7 +219,7 @@ fn projection_to_json(fields: Vec<(String, Value)>) -> Result<serde_json::Value,
 }
 
 #[no_mangle]
-pub extern "C" fn fl_engine_open(path: *const c_char) -> *mut FL_Engine {
+pub extern "C" fn hk_engine_open(path: *const c_char) -> *mut HK_Engine {
     let path = match cstr_to_string(path) {
         Ok(v) => v,
         Err(e) => {
@@ -228,11 +228,11 @@ pub extern "C" fn fl_engine_open(path: *const c_char) -> *mut FL_Engine {
         }
     };
 
-    match FireLite::open(path, FireLiteConfig::default()) {
+    match Hako::open(path, HakoConfig::default()) {
         Ok(db) => {
             clear_last_error();
-            // Box::into_raw(Box::new(FL_Engine { db }))
-            Box::into_raw(Box::new(FL_Engine { db: std::sync::Arc::new(db) }))
+            // Box::into_raw(Box::new(HK_Engine { db }))
+            Box::into_raw(Box::new(HK_Engine { db: std::sync::Arc::new(db) }))
         }
         Err(e) => {
             set_last_error(e.to_string());
@@ -242,7 +242,7 @@ pub extern "C" fn fl_engine_open(path: *const c_char) -> *mut FL_Engine {
 }
 
 #[no_mangle]
-pub extern "C" fn fl_engine_is_indexes_ready(engine: *mut FL_Engine) -> bool {
+pub extern "C" fn hk_engine_is_indexes_ready(engine: *mut HK_Engine) -> bool {
     safety_shield!(false, {
         if engine.is_null() { return false; }
         let engine = unsafe { &*engine };
@@ -253,9 +253,9 @@ pub extern "C" fn fl_engine_is_indexes_ready(engine: *mut FL_Engine) -> bool {
 /// Block until background work settles (index recovery + async index
 /// updates + blob persistence + maintenance) or `timeout_ms` lapses.
 /// Requires two consecutive clear samples, so use it before measuring.
-/// Returns true when settled. See `FireLite::await_quiescent`.
+/// Returns true when settled. See `Hako::await_quiescent`.
 #[no_mangle]
-pub extern "C" fn fl_engine_await_quiescent(engine: *mut FL_Engine, timeout_ms: u64) -> bool {
+pub extern "C" fn hk_engine_await_quiescent(engine: *mut HK_Engine, timeout_ms: u64) -> bool {
     safety_shield!(false, {
         if engine.is_null() { return false; }
         let engine = unsafe { &*engine };
@@ -263,13 +263,13 @@ pub extern "C" fn fl_engine_await_quiescent(engine: *mut FL_Engine, timeout_ms: 
     })
 }
 
-/// Point-sample diagnostic as JSON (free with fl_string_free):
+/// Point-sample diagnostic as JSON (free with hk_string_free):
 /// {"indexes_ready":b,"pending_index_ops":n,"index_backfills":n,
 ///  "pending_blob_bytes":n,"queued_blob_items":n,
 ///  "maintenance_running":b,"quiescent":b}.
 /// Tells you WHAT is outstanding instead of guessing.
 #[no_mangle]
-pub extern "C" fn fl_engine_quiescence_status(engine: *mut FL_Engine) -> *mut c_char {
+pub extern "C" fn hk_engine_quiescence_status(engine: *mut HK_Engine) -> *mut c_char {
     if engine.is_null() {
         set_last_error("null engine handle");
         return ptr::null_mut();
@@ -299,21 +299,21 @@ pub extern "C" fn fl_engine_quiescence_status(engine: *mut FL_Engine) -> *mut c_
 }
 
 #[no_mangle]
-pub extern "C" fn fl_config_new() -> *mut FL_Config {
-    Box::into_raw(Box::new(FL_Config {
-        inner: FireLiteConfig::default(),
+pub extern "C" fn hk_config_new() -> *mut HK_Config {
+    Box::into_raw(Box::new(HK_Config {
+        inner: HakoConfig::default(),
     }))
 }
 
 #[no_mangle]
-pub extern "C" fn fl_config_free(config: *mut FL_Config) {
+pub extern "C" fn hk_config_free(config: *mut HK_Config) {
     if !config.is_null() {
         unsafe { drop(Box::from_raw(config)) };
     }
 }
 
 #[no_mangle]
-pub extern "C" fn fl_config_set_durability(config: *mut FL_Config, mode: i32) {
+pub extern "C" fn hk_config_set_durability(config: *mut HK_Config, mode: i32) {
     if let Some(cfg) = unsafe { config.as_mut() } {
         cfg.inner.durability_mode = match mode {
             1 => DurabilityMode::Interval,
@@ -325,7 +325,7 @@ pub extern "C" fn fl_config_set_durability(config: *mut FL_Config, mode: i32) {
 }
 
 #[no_mangle]
-pub extern "C" fn fl_config_set_encryption_key(config: *mut FL_Config, key: *const c_char) {
+pub extern "C" fn hk_config_set_encryption_key(config: *mut HK_Config, key: *const c_char) {
     if let Some(cfg) = unsafe { config.as_mut() } {
         cfg.inner.encryption_key = cstr_to_string(key).ok();
     }
@@ -334,8 +334,8 @@ pub extern "C" fn fl_config_set_encryption_key(config: *mut FL_Config, key: *con
 /// Set which collections should be encrypted. 
 /// collections_json: A JSON array of strings, e.g., '["secrets", "private_messages"]'
 #[no_mangle]
-pub extern "C" fn fl_config_set_encrypted_collections(
-    config: *mut FL_Config,
+pub extern "C" fn hk_config_set_encrypted_collections(
+    config: *mut HK_Config,
     collections_json: *const c_char,
 ) -> i32 {
     let cfg = unsafe { match config.as_mut() {
@@ -358,8 +358,8 @@ pub extern "C" fn fl_config_set_encrypted_collections(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_config_set_audit_log(
-    config: *mut FL_Config,
+pub extern "C" fn hk_config_set_audit_log(
+    config: *mut HK_Config,
     enabled: bool,
     path: *const c_char,
 ) {
@@ -370,15 +370,15 @@ pub extern "C" fn fl_config_set_audit_log(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_config_set_query_workers(config: *mut FL_Config, count: usize) {
+pub extern "C" fn hk_config_set_query_workers(config: *mut HK_Config, count: usize) {
     if let Some(cfg) = unsafe { config.as_mut() } {
         cfg.inner.query_workers = count;
     }
 }
 
 #[no_mangle]
-pub extern "C" fn fl_config_set_memory_limits(
-    config: *mut FL_Config,
+pub extern "C" fn hk_config_set_memory_limits(
+    config: *mut HK_Config,
     mmap_size: usize,
     max_inlined_bytes: usize,
 ) {
@@ -389,8 +389,8 @@ pub extern "C" fn fl_config_set_memory_limits(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_config_set_storage_tuning(
-    config: *mut FL_Config,
+pub extern "C" fn hk_config_set_storage_tuning(
+    config: *mut HK_Config,
     page_size: usize,
     compaction_threshold: usize,
     group_commit_max_ops: usize,
@@ -403,7 +403,7 @@ pub extern "C" fn fl_config_set_storage_tuning(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_config_set_blob_threshold(config: *mut FL_Config, threshold_bytes: usize) {
+pub extern "C" fn hk_config_set_blob_threshold(config: *mut HK_Config, threshold_bytes: usize) {
     if let Some(cfg) = unsafe { config.as_mut() } {
         cfg.inner.value_blob_threshold_bytes = threshold_bytes;
     }
@@ -413,16 +413,16 @@ pub extern "C" fn fl_config_set_blob_threshold(config: *mut FL_Config, threshold
 /// ahead of the write position so steady-state appends never extend the
 /// file. Sparse: consumes no disk until written. Ignored for Manual.
 #[no_mangle]
-pub extern "C" fn fl_config_set_wal_reserve_bytes(config: *mut FL_Config, bytes: u64) {
+pub extern "C" fn hk_config_set_wal_reserve_bytes(config: *mut HK_Config, bytes: u64) {
     if let Some(cfg) = unsafe { config.as_mut() } {
         cfg.inner.wal_reserve_bytes = bytes;
     }
 }
 
 /// Write-path phase breakdown (see engine::write_stats_report). Returns a
-/// fresh C string the caller frees with fl_string_free. Counters reset.
+/// fresh C string the caller frees with hk_string_free. Counters reset.
 #[no_mangle]
-pub extern "C" fn fl_debug_write_stats() -> *mut c_char {
+pub extern "C" fn hk_debug_write_stats() -> *mut c_char {
     match std::ffi::CString::new(crate::engine::engine::write_stats_report()) {
         Ok(s) => s.into_raw(),
         Err(_) => std::ptr::null_mut(),
@@ -432,10 +432,10 @@ pub extern "C" fn fl_debug_write_stats() -> *mut c_char {
 /// Opens the engine using a custom config.
 /// Note: This function takes ownership of the config and will free it automatically.
 #[no_mangle]
-pub extern "C" fn fl_engine_open_with_config(
+pub extern "C" fn hk_engine_open_with_config(
     path: *const c_char,
-    config: *mut FL_Config,
-) -> *mut FL_Engine {
+    config: *mut HK_Config,
+) -> *mut HK_Engine {
     safety_shield!(std::ptr::null_mut(), {
         let path_str = match cstr_to_string(path) {
             Ok(v) => v,
@@ -453,11 +453,11 @@ pub extern "C" fn fl_engine_open_with_config(
         // Take ownership of the config from the FFI caller
         let cfg_box = unsafe { Box::from_raw(config) };
 
-        match FireLite::open(path_str, cfg_box.inner) {
+        match Hako::open(path_str, cfg_box.inner) {
             Ok(db) => {
                 clear_last_error();
-                // Box::into_raw(Box::new(FL_Engine { db }))
-                Box::into_raw(Box::new(FL_Engine { db: std::sync::Arc::new(db) }))
+                // Box::into_raw(Box::new(HK_Engine { db }))
+                Box::into_raw(Box::new(HK_Engine { db: std::sync::Arc::new(db) }))
             }
             Err(e) => {
                 set_last_error(e.to_string());
@@ -471,12 +471,12 @@ pub extern "C" fn fl_engine_open_with_config(
 
 // emulate snapshoot
 #[no_mangle]
-pub extern "C" fn fl_engine_watch(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_engine_watch(
+    engine: *mut HK_Engine,
     collection: *const c_char,
-    callback: FL_OnSnapshotCallback,
+    callback: HK_OnSnapshotCallback,
     user_data_ptr: *mut std::ffi::c_void,
-) -> *mut FL_Watch {
+) -> *mut HK_Watch {
     if engine.is_null() {
         return std::ptr::null_mut();
     }
@@ -523,14 +523,14 @@ pub extern "C" fn fl_engine_watch(
         }
     });
 
-    Box::into_raw(Box::new(FL_Watch {
+    Box::into_raw(Box::new(HK_Watch {
         stop_tx,
         thread_handle: Some(handle),
     }))
 }
 
 #[no_mangle]
-pub extern "C" fn fl_watch_free(watch: *mut FL_Watch) {
+pub extern "C" fn hk_watch_free(watch: *mut HK_Watch) {
     if !watch.is_null() {
         let mut w = unsafe { Box::from_raw(watch) };
         let _ = w.stop_tx.send(());
@@ -543,7 +543,7 @@ pub extern "C" fn fl_watch_free(watch: *mut FL_Watch) {
 // end of snapshoot
 
 #[no_mangle]
-pub extern "C" fn fl_engine_free(engine: *mut FL_Engine) {
+pub extern "C" fn hk_engine_free(engine: *mut HK_Engine) {
     safety_shield!((), {
         if !engine.is_null() {
             unsafe { drop(Box::from_raw(engine)) };
@@ -552,37 +552,37 @@ pub extern "C" fn fl_engine_free(engine: *mut FL_Engine) {
 }
 
 // #[no_mangle]
-// pub extern "C" fn fl_doc_new() -> *mut FL_Doc {
-//     Box::into_raw(Box::new(FL_Doc {
+// pub extern "C" fn hk_doc_new() -> *mut HK_Doc {
+//     Box::into_raw(Box::new(HK_Doc {
 //         // id: doc_id.clone(),
-//         doc: FireLiteDoc::default(),
+//         doc: HakoDoc::default(),
 //     }))
 // }
 
 // 2. Update creation points
 #[no_mangle]
-pub extern "C" fn fl_doc_new() -> *mut FL_Doc {
-    Box::into_raw(Box::new(FL_Doc {
+pub extern "C" fn hk_doc_new() -> *mut HK_Doc {
+    Box::into_raw(Box::new(HK_Doc {
         id: String::new(),
-        doc: FireLiteDoc::default(),
+        doc: HakoDoc::default(),
     }))
 }
 
 #[no_mangle]
-pub extern "C" fn fl_doc_free(doc: *mut FL_Doc) {
+pub extern "C" fn hk_doc_free(doc: *mut HK_Doc) {
     if !doc.is_null() {
         unsafe { drop(Box::from_raw(doc)) };
     }
 }
 
 #[no_mangle]
-pub extern "C" fn fl_doc_insert_str(
-    doc: *mut FL_Doc,
+pub extern "C" fn hk_doc_insert_str(
+    doc: *mut HK_Doc,
     key: *const c_char,
     value: *const c_char,
 ) -> i32 {
     if doc.is_null() {
-        return set_last_error("null FL_Doc");
+        return set_last_error("null HK_Doc");
     }
     let key = match cstr_to_string(key) {
         Ok(v) => v,
@@ -599,9 +599,9 @@ pub extern "C" fn fl_doc_insert_str(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_doc_insert_int(doc: *mut FL_Doc, key: *const c_char, value: i64) -> i32 {
+pub extern "C" fn hk_doc_insert_int(doc: *mut HK_Doc, key: *const c_char, value: i64) -> i32 {
     if doc.is_null() {
-        return set_last_error("null FL_Doc");
+        return set_last_error("null HK_Doc");
     }
     let key = match cstr_to_string(key) {
         Ok(v) => v,
@@ -614,9 +614,9 @@ pub extern "C" fn fl_doc_insert_int(doc: *mut FL_Doc, key: *const c_char, value:
 }
 
 #[no_mangle]
-pub extern "C" fn fl_doc_insert_float(doc: *mut FL_Doc, key: *const c_char, value: f64) -> i32 {
+pub extern "C" fn hk_doc_insert_float(doc: *mut HK_Doc, key: *const c_char, value: f64) -> i32 {
     if doc.is_null() {
-        return set_last_error("null FL_Doc");
+        return set_last_error("null HK_Doc");
     }
     let key = match cstr_to_string(key) {
         Ok(v) => v,
@@ -629,9 +629,9 @@ pub extern "C" fn fl_doc_insert_float(doc: *mut FL_Doc, key: *const c_char, valu
 }
 
 #[no_mangle]
-pub extern "C" fn fl_doc_insert_bool(doc: *mut FL_Doc, key: *const c_char, value: bool) -> i32 {
+pub extern "C" fn hk_doc_insert_bool(doc: *mut HK_Doc, key: *const c_char, value: bool) -> i32 {
     if doc.is_null() {
-        return set_last_error("null FL_Doc");
+        return set_last_error("null HK_Doc");
     }
     let key = match cstr_to_string(key) {
         Ok(v) => v,
@@ -644,9 +644,9 @@ pub extern "C" fn fl_doc_insert_bool(doc: *mut FL_Doc, key: *const c_char, value
 }
 
 #[no_mangle]
-pub extern "C" fn fl_doc_insert_null(doc: *mut FL_Doc, key: *const c_char) -> i32 {
+pub extern "C" fn hk_doc_insert_null(doc: *mut HK_Doc, key: *const c_char) -> i32 {
     if doc.is_null() {
-        return set_last_error("null FL_Doc");
+        return set_last_error("null HK_Doc");
     }
     let key = match cstr_to_string(key) {
         Ok(v) => v,
@@ -659,14 +659,14 @@ pub extern "C" fn fl_doc_insert_null(doc: *mut FL_Doc, key: *const c_char) -> i3
 }
 
 #[no_mangle]
-pub extern "C" fn fl_doc_insert_bin(
-    doc: *mut FL_Doc,
+pub extern "C" fn hk_doc_insert_bin(
+    doc: *mut HK_Doc,
     key: *const c_char,
     data: *const u8,
     len: usize,
 ) -> i32 {
     if doc.is_null() {
-        return set_last_error("null FL_Doc");
+        return set_last_error("null HK_Doc");
     }
     if data.is_null() && len > 0 {
         return set_last_error("null binary data");
@@ -687,11 +687,11 @@ pub extern "C" fn fl_doc_insert_bin(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_engine_insert(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_engine_insert(
+    engine: *mut HK_Engine,
     collection: *const c_char,
     doc_id: *const c_char,
-    doc: *const FL_Doc,
+    doc: *const HK_Doc,
 ) -> i32 {
     safety_shield!(-1, {
         // Returns -1 if Rust panics
@@ -716,15 +716,15 @@ pub extern "C" fn fl_engine_insert(
     })
 }
 
-/// Owned-doc insert: takes over the FL_Doc handle (no deep clone).
+/// Owned-doc insert: takes over the HK_Doc handle (no deep clone).
 /// The handle is ALWAYS consumed — success or failure — do not use or free
 /// `doc` after the call.
 #[no_mangle]
-pub extern "C" fn fl_engine_insert_take(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_engine_insert_take(
+    engine: *mut HK_Engine,
     collection: *const c_char,
     doc_id: *const c_char,
-    doc: *mut FL_Doc,
+    doc: *mut HK_Doc,
 ) -> i32 {
     safety_shield!(-1, {
         if engine.is_null() || doc.is_null() {
@@ -750,11 +750,11 @@ pub extern "C" fn fl_engine_insert_take(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_engine_get(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_engine_get(
+    engine: *mut HK_Engine,
     collection: *const c_char,
     doc_id: *const c_char,
-) -> *mut FL_Doc {
+) -> *mut HK_Doc {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() {
             set_last_error("null engine handle");
@@ -762,7 +762,7 @@ pub extern "C" fn fl_engine_get(
         }
         // ponytail: borrow the caller's C strings — the old code allocated
         // two Strings per get (strlen + validate + copy each). Only doc_id
-        // still needs ownership (moved into the FL_Doc handle).
+        // still needs ownership (moved into the HK_Doc handle).
         if collection.is_null() {
             set_last_error("null collection handle");
             return ptr::null_mut();
@@ -789,17 +789,17 @@ pub extern "C" fn fl_engine_get(
         };
         let engine = unsafe { &*engine };
         match engine.db.get(collection, &doc_id_owned) {
-            // PONYTAIL: move doc_id into FL_Doc instead of clone — doc_id is
+            // PONYTAIL: move doc_id into HK_Doc instead of clone — doc_id is
             // already a freshly-allocated String and we don't reuse it.
-            Ok(Some(doc)) => Box::into_raw(Box::new(FL_Doc { id: doc_id_owned, doc })),
+            Ok(Some(doc)) => Box::into_raw(Box::new(HK_Doc { id: doc_id_owned, doc })),
             _ => std::ptr::null_mut(),
         }
     })
 }
 
 #[no_mangle]
-pub extern "C" fn fl_engine_delete(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_engine_delete(
+    engine: *mut HK_Engine,
     collection: *const c_char,
     doc_id: *const c_char,
 ) -> i32 {
@@ -832,8 +832,8 @@ pub extern "C" fn fl_engine_delete(
 /// catch-up ever transmits it, then deletes normally (fresh tombstone
 /// timestamp keeps the version clock advanced — handshake-stable).
 #[no_mangle]
-pub extern "C" fn fl_engine_delete_local(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_engine_delete_local(
+    engine: *mut HK_Engine,
     collection: *const c_char,
     doc_id: *const c_char,
 ) -> i32 {
@@ -865,8 +865,8 @@ pub extern "C" fn fl_engine_delete_local(
 /// Marks a collection local-only (`local != 0`) or rejoins it to sync.
 /// A local-only collection never emits nor is caught up from the network.
 #[no_mangle]
-pub extern "C" fn fl_engine_set_collection_local(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_engine_set_collection_local(
+    engine: *mut HK_Engine,
     collection: *const c_char,
     local: i32,
 ) -> i32 {
@@ -885,8 +885,8 @@ pub extern "C" fn fl_engine_set_collection_local(
 
 /// Opts a key back into replication (future ops only).
 #[no_mangle]
-pub extern "C" fn fl_engine_replicate_key(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_engine_replicate_key(
+    engine: *mut HK_Engine,
     collection: *const c_char,
     doc_id: *const c_char,
 ) -> i32 {
@@ -909,8 +909,8 @@ pub extern "C" fn fl_engine_replicate_key(
 
 /// Opts a whole collection back into replication (clears flag + key marks).
 #[no_mangle]
-pub extern "C" fn fl_engine_replicate_collection(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_engine_replicate_collection(
+    engine: *mut HK_Engine,
     collection: *const c_char,
 ) -> i32 {
     if engine.is_null() {
@@ -930,8 +930,8 @@ pub extern "C" fn fl_engine_replicate_collection(
 /// replicates); drops the version so the next handshake pulls peer state.
 /// Returns tombstones purged, or -1 on error.
 #[no_mangle]
-pub extern "C" fn fl_engine_vacuum_collection(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_engine_vacuum_collection(
+    engine: *mut HK_Engine,
     collection: *const c_char,
 ) -> i32 {
     if engine.is_null() {
@@ -952,23 +952,23 @@ pub extern "C" fn fl_engine_vacuum_collection(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_batch_new() -> *mut FL_Batch {
-    Box::into_raw(Box::new(FL_Batch { ops: Vec::new() }))
+pub extern "C" fn hk_batch_new() -> *mut HK_Batch {
+    Box::into_raw(Box::new(HK_Batch { ops: Vec::new() }))
 }
 
 #[no_mangle]
-pub extern "C" fn fl_batch_free(batch: *mut FL_Batch) {
+pub extern "C" fn hk_batch_free(batch: *mut HK_Batch) {
     if !batch.is_null() {
         unsafe { drop(Box::from_raw(batch)) };
     }
 }
 
 #[no_mangle]
-pub extern "C" fn fl_batch_set(
-    batch: *mut FL_Batch,
+pub extern "C" fn hk_batch_set(
+    batch: *mut HK_Batch,
     collection: *const c_char,
     doc_id: *const c_char,
-    doc: *mut FL_Doc,
+    doc: *mut HK_Doc,
 ) -> i32 {
     if batch.is_null() || doc.is_null() {
         return set_last_error("null batch/doc handle");
@@ -997,8 +997,8 @@ pub extern "C" fn fl_batch_set(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_batch_delete(
-    batch: *mut FL_Batch,
+pub extern "C" fn hk_batch_delete(
+    batch: *mut HK_Batch,
     collection: *const c_char,
     doc_id: *const c_char,
 ) -> i32 {
@@ -1021,7 +1021,7 @@ pub extern "C" fn fl_batch_delete(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_batch_commit(engine: *mut FL_Engine, batch: *mut FL_Batch) -> i32 {
+pub extern "C" fn hk_batch_commit(engine: *mut HK_Engine, batch: *mut HK_Batch) -> i32 {
     safety_shield!(-1, {
         if engine.is_null() || batch.is_null() {
             return set_last_error("null engine/batch handle");
@@ -1045,7 +1045,7 @@ pub extern "C" fn fl_batch_commit(engine: *mut FL_Engine, batch: *mut FL_Batch) 
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_new(collection: *const c_char) -> *mut FL_Query {
+pub extern "C" fn hk_query_new(collection: *const c_char) -> *mut HK_Query {
     let collection = match cstr_to_string(collection) {
         Ok(v) => v,
         Err(e) => {
@@ -1055,21 +1055,21 @@ pub extern "C" fn fl_query_new(collection: *const c_char) -> *mut FL_Query {
     };
 
     clear_last_error();
-    Box::into_raw(Box::new(FL_Query {
+    Box::into_raw(Box::new(HK_Query {
         query: Query::new(&collection),
     }))
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_free(query: *mut FL_Query) {
+pub extern "C" fn hk_query_free(query: *mut HK_Query) {
     if !query.is_null() {
         unsafe { drop(Box::from_raw(query)) };
     }
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_eq_str(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_eq_str(
+    query: *mut HK_Query,
     field: *const c_char,
     value: *const c_char,
 ) -> i32 {
@@ -1095,8 +1095,8 @@ pub extern "C" fn fl_query_where_eq_str(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_eq_bool(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_eq_bool(
+    query: *mut HK_Query,
     field: *const c_char,
     value: bool, // Receive the bool directly
 ) -> i32 {
@@ -1136,7 +1136,7 @@ pub extern "C" fn fl_query_where_eq_bool(
 /// Executes the query and deletes all matching documents.
 /// Returns the number of deleted documents, or -1 on error.
 #[no_mangle]
-pub extern "C" fn fl_query_delete(engine: *mut FL_Engine, query: *mut FL_Query) -> i32 {
+pub extern "C" fn hk_query_delete(engine: *mut HK_Engine, query: *mut HK_Query) -> i32 {
     safety_shield!(-1, {
         if engine.is_null() || query.is_null() { return -1; }
         let engine = unsafe { &*engine };
@@ -1153,9 +1153,9 @@ pub extern "C" fn fl_query_delete(engine: *mut FL_Engine, query: *mut FL_Query) 
 }
 
 /// Local-only mass delete: marks every match so the wipe never leaves
-/// this device, then deletes. See `fl_engine_delete_local`.
+/// this device, then deletes. See `hk_engine_delete_local`.
 #[no_mangle]
-pub extern "C" fn fl_query_delete_local(engine: *mut FL_Engine, query: *mut FL_Query) -> i32 {
+pub extern "C" fn hk_query_delete_local(engine: *mut HK_Engine, query: *mut HK_Query) -> i32 {
     safety_shield!(-1, {
         if engine.is_null() || query.is_null() { return -1; }
         let engine = unsafe { &*engine };
@@ -1174,10 +1174,10 @@ pub extern "C" fn fl_query_delete_local(engine: *mut FL_Engine, query: *mut FL_Q
 /// Executes the query and applies the updates from 'patch_doc' to all matches.
 /// Returns the number of updated documents, or -1 on error.
 #[no_mangle]
-pub extern "C" fn fl_query_patch(
-    engine: *mut FL_Engine, 
-    query: *mut FL_Query, 
-    patch_doc: *const FL_Doc
+pub extern "C" fn hk_query_patch(
+    engine: *mut HK_Engine, 
+    query: *mut HK_Query, 
+    patch_doc: *const HK_Doc
 ) -> i32 {
     safety_shield!(-1, {
         if engine.is_null() || query.is_null() || patch_doc.is_null() { return -1; }
@@ -1185,7 +1185,7 @@ pub extern "C" fn fl_query_patch(
         let query_ptr = unsafe { &*query };
         let patch_ptr = unsafe { &*patch_doc };
 
-        // Convert FL_Doc fields to the internal updates vector
+        // Convert HK_Doc fields to the internal updates vector
         let updates: Vec<(String, Value)> = patch_ptr.doc.fields.iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect();
@@ -1201,7 +1201,7 @@ pub extern "C" fn fl_query_patch(
 }
 
 fn apply_string_filter(
-    query: *mut FL_Query,
+    query: *mut HK_Query,
     field: *const c_char,
     value: *const c_char,
     op: Operator,
@@ -1239,7 +1239,7 @@ fn apply_string_filter(
     0
 }
 
-fn apply_int_filter(query: *mut FL_Query, field: *const c_char, value: i64, op: Operator) -> i32 {
+fn apply_int_filter(query: *mut HK_Query, field: *const c_char, value: i64, op: Operator) -> i32 {
     // if query.is_null() {
     //     return set_last_error("null query handle");
     // }
@@ -1269,8 +1269,8 @@ fn apply_int_filter(query: *mut FL_Query, field: *const c_char, value: i64, op: 
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_eq_int(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_eq_int(
+    query: *mut HK_Query,
     field: *const c_char,
     value: i64,
 ) -> i32 {
@@ -1292,8 +1292,8 @@ pub extern "C" fn fl_query_where_eq_int(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_ne_str(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_ne_str(
+    query: *mut HK_Query,
     field: *const c_char,
     value: *const c_char,
 ) -> i32 {
@@ -1301,8 +1301,8 @@ pub extern "C" fn fl_query_where_ne_str(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_ne_int(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_ne_int(
+    query: *mut HK_Query,
     field: *const c_char,
     value: i64,
 ) -> i32 {
@@ -1310,8 +1310,8 @@ pub extern "C" fn fl_query_where_ne_int(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_gt_str(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_gt_str(
+    query: *mut HK_Query,
     field: *const c_char,
     value: *const c_char,
 ) -> i32 {
@@ -1319,8 +1319,8 @@ pub extern "C" fn fl_query_where_gt_str(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_gt_int(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_gt_int(
+    query: *mut HK_Query,
     field: *const c_char,
     value: i64,
 ) -> i32 {
@@ -1328,8 +1328,8 @@ pub extern "C" fn fl_query_where_gt_int(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_gte_str(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_gte_str(
+    query: *mut HK_Query,
     field: *const c_char,
     value: *const c_char,
 ) -> i32 {
@@ -1337,8 +1337,8 @@ pub extern "C" fn fl_query_where_gte_str(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_gte_int(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_gte_int(
+    query: *mut HK_Query,
     field: *const c_char,
     value: i64,
 ) -> i32 {
@@ -1346,8 +1346,8 @@ pub extern "C" fn fl_query_where_gte_int(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_lt_str(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_lt_str(
+    query: *mut HK_Query,
     field: *const c_char,
     value: *const c_char,
 ) -> i32 {
@@ -1355,8 +1355,8 @@ pub extern "C" fn fl_query_where_lt_str(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_lt_int(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_lt_int(
+    query: *mut HK_Query,
     field: *const c_char,
     value: i64,
 ) -> i32 {
@@ -1364,8 +1364,8 @@ pub extern "C" fn fl_query_where_lt_int(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_lte_str(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_lte_str(
+    query: *mut HK_Query,
     field: *const c_char,
     value: *const c_char,
 ) -> i32 {
@@ -1373,8 +1373,8 @@ pub extern "C" fn fl_query_where_lte_str(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_lte_int(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_lte_int(
+    query: *mut HK_Query,
     field: *const c_char,
     value: i64,
 ) -> i32 {
@@ -1382,8 +1382,8 @@ pub extern "C" fn fl_query_where_lte_int(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_array_contains(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_array_contains(
+    query: *mut HK_Query,
     field: *const c_char,
     value: *const c_char,
 ) -> i32 {
@@ -1404,10 +1404,10 @@ pub extern "C" fn fl_query_where_array_contains(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_array_contains_any(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_array_contains_any(
+    query: *mut HK_Query,
     field: *const c_char,
-    array: *mut FL_Array,
+    array: *mut HK_Array,
 ) -> i32 {
     if query.is_null() || array.is_null() {
         return -1;
@@ -1427,10 +1427,10 @@ pub extern "C" fn fl_query_where_array_contains_any(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_not_in(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_not_in(
+    query: *mut HK_Query,
     field: *const c_char,
-    array: *mut FL_Array,
+    array: *mut HK_Array,
 ) -> i32 {
     if query.is_null() || array.is_null() {
         return -1;
@@ -1450,8 +1450,8 @@ pub extern "C" fn fl_query_where_not_in(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_order_by(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_order_by(
+    query: *mut HK_Query,
     field: *const c_char,
     ascending: bool,
 ) -> i32 {
@@ -1480,7 +1480,7 @@ pub extern "C" fn fl_query_order_by(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_limit(query: *mut FL_Query, limit: usize) -> i32 {
+pub extern "C" fn hk_query_limit(query: *mut HK_Query, limit: usize) -> i32 {
     if query.is_null() {
         return -1;
     }
@@ -1491,9 +1491,9 @@ pub extern "C" fn fl_query_limit(query: *mut FL_Query, limit: usize) -> i32 {
 
 /// Opt in to deferred blobs: matching docs come back with blob-backed
 /// fields as `Value::BlobLink` placeholders (no blob-file reads).
-/// Resolve later with `fl_doc_resolve_blobs`. Default off (eager).
+/// Resolve later with `hk_doc_resolve_blobs`. Default off (eager).
 #[no_mangle]
-pub extern "C" fn fl_query_defer_blobs(query: *mut FL_Query, defer: c_int) -> i32 {
+pub extern "C" fn hk_query_defer_blobs(query: *mut HK_Query, defer: c_int) -> i32 {
     if query.is_null() {
         return -1;
     }
@@ -1506,10 +1506,10 @@ pub extern "C" fn fl_query_defer_blobs(query: *mut FL_Query, defer: c_int) -> i3
 /// No-op for docs without BlobLinks. Needs the owning collection (blob
 /// addresses are per-shard).
 #[no_mangle]
-pub extern "C" fn fl_doc_resolve_blobs(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_doc_resolve_blobs(
+    engine: *mut HK_Engine,
     collection: *const c_char,
-    doc: *mut FL_Doc,
+    doc: *mut HK_Doc,
 ) -> i32 {
     safety_shield!(-1, {
         if engine.is_null() || doc.is_null() {
@@ -1529,7 +1529,7 @@ pub extern "C" fn fl_doc_resolve_blobs(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_offset(query: *mut FL_Query, offset: usize) -> i32 {
+pub extern "C" fn hk_query_offset(query: *mut HK_Query, offset: usize) -> i32 {
     // <--- NEW FFI
     if query.is_null() {
         return -1;
@@ -1540,7 +1540,7 @@ pub extern "C" fn fl_query_offset(query: *mut FL_Query, offset: usize) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_select_field(query: *mut FL_Query, field: *const c_char) -> i32 {
+pub extern "C" fn hk_query_select_field(query: *mut HK_Query, field: *const c_char) -> i32 {
     // if query.is_null() {
     //     return set_last_error("null query handle");
     // }
@@ -1563,7 +1563,7 @@ pub extern "C" fn fl_query_select_field(query: *mut FL_Query, field: *const c_ch
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_execute(engine: *mut FL_Engine, query: *const FL_Query) -> *mut c_char {
+pub extern "C" fn hk_query_execute(engine: *mut HK_Engine, query: *const HK_Query) -> *mut c_char {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() || query.is_null() {
             set_last_error("null engine/query handle");
@@ -1624,10 +1624,10 @@ pub extern "C" fn fl_query_execute(engine: *mut FL_Engine, query: *const FL_Quer
 }
 
 // #[no_mangle]
-// pub extern "C" fn fl_query_execute_to_handles(
-//     engine: *mut FL_Engine,
-//     query: *const FL_Query,
-// ) -> *mut FL_ResultSet {
+// pub extern "C" fn hk_query_execute_to_handles(
+//     engine: *mut HK_Engine,
+//     query: *const HK_Query,
+// ) -> *mut HK_ResultSet {
 //     safety_shield!(std::ptr::null_mut(), {
 //         let engine = unsafe { &*engine };
 //         let query_obj = unsafe { &*query };
@@ -1635,64 +1635,64 @@ pub extern "C" fn fl_query_execute(engine: *mut FL_Engine, query: *const FL_Quer
 //         // 1. Run the actual query (Fast logic)
 //         let results = engine.db.query(query_obj.query.clone()).unwrap_or_default();
 
-//         // 2. Convert each result into a handle (*mut FL_Doc), just like 'get' does
-//         let doc_handles: Vec<*mut FL_Doc> = results
+//         // 2. Convert each result into a handle (*mut HK_Doc), just like 'get' does
+//         let doc_handles: Vec<*mut HK_Doc> = results
 //             .into_iter()
-//             .map(|(_id, doc)| Box::into_raw(Box::new(FL_Doc { doc })))
+//             .map(|(_id, doc)| Box::into_raw(Box::new(HK_Doc { doc })))
 //             .collect();
 
 //         // 3. Wrap the list of handles in a ResultSet handle
-//         Box::into_raw(Box::new(FL_ResultSet { docs: doc_handles }))
+//         Box::into_raw(Box::new(HK_ResultSet { docs: doc_handles }))
 //     })
 // }
 
 #[no_mangle]
-pub extern "C" fn fl_query_execute_to_handles(
-    engine: *mut FL_Engine,
-    query: *const FL_Query,
-) -> *mut FL_ResultSet {
+pub extern "C" fn hk_query_execute_to_handles(
+    engine: *mut HK_Engine,
+    query: *const HK_Query,
+) -> *mut HK_ResultSet {
     safety_shield!(std::ptr::null_mut(), {
         let engine = unsafe { &*engine };
         let query_obj = unsafe { &*query };
         let results = engine.db.query(query_obj.query.clone()).unwrap_or_default();
 
-        // PONYTAIL: store FL_Doc values directly in the ResultSet slab
-        // (one allocation) instead of N individual Box::new(FL_Doc) per
-        // result. fl_result_set_get_doc returns a borrowed pointer into
-        // the slab; fl_result_set_free drops the whole Vec in one shot.
+        // PONYTAIL: store HK_Doc values directly in the ResultSet slab
+        // (one allocation) instead of N individual Box::new(HK_Doc) per
+        // result. hk_result_set_get_doc returns a borrowed pointer into
+        // the slab; hk_result_set_free drops the whole Vec in one shot.
         // The C++ side already treats returned handles as borrowed (it
-        // calls fl_doc_to_json or reads fields, never frees them itself),
-        // so this is safe as long as fl_result_set_free is called before
+        // calls hk_doc_to_json or reads fields, never frees them itself),
+        // so this is safe as long as hk_result_set_free is called before
         // the handles go out of scope.
-        let docs: Vec<FL_Doc> = results
+        let docs: Vec<HK_Doc> = results
             .into_iter()
-            .map(|(id, doc)| FL_Doc { id, doc })
+            .map(|(id, doc)| HK_Doc { id, doc })
             .collect();
-        Box::into_raw(Box::new(FL_ResultSet { docs }))
+        Box::into_raw(Box::new(HK_ResultSet { docs }))
     })
 }
 
 #[no_mangle]
-pub extern "C" fn fl_result_set_count(results: *mut FL_ResultSet) -> usize {
+pub extern "C" fn hk_result_set_count(results: *mut HK_ResultSet) -> usize {
     if results.is_null() { return 0; }
     unsafe {
-        // results.as_ref() returns Option<&FL_ResultSet>
+        // results.as_ref() returns Option<&HK_ResultSet>
         results.as_ref().map(|rs| rs.docs.len()).unwrap_or(0)
     }
 }
 
 #[no_mangle]
-pub extern "C" fn fl_result_set_get_doc(results: *mut FL_ResultSet, index: usize) -> *mut FL_Doc {
+pub extern "C" fn hk_result_set_get_doc(results: *mut HK_ResultSet, index: usize) -> *mut HK_Doc {
     if results.is_null() { return std::ptr::null_mut(); }
     unsafe {
-        // Borrowed pointer into the FL_ResultSet's docs slab. The caller
-        // MUST not free this handle and MUST call fl_result_set_free
+        // Borrowed pointer into the HK_ResultSet's docs slab. The caller
+        // MUST not free this handle and MUST call hk_result_set_free
         // before the handle goes out of scope. C++ code already follows
         // this contract (it reads fields or passes the handle to
-        // fl_doc_to_json without calling fl_doc_free).
+        // hk_doc_to_json without calling hk_doc_free).
         if let Some(rs) = results.as_ref() {
             rs.docs.get(index)
-                .map(|d| d as *const FL_Doc as *mut FL_Doc)
+                .map(|d| d as *const HK_Doc as *mut HK_Doc)
                 .unwrap_or(std::ptr::null_mut())
         } else {
             std::ptr::null_mut()
@@ -1701,28 +1701,28 @@ pub extern "C" fn fl_result_set_get_doc(results: *mut FL_ResultSet, index: usize
 }
 
 #[no_mangle]
-pub extern "C" fn fl_result_set_free(results: *mut FL_ResultSet) {
+pub extern "C" fn hk_result_set_free(results: *mut HK_ResultSet) {
     if !results.is_null() {
-        // PONYTAIL: docs is now Vec<FL_Doc> (owned values), not Vec<*mut
-        // FL_Doc>. Dropping the Box<Vec<FL_Doc>> drops every FL_Doc in
+        // PONYTAIL: docs is now Vec<HK_Doc> (owned values), not Vec<*mut
+        // HK_Doc>. Dropping the Box<Vec<HK_Doc>> drops every HK_Doc in
         // one shot — no per-doc Box::from_raw walk needed.
         unsafe { drop(Box::from_raw(results)); }
     }
 }
 
 // --- Raw result sets (ponytail) ---
-// Same slab shape as FL_ResultSet, but rows are pinned storage bytes
-// instead of decoded docs. The C++ side reuses the same FL_Query builders
-// (order/limit/start_after via fl_query_start_after_raw) — query_raw
+// Same slab shape as HK_ResultSet, but rows are pinned storage bytes
+// instead of decoded docs. The C++ side reuses the same HK_Query builders
+// (order/limit/start_after via hk_query_start_after_raw) — query_raw
 // forces raw=true internally, so zero new query-builder surface.
-// Page like the decoded path: execute -> read rows via fl_rawdoc_bytes
+// Page like the decoded path: execute -> read rows via hk_rawdoc_bytes
 // (borrowed, no copy) -> bound the next page with the last row ->
-// free the set -> repeat. Decode any row later with fl_rawdoc_to_doc.
+// free the set -> repeat. Decode any row later with hk_rawdoc_to_doc.
 #[no_mangle]
-pub extern "C" fn fl_query_execute_raw(
-    engine: *mut FL_Engine,
-    query: *const FL_Query,
-) -> *mut FL_RawResultSet {
+pub extern "C" fn hk_query_execute_raw(
+    engine: *mut HK_Engine,
+    query: *const HK_Query,
+) -> *mut HK_RawResultSet {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() || query.is_null() {
             set_last_error("null engine/query handle");
@@ -1731,16 +1731,16 @@ pub extern "C" fn fl_query_execute_raw(
         let engine = unsafe { &*engine };
         let query_obj = unsafe { &*query };
         let results = engine.db.query_raw(query_obj.query.clone()).unwrap_or_default();
-        let docs: Vec<FL_RawDoc> = results
+        let docs: Vec<HK_RawDoc> = results
             .into_iter()
-            .map(|(id, bytes)| FL_RawDoc { id, bytes })
+            .map(|(id, bytes)| HK_RawDoc { id, bytes })
             .collect();
-        Box::into_raw(Box::new(FL_RawResultSet { docs }))
+        Box::into_raw(Box::new(HK_RawResultSet { docs }))
     })
 }
 
 #[no_mangle]
-pub extern "C" fn fl_rawresult_count(results: *mut FL_RawResultSet) -> usize {
+pub extern "C" fn hk_rawresult_count(results: *mut HK_RawResultSet) -> usize {
     if results.is_null() { return 0; }
     unsafe {
         results.as_ref().map(|rs| rs.docs.len()).unwrap_or(0)
@@ -1748,14 +1748,14 @@ pub extern "C" fn fl_rawresult_count(results: *mut FL_RawResultSet) -> usize {
 }
 
 #[no_mangle]
-pub extern "C" fn fl_rawresult_get(results: *mut FL_RawResultSet, index: usize) -> *mut FL_RawDoc {
+pub extern "C" fn hk_rawresult_get(results: *mut HK_RawResultSet, index: usize) -> *mut HK_RawDoc {
     if results.is_null() { return std::ptr::null_mut(); }
     unsafe {
         // Borrowed pointer into the slab — same contract as
-        // fl_result_set_get_doc: do not free, free the set first.
+        // hk_result_set_get_doc: do not free, free the set first.
         if let Some(rs) = results.as_ref() {
             rs.docs.get(index)
-                .map(|d| d as *const FL_RawDoc as *mut FL_RawDoc)
+                .map(|d| d as *const HK_RawDoc as *mut HK_RawDoc)
                 .unwrap_or(std::ptr::null_mut())
         } else {
             std::ptr::null_mut()
@@ -1764,17 +1764,17 @@ pub extern "C" fn fl_rawresult_get(results: *mut FL_RawResultSet, index: usize) 
 }
 
 #[no_mangle]
-pub extern "C" fn fl_rawresult_free(results: *mut FL_RawResultSet) {
+pub extern "C" fn hk_rawresult_free(results: *mut HK_RawResultSet) {
     if !results.is_null() {
         unsafe { drop(Box::from_raw(results)); }
     }
 }
 
 /// Borrowed byte view of a raw doc. Returns null on null handle; `*len_out`
-/// (when non-null) receives the length. Valid until fl_rawresult_free —
+/// (when non-null) receives the length. Valid until hk_rawresult_free —
 /// zero copies for inlined docs.
 #[no_mangle]
-pub extern "C" fn fl_rawdoc_bytes(doc: *const FL_RawDoc, len_out: *mut usize) -> *const u8 {
+pub extern "C" fn hk_rawdoc_bytes(doc: *const HK_RawDoc, len_out: *mut usize) -> *const u8 {
     if doc.is_null() { return std::ptr::null(); }
     unsafe {
         if let Some(d) = doc.as_ref() {
@@ -1791,9 +1791,9 @@ pub extern "C" fn fl_rawdoc_bytes(doc: *const FL_RawDoc, len_out: *mut usize) ->
 /// Borrowed id view of a raw doc (for keyset paging without decoding).
 /// Rust Strings are NOT NUL-terminated, so the length goes through
 /// `*len_out` (when non-null) — read `(ptr, len)`, do NOT treat as CStr.
-/// Valid until fl_rawresult_free.
+/// Valid until hk_rawresult_free.
 #[no_mangle]
-pub extern "C" fn fl_rawdoc_id(doc: *const FL_RawDoc, len_out: *mut usize) -> *const c_char {
+pub extern "C" fn hk_rawdoc_id(doc: *const HK_RawDoc, len_out: *mut usize) -> *const c_char {
     if doc.is_null() { return std::ptr::null(); }
     unsafe {
         if let Some(d) = doc.as_ref() {
@@ -1810,7 +1810,7 @@ pub extern "C" fn fl_rawdoc_id(doc: *const FL_RawDoc, len_out: *mut usize) -> *c
 /// Keyset anchor from a raw row. `id`-ordered queries bind the id with no
 /// decode; other order fields decode the row ONCE per page (not per row).
 #[no_mangle]
-pub extern "C" fn fl_query_start_after_raw(query: *mut FL_Query, anchor_doc: *const FL_RawDoc) -> i32 {
+pub extern "C" fn hk_query_start_after_raw(query: *mut HK_Query, anchor_doc: *const HK_RawDoc) -> i32 {
     safety_shield!(-1, {
         if query.is_null() || anchor_doc.is_null() { return -1; }
         let q = unsafe { &mut *query };
@@ -1819,14 +1819,14 @@ pub extern "C" fn fl_query_start_after_raw(query: *mut FL_Query, anchor_doc: *co
             return set_last_error("raw anchor needs order_by");
         }
         let mut vals = Vec::with_capacity(q.query.order_by.len());
-        let mut decoded: Option<FireLiteDoc> = None;
+        let mut decoded: Option<HakoDoc> = None;
         for order in &q.query.order_by {
             if order.field == "id" {
                 vals.push(Value::String(raw.id.clone()));
                 continue;
             }
             if decoded.is_none() {
-                decoded = match FireLiteDoc::decode(&raw.bytes) {
+                decoded = match HakoDoc::decode(&raw.bytes) {
                     Some(d) => Some(d),
                     None => return set_last_error("raw anchor bytes do not decode"),
                 };
@@ -1846,14 +1846,14 @@ pub extern "C" fn fl_query_start_after_raw(query: *mut FL_Query, anchor_doc: *co
     })
 }
 
-/// The pointer resolver: decode a raw row into an owned FL_Doc (blob
+/// The pointer resolver: decode a raw row into an owned HK_Doc (blob
 /// fields inflated via the engine, same as a decoded query row).
 #[no_mangle]
-pub extern "C" fn fl_rawdoc_to_doc(
-    engine: *mut FL_Engine,
-    raw_doc: *const FL_RawDoc,
+pub extern "C" fn hk_rawdoc_to_doc(
+    engine: *mut HK_Engine,
+    raw_doc: *const HK_RawDoc,
     collection: *const c_char,
-) -> *mut FL_Doc {
+) -> *mut HK_Doc {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() || raw_doc.is_null() || collection.is_null() {
             set_last_error("null engine/raw_doc/collection handle");
@@ -1869,7 +1869,7 @@ pub extern "C" fn fl_rawdoc_to_doc(
         };
         let engine = unsafe { &*engine };
         let raw = unsafe { &*raw_doc };
-        let mut doc = match FireLiteDoc::decode(&raw.bytes) {
+        let mut doc = match HakoDoc::decode(&raw.bytes) {
             Some(d) => d,
             None => {
                 set_last_error("raw bytes do not decode");
@@ -1880,7 +1880,7 @@ pub extern "C" fn fl_rawdoc_to_doc(
             set_last_error(e.to_string());
             return std::ptr::null_mut();
         }
-        Box::into_raw(Box::new(FL_Doc { id: raw.id.clone(), doc }))
+        Box::into_raw(Box::new(HK_Doc { id: raw.id.clone(), doc }))
     })
 }
 
@@ -1888,15 +1888,15 @@ pub extern "C" fn fl_rawdoc_to_doc(
 // Zero-alloc scan: one FFI call per walk (not per row, not per page). The
 // engine lends each row — id and bytes borrowed, no String/Arc/Vec per
 // row — and the callback returns true to continue, false to stop early.
-// Returns rows visited, or -1 on error (see fl_last_error).
+// Returns rows visited, or -1 on error (see hk_last_error).
 //
 // CONTRACT (mirrors db.walk): borrowed pointers die with the call; the
 // callback MUST NOT re-enter the engine (read lock held for the walk);
 // C cannot unwind, so no per-row shield is needed — the outer shield
-// covers setup only. Decode any row via fl_rawdoc_to_doc semantics on
+// covers setup only. Decode any row via hk_rawdoc_to_doc semantics on
 // your own copy (copy the bytes first if you must keep them).
 #[allow(non_camel_case_types)]
-pub type FlWalkCallback = Option<
+pub type HkWalkCallback = Option<
     unsafe extern "C" fn(
         id: *const c_char,
         id_len: usize,
@@ -1907,10 +1907,10 @@ pub type FlWalkCallback = Option<
 >;
 
 #[no_mangle]
-pub extern "C" fn fl_cursor_walk(
-    engine: *mut FL_Engine,
-    query: *const FL_Query,
-    callback: FlWalkCallback,
+pub extern "C" fn hk_cursor_walk(
+    engine: *mut HK_Engine,
+    query: *const HK_Query,
+    callback: HkWalkCallback,
     userdata: *mut std::ffi::c_void,
 ) -> i64 {
     safety_shield!(-1, {
@@ -1949,22 +1949,22 @@ pub extern "C" fn fl_cursor_walk(
 }
 
 // --- Borrowed views (ponytail, v0.8.11+) ---
-// The sqlite3_column_* analog: an owned FL_ViewDoc handle pins storage
+// The sqlite3_column_* analog: an owned HK_ViewDoc handle pins storage
 // bytes; typed getters pull single fields with zero owned construction.
 // Strict matches only (no cross-type coercion — convert caller-side).
 // Views never inflate blobs: BlobLink fields read back as missing here;
-// resolve via fl_view_to_doc + fl_doc_resolve_blobs when you need them.
+// resolve via hk_view_to_doc + hk_doc_resolve_blobs when you need them.
 #[allow(non_camel_case_types)]
-pub struct FL_ViewDoc {
-    view: crate::document::firelite_doc::DocView,
+pub struct HK_ViewDoc {
+    view: crate::document::hako_doc::DocView,
 }
 
 #[no_mangle]
-pub extern "C" fn fl_view_get(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_view_get(
+    engine: *mut HK_Engine,
     collection: *const c_char,
     doc_id: *const c_char,
-) -> *mut FL_ViewDoc {
+) -> *mut HK_ViewDoc {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() || collection.is_null() || doc_id.is_null() {
             set_last_error("null engine/collection/doc_id handle");
@@ -1981,7 +1981,7 @@ pub extern "C" fn fl_view_get(
         };
         let engine = unsafe { &*engine };
         match engine.db.get_view(collection, doc_id) {
-            Ok(Some(view)) => Box::into_raw(Box::new(FL_ViewDoc { view })),
+            Ok(Some(view)) => Box::into_raw(Box::new(HK_ViewDoc { view })),
             Ok(None) => std::ptr::null_mut(),
             Err(e) => {
                 set_last_error(e.to_string());
@@ -1992,14 +1992,14 @@ pub extern "C" fn fl_view_get(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_view_free(view: *mut FL_ViewDoc) {
+pub extern "C" fn hk_view_free(view: *mut HK_ViewDoc) {
     if !view.is_null() {
         unsafe { drop(Box::from_raw(view)); }
     }
 }
 
 #[no_mangle]
-pub extern "C" fn fl_view_field_count(view: *const FL_ViewDoc) -> usize {
+pub extern "C" fn hk_view_field_count(view: *const HK_ViewDoc) -> usize {
     if view.is_null() {
         return 0;
     }
@@ -2007,7 +2007,7 @@ pub extern "C" fn fl_view_field_count(view: *const FL_ViewDoc) -> usize {
 }
 
 #[no_mangle]
-pub extern "C" fn fl_view_has_field(view: *const FL_ViewDoc, key: *const c_char) -> bool {
+pub extern "C" fn hk_view_has_field(view: *const HK_ViewDoc, key: *const c_char) -> bool {
     if view.is_null() || key.is_null() {
         return false;
     }
@@ -2020,7 +2020,7 @@ pub extern "C" fn fl_view_has_field(view: *const FL_ViewDoc, key: *const c_char)
 }
 
 #[no_mangle]
-pub extern "C" fn fl_view_get_int(view: *const FL_ViewDoc, key: *const c_char, out: *mut i64) -> bool {
+pub extern "C" fn hk_view_get_int(view: *const HK_ViewDoc, key: *const c_char, out: *mut i64) -> bool {
     if view.is_null() || key.is_null() || out.is_null() {
         return false;
     }
@@ -2039,7 +2039,7 @@ pub extern "C" fn fl_view_get_int(view: *const FL_ViewDoc, key: *const c_char, o
 }
 
 #[no_mangle]
-pub extern "C" fn fl_view_get_float(view: *const FL_ViewDoc, key: *const c_char, out: *mut f64) -> bool {
+pub extern "C" fn hk_view_get_float(view: *const HK_ViewDoc, key: *const c_char, out: *mut f64) -> bool {
     if view.is_null() || key.is_null() || out.is_null() {
         return false;
     }
@@ -2058,7 +2058,7 @@ pub extern "C" fn fl_view_get_float(view: *const FL_ViewDoc, key: *const c_char,
 }
 
 #[no_mangle]
-pub extern "C" fn fl_view_get_bool(view: *const FL_ViewDoc, key: *const c_char) -> i32 {
+pub extern "C" fn hk_view_get_bool(view: *const HK_ViewDoc, key: *const c_char) -> i32 {
     if view.is_null() || key.is_null() {
         return -1;
     }
@@ -2081,10 +2081,10 @@ pub extern "C" fn fl_view_get_bool(view: *const FL_ViewDoc, key: *const c_char) 
 
 /// Borrowed UTF-8 view of a String field. Returns null when missing or not
 /// a String; `*len_out` (when non-null) receives the byte length. Valid
-/// until fl_view_free — same borrowed contract as fl_rawdoc_bytes.
+/// until hk_view_free — same borrowed contract as hk_rawdoc_bytes.
 #[no_mangle]
-pub extern "C" fn fl_view_get_str(
-    view: *const FL_ViewDoc,
+pub extern "C" fn hk_view_get_str(
+    view: *const HK_ViewDoc,
     key: *const c_char,
     len_out: *mut usize,
 ) -> *const c_char {
@@ -2109,8 +2109,8 @@ pub extern "C" fn fl_view_get_str(
 
 /// Borrowed view of a Binary field. Same lifetime contract as above.
 #[no_mangle]
-pub extern "C" fn fl_view_get_bytes(
-    view: *const FL_ViewDoc,
+pub extern "C" fn hk_view_get_bytes(
+    view: *const HK_ViewDoc,
     key: *const c_char,
     len_out: *mut usize,
 ) -> *const u8 {
@@ -2134,9 +2134,9 @@ pub extern "C" fn fl_view_get_bytes(
 }
 
 /// Escape hatch: full owned decode of the pinned bytes (links unresolved —
-/// follow with fl_doc_resolve_blobs when needed).
+/// follow with hk_doc_resolve_blobs when needed).
 #[no_mangle]
-pub extern "C" fn fl_view_to_doc(view: *const FL_ViewDoc, doc_id: *const c_char) -> *mut FL_Doc {
+pub extern "C" fn hk_view_to_doc(view: *const HK_ViewDoc, doc_id: *const c_char) -> *mut HK_Doc {
     safety_shield!(std::ptr::null_mut(), {
         if view.is_null() || doc_id.is_null() {
             set_last_error("null view/doc_id handle");
@@ -2152,7 +2152,7 @@ pub extern "C" fn fl_view_to_doc(view: *const FL_ViewDoc, doc_id: *const c_char)
         };
         let view = unsafe { &*view };
         match view.view.to_owned_doc() {
-            Some(doc) => Box::into_raw(Box::new(FL_Doc { id, doc })),
+            Some(doc) => Box::into_raw(Box::new(HK_Doc { id, doc })),
             None => {
                 set_last_error("view bytes do not decode");
                 std::ptr::null_mut()
@@ -2164,23 +2164,23 @@ pub extern "C" fn fl_view_to_doc(view: *const FL_ViewDoc, doc_id: *const c_char)
 /// View-walk callback: borrowed id + a borrowed view handle (valid for the
 /// call only — do not free, do not retain). Return true to continue.
 #[allow(non_camel_case_types)]
-pub type FlViewWalkCallback = Option<
+pub type HkViewWalkCallback = Option<
     unsafe extern "C" fn(
         id: *const c_char,
         id_len: usize,
-        view: *const FL_ViewDoc,
+        view: *const HK_ViewDoc,
         userdata: *mut std::ffi::c_void,
     ) -> bool,
 >;
 
 /// One-call lazy scan: lends each row as a view (no decode, no owned
 /// construction). Returns rows visited, -1 on error. Same no-reentry
-/// contract as fl_cursor_walk.
+/// contract as hk_cursor_walk.
 #[no_mangle]
-pub extern "C" fn fl_cursor_walk_view(
-    engine: *mut FL_Engine,
-    query: *const FL_Query,
-    callback: FlViewWalkCallback,
+pub extern "C" fn hk_cursor_walk_view(
+    engine: *mut HK_Engine,
+    query: *const HK_Query,
+    callback: HkViewWalkCallback,
     userdata: *mut std::ffi::c_void,
 ) -> i64 {
     safety_shield!(-1, {
@@ -2202,11 +2202,11 @@ pub extern "C" fn fl_cursor_walk_view(
         // The slot dies when the callback returns, so there is nothing to
         // retain or free, by construction.
         let res = engine.db.walk_view(query_obj.query.clone(), &mut |id: &str, view: &_| unsafe {
-            let slot = FL_ViewDoc { view: view.clone() };
+            let slot = HK_ViewDoc { view: view.clone() };
             cb(
                 id.as_ptr() as *const c_char,
                 id.len(),
-                &slot as *const FL_ViewDoc,
+                &slot as *const HK_ViewDoc,
                 userdata,
             )
         });
@@ -2223,15 +2223,15 @@ pub extern "C" fn fl_cursor_walk_view(
 // --- Bulk JSON (ponytail) ---
 // Streams a result set as one JSON array string with NO intermediate
 // serde_json::Value DOM (the per-doc path builds a full Map DOM per row).
-// Output is byte-identical to "[" + fl_doc_to_json(row) joined + "]" —
+// Output is byte-identical to "[" + hk_doc_to_json(row) joined + "]" —
 // locked by `bulk_json_matches_per_doc` below. Notes:
 // - serde_json::Map is a BTreeMap (no preserve_order): keys are SORTED, so
 //   fields are collected and sorted (one small Vec per doc, still ~15x
 //   fewer allocs than the DOM path), including nested Maps.
 // - The inner __blob__ meta sorts as {"len","offset"} — emitted in that
 //   order explicitly.
-// - No `id` field: mirrors fl_doc_to_json exactly (correlate by index,
-//   same as fl_result_set_get_doc today).
+// - No `id` field: mirrors hk_doc_to_json exactly (correlate by index,
+//   same as hk_result_set_get_doc today).
 use serde::ser::{Serialize, Serializer, SerializeMap, SerializeSeq};
 
 struct StreamValue<'a>(&'a Value);
@@ -2293,10 +2293,10 @@ struct BlobMeta {
     offset: u64,
 }
 
-struct SlabJson<'a>(&'a [FL_Doc]);
+struct SlabJson<'a>(&'a [HK_Doc]);
 
 /// One document's fields as a sorted map (mirrors `doc_to_json` shape).
-struct DocFields<'a>(&'a FireLiteDoc);
+struct DocFields<'a>(&'a HakoDoc);
 impl<'a> Serialize for DocFields<'a> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let mut pairs: Vec<(&str, &Value)> = self
@@ -2326,9 +2326,9 @@ impl<'a> Serialize for SlabJson<'a> {
 
 /// Bulk result-set to JSON: one call, one JSON array string, no per-doc
 /// DOM and no per-doc FFI round trips. Byte-identical to joining
-/// `fl_doc_to_json` per row. Caller frees with `fl_string_free`.
+/// `hk_doc_to_json` per row. Caller frees with `hk_string_free`.
 #[no_mangle]
-pub extern "C" fn fl_result_set_to_json(results: *mut FL_ResultSet) -> *mut c_char {
+pub extern "C" fn hk_result_set_to_json(results: *mut HK_ResultSet) -> *mut c_char {
     safety_shield!(ptr::null_mut(), {
         if results.is_null() {
             set_last_error("null result set handle");
@@ -2355,7 +2355,7 @@ pub extern "C" fn fl_result_set_to_json(results: *mut FL_ResultSet) -> *mut c_ch
 }
 
 #[no_mangle]
-pub extern "C" fn fl_doc_to_json(doc: *const FL_Doc) -> *mut c_char {
+pub extern "C" fn hk_doc_to_json(doc: *const HK_Doc) -> *mut c_char {
     if doc.is_null() {
         set_last_error("null doc handle");
         return ptr::null_mut();
@@ -2375,7 +2375,7 @@ pub extern "C" fn fl_doc_to_json(doc: *const FL_Doc) -> *mut c_char {
 }
 
 #[no_mangle]
-pub extern "C" fn fl_last_error() -> *const c_char {
+pub extern "C" fn hk_last_error() -> *const c_char {
     LAST_ERROR.with(|slot| {
         slot.borrow()
             .as_ref()
@@ -2386,18 +2386,18 @@ pub extern "C" fn fl_last_error() -> *const c_char {
 
 /// Enable library diagnostic logging to stderr. Default OFF. Idempotent.
 #[no_mangle]
-pub extern "C" fn fl_log_enable_stderr() {
+pub extern "C" fn hk_log_enable_stderr() {
     crate::util::log::enable_stderr();
 }
 
 /// Disable library diagnostic logging to stderr. Default OFF. Idempotent.
 #[no_mangle]
-pub extern "C" fn fl_log_disable_stderr() {
+pub extern "C" fn hk_log_disable_stderr() {
     crate::util::log::disable_stderr();
 }
 
 #[no_mangle]
-pub extern "C" fn fl_string_free(value: *mut c_char) {
+pub extern "C" fn hk_string_free(value: *mut c_char) {
     if !value.is_null() {
         unsafe {
             let _ = CString::from_raw(value);
@@ -2406,7 +2406,7 @@ pub extern "C" fn fl_string_free(value: *mut c_char) {
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_aggregate_count(query: *mut FL_Query) -> i32 {
+pub extern "C" fn hk_query_aggregate_count(query: *mut HK_Query) -> i32 {
     if query.is_null() {
         return set_last_error("null query handle");
     }
@@ -2417,7 +2417,7 @@ pub extern "C" fn fl_query_aggregate_count(query: *mut FL_Query) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_aggregate_sum(query: *mut FL_Query, field: *const c_char) -> i32 {
+pub extern "C" fn hk_query_aggregate_sum(query: *mut HK_Query, field: *const c_char) -> i32 {
     if query.is_null() {
         return set_last_error("null query handle");
     }
@@ -2432,7 +2432,7 @@ pub extern "C" fn fl_query_aggregate_sum(query: *mut FL_Query, field: *const c_c
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_aggregate_avg(query: *mut FL_Query, field: *const c_char) -> i32 {
+pub extern "C" fn hk_query_aggregate_avg(query: *mut HK_Query, field: *const c_char) -> i32 {
     if query.is_null() {
         return set_last_error("null query handle");
     }
@@ -2447,9 +2447,9 @@ pub extern "C" fn fl_query_aggregate_avg(query: *mut FL_Query, field: *const c_c
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_execute_aggregation(
-    engine: *mut FL_Engine,
-    query: *const FL_Query,
+pub extern "C" fn hk_query_execute_aggregation(
+    engine: *mut HK_Engine,
+    query: *const HK_Query,
 ) -> *mut c_char {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() || query.is_null() {
@@ -2460,7 +2460,7 @@ pub extern "C" fn fl_query_execute_aggregation(
         let engine = unsafe { &*engine };
         let query_wrapper = unsafe { &*query };
 
-        // Call the public method on FireLite.
+        // Call the public method on Hako.
         // This performs planning and parallel execution inside the Rust core.
         match engine.db.execute_aggregation(query_wrapper.query.clone()) {
             Ok(result) => {
@@ -2492,8 +2492,8 @@ pub extern "C" fn fl_query_execute_aggregation(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_doc_insert_timestamp(
-    doc: *mut FL_Doc,
+pub extern "C" fn hk_doc_insert_timestamp(
+    doc: *mut HK_Doc,
     key: *const c_char,
     micros: i64,
 ) -> i32 {
@@ -2510,7 +2510,7 @@ pub extern "C" fn fl_doc_insert_timestamp(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_doc_insert_server_timestamp(doc: *mut FL_Doc, key: *const c_char) -> i32 {
+pub extern "C" fn hk_doc_insert_server_timestamp(doc: *mut HK_Doc, key: *const c_char) -> i32 {
     if doc.is_null() {
         return set_last_error("null doc");
     }
@@ -2524,7 +2524,7 @@ pub extern "C" fn fl_doc_insert_server_timestamp(doc: *mut FL_Doc, key: *const c
 }
 
 #[no_mangle]
-pub extern "C" fn fl_engine_backup(engine: *mut FL_Engine, path: *const c_char) -> i32 {
+pub extern "C" fn hk_engine_backup(engine: *mut HK_Engine, path: *const c_char) -> i32 {
     safety_shield!(-1, {
         if engine.is_null() {
             return set_last_error("null engine");
@@ -2545,8 +2545,8 @@ pub extern "C" fn fl_engine_backup(engine: *mut FL_Engine, path: *const c_char) 
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_match(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_match(
+    query: *mut HK_Query,
     field: *const c_char,
     value: *const c_char,
 ) -> i32 {
@@ -2568,8 +2568,8 @@ pub extern "C" fn fl_query_where_match(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_match_prefix(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_match_prefix(
+    query: *mut HK_Query,
     field: *const c_char,
     value: *const c_char,
 ) -> i32 {
@@ -2577,8 +2577,8 @@ pub extern "C" fn fl_query_where_match_prefix(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_contains(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_contains(
+    query: *mut HK_Query,
     field: *const c_char,
     value: *const c_char,
 ) -> i32 {
@@ -2600,8 +2600,8 @@ pub extern "C" fn fl_query_where_contains(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_starts_with(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_starts_with(
+    query: *mut HK_Query,
     field: *const c_char,
     value: *const c_char,
 ) -> i32 {
@@ -2623,7 +2623,7 @@ pub extern "C" fn fl_query_where_starts_with(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_engine_list_collections(engine: *mut FL_Engine) -> *mut c_char {
+pub extern "C" fn hk_engine_list_collections(engine: *mut HK_Engine) -> *mut c_char {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() {
             set_last_error("null engine handle");
@@ -2652,12 +2652,12 @@ pub extern "C" fn fl_engine_list_collections(engine: *mut FL_Engine) -> *mut c_c
 }
 
 #[no_mangle]
-pub extern "C" fn fl_array_new() -> *mut FL_Array {
-    Box::into_raw(Box::new(FL_Array { items: Vec::new() }))
+pub extern "C" fn hk_array_new() -> *mut HK_Array {
+    Box::into_raw(Box::new(HK_Array { items: Vec::new() }))
 }
 
 #[no_mangle]
-pub extern "C" fn fl_array_free(array: *mut FL_Array) {
+pub extern "C" fn hk_array_free(array: *mut HK_Array) {
     if !array.is_null() {
         unsafe { drop(Box::from_raw(array)) };
     }
@@ -2665,7 +2665,7 @@ pub extern "C" fn fl_array_free(array: *mut FL_Array) {
 
 // --- ARRAY PUSH METHODS ---
 #[no_mangle]
-pub extern "C" fn fl_array_append_str(array: *mut FL_Array, value: *const c_char) -> i32 {
+pub extern "C" fn hk_array_append_str(array: *mut HK_Array, value: *const c_char) -> i32 {
     let s = match cstr_to_string(value) {
         Ok(v) => v,
         Err(e) => return set_last_error(e),
@@ -2677,7 +2677,7 @@ pub extern "C" fn fl_array_append_str(array: *mut FL_Array, value: *const c_char
 }
 
 #[no_mangle]
-pub extern "C" fn fl_array_append_int(array: *mut FL_Array, value: i64) -> i32 {
+pub extern "C" fn hk_array_append_int(array: *mut HK_Array, value: i64) -> i32 {
     unsafe {
         (*array).items.push(Value::Int(value));
     }
@@ -2685,7 +2685,7 @@ pub extern "C" fn fl_array_append_int(array: *mut FL_Array, value: i64) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn fl_array_append_doc(array: *mut FL_Array, doc: *const FL_Doc) -> i32 {
+pub extern "C" fn hk_array_append_doc(array: *mut HK_Array, doc: *const HK_Doc) -> i32 {
     safety_shield!(-1, {
         if array.is_null() || doc.is_null() {
             return set_last_error("null array or doc handle");
@@ -2706,10 +2706,10 @@ pub extern "C" fn fl_array_append_doc(array: *mut FL_Array, doc: *const FL_Doc) 
 
 /// Takes the contents of 'child' and inserts it as a Map into 'parent'
 #[no_mangle]
-pub extern "C" fn fl_doc_insert_doc(
-    parent: *mut FL_Doc,
+pub extern "C" fn hk_doc_insert_doc(
+    parent: *mut HK_Doc,
     key: *const c_char,
-    child: *const FL_Doc,
+    child: *const HK_Doc,
 ) -> i32 {
     safety_shield!(-1, {
         let key = match cstr_to_string(key) {
@@ -2729,10 +2729,10 @@ pub extern "C" fn fl_doc_insert_doc(
 
 /// Takes the contents of 'array' and inserts it into the document
 #[no_mangle]
-pub extern "C" fn fl_doc_insert_array(
-    doc: *mut FL_Doc,
+pub extern "C" fn hk_doc_insert_array(
+    doc: *mut HK_Doc,
     key: *const c_char,
-    array: *mut FL_Array,
+    array: *mut HK_Array,
 ) -> i32 {
     safety_shield!(-1, {
         let key = match cstr_to_string(key) {
@@ -2740,7 +2740,7 @@ pub extern "C" fn fl_doc_insert_array(
             Err(e) => return set_last_error(e),
         };
         let doc = unsafe { &mut *doc };
-        let array_inner = unsafe { Box::from_raw(array) }; // Take ownership and free FL_Array
+        let array_inner = unsafe { Box::from_raw(array) }; // Take ownership and free HK_Array
 
         doc.doc.insert(key, Value::Array(array_inner.items));
         0
@@ -2748,11 +2748,11 @@ pub extern "C" fn fl_doc_insert_array(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_engine_patch(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_engine_patch(
+    engine: *mut HK_Engine,
     collection: *const c_char,
     doc_id: *const c_char,
-    updates: *const FL_Doc,
+    updates: *const HK_Doc,
 ) -> i32 {
     safety_shield!(-1, {
         if engine.is_null() || updates.is_null() {
@@ -2790,8 +2790,8 @@ pub extern "C" fn fl_engine_patch(
 /// Creates a composite index from C++.
 /// fields_json should be like: [{"field": "age", "desc": false}]
 #[no_mangle]
-pub extern "C" fn fl_engine_create_index(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_engine_create_index(
+    engine: *mut HK_Engine,
     collection: *const c_char,
     fields_json: *const c_char,
 ) -> u32 {
@@ -2835,8 +2835,8 @@ pub extern "C" fn fl_engine_create_index(
 
 /// Simplified indexer: Create an index for a single field.
 #[no_mangle]
-pub extern "C" fn fl_engine_create_simple_index(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_engine_create_simple_index(
+    engine: *mut HK_Engine,
     collection: *const c_char,
     field: *const c_char,
 ) -> i32 {
@@ -2860,8 +2860,8 @@ pub extern "C" fn fl_engine_create_simple_index(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_engine_create_fts_index(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_engine_create_fts_index(
+    engine: *mut HK_Engine,
     collection: *const c_char,
     field: *const c_char,
 ) -> i32 {
@@ -2885,8 +2885,8 @@ pub extern "C" fn fl_engine_create_fts_index(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_engine_list_indexes(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_engine_list_indexes(
+    engine: *mut HK_Engine,
     collection: *const c_char,
 ) -> *mut c_char {
     safety_shield!(ptr::null_mut(), {
@@ -2920,22 +2920,22 @@ pub extern "C" fn fl_engine_list_indexes(
 // --- 2. SERIALIZABLE TRANSACTIONS (Read-Modify-Write) ---
 
 #[no_mangle]
-pub extern "C" fn fl_transaction_begin(engine: *mut FL_Engine) -> *mut FL_Transaction {
+pub extern "C" fn hk_transaction_begin(engine: *mut HK_Engine) -> *mut HK_Transaction {
     safety_shield!(ptr::null_mut(), {
         let engine = unsafe { &*engine };
-        Box::into_raw(Box::new(FL_Transaction {
+        Box::into_raw(Box::new(HK_Transaction {
             tx: engine.db.begin_serializable_transaction(),
         }))
     })
 }
 
 #[no_mangle]
-pub extern "C" fn fl_transaction_get(
-    engine: *mut FL_Engine,
-    tx: *mut FL_Transaction,
+pub extern "C" fn hk_transaction_get(
+    engine: *mut HK_Engine,
+    tx: *mut HK_Transaction,
     collection: *const c_char,
     doc_id: *const c_char,
-) -> *mut FL_Doc {
+) -> *mut HK_Doc {
     let engine = unsafe { &*engine };
     let tx = unsafe { &mut *tx };
     let col = match cstr_to_string(collection) {
@@ -2948,17 +2948,17 @@ pub extern "C" fn fl_transaction_get(
     };
 
     match tx.tx.get(&engine.db, &col, &id) {
-        Ok(Some(doc)) => Box::into_raw(Box::new(FL_Doc { doc, id: id.clone() })),
+        Ok(Some(doc)) => Box::into_raw(Box::new(HK_Doc { doc, id: id.clone() })),
         _ => ptr::null_mut(),
     }
 }
 
 #[no_mangle]
-pub extern "C" fn fl_transaction_set(
-    tx: *mut FL_Transaction,
+pub extern "C" fn hk_transaction_set(
+    tx: *mut HK_Transaction,
     collection: *const c_char,
     doc_id: *const c_char,
-    doc: *const FL_Doc,
+    doc: *const HK_Doc,
 ) -> i32 {
     let tx = unsafe { &mut *tx };
     let col = match cstr_to_string(collection) {
@@ -2976,11 +2976,11 @@ pub extern "C" fn fl_transaction_set(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_transaction_commit(engine: *mut FL_Engine, tx: *mut FL_Transaction) -> i32 {
+pub extern "C" fn hk_transaction_commit(engine: *mut HK_Engine, tx: *mut HK_Transaction) -> i32 {
     safety_shield!(-1, {
         let engine = unsafe { &*engine };
         // Borrow only: the caller still owns the handle and must release it
-        // with fl_transaction_free (matching the fl_batch_commit contract).
+        // with hk_transaction_free (matching the hk_batch_commit contract).
         let tx = unsafe { &*tx };
 
         match tx.tx.commit(&engine.db) {
@@ -2994,7 +2994,7 @@ pub extern "C" fn fl_transaction_commit(engine: *mut FL_Engine, tx: *mut FL_Tran
 }
 
 #[no_mangle]
-pub extern "C" fn fl_transaction_free(tx: *mut FL_Transaction) {
+pub extern "C" fn hk_transaction_free(tx: *mut HK_Transaction) {
     if !tx.is_null() {
         unsafe { drop(Box::from_raw(tx)) };
     }
@@ -3003,13 +3003,13 @@ pub extern "C" fn fl_transaction_free(tx: *mut FL_Transaction) {
 // --- 3. SUBCOLLECTION HELPERS ---
 
 #[no_mangle]
-pub extern "C" fn fl_engine_insert_subdoc(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_engine_insert_subdoc(
+    engine: *mut HK_Engine,
     col: *const c_char,
     id: *const c_char,
     sub_col: *const c_char,
     sub_id: *const c_char,
-    doc: *const FL_Doc,
+    doc: *const HK_Doc,
 ) -> i32 {
     let engine = unsafe { &*engine };
     let c = match cstr_to_string(col) {
@@ -3042,7 +3042,7 @@ pub extern "C" fn fl_engine_insert_subdoc(
 // --- 4. DIAGNOSTICS & MAINTENANCE ---
 
 #[no_mangle]
-pub extern "C" fn fl_engine_compact(engine: *mut FL_Engine) -> i32 {
+pub extern "C" fn hk_engine_compact(engine: *mut HK_Engine) -> i32 {
     safety_shield!(-1, {
         let engine = unsafe { &*engine };
         match engine.db.compact() {
@@ -3056,7 +3056,7 @@ pub extern "C" fn fl_engine_compact(engine: *mut FL_Engine) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn fl_engine_get_stats(engine: *mut FL_Engine) -> *mut c_char {
+pub extern "C" fn hk_engine_get_stats(engine: *mut HK_Engine) -> *mut c_char {
     safety_shield!(std::ptr::null_mut(), {
         let engine = unsafe { &*engine };
         let stats = engine.db.get_stats();
@@ -3070,8 +3070,8 @@ pub extern "C" fn fl_engine_get_stats(engine: *mut FL_Engine) -> *mut c_char {
 }
 
 #[no_mangle]
-pub extern "C" fn fl_doc_insert_reference(
-    doc: *mut FL_Doc,
+pub extern "C" fn hk_doc_insert_reference(
+    doc: *mut HK_Doc,
     key: *const c_char,
     target_collection: *const c_char,
     target_id: *const c_char,
@@ -3104,13 +3104,13 @@ pub extern "C" fn fl_doc_insert_reference(
 }
 
 /// Given a document and a field name containing a Reference, fetch the target document.
-/// Returns a new FL_Doc handle, or null if the field is not a reference or target not found.
+/// Returns a new HK_Doc handle, or null if the field is not a reference or target not found.
 #[no_mangle]
-pub extern "C" fn fl_engine_get_by_ref(
-    engine: *mut FL_Engine,
-    doc: *const FL_Doc,
+pub extern "C" fn hk_engine_get_by_ref(
+    engine: *mut HK_Engine,
+    doc: *const HK_Doc,
     field_key: *const c_char,
-) -> *mut FL_Doc {
+) -> *mut HK_Doc {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() || doc.is_null() || field_key.is_null() {
             return ptr::null_mut();
@@ -3134,7 +3134,7 @@ pub extern "C" fn fl_engine_get_by_ref(
 
         // 2. Resolve the reference using the engine
         match engine.db.get_by_reference(val) {
-            Ok(Some(target_doc)) => Box::into_raw(Box::new(FL_Doc { doc: target_doc, id: doc_ptr.id.clone() })),
+            Ok(Some(target_doc)) => Box::into_raw(Box::new(HK_Doc { doc: target_doc, id: doc_ptr.id.clone() })),
             Ok(None) => ptr::null_mut(), // Document doesn't exist (Dangling reference)
             Err(e) => {
                 set_last_error(e.to_string());
@@ -3145,7 +3145,7 @@ pub extern "C" fn fl_engine_get_by_ref(
 }
 
 // /// Internal helper to extract values from an anchor document based on the query's sort order
-// fn get_anchor_values(q: &crate::query::query::Query, doc: &FireLiteDoc) -> Option<Vec<Value>> {
+// fn get_anchor_values(q: &crate::query::query::Query, doc: &HakoDoc) -> Option<Vec<Value>> {
 //     if q.order_by.is_empty() { return None; }
     
 //     let mut vals = Vec::with_capacity(q.order_by.len());
@@ -3155,25 +3155,25 @@ pub extern "C" fn fl_engine_get_by_ref(
 //     Some(vals)
 // }
 // 3. Fix get_anchor_values logic
-fn get_anchor_values(q: &crate::query::query::Query, fl_doc: &FL_Doc) -> Option<Vec<Value>> {
+fn get_anchor_values(q: &crate::query::query::Query, hk_doc: &HK_Doc) -> Option<Vec<Value>> {
     if q.order_by.is_empty() { return None; }
     
     let mut vals = Vec::with_capacity(q.order_by.len());
     for order in &q.order_by {
         // MAGIC FIX: Extract internal metadata manually
         if order.field == "id" {
-            vals.push(Value::String(fl_doc.id.clone()));
+            vals.push(Value::String(hk_doc.id.clone()));
         } else if order.field == "_time" {
-            vals.push(Value::Int(fl_doc.doc._time));
+            vals.push(Value::Int(hk_doc.doc._time));
         } else {
-            vals.push(fl_doc.doc.get(&order.field)?.clone());
+            vals.push(hk_doc.doc.get(&order.field)?.clone());
         }
     }
     Some(vals)
 }
 
 // #[no_mangle]
-// pub extern "C" fn fl_query_start_after(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> i32 {
+// pub extern "C" fn hk_query_start_after(query: *mut HK_Query, anchor_doc: *const HK_Doc) -> i32 {
 //     safety_shield!(-1, {
 //         if query.is_null() || anchor_doc.is_null() { return -1; }
 //         let q = unsafe { &mut *query };
@@ -3190,7 +3190,7 @@ fn get_anchor_values(q: &crate::query::query::Query, fl_doc: &FL_Doc) -> Option<
 // }
 
 #[no_mangle]
-pub extern "C" fn fl_query_start_after(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> i32 {
+pub extern "C" fn hk_query_start_after(query: *mut HK_Query, anchor_doc: *const HK_Doc) -> i32 {
     safety_shield!(-1, {
         if query.is_null() || anchor_doc.is_null() { return -1; }
         let q = unsafe { &mut *query };
@@ -3207,7 +3207,7 @@ pub extern "C" fn fl_query_start_after(query: *mut FL_Query, anchor_doc: *const 
 }
 
 // #[no_mangle]
-// pub extern "C" fn fl_query_start_at(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> i32 {
+// pub extern "C" fn hk_query_start_at(query: *mut HK_Query, anchor_doc: *const HK_Doc) -> i32 {
 //     safety_shield!(-1, {
 //         if query.is_null() || anchor_doc.is_null() {
 //             return -1;
@@ -3225,7 +3225,7 @@ pub extern "C" fn fl_query_start_after(query: *mut FL_Query, anchor_doc: *const 
 // }
 // 4. Update pointer usages for the anchor logic
 #[no_mangle]
-pub extern "C" fn fl_query_start_at(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> i32 {
+pub extern "C" fn hk_query_start_at(query: *mut HK_Query, anchor_doc: *const HK_Doc) -> i32 {
     safety_shield!(-1, {
         if query.is_null() || anchor_doc.is_null() { return -1; }
         let q = unsafe { &mut *query };
@@ -3242,7 +3242,7 @@ pub extern "C" fn fl_query_start_at(query: *mut FL_Query, anchor_doc: *const FL_
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_end_at(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> i32 {
+pub extern "C" fn hk_query_end_at(query: *mut HK_Query, anchor_doc: *const HK_Doc) -> i32 {
     safety_shield!(-1, {
         if query.is_null() || anchor_doc.is_null() {
             return -1;
@@ -3260,7 +3260,7 @@ pub extern "C" fn fl_query_end_at(query: *mut FL_Query, anchor_doc: *const FL_Do
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_end_before(query: *mut FL_Query, anchor_doc: *const FL_Doc) -> i32 {
+pub extern "C" fn hk_query_end_before(query: *mut HK_Query, anchor_doc: *const HK_Doc) -> i32 {
     safety_shield!(-1, {
         if query.is_null() || anchor_doc.is_null() {
             return -1;
@@ -3278,7 +3278,7 @@ pub extern "C" fn fl_query_end_before(query: *mut FL_Query, anchor_doc: *const F
 }
 
 #[no_mangle]
-pub extern "C" fn fl_engine_get_audit_log(engine: *mut FL_Engine) -> *mut c_char {
+pub extern "C" fn hk_engine_get_audit_log(engine: *mut HK_Engine) -> *mut c_char {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() {
             return std::ptr::null_mut();
@@ -3301,8 +3301,8 @@ pub extern "C" fn fl_engine_get_audit_log(engine: *mut FL_Engine) -> *mut c_char
 // --- OR LOGIC ---
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_or_str(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_or_str(
+    query: *mut HK_Query,
     field: *const c_char,
     value: *const c_char,
 ) -> i32 {
@@ -3316,7 +3316,7 @@ pub extern "C" fn fl_query_where_or_str(
         Err(e) => return set_last_error(e),
     };
 
-    // Each call to fl_query_where_or creates a new standalone OR group
+    // Each call to hk_query_where_or creates a new standalone OR group
     q.query.or_groups.push(vec![crate::query::filter::Filter {
         field: f,
         op: Operator::Eq,
@@ -3326,8 +3326,8 @@ pub extern "C" fn fl_query_where_or_str(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_query_where_or_int(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_or_int(
+    query: *mut HK_Query,
     field: *const c_char,
     value: i64,
 ) -> i32 {
@@ -3348,12 +3348,12 @@ pub extern "C" fn fl_query_where_or_int(
 // --- IN LOGIC ---
 
 /// Adds an IN filter: field IN [array_items]
-/// This takes ownership of the FL_Array and frees it.
+/// This takes ownership of the HK_Array and frees it.
 #[no_mangle]
-pub extern "C" fn fl_query_where_in(
-    query: *mut FL_Query,
+pub extern "C" fn hk_query_where_in(
+    query: *mut HK_Query,
     field: *const c_char,
-    array: *mut FL_Array,
+    array: *mut HK_Array,
 ) -> i32 {
     if query.is_null() || array.is_null() {
         return -1;
@@ -3376,7 +3376,7 @@ pub extern "C" fn fl_query_where_in(
 }
 
 #[no_mangle]
-pub extern "C" fn fl_engine_snapshot_indices(engine: *mut FL_Engine) -> i32 {
+pub extern "C" fn hk_engine_snapshot_indices(engine: *mut HK_Engine) -> i32 {
     if engine.is_null() {
         return -1;
     }
@@ -3392,7 +3392,7 @@ pub extern "C" fn fl_engine_snapshot_indices(engine: *mut FL_Engine) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn fl_config_set_compression(config: *mut FL_Config, enabled: bool, level: i32) {
+pub extern "C" fn hk_config_set_compression(config: *mut HK_Config, enabled: bool, level: i32) {
     if let Some(cfg) = unsafe { config.as_mut() } {
         cfg.inner.use_compression = enabled;
         cfg.inner.compression_level = level;
@@ -3403,7 +3403,7 @@ pub extern "C" fn fl_config_set_compression(config: *mut FL_Config, enabled: boo
 /// deterministic benchmarks or hard latency bounds. Engine stays correct;
 /// files grow until re-enabled. Default on.
 #[no_mangle]
-pub extern "C" fn fl_config_set_background_maintenance(config: *mut FL_Config, enabled: bool) {
+pub extern "C" fn hk_config_set_background_maintenance(config: *mut HK_Config, enabled: bool) {
     if let Some(cfg) = unsafe { config.as_mut() } {
         cfg.inner.background_maintenance = enabled;
     }
@@ -3411,19 +3411,19 @@ pub extern "C" fn fl_config_set_background_maintenance(config: *mut FL_Config, e
 
 #[cfg(feature = "net-sync")]
 #[no_mangle]
-pub extern "C" fn fl_net_syncer_new(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_net_syncer_new(
+    engine: *mut HK_Engine,
     name: *const c_char,
     room_key: *const c_char,
-) -> *mut FL_NetSyncer {
+) -> *mut HK_NetSyncer {
     let engine_ref = unsafe { &*engine };
     let name_str = cstr_to_string(name).unwrap_or_else(|_| "node".into());
     let room_str = cstr_to_string(room_key).unwrap_or_else(|_| "default".into());
 
-    // We need to clone the Arc<FireLite> logically. 
-    // Since FL_Engine wraps FireLite (which is not an Arc inside FL_Engine), 
+    // We need to clone the Arc<Hako> logically. 
+    // Since HK_Engine wraps Hako (which is not an Arc inside HK_Engine), 
     // we use a temporary wrap to pass it to the syncer.
-    // let db_ptr:std::sync::Arc<FireLite> = unsafe { std::sync::Arc::from_raw(&engine_ref.db as *const _) };
+    // let db_ptr:std::sync::Arc<Hako> = unsafe { std::sync::Arc::from_raw(&engine_ref.db as *const _) };
     let syncer = crate::net_sync::NetSyncer::new(
         engine_ref.db.clone(),
         &name_str,
@@ -3434,7 +3434,7 @@ pub extern "C" fn fl_net_syncer_new(
     // std::mem::forget(db_ptr);
 
     clear_last_error();
-    Box::into_raw(Box::new(FL_NetSyncer {
+    Box::into_raw(Box::new(HK_NetSyncer {
         inner: std::sync::Arc::new(syncer),
     }))
 }
@@ -3445,7 +3445,7 @@ pub extern "C" fn fl_net_syncer_new(
 /// Takes effect at the next start().
 #[cfg(feature = "net-sync")]
 #[no_mangle]
-pub extern "C" fn fl_net_syncer_set_discovery(syncer: *mut FL_NetSyncer, mode: i32) -> i32 {
+pub extern "C" fn hk_net_syncer_set_discovery(syncer: *mut HK_NetSyncer, mode: i32) -> i32 {
     if syncer.is_null() { return -1; }
     let s_ref = unsafe { &*syncer };
     let m = match mode {
@@ -3461,7 +3461,7 @@ pub extern "C" fn fl_net_syncer_set_discovery(syncer: *mut FL_NetSyncer, mode: i
 
 #[cfg(feature = "net-sync")]
 #[no_mangle]
-pub extern "C" fn fl_net_syncer_start(syncer: *mut FL_NetSyncer, port: u16) -> i32 {
+pub extern "C" fn hk_net_syncer_start(syncer: *mut HK_NetSyncer, port: u16) -> i32 {
     if syncer.is_null() { return -1; }
     let s_ref = unsafe { &*syncer };
     let inner = s_ref.inner.clone();
@@ -3483,7 +3483,7 @@ pub extern "C" fn fl_net_syncer_start(syncer: *mut FL_NetSyncer, port: u16) -> i
 
 #[cfg(feature = "net-sync")]
 #[no_mangle]
-pub extern "C" fn fl_net_syncer_status(syncer: *mut FL_NetSyncer) -> *mut c_char {
+pub extern "C" fn hk_net_syncer_status(syncer: *mut HK_NetSyncer) -> *mut c_char {
     if syncer.is_null() { return ptr::null_mut(); }
     let s_ref = unsafe { &*syncer };
     let status = s_ref.inner.status();
@@ -3496,7 +3496,7 @@ pub extern "C" fn fl_net_syncer_status(syncer: *mut FL_NetSyncer) -> *mut c_char
 
 #[cfg(feature = "net-sync")]
 #[no_mangle]
-pub extern "C" fn fl_net_syncer_free(syncer: *mut FL_NetSyncer) {
+pub extern "C" fn hk_net_syncer_free(syncer: *mut HK_NetSyncer) {
     if !syncer.is_null() {
         let s = unsafe { Box::from_raw(syncer) };
         s.inner.stop();
@@ -3507,14 +3507,14 @@ pub extern "C" fn fl_net_syncer_free(syncer: *mut FL_NetSyncer) {
 // CLOUD SYNC
 #[cfg(feature = "cloud-sync")]
 #[no_mangle]
-pub extern "C" fn fl_cloud_sync_new(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_cloud_sync_new(
+    engine: *mut HK_Engine,
     mode: i32, // 0 = Server, 1 = Client
     client_id: *const c_char,
     room_name: *const c_char,
     room_key: *const c_char,
     auth_token: *const c_char,
-) -> *mut FL_CloudSync {
+) -> *mut HK_CloudSync {
     safety_shield!(ptr::null_mut(), {
         if engine.is_null() {
             set_last_error("Null engine handle");
@@ -3543,7 +3543,7 @@ pub extern "C" fn fl_cloud_sync_new(
         );
 
         clear_last_error();
-        Box::into_raw(Box::new(FL_CloudSync {
+        Box::into_raw(Box::new(HK_CloudSync {
             inner: std::sync::Arc::new(cloud_sync),
         }))
     })
@@ -3554,11 +3554,11 @@ pub extern "C" fn fl_cloud_sync_new(
 /// routes sync to the matching room group.
 #[cfg(feature = "cloud-sync")]
 #[no_mangle]
-pub extern "C" fn fl_cloud_sync_server_new(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_cloud_sync_server_new(
+    engine: *mut HK_Engine,
     server_id: *const c_char,
     auth_token: *const c_char,
-) -> *mut FL_CloudSync {
+) -> *mut HK_CloudSync {
     safety_shield!(ptr::null_mut(), {
         if engine.is_null() {
             set_last_error("Null engine handle");
@@ -3573,7 +3573,7 @@ pub extern "C" fn fl_cloud_sync_server_new(
             crate::cloud_sync::CloudSync::server(engine_ref.db.clone(), &sid_str, &token_str);
 
         clear_last_error();
-        Box::into_raw(Box::new(FL_CloudSync {
+        Box::into_raw(Box::new(HK_CloudSync {
             inner: std::sync::Arc::new(cloud_sync),
         }))
     })
@@ -3581,16 +3581,16 @@ pub extern "C" fn fl_cloud_sync_server_new(
 
 /// Creates an offline-first cloud CLIENT bound to a room of the caller's
 /// choosing. The client picks the room (room_name + room_key) and later picks
-/// the server via `fl_cloud_sync_start`.
+/// the server via `hk_cloud_sync_start`.
 #[cfg(feature = "cloud-sync")]
 #[no_mangle]
-pub extern "C" fn fl_cloud_sync_client_new(
-    engine: *mut FL_Engine,
+pub extern "C" fn hk_cloud_sync_client_new(
+    engine: *mut HK_Engine,
     client_id: *const c_char,
     room_name: *const c_char,
     room_key: *const c_char,
     auth_token: *const c_char,
-) -> *mut FL_CloudSync {
+) -> *mut HK_CloudSync {
     safety_shield!(ptr::null_mut(), {
         if engine.is_null() {
             set_last_error("Null engine handle");
@@ -3612,7 +3612,7 @@ pub extern "C" fn fl_cloud_sync_client_new(
         );
 
         clear_last_error();
-        Box::into_raw(Box::new(FL_CloudSync {
+        Box::into_raw(Box::new(HK_CloudSync {
             inner: std::sync::Arc::new(cloud_sync),
         }))
     })
@@ -3620,7 +3620,7 @@ pub extern "C" fn fl_cloud_sync_client_new(
 
 #[cfg(feature = "cloud-sync")]
 #[no_mangle]
-pub extern "C" fn fl_cloud_sync_start(cloud_sync: *mut FL_CloudSync, address: *const c_char) -> i32 {
+pub extern "C" fn hk_cloud_sync_start(cloud_sync: *mut HK_CloudSync, address: *const c_char) -> i32 {
     safety_shield!(-1, {
         if cloud_sync.is_null() {
             return set_last_error("Null cloud_sync handle");
@@ -3661,7 +3661,7 @@ pub extern "C" fn fl_cloud_sync_start(cloud_sync: *mut FL_CloudSync, address: *c
 
 #[cfg(feature = "cloud-sync")]
 #[no_mangle]
-pub extern "C" fn fl_cloud_sync_status(cloud_sync: *mut FL_CloudSync) -> *mut c_char {
+pub extern "C" fn hk_cloud_sync_status(cloud_sync: *mut HK_CloudSync) -> *mut c_char {
     safety_shield!(ptr::null_mut(), {
         if cloud_sync.is_null() {
             set_last_error("Null cloud_sync handle");
@@ -3691,7 +3691,7 @@ pub extern "C" fn fl_cloud_sync_status(cloud_sync: *mut FL_CloudSync) -> *mut c_
 
 #[cfg(feature = "cloud-sync")]
 #[no_mangle]
-pub extern "C" fn fl_cloud_sync_stop(cloud_sync: *mut FL_CloudSync) {
+pub extern "C" fn hk_cloud_sync_stop(cloud_sync: *mut HK_CloudSync) {
     safety_shield!((), {
         if !cloud_sync.is_null() {
             let cs_ref = unsafe { &*cloud_sync };
@@ -3702,7 +3702,7 @@ pub extern "C" fn fl_cloud_sync_stop(cloud_sync: *mut FL_CloudSync) {
 
 #[cfg(feature = "cloud-sync")]
 #[no_mangle]
-pub extern "C" fn fl_cloud_sync_free(cloud_sync: *mut FL_CloudSync) {
+pub extern "C" fn hk_cloud_sync_free(cloud_sync: *mut HK_CloudSync) {
     safety_shield!((), {
         if !cloud_sync.is_null() {
             let cs = unsafe { Box::from_raw(cloud_sync) };
@@ -3720,7 +3720,7 @@ mod ffi_json_tests {
     /// keys), including Binary byte arrays and escaping.
     #[test]
     fn doc_to_json_matches_serde_map_output() {
-        let mut doc = FireLiteDoc::default();
+        let mut doc = HakoDoc::default();
         // Deliberately unsorted insertion + escaping-sensitive strings.
         doc.insert("v", Value::Binary(vec![0u8, 1, 9, 10, 99, 100, 171, 255]));
         doc.insert("z", Value::Int(-42));

@@ -504,39 +504,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
-name = "firelite"
-version = "0.8.20"
-dependencies = [
- "bincode",
- "cbindgen",
- "chacha20poly1305",
- "crc32fast",
- "criterion",
- "crossbeam-channel",
- "futures-util",
- "fxhash",
- "gethostname",
- "hashbrown 0.14.5",
- "local-ip-address",
- "mdns-sd",
- "memmap2",
- "parking_lot",
- "rand 0.8.5",
- "rayon",
- "rmp-serde",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "smallvec",
- "socket2 0.5.10",
- "thiserror 1.0.69",
- "tokio",
- "tokio-tungstenite",
- "zstd",
-]
-
-[[package]]
 name = "flume"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -665,6 +632,39 @@ dependencies = [
  "r-efi 6.0.0",
  "wasip2",
  "wasip3",
+]
+
+[[package]]
+name = "hakodb"
+version = "0.8.21"
+dependencies = [
+ "bincode",
+ "cbindgen",
+ "chacha20poly1305",
+ "crc32fast",
+ "criterion",
+ "crossbeam-channel",
+ "futures-util",
+ "fxhash",
+ "gethostname",
+ "hashbrown 0.14.5",
+ "local-ip-address",
+ "mdns-sd",
+ "memmap2",
+ "parking_lot",
+ "rand 0.8.5",
+ "rayon",
+ "rmp-serde",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smallvec",
+ "socket2 0.5.10",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite",
+ "zstd",
 ]
 
 [[package]]

@@ -36,7 +36,7 @@ impl Value {
         }
     }
 
-    /// Converts a FireLite Value into a serde_json::Value.
+    /// Converts a HakoDB Value into a serde_json::Value.
     /// This is used by the FFI, Tauri Gateway, and CLI.
     pub fn to_json(&self) -> serde_json::Value {
         match self {
@@ -77,7 +77,7 @@ impl Value {
         }
     }
 
-    /// Converts a serde_json::Value into a FireLite Value.
+    /// Converts a serde_json::Value into a HakoDB Value.
     /// Automatically detects special keys like __ref__ and __blob__.
     pub fn from_json(json: serde_json::Value) -> std::result::Result<Self, String> {
         match json {

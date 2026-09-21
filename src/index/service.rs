@@ -1,4 +1,4 @@
-use crate::document::firelite_doc::FireLiteDoc;
+use crate::document::hako_doc::HakoDoc;
 use crate::index::manager::IndexManager;
 use crate::document::value::Value;
 
@@ -11,7 +11,7 @@ impl IndexingService {
         manager: &mut IndexManager,
         collection: &str,
         doc_id: &str,
-        doc: &FireLiteDoc,
+        doc: &HakoDoc,
     ) {
         manager.index_document(collection, doc_id, doc);
     }
@@ -20,14 +20,14 @@ impl IndexingService {
         manager: &mut IndexManager,
         collection: &str,
         doc_id: &str,
-        doc: &FireLiteDoc,
+        doc: &HakoDoc,
     ) {
         manager.remove_document(collection, doc_id, doc);
     }
 
     pub fn backfill_secondary<'a, I>(manager: &mut IndexManager, collection: &str, docs: I)
     where
-        I: IntoIterator<Item = (&'a str, &'a FireLiteDoc)>,
+        I: IntoIterator<Item = (&'a str, &'a HakoDoc)>,
     {
         for (doc_id, doc) in docs {
             if let Some(sec_map) = manager.secondary.get_mut(collection) {
@@ -52,7 +52,7 @@ impl IndexingService {
 
     pub fn backfill_fts<'a, I>(manager: &mut IndexManager, collection: &str, docs: I)
     where
-        I: IntoIterator<Item = (&'a str, &'a FireLiteDoc)>,
+        I: IntoIterator<Item = (&'a str, &'a HakoDoc)>,
     {
         for (doc_id, doc) in docs {
             if let Some(fts_map) = manager.fts.get_mut(collection) {
@@ -67,7 +67,7 @@ impl IndexingService {
 
     pub fn backfill_composite<'a, I>(manager: &mut IndexManager, collection: &str, docs: I)
     where
-        I: IntoIterator<Item = (&'a str, &'a FireLiteDoc)> + Clone,
+        I: IntoIterator<Item = (&'a str, &'a HakoDoc)> + Clone,
     {
         manager.composite.index_batch(collection, docs);
     }

@@ -5,22 +5,22 @@
 // with OPLOG_OPS. No indexes are created on purpose — unindexed paths
 // (FullCollection scan+match) are exactly what this exercises, and every
 // read here is synchronous (no async-index races by construction).
-use firelite::config::{DurabilityMode, FireLiteConfig};
-use firelite::document::firelite_doc::FireLiteDoc;
-use firelite::document::value::Value;
-use firelite::engine::{BatchMutation, FireLite};
-use firelite::query::query::Query;
+use hakodb::config::{DurabilityMode, HakoConfig};
+use hakodb::document::hako_doc::HakoDoc;
+use hakodb::document::value::Value;
+use hakodb::engine::{BatchMutation, Hako};
+use hakodb::query::query::Query;
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use std::collections::{BTreeMap, HashMap};
 
 type Model = HashMap<(String, String), BTreeMap<String, Value>>;
 
-fn model_fields(doc: &FireLiteDoc) -> BTreeMap<String, Value> {
+fn model_fields(doc: &HakoDoc) -> BTreeMap<String, Value> {
     doc.fields.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
 }
 
-fn engine_fields(doc: &FireLiteDoc) -> BTreeMap<String, Value> {
+fn engine_fields(doc: &HakoDoc) -> BTreeMap<String, Value> {
     model_fields(doc)
 }
 
@@ -41,9 +41,9 @@ fn gen_value(rng: &mut StdRng) -> Value {
     }
 }
 
-fn gen_doc(rng: &mut StdRng) -> FireLiteDoc {
+fn gen_doc(rng: &mut StdRng) -> HakoDoc {
     // Low-cardinality `grp` field supports filtered-query checks.
-    let mut doc = FireLiteDoc::default();
+    let mut doc = HakoDoc::default();
     doc.insert("grp", Value::String(format!("g{}", rng.gen_range(0..3))));
     let extra = rng.gen_range(0..3);
     for i in 0..extra {
@@ -53,7 +53,7 @@ fn gen_doc(rng: &mut StdRng) -> FireLiteDoc {
 }
 
 /// Full cross-path verification of one collection against the model.
-fn verify_collection(db: &FireLite, model: &Model, col: &str, ctx: &str) {
+fn verify_collection(db: &Hako, model: &Model, col: &str, ctx: &str) {
     let want_ids: Vec<String> = model
         .iter()
         .filter(|((c, _), _)| c == col)
@@ -101,7 +101,7 @@ fn verify_collection(db: &FireLite, model: &Model, col: &str, ctx: &str) {
     // assert membership + predicate, never exact set (hash order).
     let g = format!("g{}", want_sorted.len() % 3);
     let mut q = Query::new(col);
-    q = q.where_filter("grp", firelite::query::filter::Operator::Eq, Value::String(g.clone()));
+    q = q.where_filter("grp", hakodb::query::filter::Operator::Eq, Value::String(g.clone()));
     q.limit = Some(10);
     let rows = db.query(q).unwrap_or_else(|e| panic!("{ctx} filtered: {e:?}"));
     let total_matches = model
@@ -137,7 +137,7 @@ fn verify_collection(db: &FireLite, model: &Model, col: &str, ctx: &str) {
         let mut q = Query::new(col).order_by("id", true);
         let rows = db.query_raw(q).unwrap_or_else(|e| panic!("{ctx} raw: {e:?}"));
         let found = rows.iter().find(|(id, _)| id == sample).expect("sample present");
-        let doc = FireLiteDoc::decode(&found.1).expect("raw decodes");
+        let doc = HakoDoc::decode(&found.1).expect("raw decodes");
         assert_eq!(
             &engine_fields(&doc),
             &model[&(col.to_string(), sample.clone())],
@@ -146,7 +146,7 @@ fn verify_collection(db: &FireLite, model: &Model, col: &str, ctx: &str) {
     }
 }
 
-fn wait_ready(db: &FireLite) {
+fn wait_ready(db: &Hako) {
     let t0 = std::time::Instant::now();
     while !db.is_indexes_ready() {
         assert!(t0.elapsed() < std::time::Duration::from_secs(30), "indexes never ready");
@@ -169,9 +169,9 @@ fn oplog_fuzz() {
 
     let dir = std::env::temp_dir().join(format!("fl-test-oplog-{seed}"));
     let _ = std::fs::remove_dir_all(&dir);
-    let mut cfg = FireLiteConfig::default();
+    let mut cfg = HakoConfig::default();
     cfg.durability_mode = DurabilityMode::Manual;
-    let mut db = FireLite::open(&dir, cfg.clone()).expect("open");
+    let mut db = Hako::open(&dir, cfg.clone()).expect("open");
     wait_ready(&db);
 
     let cols = ["a", "b"];
@@ -219,7 +219,7 @@ fn oplog_fuzz() {
                 let mut q = Query::new(&col);
                 q = q.where_filter(
                     "grp",
-                    firelite::query::filter::Operator::Eq,
+                    hakodb::query::filter::Operator::Eq,
                     Value::String(g.clone()),
                 );
                 q.limit = Some(5);
@@ -273,7 +273,7 @@ fn oplog_fuzz() {
             // handle replays, then the run CONTINUES (post-reopen writes
             // exercise recovery-yearned state, not just a verified stop).
             drop(db);
-            db = FireLite::open(&dir, cfg.clone()).expect("reopen");
+            db = Hako::open(&dir, cfg.clone()).expect("reopen");
             wait_ready(&db);
             for c in cols {
                 verify_collection(&db, &model, c, &format!("reopen@{step}"));

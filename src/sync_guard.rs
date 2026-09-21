@@ -3,7 +3,7 @@
 //! # Posture (read this before changing anything here)
 //!
 //! Encryption at rest (WAL/segments) and sync-time plaintext are INDEPENDENT
-//! properties in FireLite. Before this module, a node holding the at-rest
+//! properties in HakoDB. Before this module, a node holding the at-rest
 //! key would happily broadcast an encrypted collection's documents IN
 //! PLAINTEXT to any peer — including peers that could never read that
 //! collection locally — with zero signal. The cloud server additionally
@@ -18,7 +18,7 @@
 //! ## Rules (enforced identically on mesh and cloud, both directions)
 //!
 //! Let `E(C)` = "collection C is encrypted on THIS node"
-//! (`FireLite::is_collection_encrypted`), `F` = this node's key fingerprint,
+//! (`Hako::is_collection_encrypted`), `F` = this node's key fingerprint,
 //! `P` = the peer's announced capabilities (`None` = never announced,
 //! e.g. an older peer).
 //!
@@ -82,7 +82,7 @@ pub fn local_fingerprint(encryption_key: Option<&str>) -> [u8; 32] {
 }
 
 /// The single decision function for both directions. `col_encrypted_locally`
-/// comes from `FireLite::is_collection_encrypted` (at-rest config of THIS
+/// comes from `Hako::is_collection_encrypted` (at-rest config of THIS
 /// node for THIS collection); `local_fp` from `local_fingerprint`;
 /// `peer` is the counterparty's announced caps (`None` = unknown/old peer).
 ///

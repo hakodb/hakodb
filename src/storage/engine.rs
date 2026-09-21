@@ -2,8 +2,8 @@ use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
 // use std::fs::File;
 
-use crate::config::{FireLiteConfig, DurabilityMode};
-use crate::error::{FireLiteError, Result};
+use crate::config::{HakoConfig, DurabilityMode};
+use crate::error::{HakoError, Result};
 use std::sync::{Arc, Mutex};
 // use std::sync::atomic::Ordering;
 use std::time::UNIX_EPOCH;
@@ -15,7 +15,7 @@ use super::crypto::EncryptionContext;
 use super::segment::Segment;
 use super::wal::{Wal, WalOp};
 use crossbeam_channel::Sender as CrossbeamSender;
-use crate::document::firelite_doc::FireLiteDoc;
+use crate::document::hako_doc::HakoDoc;
 // use crate::document::value::Value;
 
 
@@ -31,7 +31,7 @@ pub enum Pointer {
         offset: u64,
         len: u32,
     },
-    BlobPending(Arc<FireLiteDoc>),
+    BlobPending(Arc<HakoDoc>),
     BlobPendingData { 
         data: Arc<Vec<u8>>, 
         skeleton: Vec<u8> 
@@ -86,7 +86,7 @@ pub struct StorageEngine {
 impl StorageEngine {
     pub fn open(
         base_dir: impl AsRef<Path>, 
-        cfg: &FireLiteConfig,
+        cfg: &HakoConfig,
         logical_name: String,
         encryption: Option<EncryptionContext>,
     ) -> Result<Self> {
@@ -331,11 +331,6 @@ impl StorageEngine {
     /// Returns a half-half-open range `[start_pos, end_pos)` over the sorted key list,
     /// or `None` if the start key isn't found. The caller can then slice
     /// `self.sorted_keys[start_pos..end_pos]` and look up pointers via `self.index`.
-    // Kept around for cursor / start_at use cases the executor doesn't cover
-    // yet. Marked allow(dead_code) so the executor's inline slice doesn't
-    // leave it as a dangling warning — remove if it stays unused for another
-    // release.
-    #[allow(dead_code)]
     pub(crate) fn sorted_key_range(
         &self,
         start: Option<&str>,
@@ -590,7 +585,7 @@ impl StorageEngine {
         let size = self
             .segments
             .get_mut(&self.active_segment_id)
-            .ok_or_else(|| FireLiteError::Corrupt("active segment missing".into()))?
+            .ok_or_else(|| HakoError::Corrupt("active segment missing".into()))?
             .segment
             .size_bytes()? as usize;
 
@@ -718,7 +713,7 @@ impl StorageEngine {
                     ops.push(WalOp::PutBlob { key: key.clone(), offset: *offset, len: *len });
                 }
                 Pointer::BlobPending(pending_doc) => {
-                    // pending_doc is Arc<FireLiteDoc>
+                    // pending_doc is Arc<HakoDoc>
                     let mut skeleton = (**pending_doc).clone();
                     if let Some(bm) = &self.blob_manager {
                         bm.extract_blobs_placeholder(&self.logical_name, &mut skeleton, self.blob_threshold);

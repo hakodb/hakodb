@@ -1,18 +1,18 @@
-use crate::document::firelite_doc::FireLiteDoc;
+use crate::document::hako_doc::HakoDoc;
 use crate::document::value::Value;
-use crate::engine::FireLite;
+use crate::engine::Hako;
 use crate::query::query::{Query, AggregateOp};
 use crate::query::filter::Operator;
 use crate::error::Result;
 
 /// Entry point for the fluent API: db.collection("users")
 pub struct Collection<'a> {
-    db: &'a FireLite,
+    db: &'a Hako,
     name: String,
 }
 
 impl<'a> Collection<'a> {
-    pub fn new(db: &'a FireLite, name: &str) -> Self {
+    pub fn new(db: &'a Hako, name: &str) -> Self {
         Self { db, name: name.to_string() }
     }
 
@@ -27,19 +27,19 @@ impl<'a> Collection<'a> {
     }
 
     /// Direct access to document by ID
-    pub fn doc(self, id: &str) -> Result<Option<FireLiteDoc>> {
+    pub fn doc(self, id: &str) -> Result<Option<HakoDoc>> {
         self.db.get(&self.name, id)
     }
 }
 
 /// The stateful builder that carries the query and the database reference
 pub struct QueryBuilder<'a> {
-    db: &'a FireLite,
+    db: &'a Hako,
     query: Query,
 }
 
 impl<'a> QueryBuilder<'a> {
-    pub fn new(db: &'a FireLite, collection: String) -> Self {
+    pub fn new(db: &'a Hako, collection: String) -> Self {
         Self {
             db,
             query: Query::new(&collection),
@@ -84,12 +84,12 @@ impl<'a> QueryBuilder<'a> {
     // --- Terminal Execution Methods (Querying) ---
 
     /// Execute the query and return documents
-    pub fn get(self) -> Result<Vec<(String, FireLiteDoc)>> {
+    pub fn get(self) -> Result<Vec<(String, HakoDoc)>> {
         self.db.query(self.query)
     }
 
     /// Execute and return only the first document
-    pub fn first(mut self) -> Result<Option<(String, FireLiteDoc)>> {
+    pub fn first(mut self) -> Result<Option<(String, HakoDoc)>> {
         self.query.limit = Some(1);
         let mut results = self.db.query(self.query)?;
         Ok(results.pop())
