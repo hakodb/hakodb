@@ -4,6 +4,8 @@ version = "0.8.21"
 edition = "2021"
 authors = ["AbcDev Team"]
 description = "Embedded & Cloud-native Document Engine"
+license = "MIT"
+repository = "https://github.com/hakodb/hakodb"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
