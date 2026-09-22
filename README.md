@@ -248,7 +248,7 @@ Core FFI functions: `hk_net_syncer_new`, `hk_net_syncer_start`, `hk_net_syncer_s
 
 ```toml
 [dependencies]
-hakodb = { version = "0.7.5", features = ["net-sync"] }
+hakodb = { version = "0.8", features = ["net-sync"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -273,7 +273,7 @@ The `cloud-sync` feature provides cloud-level, **bi-directional synchronization*
 
 ```toml
 [dependencies]
-hakodb = { version = "0.7.5", features = ["cloud-sync"] }
+hakodb = { version = "0.8", features = ["cloud-sync"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -522,7 +522,7 @@ API (HakoDB + FFI + SDKs)
 | Subcollections | Implemented | Prefix-based hierarchical document nesting |
 | Multi-platform FFI | Implemented | Windows (`.dll`), Linux (`.so`), macOS (`.dylib`) |
 | Compaction | Implemented | Tiered LSM-style background merging + memory checkpointing |
-| Parity (Cloud) | Non-goal | No remote authentication or globally distributed state |
+| Parity (Cloud) | Implemented | Central hub + offline-first clients, room isolation, auth tokens + group API keys |
 
 ### Module map
 
@@ -539,7 +539,7 @@ API (HakoDB + FFI + SDKs)
 
 ## Contribution notes
 
-- Keep module boundaries aligned with `STRUCTURE.md`.
+- Keep module boundaries aligned with the Module map below.
 - Add recovery tests when touching storage/WAL/indexing.
 - Document binary format or compatibility-impacting changes.
 - Keep C ABI additions reflected in cbindgen config + the generated header.
