@@ -2,7 +2,7 @@
 
 **HakoDB is an embedded, Firestore-style document database written in Rust.**
 
-It stores typed JSON-like documents in binary form, runs **fully in-process** like SQLite (no server process, no daemon, no network config), and exposes a **flat C ABI** so it can be embedded in applications written in Rust, C/C++, Go, JavaScript/TypeScript (Node.js + Bun), Pascal/Lazarus, and more.
+It stores typed JSON-like documents in binary form, runs **fully in-process** like SQLite (no server process, no daemon, no network config), and exposes a **flat C ABI** (`include/hakodb.h`) so any language can embed it. Ready-made SDKs live in their own repos — Go, JavaScript/TypeScript, Pascal/Lazarus, Tauri, and more (see [Repositories](#repositories)).
 
 HakoDB speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
@@ -91,7 +91,7 @@ Because it is a library, HakoDB has no "database server" to manage. Your app *is
 | Offline-first mobile/edge/desktop app that syncs to a central backend | **Cloud Sync** (client) | Local reads/writes keep working offline; deltas sync over `ws://`/`wss://`. |
 | Central hub collecting writes from many devices | **Cloud Sync** (server) | Thousands of concurrent WebSocket clients, 5ms micro-batched writes, WAL tailer broadcast. |
 | Real-time multiplayer / collaborative session on one LAN | **Net Sync** (mesh) | mDNS discovery, room-key isolation, delta replication across peers. |
-| Local app that must *also* be reachable by other processes/languages | **Embedded + FFI** | C ABI with Go/JS/Pascal gateways; watch streams for reactive UIs. |
+| Local app that must *also* be reachable by other processes/languages | **Embedded + FFI** | C ABI plus per-language SDK repos; watch streams for reactive UIs. |
 | Analytics / ad-hoc queries over large datasets | **Embedded** | Composite indexes, FTS, aggregates, zero-copy projection, parallel scans. |
 
 **In short:** use HakoDB **without sync** when your data is local to one process. Turn on **Net Sync** when you need peer-to-peer replication across devices on a network you control. Turn on **Cloud Sync** when you need offline-first clients to converge through a central server (or to build a real-time multi-client hub).
@@ -111,7 +111,7 @@ Because it is a library, HakoDB has no "database server" to manage. Your app *is
 - **Real-time watch streams** — `watch_collection` with change events; FFI bridge for cross-language reactive UIs.
 - **Subcollections** — `put/get/delete/query` on hierarchical nested collections.
 - **Security & operations** — collection-prefix allow/deny policy rules; in-memory and file-backed audit logging (`audit.log`).
-- **Multi-language FFI** — opaque handle C ABI with document builder, CRUD, query, batch, transaction, watch, result-set and cloud-sync functions; gateways for Go, JavaScript/TypeScript and Pascal.
+- **Multi-language FFI** — opaque handle C ABI with document builder, CRUD, query, batch, transaction, watch, result-set and cloud-sync functions; per-language SDKs live in their own repos (see [Repositories](#repositories)).
 
 ---
 
@@ -182,7 +182,7 @@ See [`example/rust/basic`](example/rust/basic) for a complete, working example o
 
 ## Multi-language platform support (C ABI)
 
-HakoDB exposes a flat C ABI for Node.js/Python/C++/C# and other integration layers. Opaque handle types are defined in `include/hakodb.h`.
+HakoDB exposes a flat C ABI for embedding in other languages and integration layers. Opaque handle types are defined in `include/hakodb.h`. Language SDKs wrapping this ABI live in their own repos — see [Repositories](#repositories).
 
 ### Build artifacts
 
@@ -228,7 +228,7 @@ Platform outputs:
 - **Net Sync:** `hk_net_syncer_new/start/status/free`.
 - **Cloud Sync:** `hk_cloud_sync_new/start/status/stop/free`, plus the room-agnostic `hk_cloud_sync_server_new` and the room-bound `hk_cloud_sync_client_new`.
 
-All FFI gateways (Go / JS-TS / Pascal) wrap these APIs.
+The per-language SDKs (see [Repositories](#repositories)) wrap these APIs.
 
 ---
 
@@ -459,14 +459,14 @@ HakoDB lives under the [`hakodb`](https://github.com/hakodb) organization
 
 | Repo | Delivers | Version |
 |---|---|---|
-| [`hakodb/hakodb`](https://github.com/hakodb/hakodb) | Core library: engine, storage, query, FFI (`hakodb.h`), net/cloud sync | 0.8.21 |
+| [`hakodb/hakodb`](https://github.com/hakodb/hakodb) | Core library: engine, storage, query, FFI (`hakodb.h`), net/cloud sync | 0.8.23 |
 | [`hakodb/hakocli`](https://github.com/hakodb/hakocli) | Command-line manager + serve REPL | 0.2.1 |
 | [`hakodb/hakocloudserver`](https://github.com/hakodb/hakocloudserver) | Managed sync hub + admin console | 0.1.1 |
-| [`hakodb/hakotauri`](https://github.com/hakodb/hakotauri) | Tauri gateway crate (Rust) | 0.1.1 |
-| [`hakodb/hakotaurits`](https://github.com/hakodb/hakotaurits) | Tauri client (`@hakodb/tauri`) | 0.1.1 |
+| [`hakodb/hakotauri`](https://github.com/hakodb/hakotauri) | Tauri gateway crate (Rust) | 0.2.0 |
+| [`hakodb/hakotaurits`](https://github.com/hakodb/hakotaurits) | Tauri client (`@hakodb/tauri`) | 0.2.0 |
 | [`hakodb/hakobench`](https://github.com/hakodb/hakobench) | C++ benchmark harnesses + SQLite duel | 0.1.1 |
-| [`hakodb/hakogo`](https://github.com/hakodb/hakogo) | Go SDK (cgo) | 0.1.1 |
-| [`hakodb/hakojs`](https://github.com/hakodb/hakojs) | JS/TS SDK (`@hakodb/client`, Node + Bun) | 0.5.12 |
+| [`hakodb/hakogo`](https://github.com/hakodb/hakogo) | Go SDK (cgo) | 0.1.2 |
+| [`hakodb/hakojs`](https://github.com/hakodb/hakojs) | JS/TS SDK (`@hakodb/client`, Node + Bun) | 0.5.13 |
 | [`hakodb/hakopascal`](https://github.com/hakodb/hakopascal) | Lazarus/FPC wrapper + components | 0.1.1 |
 
 Branches: **`main`** (stable — merged releases only) and **`cloud_sync`**
