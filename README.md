@@ -470,9 +470,12 @@ HakoDB lives under the [`hakodb`](https://github.com/hakodb) organization
 | [`hakodb/hakopascal`](https://github.com/hakodb/hakopascal) | Lazarus/FPC wrapper + components | 0.1.1 |
 
 Branches: **`main`** (stable — merged releases only) and **`cloud_sync`**
-(active development). The pre-rebrand history remains archived, read-only,
-at [`rizaptk/firelite`](https://github.com/rizaptk/firelite) for existing
-consumers (v0.8.19 and below).
+(active development). Before v0.8.20 the project was developed privately
+as FireLite, so there is no public repo or history to browse — the
+[CHANGELOG](CHANGELOG.md) in this repo is the authoritative record of
+what changed and when. Migrating a private FireLite (≤0.8.19) database?
+Open it once with v0.8.21+: internal collections migrate automatically
+(`__firelite_*` → `__hako_*`).
 
 ---
 
