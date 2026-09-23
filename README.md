@@ -468,6 +468,7 @@ HakoDB lives under the [`hakodb`](https://github.com/hakodb) organization
 | [`hakodb/hakogo`](https://github.com/hakodb/hakogo) | Go SDK (cgo) | 0.1.2 |
 | [`hakodb/hakojs`](https://github.com/hakodb/hakojs) | JS/TS SDK (`@hakodb/client`, Node + Bun) | 0.5.13 |
 | [`hakodb/hakopascal`](https://github.com/hakodb/hakopascal) | Lazarus/FPC wrapper + components | 0.1.1 |
+| [`hakodb/hakobackend`](https://github.com/hakodb/hakobackend) | Universal HTTP backend gateway + plug-and-play DBs | 0.1.0 |
 
 Branches: **`main`** (stable — merged releases only) and **`cloud_sync`**
 (active development). Before v0.8.20 the project was developed privately
