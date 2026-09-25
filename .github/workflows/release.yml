@@ -3,6 +3,13 @@ name: release
 # Core library releases only. Satellites (cli, cloudserver, SDKs, bench,
 # tauri) version independently and carry no workflows; FFI consumers pin
 # these assets by tag: hakodb-<version>-<target>.<ext> + headers.
+#
+# Linux is a per-distro-family MATRIX, not one ubuntu build: our server is
+# only ONE consumer — the public runs ubuntu/arch/EL/Alpine. glibc is
+# backward-compatible (an EL8 build runs on newer distros) but never
+# forward: an ubuntu-24.04 .so refuses to load on EL8 (proven at deploy:
+# GLIBC_2.30..2.38 missing). So each family gets a native-container build
+# plus a static musl fallback that runs anywhere (incl. Alpine).
 on:
   push:
     tags:
@@ -36,10 +43,39 @@ jobs:
           name: hakodb-${{ github.ref_name }}-x86_64-pc-windows-msvc
           path: dist/
 
+  # Public Linux matrix: one native-container build per distro family
+  # (glibc floor pinned by the container) + one static musl fallback.
+  # Containers run as root; every image gets git + a C/C++ toolchain
+  # (ring/aws-lc-sys compile C/C++ at build time: cmake + perl + g++).
   linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # EL/Rocky/Alma 8-9 class: glibc 2.28 floor — runs on EL8 AND all
+          # newer glibc distros (backward-compatible). Also what our own
+          # server fleet consumes.
+          - image: almalinux:8
+            suffix: linux-glibc2.28-el8
+            setup: yum install -y git gcc gcc-c++ cmake perl make curl tar gzip ca-certificates
+          - image: ubuntu:22.04
+            suffix: linux-glibc2.35-ubuntu22
+            setup: apt-get update && apt-get install -y git gcc g++ cmake perl make curl tar gzip ca-certificates
+          - image: ubuntu:24.04
+            suffix: linux-glibc2.39-ubuntu24
+            setup: apt-get update && apt-get install -y git gcc g++ cmake perl make curl tar gzip ca-certificates
+          # Rolling: no glibc promise (rebuild often); provided for Arch users
+          # who want a same-week toolchain build.
+          - image: archlinux:latest
+            suffix: linux-arch
+            setup: pacman -Sy --noconfirm base-devel cmake perl curl tar gzip ca-certificates
     runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
     steps:
       - uses: actions/checkout@v4
+      - name: Setup container toolchain
+        run: ${{ matrix.setup }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Build cdylib + rlib
         run: cargo build --release
@@ -50,7 +86,38 @@ jobs:
           (cd dist && sha256sum * > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:
-          name: hakodb-${{ github.ref_name }}-x86_64-unknown-linux-gnu
+          name: hakodb-${{ github.ref_name }}-x86_64-unknown-${{ matrix.suffix }}
+          path: dist/
+
+  linux-musl:
+    # Static fallback: runs on ANY Linux incl. musl distros (Alpine) and
+    # ancient glibc. Embedded core only (--no-default-features): the sync
+    # features pull rustls/ring/aws-lc-sys, whose C++ build has no musl
+    # toolchain in stock CI images (musl-tools ships C only). The suffix
+    # says so explicitly — no surprise for consumers. If a full-featured
+    # static build is ever needed, the road is cargo-zigbuild (zig ships
+    # musl libc++), not stock musl-gcc.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Setup musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build cdylib + rlib (static, embedded core)
+        run: cargo build --release --no-default-features --target x86_64-unknown-linux-musl
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      - name: Collect assets
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/libhakodb.so target/x86_64-unknown-linux-musl/release/libhakodb.rlib include/hakodb.h dist/
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hakodb-${{ github.ref_name }}-x86_64-unknown-linux-musl-core
           path: dist/
 
   android:
@@ -87,7 +154,7 @@ jobs:
           path: dist/
 
   publish:
-    needs: [windows-msvc, linux, android]
+    needs: [windows-msvc, linux, linux-musl, android]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -96,12 +163,13 @@ jobs:
           path: assets/windows
       - uses: actions/download-artifact@v4
         with:
-          name: hakodb-${{ github.ref_name }}-x86_64-unknown-linux-gnu
-          path: assets/linux
-      - uses: actions/download-artifact@v4
-        with:
           name: hakodb-${{ github.ref_name }}-aarch64-linux-android
           path: assets/android
+      # All linux-matrix artifacts land in their own subdirectory each.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hakodb-${{ github.ref_name }}-x86_64-unknown-linux-*
+          path: assets/linux-matrix
       # Flat staging with target-qualified names: deterministic download
       # URLs regardless of how the uploader preserves directories.
       # Consumers rename to canonical names on download (see each
@@ -110,24 +178,29 @@ jobs:
       # one-click installs; individual files stay for script consumers.
       - name: Stage flat release files and bundles
         run: |
-          mkdir -p release pkg/win pkg/linux pkg/android
+          mkdir -p release pkg/win pkg/android
           cp assets/windows/hakodb.dll release/hakodb-x86_64-pc-windows-msvc.dll
           cp assets/windows/hakodb.lib release/hakodb-x86_64-pc-windows-msvc.lib
-          cp assets/linux/libhakodb.so release/libhakodb-x86_64-unknown-linux-gnu.so
-          cp assets/linux/libhakodb.rlib release/libhakodb-x86_64-unknown-linux-gnu.rlib
           cp assets/android/libhakodb.so release/libhakodb-aarch64-linux-android.so
           cp assets/windows/hakodb.h release/hakodb.h
           cp assets/windows/hakodb.dll assets/windows/hakodb.lib assets/windows/hakodb.h pkg/win/
-          cp assets/linux/libhakodb.so assets/linux/libhakodb.rlib assets/windows/hakodb.h pkg/linux/
           cp assets/android/libhakodb.so assets/windows/hakodb.h pkg/android/
-          (cd release && sha256sum * > SHA256SUMS)
           (cd pkg/win && sha256sum * > SHA256SUMS)
-          (cd pkg/linux && sha256sum * > SHA256SUMS)
           (cd pkg/android && sha256sum * > SHA256SUMS)
           (cd pkg/win && zip -q ../hakodb-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip *)
-          (cd pkg/linux && tar -czf ../hakodb-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz *)
           (cd pkg/android && tar -czf ../hakodb-${{ github.ref_name }}-aarch64-linux-android.tar.gz *)
           mv pkg/*.zip pkg/*.tar.gz release/
+          # Linux matrix: one qualified set per distro family.
+          for d in assets/linux-matrix/*/; do
+            tag=$(basename "$d" | sed "s/^hakodb-${{ github.ref_name }}-//")
+            cp "$d/libhakodb.so" "release/libhakodb-$tag.so"
+            cp "$d/libhakodb.rlib" "release/libhakodb-$tag.rlib"
+            mkdir -p "pkg/$tag"
+            cp "$d/libhakodb.so" "$d/libhakodb.rlib" assets/windows/hakodb.h "pkg/$tag/"
+            (cd "pkg/$tag" && sha256sum * > SHA256SUMS)
+            (cd pkg && tar -czf "../release/hakodb-${{ github.ref_name }}-$tag.tar.gz" "$tag")
+          done
+          (cd release && sha256sum * > SHA256SUMS)
       - uses: softprops/action-gh-release@v2
         with:
           files: release/*

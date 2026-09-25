@@ -1,6 +1,6 @@
 [package]
 name = "hakodb"
-version = "0.8.23"
+version = "0.8.24"
 edition = "2021"
 authors = ["AbcDev Team"]
 description = "Embedded & Cloud-native Document Engine"

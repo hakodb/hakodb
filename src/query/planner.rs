@@ -262,7 +262,12 @@ impl QueryPlanner {
                                 
                                 // CRITICAL FIX: Mark filters satisfied if this is the ONLY filter
                                 let filters_satisfied = query.filters.len() == 1 && query.or_groups.is_empty();
-                                let safe_limit = if filters_satisfied { 
+                                // ponytail: no limit pushdown under ORDER BY — the
+                                // point scan is NOT in sort order, so truncating
+                                // before the executor sort returns the wrong
+                                // TOP-N (same trap as the FullCollection
+                                // fallback below). Unordered keeps the pushdown.
+                                let safe_limit = if filters_satisfied && query.order_by.is_empty() { 
                                     query.limit.map(|l| l + query.offset.unwrap_or(0)) 
                                 } else { None };
 
@@ -284,12 +289,14 @@ impl QueryPlanner {
         // This is the "Safety Net". If no index was found for 'id:eq',
         // it lands here and the Worker checks the storage keys manually.
         // ponytail: push limit+offset into the scan ONLY when no filters
-        // need matching — unordered scans can satisfy TOP-N from ANY rows,
-        // but pre-truncating before filter matching returns wrong (usually
-        // empty) results. Unfiltered keeps the pushdown; filtered scans
-        // everything and truncates downstream (inherent to unindexed match).
+        // need matching AND no ORDER BY is requested — unordered scans can
+        // satisfy TOP-N from ANY rows, but pre-truncating before filter
+        // matching returns wrong (usually empty) results, and pre-truncating
+        // before the executor's in-memory sort returns the wrong TOP-N.
+        // Unfiltered+unordered keeps the pushdown; everything else scans
+        // fully and truncates downstream (inherent to unindexed match/sort).
         let no_filters = query.filters.is_empty() && query.or_groups.is_empty();
-        let fc_limit = if no_filters {
+        let fc_limit = if no_filters && query.order_by.is_empty() {
             query.limit.map(|l| l + query.offset.unwrap_or(0))
         } else {
             None
@@ -719,6 +726,44 @@ mod tests {
             plan.scan
         );
         assert_eq!(plan.scan_limit, Some(20));
+    }
+
+    #[test]
+    fn ordered_eq_no_limit_pushdown() {
+        // Single Eq on a secondary-only field + ORDER BY on another field:
+        // P6 SecondaryIndex is NOT in sort order, so pushing limit would
+        // truncate before the executor sort (wrong TOP-N). scan_limit None.
+        let mut m = IndexManager::default();
+        m.create_secondary_index("bench", "age");
+        let q = Query::new("bench")
+            .where_eq("age", Value::Int(30))
+            .order_by("score", false)
+            .limit(20);
+        let plan = QueryPlanner::plan(&q, &m, 1000, 8, true);
+        assert!(
+            matches!(plan.scan, ScanType::SecondaryIndex { .. }),
+            "should fall to P6 secondary, got {:?}",
+            plan.scan
+        );
+        assert_eq!(plan.scan_limit, None);
+        // Same shape unordered keeps the pushdown.
+        let q2 = Query::new("bench").where_eq("age", Value::Int(30)).limit(20);
+        assert_eq!(QueryPlanner::plan(&q2, &m, 1000, 8, true).scan_limit, Some(20));
+    }
+
+    #[test]
+    fn fallback_order_no_limit_pushdown() {
+        // No indexes at all: unordered keeps TOP-N pushdown, ordered does
+        // not (full scan + executor sort, then truncate).
+        let m = IndexManager::default();
+        let q = Query::new("plain").order_by("age", false).limit(100);
+        let plan = QueryPlanner::plan(&q, &m, 1000, 8, true);
+        assert!(matches!(plan.scan, ScanType::FullCollection));
+        assert_eq!(plan.scan_limit, None);
+        let q2 = Query::new("plain").limit(100);
+        let plan2 = QueryPlanner::plan(&q2, &m, 1000, 8, true);
+        assert!(matches!(plan2.scan, ScanType::FullCollection));
+        assert_eq!(plan2.scan_limit, Some(100));
     }
 }
 
