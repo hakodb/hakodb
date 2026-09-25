@@ -1420,7 +1420,7 @@ impl Hako {
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
 
-        let is_ready = self.indexes_ready.load(std::sync::atomic::Ordering::Acquire);
+        let is_ready = self.index_query_ready();
 
         let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
 
@@ -1460,7 +1460,7 @@ impl Hako {
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
 
-        let is_ready = self.indexes_ready.load(std::sync::atomic::Ordering::Acquire);
+        let is_ready = self.index_query_ready();
 
         let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
 
@@ -1500,7 +1500,7 @@ impl Hako {
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
 
-        let is_ready = self.indexes_ready.load(std::sync::atomic::Ordering::Acquire);
+        let is_ready = self.index_query_ready();
 
         let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
 
@@ -1538,7 +1538,7 @@ impl Hako {
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
 
-        let is_ready = self.indexes_ready.load(std::sync::atomic::Ordering::Acquire);
+        let is_ready = self.index_query_ready();
 
         let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
 
@@ -1577,7 +1577,7 @@ impl Hako {
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
 
-        let is_ready = self.indexes_ready.load(std::sync::atomic::Ordering::Acquire);
+        let is_ready = self.index_query_ready();
         let plan = self.plan_cache.get_or_compute(&q, &indexes, rows, self.config.query_workers, is_ready);
 
         // SIMPLE CALL: Worker handles blob resolution internally
@@ -1744,7 +1744,7 @@ impl Hako {
     /// path costs the same as the former in-tree call — only the location
     /// moved, not the complexity.
     pub fn plan_for_watch(&self, query: &crate::query::query::Query) -> crate::query::plan::QueryPlan {        let indexes = self.indexes.read().unwrap();
-        let is_ready = self.indexes_ready.load(Ordering::Acquire);
+        let is_ready = self.index_query_ready();
         crate::query::planner::QueryPlanner::plan(query, &indexes, 0, 1, is_ready)
     }
 
@@ -1874,7 +1874,7 @@ impl Hako {
             .unwrap()
             .count_prefix("");
 
-        let is_ready = self.indexes_ready.load(std::sync::atomic::Ordering::Acquire);
+        let is_ready = self.index_query_ready();
         // FIX: Add self.config.query_workers as the 4th argument
         let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
 
@@ -2471,6 +2471,18 @@ impl Hako {
     /// and tests before measuring. Mirrors `hk_engine_is_indexes_ready`.
     pub fn is_indexes_ready(&self) -> bool {
         self.indexes_ready.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Query planning may trust indexes only when open-recovery is done AND
+    /// no runtime backfill is in flight. A new index registers before its
+    /// backfill thread finishes; planning against the partial index returns
+    /// wrong (empty/partial) results — fall back to `FullCollection`
+    /// instead. The plan cache is invalidated at index creation, so no
+    /// stale fast plan survives into the build window (a slow plan cached
+    /// during the window self-heals at TTL).
+    pub(crate) fn index_query_ready(&self) -> bool {
+        self.indexes_ready.load(std::sync::atomic::Ordering::Acquire)
+            && self.backfill_inflight.load(std::sync::atomic::Ordering::Acquire) == 0
     }
 
     /// Point sample of background activity. All fields best-effort (locks
