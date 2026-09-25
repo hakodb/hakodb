@@ -83,4 +83,8 @@ pub struct QueryPlan {
     /// and it keys the plan cache (a raw query must never reuse a decoded
     /// plan's output shape or vice versa).
     pub raw: bool,
+    /// True when the query carries cursor bounds. Unsatisfied-order scans
+    /// cannot apply them natively (the driver post-filters), so the TopN
+    /// lane refuses such plans and they keep the legacy full path.
+    pub has_cursor_bounds: bool,
 }

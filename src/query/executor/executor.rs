@@ -1,5 +1,6 @@
 use hashbrown::HashMap;
 use rayon::prelude::*;
+use std::collections::BinaryHeap;
 use std::sync::{Arc, RwLock};
 use std::thread;
 
@@ -7,6 +8,7 @@ use crate::document::hako_doc::{BorrowedValue, DocView, HakoDoc, HakoDocView};
 use crate::document::value::Value;
 use crate::error::Result;
 use crate::index::manager::IndexManager;
+use crate::query::order::OrderBy;
 use crate::query::plan::ScanType;
 use crate::query::query::AggregateOp;
 use crate::storage::engine::{Pointer, StorageEngine};
@@ -17,10 +19,102 @@ use super::scheduler::shard_tasks;
 use super::task::QueryTask;
 use super::worker::{matches_filters_view, run_task, run_task_projected};
 
+/// TopN lane firings since process start: operational visibility and test
+/// engagement proof (the parity suite asserts this moves). One Relaxed
+/// increment per TopN query — negligible next to a scan.
+static TOPN_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many queries took the TopN lane (see `execute_topn`).
+pub fn topn_runs() -> usize {
+    TOPN_RUNS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 use crate::index::index_key::decode_scalar_as_f64;
 
 pub struct ParallelQueryExecutor {
     workers: usize,
+}
+
+/// One ORDER BY slot, resolved per direction at compare time.
+/// `Field(None)` = missing (sorts below every value — same as the full
+/// sort's `Option` compare).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TopKey {
+    Id,
+    Time(i64),
+    Field(Option<Value>),
+}
+
+/// Heap candidate: owned sort keys + scan position + identity. The pointer
+/// is re-read at fetch (never compared).
+struct TopEntry {
+    keys: Vec<TopKey>,
+    seq: usize,
+    id: String,
+    ptr: Pointer,
+}
+
+/// Heap item borrows the order spec (directions live in the plan).
+struct TopItem<'a> {
+    entry: TopEntry,
+    orders: &'a [OrderBy],
+}
+
+impl<'a> PartialEq for TopItem<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        cmp_top(&self.entry, &other.entry, self.orders) == std::cmp::Ordering::Equal
+    }
+}
+impl<'a> Eq for TopItem<'a> {}
+impl<'a> PartialOrd for TopItem<'a> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(cmp_top(&self.entry, &other.entry, self.orders))
+    }
+}
+impl<'a> Ord for TopItem<'a> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        cmp_top(&self.entry, &other.entry, self.orders)
+    }
+}
+
+/// The phase-6 comparator, factored for the heap: per-slot direction, then
+/// scan-seq (a stable sort over scan order is exactly (keys…, input-seq),
+/// so this reproduces the legacy page bit-for-bit, ties included).
+fn cmp_top(a: &TopEntry, b: &TopEntry, orders: &[OrderBy]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for (o, (ka, kb)) in orders.iter().zip(a.keys.iter().zip(b.keys.iter())) {
+        let cmp = match (o.field.as_str(), ka, kb) {
+            ("id", _, _) => a.id.cmp(&b.id),
+            ("_time", TopKey::Time(x), TopKey::Time(y)) => x.cmp(y),
+            (_, TopKey::Field(x), TopKey::Field(y)) => x.cmp(y),
+            // Unreachable: keys are built from this same spec. Equal keeps
+            // the heap total without inventing order.
+            _ => Ordering::Equal,
+        };
+        if cmp != Ordering::Equal {
+            return if o.ascending { cmp } else { cmp.reverse() };
+        }
+    }
+    a.seq.cmp(&b.seq)
+}
+
+/// Pull one ORDER BY slot per doc from the view: header time, id compare
+/// needs nothing, fields decode a single value (never the whole doc).
+fn top_keys(view: &HakoDocView, orders: &[OrderBy]) -> Vec<TopKey> {
+    orders
+        .iter()
+        .map(|o| match o.field.as_str() {
+            "id" => TopKey::Id,
+            "_time" => TopKey::Time(view._time),
+            f => TopKey::Field(
+                view.iter()
+                    .find(|(k, _, _)| *k == f)
+                    .and_then(|(_, tag, data)| {
+                        crate::document::hako_doc::decode_value(tag, data)
+                    }),
+            ),
+        })
+        .collect()
 }
 
 impl ParallelQueryExecutor {
@@ -65,6 +159,24 @@ impl ParallelQueryExecutor {
         };
 
         let doc_count = keys_from_index.len();
+
+        // --- TOPN FAST LANE: unsatisfied ORDER BY + LIMIT, no cursor bounds.
+        // Full scans used to decode every doc + full sort + truncate (~10ms
+        // per 2000 docs). The heap keeps limit+offset candidates by sort
+        // keys pulled from views (no full decode); only the final page
+        // decodes. Cursor shapes keep the legacy path (bounds need the
+        // contract predicate; the gateway post-filters them anyway).
+        // Guard: limit >= scanned rows means no eviction is possible — the
+        // heap would be pure overhead, so those keep the legacy full sort
+        // (deep offsets with small limits still qualify: skipping is cheap,
+        // decoding the skipped prefix is not).
+        let topn = !plan.order_by.is_empty()
+            && !plan.order_by_satisfied
+            && !plan.has_cursor_bounds
+            && matches!(plan.limit, Some(l) if l < keys_from_index.len());
+        if topn {
+            return self.execute_topn(storage_arc, &plan, keys_from_index);
+        }
 
         // --- THE FAST PATH: satisfied scans skip the heavy machinery ---
         // Bypasses physical sorting, String re-clones, rayon dispatch, and
@@ -273,6 +385,109 @@ impl ParallelQueryExecutor {
         }
 
         Ok(results)
+    }
+
+    /// TopN heap for unsatisfied ORDER BY + LIMIT (see the hook in
+    /// [`Self::execute`]). Scan order in, globally-correct top page out:
+    ///
+    /// - Key-only scan: sort keys come from [`HakoDocView`] (header `_time`,
+    ///   id compare, single-field view pull) — never a full decode, except
+    ///   the final page. Filter matching is view-based too, or skipped when
+    ///   the scan already constrained to matches (same trust as the fast path).
+    /// - Exact parity with the legacy full stable sort: the heap orders by
+    ///   (keys…, scan-seq), and a stable sort is exactly (keys…, input-seq).
+    ///   Same scan order in → identical page out, ties included.
+    /// - Corrupt rows (view ok, full decode fails) drop at fetch like the
+    ///   legacy paths drop undecodables; offset applies over successes.
+    ///   Storage writes validated docs, so this is bitrot-only territory.
+    fn execute_topn(
+        &self,
+        storage_arc: Arc<RwLock<StorageEngine>>,
+        plan: &QueryPlan,
+        keys: Vec<(String, Pointer)>,
+    ) -> Result<Vec<(String, HakoDoc)>> {
+        let limit = plan.limit.unwrap_or(usize::MAX);
+        let offset = plan.offset.unwrap_or(0);
+        let k = limit.saturating_add(offset);
+        TOPN_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let orders = &plan.order_by;
+        let need_match = !plan.filters.is_empty() || !plan.or_groups.is_empty();
+        let trust_scan = plan.filters_satisfied_by_index;
+        let storage = storage_arc.read().unwrap();
+        // Max-heap of the K best so far: peek is the worst kept; a better
+        // arrival evicts it. (NOT Reverse: that would peak the best and
+        // freeze the heap on the first K scanned.)
+        let mut heap: BinaryHeap<TopItem> = BinaryHeap::new();
+        for (seq, (id, ptr)) in keys.iter().enumerate() {
+            let Some(shared) = storage.read_pointer_shared(ptr)? else {
+                continue;
+            };
+            let bytes: &[u8] = &shared;
+            let Some(view) = HakoDocView::new(bytes) else {
+                continue;
+            };
+            if need_match && !trust_scan && !matches_filters_view(&id, bytes, plan) {
+                continue;
+            }
+            let entry = TopEntry {
+                keys: top_keys(&view, orders),
+                seq,
+                id: id.clone(),
+                ptr: ptr.clone(),
+            };
+            let item = TopItem { entry, orders };
+            if heap.len() < k {
+                heap.push(item);
+            } else if let Some(worst) = heap.peek() {
+                if item < *worst {
+                    heap.pop();
+                    heap.push(item);
+                }
+            }
+        }
+        // Best-first, then offset over successes + take limit (mirrors the
+        // legacy slice order: offset first, then limit).
+        let mut entries: Vec<TopEntry> =
+            heap.into_iter().map(|item| item.entry).collect();
+        entries.sort_by(|a, b| cmp_top(a, b, orders));
+        let blob_manager = storage.blob_manager.as_ref();
+        let mut out = Vec::new();
+        let mut skipped = 0usize;
+        for e in entries {
+            // ponytail: decode lazily in order; corrupt rows drop and the
+            // page backfills from the heap remainder (same rows the legacy
+            // full-decode-then-sort would have kept).
+            let bytes = match storage.read_pointer(&e.ptr)? {
+                Some(b) => b,
+                None => continue,
+            };
+            let Some(doc) = HakoDoc::decode(&bytes) else {
+                continue;
+            };
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if out.len() >= limit {
+                break;
+            }
+            out.push((e.id, doc));
+        }
+        // Blob inflation for the final page only (mirrors the fast path).
+        if !plan.defer_blobs {
+            if let Some(bm) = blob_manager {
+                use crate::query::executor::worker::{doc_has_links, inflate_blobs};
+                if out.iter().any(|(_, doc)| doc_has_links(doc)) {
+                    out.par_iter_mut().for_each(|(_, doc)| {
+                        let _ = inflate_blobs(doc, bm);
+                    });
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Raw scan: phase-1 index walk with byte materialization — no decode,

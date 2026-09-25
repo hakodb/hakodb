@@ -315,6 +315,11 @@ impl QueryPlanner {
     ) -> QueryPlan {
         // If there's no specific sort requested, then the index's natural order is acceptable
         let actual_order_satisfied = query.order_by.is_empty() || order_satisfied;
+        // Cursor bounds ride into bounded index scans (SortedKeys, ranges);
+        // anything else leaves them to post-filtering (see has_cursor_bounds).
+        let has_cursor_bounds = [&query.start_at, &query.start_after, &query.end_at, &query.end_before]
+            .iter()
+            .any(|b| matches!(b, Some(v) if !v.is_empty()));
 
         QueryPlan {
             collection: query.collection.clone(),
@@ -330,6 +335,7 @@ impl QueryPlanner {
             filters_satisfied_by_index: filters_satisfied,
             defer_blobs: query.defer_blobs,
             raw: query.raw,
+            has_cursor_bounds,
         }
     }
 
