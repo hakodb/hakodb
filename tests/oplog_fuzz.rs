@@ -123,7 +123,7 @@ fn verify_collection(db: &Hako, model: &Model, col: &str, ctx: &str) {
     }
 
     // Walk ids + raw decode spot check.
-    let mut q = Query::new(col).order_by("id", true);
+    let q = Query::new(col).order_by("id", true);
     let mut walked = Vec::new();
     db.walk(q, &mut |id: &str, _| {
         walked.push(id.to_string());
@@ -134,7 +134,7 @@ fn verify_collection(db: &Hako, model: &Model, col: &str, ctx: &str) {
     assert_eq!(walked, want_sorted, "{ctx} walk ids");
 
     if let Some(sample) = want_sorted.first() {
-        let mut q = Query::new(col).order_by("id", true);
+        let q = Query::new(col).order_by("id", true);
         let rows = db.query_raw(q).unwrap_or_else(|e| panic!("{ctx} raw: {e:?}"));
         let found = rows.iter().find(|(id, _)| id == sample).expect("sample present");
         let doc = HakoDoc::decode(&found.1).expect("raw decodes");

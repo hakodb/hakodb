@@ -201,7 +201,7 @@ fn point_get_floor() {
     let col = std::ffi::CString::new("bench").unwrap();
     let field = std::ffi::CString::new("v").unwrap();
     let payload = vec![0xABu8; 100];
-    let engine_ptr = unsafe {
+    let engine_ptr =  {
         let cfg = hakodb::ffi::hk_config_new();
         hakodb::ffi::hk_config_set_durability(cfg, 2);
         hakodb::ffi::hk_engine_open_with_config(fdir_c.as_ptr(), cfg)
@@ -209,8 +209,8 @@ fn point_get_floor() {
     assert!(!engine_ptr.is_null());
     for i in 0..N {
         let k = std::ffi::CString::new(format!("{i:016x}")).unwrap();
-        let doc = unsafe { hakodb::ffi::hk_doc_new() };
-        unsafe {
+        let doc =  { hakodb::ffi::hk_doc_new() };
+         {
             assert_eq!(
                 hakodb::ffi::hk_doc_insert_bin(doc, field.as_ptr(), payload.as_ptr(), payload.len()),
                 0
@@ -227,15 +227,15 @@ fn point_get_floor() {
     for _ in 0..N {
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let k = std::ffi::CString::new(format!("{:016x}", (state >> 11) as usize % N)).unwrap();
-        let doc = unsafe {
+        let doc =  {
             hakodb::ffi::hk_engine_get(engine_ptr, col.as_ptr(), k.as_ptr())
         };
         if !doc.is_null() {
-            let js = unsafe { hakodb::ffi::hk_doc_to_json(doc) };
+            let js =  { hakodb::ffi::hk_doc_to_json(doc) };
             if !js.is_null() {
-                unsafe { hakodb::ffi::hk_string_free(js) };
+                 { hakodb::ffi::hk_string_free(js) };
             }
-            unsafe { hakodb::ffi::hk_doc_free(doc) };
+             { hakodb::ffi::hk_doc_free(doc) };
             found += 1;
         }
     }
@@ -245,7 +245,7 @@ fn point_get_floor() {
         "point-get FFI+JSON (harness-equivalent): {N} gets in {ffi_dt:?} = {} ops/s",
         N as u128 * 1_000_000_000 / ffi_dt.as_nanos().max(1),
     );
-    unsafe { hakodb::ffi::hk_engine_free(engine_ptr) };
+     { hakodb::ffi::hk_engine_free(engine_ptr) };
     std::fs::remove_dir_all(&fdir).ok();
 
     // Control: same FFI get loop, but seeded via BATCHES (like fillrandbatch)
@@ -259,18 +259,18 @@ fn point_get_floor() {
             .as_nanos()
     ));
     let bdir_c = std::ffi::CString::new(bdir.to_str().unwrap()).unwrap();
-    let bengine = unsafe {
+    let bengine =  {
         let cfg = hakodb::ffi::hk_config_new();
         hakodb::ffi::hk_config_set_durability(cfg, 2);
         hakodb::ffi::hk_engine_open_with_config(bdir_c.as_ptr(), cfg)
     };
     assert!(!bengine.is_null());
     for chunk in (0..N).collect::<Vec<_>>().chunks(500) {
-        let batch = unsafe { hakodb::ffi::hk_batch_new() };
+        let batch =  { hakodb::ffi::hk_batch_new() };
         for &i in chunk {
             let k = std::ffi::CString::new(format!("{i:016x}")).unwrap();
-            let doc = unsafe { hakodb::ffi::hk_doc_new() };
-            unsafe {
+            let doc =  { hakodb::ffi::hk_doc_new() };
+             {
                 assert_eq!(
                     hakodb::ffi::hk_doc_insert_bin(doc, field.as_ptr(), payload.as_ptr(), payload.len()),
                     0
@@ -282,7 +282,7 @@ fn point_get_floor() {
                 hakodb::ffi::hk_doc_free(doc);
             }
         }
-        unsafe {
+         {
             assert_eq!(hakodb::ffi::hk_batch_commit(bengine, batch), 0);
             hakodb::ffi::hk_batch_free(batch);
         }
@@ -293,15 +293,15 @@ fn point_get_floor() {
     for _ in 0..N {
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let k = std::ffi::CString::new(format!("{:016x}", (state >> 11) as usize % N)).unwrap();
-        let doc = unsafe {
+        let doc =  {
             hakodb::ffi::hk_engine_get(bengine, col.as_ptr(), k.as_ptr())
         };
         if !doc.is_null() {
-            let js = unsafe { hakodb::ffi::hk_doc_to_json(doc) };
+            let js =  { hakodb::ffi::hk_doc_to_json(doc) };
             if !js.is_null() {
-                unsafe { hakodb::ffi::hk_string_free(js) };
+                 { hakodb::ffi::hk_string_free(js) };
             }
-            unsafe { hakodb::ffi::hk_doc_free(doc) };
+             { hakodb::ffi::hk_doc_free(doc) };
             found += 1;
         }
     }
@@ -318,11 +318,11 @@ fn point_get_floor() {
     for _ in 0..N {
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let k = std::ffi::CString::new(format!("{:016x}", (state >> 11) as usize % N)).unwrap();
-        let doc = unsafe {
+        let doc =  {
             hakodb::ffi::hk_engine_get(bengine, col.as_ptr(), k.as_ptr())
         };
         if !doc.is_null() {
-            unsafe { hakodb::ffi::hk_doc_free(doc) };
+             { hakodb::ffi::hk_doc_free(doc) };
             found += 1;
         }
     }
@@ -333,40 +333,40 @@ fn point_get_floor() {
         N as u128 * 1_000_000_000 / getonly_dt.as_nanos().max(1),
     );
     let k0 = std::ffi::CString::new("0000000000000000").unwrap();
-    let one = unsafe { hakodb::ffi::hk_engine_get(bengine, col.as_ptr(), k0.as_ptr()) };
+    let one =  { hakodb::ffi::hk_engine_get(bengine, col.as_ptr(), k0.as_ptr()) };
     assert!(!one.is_null());
     let t0 = std::time::Instant::now();
     for _ in 0..N {
-        let js = unsafe { hakodb::ffi::hk_doc_to_json(one) };
+        let js =  { hakodb::ffi::hk_doc_to_json(one) };
         assert!(!js.is_null());
-        unsafe { hakodb::ffi::hk_string_free(js) };
+         { hakodb::ffi::hk_string_free(js) };
     }
     let jsononly_dt = t0.elapsed();
     eprintln!(
         "hk_doc_to_json alone x{N}: {jsononly_dt:?} = {} ops/s",
         N as u128 * 1_000_000_000 / jsononly_dt.as_nanos().max(1),
     );
-    unsafe { hakodb::ffi::hk_doc_free(one) };
+     { hakodb::ffi::hk_doc_free(one) };
     // Control: same serialize loop over a STRING-valued doc (no byte array).
     // If this is multiples faster, the Binary-array arm is the confirmed hog.
-    let sdoc = unsafe { hakodb::ffi::hk_doc_new() };
+    let sdoc =  { hakodb::ffi::hk_doc_new() };
     let sval = std::ffi::CString::new("x".repeat(100)).unwrap();
-    unsafe {
+     {
         hakodb::ffi::hk_doc_insert_str(sdoc, field.as_ptr(), sval.as_ptr());
     }
     let t0 = std::time::Instant::now();
     for _ in 0..N {
-        let js = unsafe { hakodb::ffi::hk_doc_to_json(sdoc) };
+        let js =  { hakodb::ffi::hk_doc_to_json(sdoc) };
         assert!(!js.is_null());
-        unsafe { hakodb::ffi::hk_string_free(js) };
+         { hakodb::ffi::hk_string_free(js) };
     }
     let sjson_dt = t0.elapsed();
     eprintln!(
         "hk_doc_to_json string-doc x{N}: {sjson_dt:?} = {} ops/s",
         N as u128 * 1_000_000_000 / sjson_dt.as_nanos().max(1),
     );
-    unsafe { hakodb::ffi::hk_doc_free(sdoc) };
-    unsafe { hakodb::ffi::hk_engine_free(bengine) };
+     { hakodb::ffi::hk_doc_free(sdoc) };
+     { hakodb::ffi::hk_engine_free(bengine) };
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(&bdir).ok();
 }
@@ -454,7 +454,7 @@ fn raw_ffi_roundtrip() {
     let idf = std::ffi::CString::new("id").unwrap();
     let payload = vec![0xABu8; 100];
 
-    let engine = unsafe {
+    let engine =  {
         let cfg = ffi::hk_config_new();
         ffi::hk_config_set_durability(cfg, 2);
         ffi::hk_engine_open_with_config(dir_c.as_ptr(), cfg)
@@ -462,14 +462,14 @@ fn raw_ffi_roundtrip() {
     assert!(!engine.is_null());
     for i in 0..N {
         let k = std::ffi::CString::new(format!("{i:016x}")).unwrap();
-        let doc = unsafe { ffi::hk_doc_new() };
-        unsafe {
+        let doc =  { ffi::hk_doc_new() };
+         {
             assert_eq!(ffi::hk_doc_insert_bin(doc, field.as_ptr(), payload.as_ptr(), payload.len()), 0);
             assert_eq!(ffi::hk_engine_insert_take(engine, col.as_ptr(), k.as_ptr(), doc), 0);
         }
     }
     let t0 = std::time::Instant::now();
-    while unsafe { !ffi::hk_engine_is_indexes_ready(engine) } {
+    while !ffi::hk_engine_is_indexes_ready(engine) {
         assert!(t0.elapsed() < std::time::Duration::from_secs(30), "indexes never ready");
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
@@ -485,8 +485,8 @@ fn raw_ffi_roundtrip() {
     let mut prev_rs: *mut ffi::HK_RawResultSet = std::ptr::null_mut();
     let mut prev_last: *mut ffi::HK_RawDoc = std::ptr::null_mut();
     loop {
-        let q = unsafe { ffi::hk_query_new(col.as_ptr()) };
-        unsafe {
+        let q =  { ffi::hk_query_new(col.as_ptr()) };
+         {
             assert_eq!(ffi::hk_query_order_by(q, idf.as_ptr(), false), 0);
             assert_eq!(ffi::hk_query_limit(q, PAGE), 0);
             if !prev_last.is_null() {
@@ -494,28 +494,26 @@ fn raw_ffi_roundtrip() {
             }
             if !prev_rs.is_null() {
                 ffi::hk_rawresult_free(prev_rs);
-                prev_rs = std::ptr::null_mut();
-                prev_last = std::ptr::null_mut();
             }
         }
-        let rs = unsafe { ffi::hk_query_execute_raw(engine, q) };
+        let rs =  { ffi::hk_query_execute_raw(engine, q) };
         assert!(!rs.is_null());
-        let n = unsafe { ffi::hk_rawresult_count(rs) };
+        let n =  { ffi::hk_rawresult_count(rs) };
         if n == 0 {
-            unsafe { ffi::hk_rawresult_free(rs) };
-            unsafe { ffi::hk_query_free(q) };
+             { ffi::hk_rawresult_free(rs) };
+             { ffi::hk_query_free(q) };
             break;
         }
         let mut last_raw: *mut ffi::HK_RawDoc = std::ptr::null_mut();
         for i in 0..n {
-            let r = unsafe { ffi::hk_rawresult_get(rs, i) };
+            let r =  { ffi::hk_rawresult_get(rs, i) };
             assert!(!r.is_null());
             let mut len = 0usize;
-            let ptr = unsafe { ffi::hk_rawdoc_bytes(r, &mut len as *mut usize) };
+            let ptr =  { ffi::hk_rawdoc_bytes(r, &mut len as *mut usize) };
             assert!(!ptr.is_null() && len > 0, "raw row has bytes");
             total_bytes += len;
             let mut idlen = 0usize;
-            let idp = unsafe { ffi::hk_rawdoc_id(r, &mut idlen as *mut usize) };
+            let idp =  { ffi::hk_rawdoc_id(r, &mut idlen as *mut usize) };
             assert!(!idp.is_null() && idlen > 0);
             let id = unsafe { std::slice::from_raw_parts(idp as *const u8, idlen) };
             ids.push(String::from_utf8_lossy(id).into_owned());
@@ -524,18 +522,18 @@ fn raw_ffi_roundtrip() {
         // Resolve the first row of the first page end-to-end.
         if first_page {
             first_page = false;
-            let first = unsafe { ffi::hk_rawresult_get(rs, 0) };
-            let d = unsafe { ffi::hk_rawdoc_to_doc(engine, first, col.as_ptr()) };
+            let first =  { ffi::hk_rawresult_get(rs, 0) };
+            let d =  { ffi::hk_rawdoc_to_doc(engine, first, col.as_ptr()) };
             assert!(!d.is_null(), "raw row resolves");
-            let js = unsafe { ffi::hk_doc_to_json(d) };
+            let js =  { ffi::hk_doc_to_json(d) };
             assert!(!js.is_null());
             resolved_json = unsafe { std::ffi::CStr::from_ptr(js) }.to_str().unwrap().to_string();
-            unsafe { ffi::hk_string_free(js) };
-            unsafe { ffi::hk_doc_free(d) };
+             { ffi::hk_string_free(js) };
+             { ffi::hk_doc_free(d) };
         }
         prev_rs = rs;
         prev_last = last_raw;
-        unsafe { ffi::hk_query_free(q) };
+         { ffi::hk_query_free(q) };
     }
     let dt = t0.elapsed();
     assert_eq!(ids.len(), N, "raw FFI scan missed docs");
@@ -545,7 +543,7 @@ fn raw_ffi_roundtrip() {
         "raw FFI scan: {N} docs / {total_bytes} bytes in {dt:?} = {} docs/s",
         N as u128 * 1_000_000_000 / dt.as_nanos().max(1),
     );
-    unsafe { ffi::hk_engine_free(engine) };
+     { ffi::hk_engine_free(engine) };
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -845,7 +843,7 @@ fn walk_ffi() {
     let idf = std::ffi::CString::new("id").unwrap();
     let payload = vec![0xABu8; 100];
 
-    let engine = unsafe {
+    let engine =  {
         let cfg = ffi::hk_config_new();
         ffi::hk_config_set_durability(cfg, 2);
         ffi::hk_engine_open_with_config(dir_c.as_ptr(), cfg)
@@ -853,26 +851,26 @@ fn walk_ffi() {
     assert!(!engine.is_null());
     for i in 0..N {
         let k = std::ffi::CString::new(format!("{i:016x}")).unwrap();
-        let doc = unsafe { ffi::hk_doc_new() };
-        unsafe {
+        let doc =  { ffi::hk_doc_new() };
+         {
             assert_eq!(ffi::hk_doc_insert_bin(doc, field.as_ptr(), payload.as_ptr(), payload.len()), 0);
             assert_eq!(ffi::hk_engine_insert_take(engine, col.as_ptr(), k.as_ptr(), doc), 0);
         }
     }
     let t0 = std::time::Instant::now();
-    while unsafe { !ffi::hk_engine_is_indexes_ready(engine) } {
+    while !ffi::hk_engine_is_indexes_ready(engine) {
         assert!(t0.elapsed() < std::time::Duration::from_secs(30), "indexes never ready");
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 
     // Full descending walk, no limit — one call.
-    let q = unsafe { ffi::hk_query_new(col.as_ptr()) };
-    unsafe {
+    let q =  { ffi::hk_query_new(col.as_ptr()) };
+     {
         assert_eq!(ffi::hk_query_order_by(q, idf.as_ptr(), false), 0);
     }
     let mut st = WalkState::default();
     let t0 = std::time::Instant::now();
-    let n = unsafe {
+    let n =  {
         ffi::hk_cursor_walk(
             engine,
             q,
@@ -889,15 +887,15 @@ fn walk_ffi() {
         st.bytes,
         N as u128 * 1_000_000_000 / dt.as_nanos().max(1),
     );
-    unsafe { ffi::hk_query_free(q) };
+     { ffi::hk_query_free(q) };
 
     // Early-stop + null callback.
-    let q2 = unsafe { ffi::hk_query_new(col.as_ptr()) };
-    unsafe {
+    let q2 =  { ffi::hk_query_new(col.as_ptr()) };
+     {
         assert_eq!(ffi::hk_query_order_by(q2, idf.as_ptr(), true), 0);
     }
     let mut cnt = 0usize;
-    let n = unsafe {
+    let n =  {
         ffi::hk_cursor_walk(
             engine,
             q2,
@@ -907,10 +905,10 @@ fn walk_ffi() {
     };
     assert_eq!(n, 100, "early stop visits exactly 100");
     assert_eq!(cnt, 100);
-    let n = unsafe { ffi::hk_cursor_walk(engine, q2, None, std::ptr::null_mut()) };
+    let n =  { ffi::hk_cursor_walk(engine, q2, None, std::ptr::null_mut()) };
     assert_eq!(n, -1, "null callback errors");
-    unsafe { ffi::hk_query_free(q2) };
+     { ffi::hk_query_free(q2) };
 
-    unsafe { ffi::hk_engine_free(engine) };
+     { ffi::hk_engine_free(engine) };
     std::fs::remove_dir_all(&dir).ok();
 }
