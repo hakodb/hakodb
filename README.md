@@ -6,11 +6,23 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 HakoDB speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.8.23 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.8.25 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.8.23)
+## What's new (0.7.2 → 0.8.25)
+
+### v0.8.25 — TopN heap for unindexed order+limit
+- Unsatisfied `ORDER BY` + `LIMIT` no longer decodes every doc + full sort:
+  key-only scan via views, bounded heap (limit+offset), exact stable-sort
+  parity (scan-seq tiebreak), corrupt-row backfill. ~3-4x on 2000-doc
+  ordered pages; over-fetch and cursor shapes keep the legacy path.
+- Linux release matrix per distro family (glibc floors: EL8/Ubuntu22/
+  Ubuntu24/Arch) + static musl-core (rlib-only) + existing Windows/Android.
+
+### v0.8.24 — ordered limit-pushdown correctness + public Linux matrix
+- Planner no longer pushes scan limits under unsatisfied `ORDER BY`
+  (was wrong TOP-N for direct callers); per-distro Linux release assets.
 
 ### v0.8.23 — header rename + query-decode micro-opts
 - C header renamed `hako.h` → `hakodb.h` (guard `HAKODB_H`); release
