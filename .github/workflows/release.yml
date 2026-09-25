@@ -97,6 +97,10 @@ jobs:
     # says so explicitly — no surprise for consumers. If a full-featured
     # static build is ever needed, the road is cargo-zigbuild (zig ships
     # musl libc++), not stock musl-gcc.
+    #
+    # rlib ONLY: rustc drops `cdylib` for musl targets ("unsupported crate
+    # type") — there is no .so here by construction, not by accident. Rust
+    # consumers link the rlib statically; C consumers take a glibc .so.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -105,7 +109,7 @@ jobs:
           targets: x86_64-unknown-linux-musl
       - name: Setup musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: Build cdylib + rlib (static, embedded core)
+      - name: Build rlib (static, embedded core)
         run: cargo build --release --no-default-features --target x86_64-unknown-linux-musl
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
@@ -113,7 +117,7 @@ jobs:
       - name: Collect assets
         run: |
           mkdir -p dist
-          cp target/x86_64-unknown-linux-musl/release/libhakodb.so target/x86_64-unknown-linux-musl/release/libhakodb.rlib include/hakodb.h dist/
+          cp target/x86_64-unknown-linux-musl/release/libhakodb.rlib include/hakodb.h dist/
           (cd dist && sha256sum * > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:
@@ -190,13 +194,18 @@ jobs:
           (cd pkg/win && zip -q ../hakodb-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip *)
           (cd pkg/android && tar -czf ../hakodb-${{ github.ref_name }}-aarch64-linux-android.tar.gz *)
           mv pkg/*.zip pkg/*.tar.gz release/
-          # Linux matrix: one qualified set per distro family.
+          # Linux matrix: one qualified set per distro family. The .so is
+          # optional per family (musl ships rlib-only: rustc drops cdylib
+          # for musl targets) — hence the existence guard, not || true.
           for d in assets/linux-matrix/*/; do
             tag=$(basename "$d" | sed "s/^hakodb-${{ github.ref_name }}-//")
-            cp "$d/libhakodb.so" "release/libhakodb-$tag.so"
             cp "$d/libhakodb.rlib" "release/libhakodb-$tag.rlib"
             mkdir -p "pkg/$tag"
-            cp "$d/libhakodb.so" "$d/libhakodb.rlib" assets/windows/hakodb.h "pkg/$tag/"
+            cp "$d/libhakodb.rlib" assets/windows/hakodb.h "pkg/$tag/"
+            if [ -f "$d/libhakodb.so" ]; then
+              cp "$d/libhakodb.so" "release/libhakodb-$tag.so"
+              cp "$d/libhakodb.so" "pkg/$tag/"
+            fi
             (cd "pkg/$tag" && sha256sum * > SHA256SUMS)
             (cd pkg && tar -czf "../release/hakodb-${{ github.ref_name }}-$tag.tar.gz" "$tag")
           done
