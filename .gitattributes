@@ -1,0 +1,3 @@
+# Normalize line endings on commit (LF in repo); silence CRLF-checkout
+# phantom diffs on Windows. Compilers accept either; git compares normalized.
+* text=auto
