@@ -336,22 +336,29 @@ impl ParallelQueryExecutor {
         };
 
         // 5. PHASE 5: LOGICAL ORDER RESTORATION
-        let mut processed_map: HashMap<String, HakoDoc> = processed_docs.into_iter().collect();
-        let mut ordered_results = Vec::with_capacity(doc_count);
+        // ponytail: single-worker output is already in work_items order
+        // (tasks stay ordered, flat_map preserves) — the HashMap round-trip
+        // below (2 hashes/row) only exists for parallel completion order.
+        let mut results: Vec<(String, HakoDoc)> = if target_workers == 1 {
+            processed_docs
+        } else {
+            let mut processed_map: HashMap<String, HakoDoc> = processed_docs.into_iter().collect();
+            let mut ordered_results = Vec::with_capacity(doc_count);
 
-        for (original_pos, key, _) in work_items {
-            if let Some(doc) = processed_map.remove(&key) {
-                ordered_results.push((original_pos, key, doc));
+            for (original_pos, key, _) in work_items {
+                if let Some(doc) = processed_map.remove(&key) {
+                    ordered_results.push((original_pos, key, doc));
+                }
             }
-        }
 
-        // Restore the order provided by the index (or original insertion order)
-        ordered_results.sort_by_key(|(pos, _, _)| *pos);
+            // Restore the order provided by the index (or original insertion order)
+            ordered_results.sort_by_key(|(pos, _, _)| *pos);
 
-        let mut results: Vec<(String, HakoDoc)> = ordered_results
-            .into_iter()
-            .map(|(_, k, d)| (k, d))
-            .collect();
+            ordered_results
+                .into_iter()
+                .map(|(_, k, d)| (k, d))
+                .collect()
+        };
 
         // 6. PHASE 6: FINAL SORTING & SLICING
         // Manual sort if the Index couldn't satisfy the order_by clause

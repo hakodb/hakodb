@@ -83,11 +83,11 @@ pub fn run_task(task: QueryTask) -> Vec<(String, HakoDoc)> {
         // blob inflation happens once below, concurrently (see execute()).
         match pointer {
             crate::storage::engine::Pointer::Inlined(shared) => {
-                decode_row(&id, &shared, &task.plan, &optimized_plan, &mut out);
+                decode_row(id, &shared, &task.plan, &optimized_plan, &mut out);
             }
             other => {
                 if let Ok(Some(bytes)) = storage_guard.read_pointer(&other) {
-                    decode_row(&id, &bytes, &task.plan, &optimized_plan, &mut out);
+                    decode_row(id, &bytes, &task.plan, &optimized_plan, &mut out);
                 }
             }
         }
@@ -112,7 +112,7 @@ pub fn run_task(task: QueryTask) -> Vec<(String, HakoDoc)> {
 /// Shared decode+push helper for run_task's borrowed/owned sources.
 /// Inflation is the caller's job (once, concurrently — see above).
 fn decode_row(
-    id: &str,
+    id: String,
     bytes: &[u8],
     plan: &crate::query::plan::QueryPlan,
     optimized_plan: &crate::query::plan::QueryPlan,
@@ -122,12 +122,12 @@ fn decode_row(
     // Skeletons only — the caller inflates once, concurrently (see above).
     if plan.filters_satisfied_by_index {
         if let Some(doc) = HakoDoc::decode(bytes) {
-            out.push((id.to_string(), doc));
+            out.push((id, doc));
         }
     } else {
         // Slower Path: Query contains filters that the index couldn't verify
-        if let Some(doc) = unified_match_decode(id, bytes, optimized_plan) {
-            out.push((id.to_string(), doc));
+        if let Some(doc) = unified_match_decode(&id, bytes, optimized_plan) {
+            out.push((id, doc));
         }
     }
 }
