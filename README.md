@@ -6,11 +6,18 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 HakoDB speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.8.27 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.8.28 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.8.27)
+## What's new (0.7.2 → 0.8.28)
+
+### v0.8.28 — zero-clone query fan-out (−20% unindexed scans)
+- Task sharding moves id Strings (`drain`, no `to_vec` re-clone),
+  matched ids move (no `to_string` per row), single-worker queries skip
+  the HashMap order-restoration round-trip (2 hashes/row, only needed
+  for parallel completion order). Server bench-lab: filter-eq
+  0.020→0.015s ×3 runs, all other lanes flat, gate PASS.
 
 ### v0.8.27 — FxHash interning (+7–14% decode-heavy queries)
 - Field-name interning pool moves from std `HashMap` (SipHash) to
