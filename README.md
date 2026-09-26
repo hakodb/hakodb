@@ -6,11 +6,18 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 HakoDB speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.8.25 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.8.26 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.8.25)
+## What's new (0.7.2 → 0.8.26)
+
+### v0.8.26 — get fast path (lock-free gates, contention-free populate)
+- `allowed()`: atomic no-rules gate skips the RwLock on every op when no
+  security rules are set (get/query/batch all benefit).
+- `get()`: hot-cache key alloc deferred until a version exists to compare;
+  cache populate uses `try_write` so a contended cache no longer serializes
+  concurrent readers (read hits 8-thread scaling).
 
 ### v0.8.25 — TopN heap for unindexed order+limit
 - Unsatisfied `ORDER BY` + `LIMIT` no longer decodes every doc + full sort:
