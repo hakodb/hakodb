@@ -920,12 +920,17 @@ impl Hako {
             assigned_ids.push(doc_id.clone());
 
             // 2. COMPUTE KEY ONCE
-            
-            let work = shard_map.entry(col.clone()).or_insert_with(|| ShardWork {
-                ops: Vec::new(), keys: Vec::new(), events: Vec::new(), 
-                index_puts: Vec::new(), blob_queue_items: Vec::new(),
-                index_deletes: Vec::new()
-            });
+            // ponytail: get_mut first — the old entry(col.clone()) allocated
+            // a key String per mutation even on hit (20K allocs/batch on
+            // single-collection batches).
+            let work = match shard_map.get_mut(&col) {
+                Some(w) => w,
+                None => shard_map.entry(col.clone()).or_insert_with(|| ShardWork {
+                    ops: Vec::new(), keys: Vec::new(), events: Vec::new(),
+                    index_puts: Vec::new(), blob_queue_items: Vec::new(),
+                    index_deletes: Vec::new()
+                }),
+            };
 
             let key_arc: Arc<str> = Arc::from(doc_id.as_str());
             
@@ -1016,20 +1021,22 @@ impl Hako {
                 // blob worker's BlobPending-gated swap simply no-ops, and
                 // pre-flush blob reads still resolve via the flush queue.
                 // Falls back to BlobPending if the WAL op is ever absent.
-                let mut put_bytes: std::collections::HashMap<&str, &[u8]> =
-                    std::collections::HashMap::with_capacity(work.index_puts.len());
+                // ponytail: PutInlined ops and index_puts are pushed in
+                // lockstep (one pair per put/patch; deletes touch ops only),
+                // so zip positionally. The old code built a full HashMap of
+                // every key first (SipHash ×2/row on big batches) — gone.
+                // index_puts stays put for the indexer send below.
+                let mut put_idx = 0;
                 for op in &work.ops {
-                    if let WalOp::PutInlined { key, value } = op {
-                        put_bytes.insert(key.as_str(), value.as_slice());
+                    if let WalOp::PutInlined { value, .. } = op {
+                        if let Some((doc_id, _)) = work.index_puts.get(put_idx) {
+                            put_idx += 1;
+                            let ptr = Pointer::Inlined(Arc::new(value.clone()));
+                            shard.update_index_entry(doc_id.clone(), Some(ptr));
+                        }
                     }
                 }
-                for (doc_id, doc_arc) in &work.index_puts {
-                    let ptr = match put_bytes.get(doc_id.as_str()) {
-                        Some(bytes) => Pointer::Inlined(Arc::new(bytes.to_vec())),
-                        None => Pointer::BlobPending(Arc::clone(doc_arc)),
-                    };
-                    shard.update_index_entry(doc_id.clone(), Some(ptr));
-                }
+                debug_assert!(work.index_puts.get(put_idx).is_none(), "ops/index_puts lockstep broke");
                 for op in &work.ops {
                     if let WalOp::Delete { key, timestamp } = op {
                         shard.update_index_entry(key.clone(), Some(Pointer::Deleted { timestamp: *timestamp }));
@@ -1050,15 +1057,19 @@ impl Hako {
 
             // ponytail: drop hot-cache entries for written keys. The version
             // bump alone would invalidate them; this reclaims memory eagerly.
+            // ponytail: skip the whole pass when the cache is empty (the
+            // common batch/seed case) — 20K format!+remove for nothing.
             let t_cache = Instant::now();
             {
                 let mut cache = self.doc_cache.write().unwrap();
-                for (doc_id, _) in &work.index_puts {
-                    cache.remove(&format!("{col_name}\0{doc_id}"));
-                }
-                for op in &work.ops {
-                    if let WalOp::Delete { key, .. } = op {
-                        cache.remove(&format!("{col_name}\0{key}"));
+                if !cache.is_empty() {
+                    for (doc_id, _) in &work.index_puts {
+                        cache.remove(&format!("{col_name}\0{doc_id}"));
+                    }
+                    for op in &work.ops {
+                        if let WalOp::Delete { key, .. } = op {
+                            cache.remove(&format!("{col_name}\0{key}"));
+                        }
                     }
                 }
             }
