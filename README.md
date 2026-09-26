@@ -6,11 +6,18 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 HakoDB speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.8.28 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.8.29 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.8.28)
+## What's new (0.7.2 → 0.8.29)
+
+### v0.8.29 — cheaper batch path (apply −23%, seed −10%)
+- Apply zips WAL ops with index puts positionally (lockstep push order)
+  instead of building a per-batch key HashMap; hot-cache invalidation
+  skips entirely when the cache is empty; shard-map entry no longer
+  clones the collection key on hit. Server seed: 0.122→0.111s with
+  apply 30→23ms and cache 5.3→0ms (single-fsync variance aside).
 
 ### v0.8.28 — zero-clone query fan-out (−20% unindexed scans)
 - Task sharding moves id Strings (`drain`, no `to_vec` re-clone),
