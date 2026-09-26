@@ -1,6 +1,5 @@
 use crate::document::value::Value;
 use crate::util::varint::*;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::cell::RefCell;
 
@@ -9,7 +8,10 @@ const VERSION: u8 = 5;
 
 thread_local! {
     static ENCODE_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(128 * 1024));
-    static FIELD_NAMES: RefCell<HashMap<String, Arc<str>>> = RefCell::new(HashMap::new());
+    // ponytail: Fx over std RandomState — interning hashes every field key
+    // of every decoded doc on the hot path; SipHash was the single biggest
+    // per-field cost (bench-lab get/decode split). fxhash is already a dep.
+    static FIELD_NAMES: RefCell<fxhash::FxHashMap<String, Arc<str>>> = RefCell::new(fxhash::FxHashMap::default());
 }
 
 /// ponytail: field names repeat across every document ("tenant", "score",
