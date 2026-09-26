@@ -355,6 +355,9 @@ pub struct Hako {
     pub(crate) doc_versions: Vec<RwLock<HashMap<Arc<str>, u64>>>,
     global_version: AtomicU64,
     security_rules: RwLock<Vec<SecurityRule>>,
+    /// ponytail: lock-free gate for allowed(). The common case (no rules)
+    /// skips the RwLock acquisition on every op; set alongside the rules.
+    security_enabled: std::sync::atomic::AtomicBool,
     audit_data: Arc<RwLock<Vec<AuditEntry>>>,
     audit_tx: Sender<AuditEntry>,
     pub(crate) index_tx: Sender<IndexOp>,
@@ -635,6 +638,7 @@ impl Hako {
             doc_versions,
             global_version: AtomicU64::new(1),
             security_rules: RwLock::new(Vec::new()),
+            security_enabled: std::sync::atomic::AtomicBool::new(false),
             audit_tx,
             index_tx,
             index_inflight,
@@ -1136,9 +1140,12 @@ impl Hako {
         // ponytail: one version lookup serves both the probe and the
         // populate below (the old code paid fxhash + sharded lock twice).
         let ver = self.current_version(doc_id);
-        let cache_key = format!("{collection}\0{doc_id}");
-        if let Some(ver) = ver {
-            if let Some((v, cached)) = self.doc_cache.read().unwrap().get(&cache_key) {
+        // ponytail: cache-key alloc only when a version exists to compare
+        // against — unversioned docs paid a format! for a probe that could
+        // never hit. Built once, shared by probe + populate below.
+        let cache_key = ver.map(|_| format!("{collection}\0{doc_id}"));
+        if let (Some(ver), Some(cache_key)) = (ver, &cache_key) {
+            if let Some((v, cached)) = self.doc_cache.read().unwrap().get(cache_key) {
                 if *v == ver {
                     return Ok(Some((**cached).clone()));
                 }
@@ -1169,12 +1176,16 @@ impl Hako {
             self.resolve_doc(&mut doc, collection)?;
             // ponytail: populate post-resolve. Bounded at 8192 with single
             // arbitrary eviction when full.
-            if let Some(ver) = ver {
-                let mut cache = self.doc_cache.write().unwrap();
-                if cache.len() >= 8192 {
-                    if let Some(k) = cache.keys().next().cloned() { cache.remove(&k); }
+            // ponytail: try_write — a contended cache must not serialize
+            // readers. Skipped populate just means the next read re-decodes;
+            // correctness is untouched (version check revalidates).
+            if let (Some(ver), Some(cache_key)) = (ver, cache_key) {
+                if let Ok(mut cache) = self.doc_cache.try_write() {
+                    if cache.len() >= 8192 {
+                        if let Some(k) = cache.keys().next().cloned() { cache.remove(&k); }
+                    }
+                    cache.insert(cache_key, (ver, Arc::new(doc.clone())));
                 }
-                cache.insert(cache_key, (ver, Arc::new(doc.clone())));
             }
             return Ok(Some(doc));
         }
@@ -1684,6 +1695,10 @@ impl Hako {
     }
 
     fn allowed(&self, col: &str, op: AccessOp) -> bool {
+        // ponytail: no-rules fast path without touching the lock.
+        if !self.security_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
         let rules = self.security_rules.read().unwrap();
         if rules.is_empty() {
             return true;
@@ -1853,6 +1868,7 @@ impl Hako {
     }
     
     pub fn set_security_rules(&self, rules: Vec<SecurityRule>) {
+        self.security_enabled.store(!rules.is_empty(), std::sync::atomic::Ordering::Relaxed);
         *self.security_rules.write().unwrap() = rules;
     }
 
