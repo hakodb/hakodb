@@ -198,8 +198,16 @@ impl StorageEngine {
         // WAL hygiene: hot-small collections pile history that nothing ever
         // compacts (segments never spill at this volume). One bounded rewrite
         // on open when stale history dominates; best-effort, never fails open.
+        // 2-a (insiden-hako-wal-20260928): the rewrite resets the file and
+        // stages the snapshot in the RAM buffer — WITHOUT this flush a
+        // SIGTERM before the next threshold-triggered append wipes the
+        // collection (file zeros + data only in RAM, indefinitely on a
+        // quiet server). One write_all+fdatasync per bloated open: off the
+        // write hot path by construction.
         if engine.wal_snapshot_worthwhile() {
-            let _ = engine.rewrite_wal_snapshot();
+            if engine.rewrite_wal_snapshot().is_ok() {
+                let _ = engine.wal.flush();
+            }
         }
         Ok(engine)
     }
@@ -575,6 +583,14 @@ impl StorageEngine {
     }
 
     pub fn run_background_maintenance(&mut self) -> Result<()> {
+        // 2-c: Interval shards flush dirty buffers on the existing 500ms
+        // system tick (off the request path) — closes the quiet-window where
+        // a SIGKILL/power loss would take unflushed appends. Mode contracts
+        // hold: Manual never auto-flushes, OnCommit flushes only at commit,
+        // Always is already per-op. Idle shards = one is_empty check.
+        if self.wal.durability_mode() == DurabilityMode::Interval && self.wal.has_pending() {
+            let _ = self.wal.flush();
+        }
         self.maybe_rotate_active_segment()?;
         // Check if RAM is full and spill to disk if needed
         self.checkpoint_inlined_data()?;
@@ -685,6 +701,11 @@ impl StorageEngine {
                 segment: target 
             });
         self.rewrite_wal_snapshot()?;
+        // 2-a: same staged-without-flush hazard as the open-time rewrite —
+        // the process keeps running here, but on a quiet server no later
+        // append would flush it before a SIGTERM. Sync it now (one fdatasync
+        // per compaction, not per write).
+        self.wal.flush()?;
 
         Ok(true)
     }
@@ -895,10 +916,13 @@ impl StorageEngine {
     /// Tombstones count as zero live, so a dead-only WAL always qualifies
     /// once past the threshold. `inlined_bytes` is maintained on every index
     /// write, so this is O(1) — safe on open and on every manual compact.
+    /// 2-b: measures REAL record bytes (Wal::data_len), never the sparse
+    /// file length — the 4-8MB zero reservation used to qualify tiny
+    /// collections and fire rewrites that (pre-2-a) wiped them on SIGTERM.
     pub(crate) fn wal_snapshot_worthwhile(&self) -> bool {
-        let wal_len = self.wal.file.metadata().map(|m| m.len()).unwrap_or(0);
-        wal_len > self.compaction_threshold_bytes as u64
-            && wal_len > (self.inlined_bytes as u64).saturating_mul(3)
+        let data_len = self.wal.data_len();
+        data_len > self.compaction_threshold_bytes as u64
+            && data_len > (self.inlined_bytes as u64).saturating_mul(3)
     }
 
     pub fn compact(&mut self) -> Result<()> {
@@ -1120,4 +1144,83 @@ fn parse_segment_name(name: &str) -> Option<(u32, u64)> {
     let core = &name[9..name.len() - 4];
     let (level, id) = core.split_once('-')?;
     Some((level.parse().ok()?, id.parse().ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::wal::WalOp;
+
+    fn tmp(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("hako-eng-{label}-{nanos}-{}", std::process::id()))
+    }
+
+    fn cfg_for(mode: DurabilityMode) -> HakoConfig {
+        HakoConfig {
+            durability_mode: mode,
+            wal_reserve_bytes: 0,
+            auto_compaction_threshold_bytes: 1024,
+            ..Default::default()
+        }
+    }
+
+    /// 2-a: the open-time snapshot rewrite must hit disk, not just RAM.
+    /// Builds stale history (10x overwrite, ~10KB WAL, 1KB live) so the
+    /// rewrite fires on reopen, then asserts the file holds records
+    /// immediately — pre-fix it was zeros until the next lucky append.
+    #[test]
+    fn open_rewrite_is_flushed() {
+        let dir = tmp("rewrite");
+        let big = vec![7u8; 1024];
+        {
+            let mut eng = StorageEngine::open(&dir, &cfg_for(DurabilityMode::Interval), "c".into(), None).unwrap();
+            for _ in 0..10 {
+                eng.put("k".into(), &big).unwrap();
+            }
+            // Drop flushes (Drop impl) — history lands, then reopen fires it.
+        }
+        let wal_path = dir.join("wal.log");
+        assert!(std::fs::metadata(&wal_path).unwrap().len() > 4096, "history setup");
+        {
+            let eng = StorageEngine::open(&dir, &cfg_for(DurabilityMode::Interval), "c".into(), None).unwrap();
+            // The rewrite fired on open (10KB history vs 1KB live) and
+            // collapsed it: data_len is snapshot-sized, not history-sized.
+            // Pre-fix the file was zeros here with data_len == 0 (staged).
+            assert!(eng.wal.data_len() > 8, "snapshot flushed, data_len {}", eng.wal.data_len());
+            assert!(eng.wal.data_len() < 4096, "history collapsed, data_len {}", eng.wal.data_len());
+            assert_eq!(eng.get("k").unwrap().unwrap().len(), 1024, "live doc readable");
+        }
+        // No write happened after reopen: the file itself must hold records.
+        let raw = std::fs::read(&wal_path).unwrap();
+        assert!(raw.len() > 8, "snapshot flushed, not just staged");
+        assert!(raw[0..8].iter().any(|&b| b != 0), "first header is a record, not zeros");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2-c: the maintenance tick flushes Interval buffers only.
+    /// Manual never auto-flushes; OnCommit only at commit — both files
+    /// must stay pristine while Interval lands.
+    #[test]
+    fn maintenance_flush_respects_mode() {
+        for (mode, expect_bytes) in [
+            (DurabilityMode::Interval, true),
+            (DurabilityMode::Manual, false),
+            (DurabilityMode::OnCommit, false),
+        ] {
+            let dir = tmp(&format!("maint-{mode:?}"));
+            let mut eng = StorageEngine::open(&dir, &cfg_for(mode), "c".into(), None).unwrap();
+            // One op, no commit marker, no thresholds: sits in the buffer.
+            eng.wal
+                .append(&WalOp::PutInlined { key: "k".into(), value: vec![1, 2, 3] }, false)
+                .unwrap();
+            eng.run_background_maintenance().unwrap();
+            let len = std::fs::metadata(dir.join("wal.log")).unwrap().len();
+            assert_eq!(len > 0, expect_bytes, "mode {mode:?}: file len {len}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }

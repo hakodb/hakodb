@@ -51,6 +51,13 @@ pub struct Wal {
     last_sync: Instant,
     group_commit_interval: Duration,
     reserve_bytes: u64,
+    /// Real record bytes on disk (end-of-records), EXCLUDING the sparse
+    /// preallocation reservation. File length lies (4-8MB of zeros);
+    /// heuristics must use this or they fire on phantom size
+    /// (insiden-hako-wal-20260928: open-time rewrite ratchet). Updated on
+    /// replay/reset/flush; buffered-but-unflushed appends don't count
+    /// (undercount = fewer rewrites = the safe direction).
+    data_len: u64,
 }
 
 /// ponytail: every encoded op is >= 1 byte, so an all-zero 8-byte header can
@@ -107,6 +114,9 @@ impl Wal {
             last_sync: Instant::now(),
             group_commit_interval: Duration::from_millis(5),
             reserve_bytes,
+            // Unknown until the first replay/reset/flush recounts it;
+            // heuristics must not run on file length meanwhile (see field).
+            data_len: 0,
         })
     }
 
@@ -265,6 +275,8 @@ impl Wal {
         self.write_buffer.clear();
         self.pending_ops_since_sync = 0;
         self.last_sync = Instant::now();
+        // Cursor sits exactly at end-of-records after the write_all above.
+        self.data_len = self.file.stream_position()?;
         Ok(())
     }
 
@@ -379,6 +391,7 @@ impl Wal {
         // 4. Seek so future appends continue exactly at end-of-records.
         // (NOT End(0): with preallocation those differ — see replay().)
         self.file.seek(SeekFrom::Start(last_valid_pos))?;
+        self.data_len = last_valid_pos;
 
         // 5. Apply Transaction Logic (Only return ops from committed TXs)
         Ok(filter_committed_ops(raw_ops))
@@ -466,6 +479,7 @@ impl Wal {
         // preallocated file those differ, and appending past the padding
         // would strand records replay can no longer reach.
         self.file.seek(SeekFrom::Start(last_valid_pos))?;
+        self.data_len = last_valid_pos;
         Ok(filter_committed_ops(raw_ops))
     }
 
@@ -487,11 +501,22 @@ impl Wal {
         }
         self.file.seek(SeekFrom::Start(0))?;
         self.pending_ops_since_sync = 0;
+        self.data_len = 0;
         Ok(())
     }
 
     pub fn durability_mode(&self) -> DurabilityMode {
         self.mode
+    }
+
+    /// Real record bytes (see field): the honest input for size heuristics.
+    pub fn data_len(&self) -> u64 {
+        self.data_len
+    }
+
+    /// Buffered-but-unflushed bytes exist (the quiet-window at risk on SIGKILL).
+    pub fn has_pending(&self) -> bool {
+        !self.write_buffer.is_empty()
     }
 
     pub fn set_durability_mode(&mut self, mode: DurabilityMode) {
@@ -927,6 +952,39 @@ mod tests {
         let replayed = wal3.replay().expect("replay2");
         assert_eq!(replayed.len(), 4, "post-reopen append must be reachable, got {replayed:?}");
 
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    /// 2-b: data_len tracks real records, never the sparse reservation.
+    /// A 4MB-reserved file holding 3 small puts must report ~bytes, or
+    /// size heuristics fire on phantom megabytes (ratchet trigger).
+    #[test]
+    fn data_len_ignores_reservation() {
+        let path = std::env::temp_dir().join(format!(
+            "hako-wal-dlen-{}.log",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+
+        let mut wal = Wal::open(&path, DurabilityMode::Always, 100, None, 4 * 1024 * 1024).expect("open");
+        wal.append(&WalOp::PutInlined { key: "k".into(), value: vec![9u8; 64] }, false).expect("put");
+        // Always flushes per append: file is 4MB sparse, data is ~100B.
+        assert!(fs::metadata(&path).expect("meta").len() >= 4 * 1024 * 1024);
+        assert!(wal.data_len() < 1024, "data_len {}, must be bytes not megabytes", wal.data_len());
+        assert!(!wal.has_pending(), "Always flushes: nothing pending");
+
+        // Buffered-only append is pending but uncounted (safe direction).
+        let mut wal2 = Wal::open(&path, DurabilityMode::Manual, 100, None, 0).expect("open2");
+        wal2.append(&WalOp::PutInlined { key: "q".into(), value: vec![1u8; 64] }, false).expect("put2");
+        assert!(wal2.has_pending(), "Manual buffers");
+        let dlen = wal2.data_len();
+        wal2.flush().expect("explicit flush");
+        assert!(wal2.data_len() > dlen, "flush recounts end-of-records");
+
+        drop(wal);
+        drop(wal2);
         fs::remove_file(path).expect("cleanup");
     }
 }
