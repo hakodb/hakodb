@@ -284,6 +284,16 @@ pub extern "C" fn hk_config_set_durability(config: *mut HK_Config, mode: i32) {
     }
 }
 
+/// Group-commit window in ms (Interval mode). Stored raw; clamped to
+/// 1..=30_000 at open (see HakoConfig). Cluster use-case: per-instance
+/// intervals (+ staggered starts) spread fsync storms.
+#[no_mangle]
+pub extern "C" fn hk_config_set_group_commit_interval_ms(config: *mut HK_Config, ms: u64) {
+    if let Some(cfg) = unsafe { config.as_mut() } {
+        cfg.inner.group_commit_interval_ms = ms;
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn hk_config_set_encryption_key(config: *mut HK_Config, key: *const c_char) {
     if let Some(cfg) = unsafe { config.as_mut() } {
