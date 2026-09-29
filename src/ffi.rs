@@ -157,56 +157,16 @@ fn value_to_json(v: &Value) -> serde_json::Value {
     v.to_json()
 }
 
-/// ponytail: 1-3 digit push without fmt machinery (~5ns/byte).
-/// serde_json renders numbers as plain digits — this matches it exactly.
-fn push_u8(out: &mut String, b: u8) {
-    if b >= 100 {
-        out.push((b / 100 + b'0') as char);
-        out.push(((b / 10) % 10 + b'0') as char);
-    } else if b >= 10 {
-        out.push((b / 10 + b'0') as char);
-    }
-    out.push((b % 10 + b'0') as char);
-}
-
 fn doc_to_json(doc: &HakoDoc) -> Result<String, String> {
     safety_shield!(Err("Internal Panic".into()), {
-        // ponytail: stream instead of boxing every value into
-        // serde_json::Value first. A 100-byte Binary used to become 100
-        // boxed Numbers (~8µs/op on point-gets); digits need no escaping
-        // so they format straight into the buffer. Keys and all other
-        // values still go through serde_json (escaping identical). Fields
-        // emit in sorted-key order — byte-identical to the old BTreeMap
-        // output (see test below).
-        let mut fields: Vec<&(std::sync::Arc<str>, Value)> = doc.fields.iter().collect();
-        fields.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
-        let mut out = String::with_capacity(256);
-        out.push('{');
-        for (i, (k, v)) in fields.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push_str(&serde_json::to_string(k.as_ref()).map_err(|e| e.to_string())?);
-            out.push(':');
-            match v {
-                Value::Binary(bytes) => {
-                    out.push('[');
-                    for (j, b) in bytes.iter().enumerate() {
-                        if j > 0 {
-                            out.push(',');
-                        }
-                        push_u8(&mut out, *b);
-                    }
-                    out.push(']');
-                }
-                _ => {
-                    let s = serde_json::to_string(&value_to_json(v)).map_err(|e| e.to_string())?;
-                    out.push_str(&s);
-                }
-            }
-        }
-        out.push('}');
-        Ok(out)
+        // Unified on HakoDoc::write_json (0.9.x): full shape WITH `_time`,
+        // byte-identical to to_json()+serialize. The old hand-rolled writer
+        // omitted `_time`, which made FFI-serialized docs second-class on
+        // sync re-entry (LWW needs the timestamp). Breaking the old shape
+        // is accepted: no external consumers exist yet.
+        let mut out = Vec::with_capacity(256);
+        doc.write_json(&mut out);
+        String::from_utf8(out).map_err(|e| e.to_string())
     })
 }
 
@@ -2222,9 +2182,9 @@ pub extern "C" fn hk_cursor_walk_view(
 
 // --- Bulk JSON (ponytail) ---
 // Streams a result set as one JSON array string with NO intermediate
-// serde_json::Value DOM (the per-doc path builds a full Map DOM per row).
-// Output is byte-identical to "[" + hk_doc_to_json(row) joined + "]" —
-// locked by `bulk_json_matches_per_doc` below. Notes:
+// serde_json::Value DOM. Output is byte-identical to "[" +
+// hk_doc_to_json(row) joined + "]" — locked by `bulk_json_matches_per_doc`
+// below (both now carry `_time` at its sorted position). Notes:
 // - serde_json::Map is a BTreeMap (no preserve_order): keys are SORTED, so
 //   fields are collected and sorted (one small Vec per doc, still ~15x
 //   fewer allocs than the DOM path), including nested Maps.
@@ -2295,7 +2255,9 @@ struct BlobMeta {
 
 struct SlabJson<'a>(&'a [HK_Doc]);
 
-/// One document's fields as a sorted map (mirrors `doc_to_json` shape).
+/// One document's fields as a sorted map, now WITH `_time` (mirrors the
+/// unified `doc_to_json` shape above — the bulk renderer and per-doc path
+/// must stay byte-identical, locked by `bulk_json_matches_per_doc`).
 struct DocFields<'a>(&'a HakoDoc);
 impl<'a> Serialize for DocFields<'a> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -2306,9 +2268,22 @@ impl<'a> Serialize for DocFields<'a> {
             .map(|(k, v)| (AsRef::<str>::as_ref(k), v))
             .collect();
         pairs.sort_by(|a, b| a.0.cmp(b.0));
-        let mut m = s.serialize_map(Some(pairs.len()))?;
+        let mut m = s.serialize_map(Some(pairs.len() + 1))?;
+        // _time merges at BTreeMap-sorted position; a literal "_time"
+        // field wins and swallows the timestamp (map-overwrite parity).
+        let mut time_written = false;
         for (k, v) in pairs {
+            if !time_written && k > "_time" {
+                m.serialize_entry("_time", &self.0._time)?;
+                time_written = true;
+            }
+            if !time_written && k == "_time" {
+                time_written = true;
+            }
             m.serialize_entry(k, &StreamValue(v))?;
+        }
+        if !time_written {
+            m.serialize_entry("_time", &self.0._time)?;
         }
         m.end()
     }
@@ -3806,8 +3781,9 @@ mod ffi_json_tests {
     use super::*;
 
     /// The streaming `doc_to_json` must emit byte-identical output to the
-    /// old Box-everything-into-serde-Value approach (BTreeMap = sorted
-    /// keys), including Binary byte arrays and escaping.
+    /// `to_json` + serialize approach (BTreeMap = sorted keys, `_time`
+    /// merged at its sorted position), including Binary byte arrays and
+    /// escaping.
     #[test]
     fn doc_to_json_matches_serde_map_output() {
         let mut doc = HakoDoc::default();
@@ -3816,15 +3792,18 @@ mod ffi_json_tests {
         doc.insert("z", Value::Int(-42));
         doc.insert("a", Value::String("q\"\\qé".to_string()));
         doc.insert("m", Value::Bool(true));
+        doc._time = 12345;
 
         let mut reference = serde_json::Map::new();
+        reference.insert("_time".to_string(), serde_json::json!(doc._time));
         for (k, v) in &doc.fields {
             reference.insert(k.to_string(), value_to_json(v));
         }
         let expected = serde_json::to_string(&serde_json::Value::Object(reference)).unwrap();
 
         assert_eq!(doc_to_json(&doc).unwrap(), expected);
-        // Spot-check the binary arm shape (no spaces, plain digits).
+        // Spot-check the binary arm shape (no spaces, plain digits) + _time.
         assert!(expected.contains("\"v\":[0,1,9,10,99,100,171,255]"));
+        assert!(expected.contains("\"_time\":12345"));
     }
 }
