@@ -50,6 +50,9 @@ pub struct Wal {
     write_buffer: Vec<u8>,
     last_sync: Instant,
     group_commit_interval: Duration,
+    /// Strict-time mode (custom interval): count/size triggers off, clock
+    /// only (+ emergency cap). See HakoConfig docs for the rule.
+    strict_interval: bool,
     reserve_bytes: u64,
     /// Real record bytes on disk (end-of-records), EXCLUDING the sparse
     /// preallocation reservation. File length lies (4-8MB of zeros);
@@ -64,6 +67,12 @@ pub struct Wal {
 /// only be unwritten preallocation padding (see open()). Readers treat it as
 /// clean end-of-records: stop WITHOUT truncating (the reservation must
 /// survive recovery) and WITHOUT erroring (tail() callers progress normally).
+/// Emergency buffer cap for strict-time mode: memory bound, not latency.
+/// Without it a sustained burst inside one long window grows RAM without
+/// limit. Count/size triggers are OFF there by design; this is the only
+/// non-clock flush left (besides explicit/Drop/rewrite flushes).
+const STRICT_EMERGENCY_BYTES: usize = 16 * 1024 * 1024;
+
 #[inline]
 fn is_zero_header(header: &[u8; 8]) -> bool {
     header.iter().all(|&b| b == 0)
@@ -113,6 +122,7 @@ impl Wal {
             write_buffer: Vec::with_capacity(1024 * 1024), // 1MB WAL buffer
             last_sync: Instant::now(),
             group_commit_interval: Duration::from_millis(5),
+            strict_interval: false,
             reserve_bytes,
             // Unknown until the first replay/reset/flush recounts it;
             // heuristics must not run on file length meanwhile (see field).
@@ -297,7 +307,19 @@ impl Wal {
             // Pool operations, only write to disk when a transaction finishes
             DurabilityMode::OnCommit => is_commit,
 
-            // The most performant mode: pool until time or volume threshold is hit
+            // The most performant mode: pool until time or volume threshold is hit.
+            // Strict-time (custom interval): count/size triggers OFF — they
+            // re-synchronize fleet flushes under balanced load, defeating
+            // staggering. Clock only, plus the emergency buffer cap below.
+            DurabilityMode::Interval if self.strict_interval => {
+                is_commit && (
+                    now.duration_since(self.last_sync) >= self.group_commit_interval
+                    || self.write_buffer.len() > STRICT_EMERGENCY_BYTES
+                )
+            }
+
+            // Legacy triple-trigger (default 5ms): benchmarks and gates
+            // pin this behavior exactly; do not touch.
             DurabilityMode::Interval => {
                 is_commit && (
                     self.pending_ops_since_sync >= self.group_commit_max_ops
@@ -519,14 +541,27 @@ impl Wal {
         !self.write_buffer.is_empty()
     }
 
+    /// Maintenance-tick predicate (2-c): flush a dirty Interval buffer when
+    /// its own configured window elapsed — NOT blindly every tick, or a
+    /// custom (long) interval degrades to the 500ms tick cadence and fleet
+    /// staggering breaks the same way count-triggers would.
+    pub fn should_tick_flush(&self) -> bool {
+        self.mode == DurabilityMode::Interval
+            && self.has_pending()
+            && Instant::now().duration_since(self.last_sync) >= self.group_commit_interval
+    }
+
     pub fn set_durability_mode(&mut self, mode: DurabilityMode) {
         self.mode = mode;
     }
 
     /// Group-commit window (Interval mode). Applied from
     /// `HakoConfig::group_commit_interval_ms` at engine open (clamped).
-    pub fn set_group_commit_interval(&mut self, d: Duration) {
-        self.group_commit_interval = d;
+    /// A non-default value also arms strict-time (see field docs).
+    pub fn set_group_commit_interval(&mut self, ms: u64) {
+        let ms = crate::config::clamp_group_commit_interval_ms(ms);
+        self.group_commit_interval = Duration::from_millis(ms);
+        self.strict_interval = ms != crate::config::DEFAULT_GROUP_COMMIT_INTERVAL_MS;
     }
 
     pub fn tail(&self, start_offset: u64) -> Result<(Vec<WalOp>, u64)> {

@@ -114,10 +114,8 @@ impl StorageEngine {
             wal_reserve,
         )?;
         // Per-instance group-commit window (cluster fsync staggering).
-        // Clamped: see HakoConfig::group_commit_interval_ms.
-        wal.set_group_commit_interval(std::time::Duration::from_millis(
-            crate::config::clamp_group_commit_interval_ms(cfg.group_commit_interval_ms),
-        ));
+        // Clamped + strict-armed inside the setter; see HakoConfig docs.
+        wal.set_group_commit_interval(cfg.group_commit_interval_ms);
 
         let mut segments = HashMap::new();
         let mut max_id = 0;
@@ -593,7 +591,9 @@ impl StorageEngine {
         // a SIGKILL/power loss would take unflushed appends. Mode contracts
         // hold: Manual never auto-flushes, OnCommit flushes only at commit,
         // Always is already per-op. Idle shards = one is_empty check.
-        if self.wal.durability_mode() == DurabilityMode::Interval && self.wal.has_pending() {
+        // The predicate is interval-aware (not blind): a custom long window
+        // must not degrade to tick cadence.
+        if self.wal.should_tick_flush() {
             let _ = self.wal.flush();
         }
         self.maybe_rotate_active_segment()?;
@@ -1222,6 +1222,10 @@ mod tests {
             eng.wal
                 .append(&WalOp::PutInlined { key: "k".into(), value: vec![1, 2, 3] }, false)
                 .unwrap();
+            // The tick predicate is time-aware (elapsed >= interval): sleep
+            // past the 5ms test window so Interval is due. Monotonic clock
+            // makes this one-directional (slowness only helps).
+            std::thread::sleep(std::time::Duration::from_millis(10));
             eng.run_background_maintenance().unwrap();
             let len = std::fs::metadata(dir.join("wal.log")).unwrap().len();
             assert_eq!(len > 0, expect_bytes, "mode {mode:?}: file len {len}");
@@ -1251,6 +1255,32 @@ mod tests {
         eng.flush_all().unwrap();
         assert!(!eng.wal.has_pending());
         assert!(eng.wal.data_len() > 0, "explicit flush lands");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Strict-time ignores the count trigger: 200 ops (> 128 legacy max)
+    /// stay buffered inside a long window. This is the compromise that
+    /// makes staggering work under burst (count-driven flushes would
+    /// re-synchronize a balanced fleet).
+    #[test]
+    fn strict_time_ignores_count_trigger() {
+        use crate::storage::wal::WalOp;
+
+        let dir = tmp("strict-count");
+        let cfg = HakoConfig {
+            durability_mode: DurabilityMode::Interval,
+            wal_reserve_bytes: 0,
+            auto_compaction_threshold_bytes: 1024,
+            group_commit_interval_ms: 30_000,
+            ..Default::default()
+        };
+        let mut eng = StorageEngine::open(&dir, &cfg, "c".into(), None).unwrap();
+        let ops: Vec<WalOp> = (0..200)
+            .map(|i| WalOp::PutInlined { key: format!("k{i}"), value: vec![i as u8; 16] })
+            .collect();
+        eng.wal.append_batch_fast(1, &ops, false).unwrap();
+        assert!(eng.wal.has_pending(), "strict: 200 ops must NOT trip count flush");
+        assert_eq!(eng.wal.data_len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

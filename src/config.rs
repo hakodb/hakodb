@@ -23,6 +23,14 @@ pub struct HakoConfig {
     /// spread fsync storms. Clamped to 1..=30_000 at open — larger would
     /// approach Manual durability without saying so (unbounded loss
     /// window); use Manual + explicit flush if you really mean it.
+    ///
+    /// Strict-time rule: the DEFAULT value keeps the legacy triple-trigger
+    /// (count 128 ops / 124KB buffer / elapsed), so benchmarks and gates
+    /// never move. Any CUSTOM value switches to strict time — the count
+    /// and size triggers are disabled (they would re-synchronize fleet
+    /// flushes under balanced load, defeating staggering) and only
+    /// `elapsed >= interval` flushes, plus a 16MB emergency buffer cap
+    /// (memory bound, not latency). Same rule drives the maintenance tick.
     pub group_commit_interval_ms: u64,
     pub encryption_key: Option<String>,
     pub encrypted_cols: Option<HashSet<String>>,
@@ -76,7 +84,7 @@ impl Default for HakoConfig {
             auto_compaction_threshold_bytes: 8 * 1024 * 1024,
             durability_mode: DurabilityMode::Interval,
             group_commit_max_ops: 128,
-            group_commit_interval_ms: 5,
+            group_commit_interval_ms: DEFAULT_GROUP_COMMIT_INTERVAL_MS,
             encryption_key: None,
             encrypted_cols: None,
             enable_audit_log: false,
@@ -92,6 +100,9 @@ wal_reserve_bytes: 4 * 1024 * 1024,
         }
     }
 }
+
+/// Default group-commit window (legacy triple-trigger behavior).
+pub const DEFAULT_GROUP_COMMIT_INTERVAL_MS: u64 = 5;
 
 /// Clamp for `group_commit_interval_ms` (see field docs). Pure for testing.
 pub fn clamp_group_commit_interval_ms(ms: u64) -> u64 {
@@ -110,6 +121,6 @@ mod tests {
         assert_eq!(clamp_group_commit_interval_ms(30_000), 30_000);
         // Unbounded windows approach Manual without saying so: capped.
         assert_eq!(clamp_group_commit_interval_ms(999_999), 30_000);
-        assert_eq!(HakoConfig::default().group_commit_interval_ms, 5);
+        assert_eq!(HakoConfig::default().group_commit_interval_ms, DEFAULT_GROUP_COMMIT_INTERVAL_MS);
     }
 }
