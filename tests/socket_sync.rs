@@ -75,6 +75,13 @@ async fn socket_snapshot_and_live_both_directions() {
         b.get("c", "k1").ok().flatten().is_some()
     })
     .await;
+    // PROBE (temporary): sample presence over time to classify the
+    // disappearance as transient (cache/version race) or permanent.
+    for i in 0..10 {
+        let present = b.get("c", "k1").ok().flatten().is_some();
+        eprintln!("PROBE k1 t+{i} present={present}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     poll_until("snapshot k2", || {
         b.get("c", "k2").ok().flatten().is_some()
     })
