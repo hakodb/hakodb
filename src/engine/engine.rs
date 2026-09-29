@@ -1460,6 +1460,22 @@ impl Hako {
         Ok(results)
     }
 
+    /// EXPLAIN: return the plan `query()` would execute, without running it.
+    /// Same admission gate (a denied caller learns nothing about indexes),
+    /// same plan-cache path (what you see is what the next call runs).
+    /// For SDKs, gateway debugging, and tests that pin routing behavior.
+    pub fn explain(&self, query: Query) -> Result<crate::query::plan::QueryPlan> {
+        if !self.allowed(&query.collection, AccessOp::Query) {
+            return Err(HakoError::Corrupt("Denied".into()));
+        }
+        let shard_arc = self.get_shard(&query.collection)?;
+        let indexes = self.indexes.read().unwrap();
+        let rows = shard_arc.read().unwrap().count_prefix("");
+        let is_ready = self.index_query_ready();
+        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
+        Ok((*plan).clone())
+    }
+
     /// Raw scan: storage-encoded bytes instead of decoded docs. Same
     /// admission path as [`Self::query`] (security, plan cache, audit);
     /// execution stops after the index walk — see
