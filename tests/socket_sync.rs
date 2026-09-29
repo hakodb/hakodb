@@ -1,6 +1,11 @@
 //! socket_sync end-to-end (unix-only): two engines peer over a unix
 //! socket — snapshot on connect plus live tail both directions, deletes
 //! propagate, echo discipline holds (no ping-pong growth).
+//!
+//! Interval durability (not Manual): the live tailer reads the WAL *file*,
+//! and only flushed bytes are visible there. Interval flushes on every
+//! append past the 5ms group-commit window, so live phases are
+//! deterministic under the 10s poll budget below.
 
 #![cfg(all(unix, feature = "socket-sync"))]
 
@@ -23,7 +28,7 @@ fn tmp(label: &str) -> std::path::PathBuf {
 
 fn open_db(dir: &std::path::Path) -> Arc<Hako> {
     let mut cfg = HakoConfig::default();
-    cfg.durability_mode = DurabilityMode::Manual;
+    cfg.durability_mode = DurabilityMode::Interval;
     Arc::new(Hako::open(dir, cfg).unwrap())
 }
 
@@ -48,7 +53,6 @@ async fn socket_snapshot_and_live_both_directions() {
     let dir_a = tmp("a");
     let dir_b = tmp("b");
     let sock = tmp("sock").join("s.sock");
-    eprintln!("TEST sock path: {} parent: {:?}", sock.display(), sock.parent());
     std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
     let sock_str = sock.to_string_lossy().into_owned();
 
@@ -69,22 +73,12 @@ async fn socket_snapshot_and_live_both_directions() {
     // Snapshot A -> B.
     poll_until("snapshot k1", || {
         b.get("c", "k1").ok().flatten().is_some()
-    });
+    })
+    .await;
     poll_until("snapshot k2", || {
         b.get("c", "k2").ok().flatten().is_some()
-    });
-    // BISECT (temporary): halt all sync activity, then observe stability.
-    // If k1 survives halted, the deleter is ongoing background work.
-    // If k1 still vanishes, the deleter already ran (ingest/snapshot).
-    sa.stop();
-    sb.stop();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    {
-        // DEBUG: which key form resolves?
-        let bare = b.get("c", "k1").ok().flatten().is_some();
-        let namespaced = b.get("c", "c:k1").ok().flatten().is_some();
-        eprintln!("DEBUG B k1 bare={bare} namespaced={namespaced} (sync halted)");
-    }
+    })
+    .await;
     assert_eq!(
         b.get("c", "k1").unwrap().unwrap().get("v"),
         Some(&Value::String("one".into()))
@@ -94,17 +88,22 @@ async fn socket_snapshot_and_live_both_directions() {
     put_kv(&b, "c", "k3", "three");
     poll_until("live k3", || {
         a.get("c", "k3").ok().flatten().is_some()
-    });
+    })
+    .await;
 
     // Live write A -> B.
     put_kv(&a, "c", "k4", "four");
     poll_until("live k4", || {
         b.get("c", "k4").ok().flatten().is_some()
-    });
+    })
+    .await;
 
     // Delete propagates.
     a.delete("c", "k1").unwrap();
-    poll_until("delete k1", || b.get("c", "k1").ok().flatten().is_none());
+    poll_until("delete k1", || {
+        b.get("c", "k1").ok().flatten().is_none()
+    })
+    .await;
 
     // Echo discipline: no ping-pong duplicates (each key exactly once).
     let count_a = a.get("c", "k4").unwrap().is_some() as u8;
