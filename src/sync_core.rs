@@ -133,7 +133,11 @@ pub async fn apply_replicated_batch(
                     cache.insert(key.clone(), remote_ts);
                 }
                 accepted_ops.push(WalOp::Delete { key: key.clone(), timestamp: remote_ts });
-                index_puts.push((key, None)); // None signals delete below
+                index_puts.push((key.clone(), None)); // None signals delete below
+                // Deletes bump versions too: Hako::get serves from doc_cache
+                // on version match, so an unbumped delete leaves the live
+                // doc cached FOREVER (stale reads after replicated deletes).
+                affected_keys.push(key.into());
             } else {
                 let ts = doc.get_logical_time();
                 {

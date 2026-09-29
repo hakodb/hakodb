@@ -307,9 +307,6 @@ async fn handle_conn(st: Shared, stream: UnixStream, label: String) {
                 if logical.is_empty() {
                     continue;
                 }
-                // TMP-DEBUG: trace what the tailer sends.
-                let n_del = logical.iter().filter(|o| matches!(o, WalOp::Delete { .. })).count();
-                eprintln!("[sock-tmp] tailer send {} ops ({} deletes) col={}", logical.len(), n_del, col);
                 if frame_packet(&SockPacket::Data { collection: col, ops: logical })
                     .ok()
                     .and_then(|f| tx_tail.send(f).ok())
@@ -330,9 +327,6 @@ async fn handle_conn(st: Shared, stream: UnixStream, label: String) {
         match rd_buf.recv().await {
             Ok(SockPacket::Snapshot { collection, ops })
             | Ok(SockPacket::Data { collection, ops }) => {
-                // TMP-DEBUG: trace ingest.
-                let n_del = ops.iter().filter(|o| matches!(o, WalOp::Delete { .. })).count();
-                eprintln!("[sock-tmp] ingest {} ops ({} deletes) col={}", ops.len(), n_del, collection);
                 apply_replicated_batch(st.db.clone(), collection, ops, st.echo_cache.clone()).await;
             }
             _ => break,
