@@ -98,7 +98,13 @@ async fn socket_snapshot_and_live_both_directions() {
     })
     .await;
 
-    // Delete propagates.
+    // Delete propagates. NOTE the sleep: Interval flushes on append only
+    // past the 5ms group-commit window — an append landing within 5ms of
+    // the last flush sits in RAM, invisible to the file-tailing live path
+    // (same quiet-window class as insiden-hako-wal-20260928; the 2-c tick
+    // covers it in production within 500ms). Sleep past the window so the
+    // delete's own append flushes deterministically.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     a.delete("c", "k1").unwrap();
     poll_until("delete k1", || {
         b.get("c", "k1").ok().flatten().is_none()
