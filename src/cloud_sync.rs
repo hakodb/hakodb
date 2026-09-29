@@ -1492,29 +1492,12 @@ kind,
                                         continue;
                                     }
                                     let key = op.get_key();
-                                    let wal_ts = match &op {
-                                        WalOp::PutInlined { value, .. } => {
-                                            i64::from_le_bytes(value[2..10].try_into().unwrap_or([0; 8]))
-                                        }
-                                        WalOp::Delete { timestamp, .. } => *timestamp,
-                                        _ => 0,
-                                    };
+                                    // (sync_core: shared decode + echo take, all tailers).
+                                    let wal_ts = crate::sync_core::op_logical_time(&op);
 
                                     // Skip writes originating from client WebSockets (already handled)
                                     let ek = echo_key(&prefix, &plain_col, &key);
-                                    let is_echo = {
-                                        let mut cache = echo_cache.lock().unwrap();
-                                        if let Some(&cached_ts) = cache.get(&ek) {
-                                            if cached_ts == wal_ts {
-                                                cache.remove(&ek);
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        } else {
-                                            false
-                                        }
-                                    };
+                                    let is_echo = crate::sync_core::echo_take(&echo_cache, &ek, wal_ts);
 
                                     if !is_echo {
                                         // Local-only signal: server never fans marked ops out.
@@ -1825,28 +1808,11 @@ kind,
                                         continue;
                                     }
                                     let key = op.get_key();
-                                    let wal_ts = match &op {
-                                        WalOp::PutInlined { value, .. } => {
-                                            i64::from_le_bytes(value[2..10].try_into().unwrap_or([0; 8]))
-                                        }
-                                        WalOp::Delete { timestamp, .. } => *timestamp,
-                                        _ => 0,
-                                    };
+                                    // (sync_core: shared decode + echo take, all tailers).
+                                    let wal_ts = crate::sync_core::op_logical_time(&op);
 
                                     let echo_key = echo_key("", &col, &key);
-                                    let is_echo = {
-                                        let mut cache = echo_cache.lock().unwrap();
-                                        if let Some(&cached_ts) = cache.get(&echo_key) {
-                                            if cached_ts == wal_ts {
-                                                cache.remove(&echo_key);
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        } else {
-                                            false
-                                        }
-                                    };
+                                    let is_echo = crate::sync_core::echo_take(&echo_cache, &echo_key, wal_ts);
 
                                     if !is_echo {
                                         // Local-only signal: client never pushes marked ops upstream.

@@ -3504,6 +3504,95 @@ pub extern "C" fn hk_net_syncer_free(syncer: *mut HK_NetSyncer) {
 }
 
 
+// SOCKET SYNC (unix-only): co-located instances, explicit paths.
+#[cfg(all(unix, feature = "socket-sync"))]
+pub struct HK_SocketSync {
+    inner: std::sync::Arc<crate::socket_sync::SocketSync>,
+}
+
+#[cfg(all(unix, feature = "socket-sync"))]
+#[no_mangle]
+pub extern "C" fn hk_socket_sync_new(engine: *mut HK_Engine) -> *mut HK_SocketSync {
+    if engine.is_null() {
+        return std::ptr::null_mut();
+    }
+    let engine_ref = unsafe { &*engine };
+    let syncer = crate::socket_sync::SocketSync::new(engine_ref.db.clone(), vec![]);
+    clear_last_error();
+    Box::into_raw(Box::new(HK_SocketSync {
+        inner: std::sync::Arc::new(syncer),
+    }))
+}
+
+#[cfg(all(unix, feature = "socket-sync"))]
+#[no_mangle]
+pub extern "C" fn hk_socket_sync_serve(syncer: *mut HK_SocketSync, path: *const c_char) -> i32 {
+    if syncer.is_null() {
+        return -1;
+    }
+    let s_ref = unsafe { &*syncer };
+    let path_str = cstr_to_string(path).unwrap_or_default();
+    if path_str.is_empty() {
+        return set_last_error("empty socket path");
+    }
+    // tokio::spawn inside serve() needs a runtime context.
+    let rt = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => return set_last_error("No tokio runtime found"),
+    };
+    let inner = s_ref.inner.clone();
+    match rt.block_on(async move { inner.serve(&path_str) }) {
+        Ok(_) => 0,
+        Err(e) => set_last_error(e.to_string()),
+    }
+}
+
+#[cfg(all(unix, feature = "socket-sync"))]
+#[no_mangle]
+pub extern "C" fn hk_socket_sync_dial(syncer: *mut HK_SocketSync, path: *const c_char) -> i32 {
+    if syncer.is_null() {
+        return -1;
+    }
+    let s_ref = unsafe { &*syncer };
+    let path_str = cstr_to_string(path).unwrap_or_default();
+    if path_str.is_empty() {
+        return set_last_error("empty socket path");
+    }
+    let rt = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => return set_last_error("No tokio runtime found"),
+    };
+    let inner = s_ref.inner.clone();
+    match rt.block_on(async move { inner.dial(&path_str).await }) {
+        Ok(_) => 0,
+        Err(e) => set_last_error(e.to_string()),
+    }
+}
+
+#[cfg(all(unix, feature = "socket-sync"))]
+#[no_mangle]
+pub extern "C" fn hk_socket_sync_status(syncer: *mut HK_SocketSync) -> *mut c_char {
+    if syncer.is_null() {
+        return ptr::null_mut();
+    }
+    let s_ref = unsafe { &*syncer };
+    let status = serde_json::json!({ "peers": s_ref.inner.peer_count() });
+    match serde_json::to_string(&status) {
+        Ok(json) => CString::new(json).unwrap().into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+#[cfg(all(unix, feature = "socket-sync"))]
+#[no_mangle]
+pub extern "C" fn hk_socket_sync_free(syncer: *mut HK_SocketSync) {
+    if !syncer.is_null() {
+        let s = unsafe { Box::from_raw(syncer) };
+        s.inner.stop();
+    }
+}
+
+
 // CLOUD SYNC
 #[cfg(feature = "cloud-sync")]
 #[no_mangle]

@@ -11,9 +11,13 @@ repository = "https://github.com/hakodb/hakodb"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["net-sync", "cloud-sync"]
+default = ["net-sync", "cloud-sync", "socket-sync"]
 net-sync = ["dep:tokio", "dep:mdns-sd", "dep:gethostname", "dep:local-ip-address", "dep:socket2" ]
 cloud-sync = ["dep:tokio", "dep:tokio-tungstenite", "dep:rustls", "dep:futures-util", "dep:rmp-serde"]
+# Co-located instance sync over unix sockets (balancer use-case). Unix-only:
+# tokio has no net::unix on Windows, so the module compiles out there and
+# the feature is a silent no-op (Windows builds stay green).
+socket-sync = ["dep:tokio"]
 
 
 [dependencies]

@@ -7,6 +7,7 @@ pub mod index;
 pub mod memory;
 pub mod query;
 pub mod storage;
+pub mod sync_core;
 pub mod sync_guard;
 
 pub mod util;
@@ -16,6 +17,9 @@ pub mod net_sync;
 
 #[cfg(feature = "cloud-sync")]
 pub mod cloud_sync;
+
+#[cfg(all(unix, feature = "socket-sync"))]
+pub mod socket_sync;
 
 #[cfg(feature = "cloud-sync")]
 pub use cloud_sync::{CloudPacket, CloudStatus, CloudSync, CloudSyncMode};

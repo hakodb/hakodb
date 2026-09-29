@@ -28,8 +28,6 @@ use tokio::net::{TcpStream, tcp::OwnedWriteHalf};
 use crate::sync_guard::{self, CapsMap, PeerCaps};
 #[cfg(feature = "net-sync")]
 use mdns_sd::{ServiceDaemon, ServiceInfo, ServiceEvent};
-#[cfg(feature = "net-sync")]
-use crate::storage::blob::BlobWork;
 
 // --- Data Structures ---
 
@@ -649,31 +647,15 @@ impl NetSyncer {
                                 let key = op.get_key();
                                         
                                 // 1. Get the timestamp from the WAL record
-                                let wal_timestamp = match &op {
-                                    WalOp::PutInlined { value, .. } => {
-                                        // Version 3: Magic(1), Ver(1), Time(8)
-                                        i64::from_le_bytes(value[2..10].try_into().unwrap_or([0;8]))
-                                    }
-                                    WalOp::Delete { timestamp, .. } => *timestamp,
-                                    _ => 0,
-                                };
+                                // (sync_core: shared decode, all tailers).
+                                let wal_timestamp = crate::sync_core::op_logical_time(&op);
 
                                 // 2. CHECK & REMOVE (The Core Fix)
-                                let is_echo = {
-                                    let echo_cache = echo_cache_clone.clone();
-                                    let mut cache = echo_cache.lock().unwrap();
-                                    if let Some(&cached_ts) = cache.get(key) {
-                                        if cached_ts == wal_timestamp {
-                                            // Match found! Remove it so it doesn't linger
-                                            cache.remove(key);
-                                            true
-                                        } else {
-                                            false
-                                        }
-                                    } else {
-                                        false
-                                    }
-                                };
+                                let is_echo = crate::sync_core::echo_take(
+                                    &echo_cache_clone,
+                                    key,
+                                    wal_timestamp,
+                                );
 
                                 if is_echo {
                                     continue; // Skip this one, it was a remote write
@@ -1061,36 +1043,9 @@ async fn handle_peer(
 
 
 fn resolve_op_to_bytes(shard_arc: &Arc<RwLock<crate::storage::engine::StorageEngine>>, db: &Arc<Hako>, op: &WalOp) -> Option<Vec<u8>> {
-    // 1. Resolve the raw bytes (Skeleton) from the WAL op
-    let bytes = match op {
-        WalOp::PutInlined { value, .. } => value.clone(),
-        WalOp::Put { segment_id, segment_offset, len, .. } => {
-            let ptr = Pointer::Segment { segment_id: *segment_id, offset: *segment_offset, len: *len };
-            shard_arc.read().unwrap().read_pointer_internal(&ptr, false).ok().flatten()?
-        }
-        WalOp::PutBlob { offset, len, .. } => {
-            let ptr = Pointer::Blob { offset: *offset, len: *len };
-            shard_arc.read().unwrap().read_pointer_internal(&ptr, false).ok().flatten()?
-        }
-        _ => return None,
-    };
-
-    // 2. Decode to check for BlobLinks
-    if let Some(mut doc) = HakoDoc::decode(&bytes) {
-        let has_links = doc.fields.iter().any(|(_, v)| matches!(v, Value::BlobLink { .. }));
-        
-        if has_links {
-            // INFLATE: Replace file offsets with actual binary data for the wire
-            // Blobs are not encrypted/compressed, so we read them raw from disk
-            let encryption_key = db.config.encryption_key.as_deref();
-            if crate::engine::engine::resolve_doc_static(&mut doc, shard_arc, encryption_key).is_ok() {
-                return Some(doc.encode_buffered()); // Encode the now-full document
-            }
-            return None;
-        }
-    }
-
-    Some(bytes)
+    // 0.9.0: shared send-side inflation (sync_core) — one blob path for
+    // all transports. Body moved verbatim; this stays as the call edge.
+    crate::sync_core::resolve_send_bytes(shard_arc, db, op)
 }
 
 async fn handle_bootstrap(db: &Arc<Hako>, peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, peer_id: &str, excluded: &HashSet<String>, caps: &Arc<CapsMap>) {
@@ -1313,193 +1268,9 @@ async fn send_replication_packet(
 
 #[cfg(feature = "net-sync")]
 async fn apply_replication_batch(db: Arc<Hako>, collection: String, ops: Vec<WalOp>, echo_cache: Arc<Mutex<HashMap<String, i64>>>,) {
-    // Local-only signal (inbound): a locally-scoped collection refuses
-    // everything the mesh offers. Per-key marks do NOT filter inbound —
-    // a genuinely newer remote put still resurrects (documented rule).
-    if db.is_collection_local(&collection) {
-        return;
-    }
-    // let shard_arc = db.get_shard(&collection);
-    let shard_arc = match db.get_shard(&collection) {
-        Ok(s) => s,
-        Err(e) => {
-            // This is a serious error: we received data but cannot write it
-            // because the local shard is locked/unreadable.
-            eprintln!("[sync] CRITICAL: Cannot apply replication to {}. Shard error: {}", collection, e);
-            return; 
-        }
-    };
-    let threshold = db.config.value_blob_threshold_bytes;
-    
-    let mut accepted_ops = Vec::new();
-    let mut affected_keys = Vec::new();
-    let mut index_puts = Vec::new();
-    let mut blob_work_items = Vec::new();
-
-    // 1. PHASE 1: PREPARE AND CONFLICT RESOLUTION
-    {
-        // We take a read lock first to check timestamps (LWW)
-        let shard_read = shard_arc.read().unwrap();
-        let echo_cache_clone = echo_cache.clone();
-        
-        for op in ops {
-            let (key, mut doc, is_delete, remote_ts) = match op {
-                WalOp::PutInlined { ref key, ref value } => {
-                    if let Some(d) = HakoDoc::decode(value) { 
-                        let ts = d.get_logical_time();
-                        (key.clone(), d, false, ts) 
-                    } else { continue; }
-                }
-                WalOp::Delete { ref key, timestamp } => {
-                    (key.clone(), HakoDoc::default(), true, timestamp)
-                }
-                _ => continue,
-            };
-
-            // Conflict Resolution: Only apply if the remote timestamp is newer than local
-            if let Some(local_ptr) = shard_read.index.get(&key) {
-                let local_ts = match local_ptr {
-                    Pointer::Deleted { timestamp } => *timestamp,
-                    Pointer::Inlined(bytes) => i64::from_le_bytes(bytes[2..10].try_into().unwrap_or([0;8])),
-                    _ => {
-                        // Fast path: if the pointer is in-memory (Inlined/Pending), get time directly
-                        // otherwise decode the disk header.
-                        shard_read.read_pointer_internal(local_ptr, false)
-                            .ok().flatten()
-                            .and_then(|b| HakoDoc::decode(&b))
-                            .map(|d| d.get_logical_time())
-                            .unwrap_or(0)
-                    }
-                };
-                if remote_ts <= local_ts { continue; }
-            }
-
-            if is_delete {
-                {
-                    let mut cache = echo_cache_clone.lock().unwrap();
-                    cache.insert(key.clone(), remote_ts);
-                }
-                accepted_ops.push(WalOp::Delete { key: key.clone(), timestamp: remote_ts });
-                index_puts.push((key, None)); // None signals delete in our local loop
-            } else {
-                let ts = doc.get_logical_time();
-                {
-                    let mut cache = echo_cache_clone.lock().unwrap();
-                    cache.insert(key.clone(), ts);
-                }
-                // RE-EXTRACT BLOBS: If the sender sent a full doc but it's large,
-                // we extract blobs locally on the receiver to save segment space.
-                if let Some(bm) = &shard_read.blob_manager {
-                    let extracted = bm.extract_blobs_raw(&collection, &key, &mut doc, threshold);
-                    for b in extracted {
-                        blob_work_items.push(b);
-                    }
-                }
-                
-                let skeleton_bytes = doc.encode();
-                accepted_ops.push(WalOp::PutInlined { key: key.clone(), value: skeleton_bytes });
-                index_puts.push((key.clone(), Some(doc)));
-                affected_keys.push(key.into());
-            }
-        }
-    } // Read lock dropped
-
-    if accepted_ops.is_empty() { return; }
-
-    // 2. PHASE 2: PHYSICAL COMMIT (Receiver Shard)
-    {
-        let mut shard = shard_arc.write().unwrap();
-        
-        // A. WAL Commit
-        let tx_id = shard.next_tx_id;
-        shard.next_tx_id += 1;
-        // Use the fast batch appender
-        let _ = shard.wal.append_batch_fast(tx_id, &accepted_ops, true); // true = remote (skip fsync)
-
-        // B. Index Update
-        for (key, doc_opt) in index_puts {
-            if let Some(doc) = doc_opt {
-                // If we extracted blobs, mark as Pending
-                let has_blob = blob_work_items.iter().any(|b| {
-                    if let BlobWork::PutRaw { key: k, .. } = b { k == &key } else { false }
-                });
-
-                if has_blob {
-                    shard.update_index_entry(key, Some(Pointer::BlobPending(Arc::new(doc))));
-                } else {
-                    shard.update_index_entry(key, Some(Pointer::Inlined(Arc::new(doc.encode()))));
-                }
-            } else {
-                // It was a delete
-                let ts = accepted_ops.iter().find_map(|o| {
-                    if let WalOp::Delete { key: k, timestamp } = o {
-                        if k == &key { return Some(*timestamp); }
-                    }
-                    None
-                }).unwrap_or(0);
-                shard.update_index_entry(key, Some(Pointer::Deleted { timestamp: ts }));
-            }
-        }
-
-        // C. Queue Blobs for Receiver's Blob Worker
-        let mut total_bytes = 0;
-        for b in blob_work_items {
-            if let BlobWork::PutRaw { len, .. } = &b { total_bytes += *len as usize; }
-            shard.blob_flush_queue.push_back(b);
-        }
-        shard.total_pending_blob_bytes.fetch_add(total_bytes, Ordering::Relaxed);
-        
-        // Wake up receiver's blob worker
-        db.trigger_blob_flush.store(true, Ordering::Release);
-    }
-
-    // 3. PHASE 3: NOTIFY LOCAL SYSTEM
-    db.bump_versions_by_keys(affected_keys);
-    
-    // 4. PHASE 4: Hand to Indexer
-    // update search indexes.
-    let index_docs: Vec<(String, Arc<HakoDoc>)> = accepted_ops.iter().filter_map(|op| {
-        if let WalOp::PutInlined { key, value } = op {
-            // Attempt to extract naked ID if using "col:id" format, else use key as is
-            let doc_id = key.split_once(':')
-                .map(|(_, id)| id.to_string())
-                .unwrap_or_else(|| key.clone());
-
-            // Decode the bytes and wrap the resulting document in an Arc immediately
-            HakoDoc::decode(value).map(|d| (doc_id, Arc::new(d)))
-        } else { 
-            None 
-        }
-    }).collect();
-
-    if !index_docs.is_empty() {
-        // Send the batch to the persistent index worker
-        let _ = db.index_tx.send(crate::engine::engine::IndexOp::Update { 
-            collection: collection.clone(), 
-            // Wrap the whole vector in an Arc as required by the Enum definition
-            puts: Arc::new(index_docs), 
-            deletes: vec![] 
-        });
-    }
-
-    // 5. PHASE 5. Notify Watcher (change event)
-    for op in &accepted_ops {
-        let kind = match op {
-            WalOp::PutInlined { .. } => crate::engine::ChangeKind::Put,
-            WalOp::Delete { .. } => crate::engine::ChangeKind::Delete,
-            _ => continue,
-        };
-
-let event = crate::engine::ChangeEvent {
-path: Arc::from(op.get_key()),
-kind,
-};
-
-        // Notify local watchers (Tauri frontend, etc.)
-        // This triggers the UI but the 'Tailer' will skip re-broadcasting 
-        // because the key/timestamp is in the echo_cache.
-        db.notify_watchers(&collection, event);
-    }
+    // 0.9.0: shared ingest (sync_core) — one LWW/echo/commit path for all
+    // transports. Body moved verbatim; this stays as the call edge.
+    crate::sync_core::apply_replicated_batch(db, collection, ops, echo_cache).await
 }
 
 async fn relay_mesh(
