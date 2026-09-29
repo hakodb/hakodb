@@ -6,11 +6,26 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 HakoDB speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.8.29 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.9.0 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.8.29)
+## What's new (0.7.2 → 0.9.0)
+
+### v0.9.0 — sync becomes a core (`sync_core` + `socket_sync`)
+- `sync_core`: timestamp decode, echo discipline, send-side blob
+  inflation, and the full replicated ingest (LWW + tombstones + echo +
+  WAL + index + watchers) hoisted out of `net_sync` — one path for all
+  transports. `net_sync` rewired onto it (behavior verbatim); cloud keeps
+  its own batching architecture.
+- `socket_sync` (new, `socket-sync` feature, unix-only): co-located
+  instance sync over unix sockets — length-prefix framing, hello +
+  full-snapshot + 500ms live tail, same LWW/echo rules. Built for a
+  single-writer balancer fleet. FFI: `hk_socket_sync_*`.
+- Fixed along the way: replicated deletes never bumped versions, so
+  `Hako::get` served the tombstoned doc from `doc_cache` forever
+  (stale reads on mesh too, not just socket). Now bumped; covered by a
+  shared-ingest contract test plus a two-engine socket e2e.
 
 ### v0.8.29 — cheaper batch path (apply −23%, seed −10%)
 - Apply zips WAL ops with index puts positionally (lockstep push order)
