@@ -23,7 +23,7 @@ use crate::storage::engine::{Pointer, StorageEngine};
 use crate::storage::wal::WalOp;
 
 /// Logical timestamp carried by a WAL op: the `_time` prefix of inlined
-/// values (Version 3 layout: magic[1] ver[1] time[8]) or the delete marker.
+/// values (Version 3 layout: magic(1) ver(1) time(8)) or the delete marker.
 /// Anything else (tx markers, segment/blob pointers, short/corrupt values)
 /// carries none → 0 and is never echo-matched. One deliberate deviation
 /// from the three inlined copies it replaces: they sliced `value[2..10]`
