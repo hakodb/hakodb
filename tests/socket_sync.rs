@@ -48,6 +48,7 @@ async fn socket_snapshot_and_live_both_directions() {
     let dir_a = tmp("a");
     let dir_b = tmp("b");
     let sock = tmp("sock").join("s.sock");
+    eprintln!("TEST sock path: {} parent: {:?}", sock.display(), sock.parent());
     std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
     let sock_str = sock.to_string_lossy().into_owned();
 
@@ -100,7 +101,11 @@ async fn socket_snapshot_and_live_both_directions() {
 
     sa.stop();
     sb.stop();
+    // Cleanup must never panic (a sync bug must fail in the phases above,
+    // not here hiding as an unwrap).
     std::fs::remove_dir_all(&dir_a).ok();
     std::fs::remove_dir_all(&dir_b).ok();
-    std::fs::remove_dir_all(sock.parent().unwrap()).ok();
+    if let Some(parent) = sock.parent() {
+        std::fs::remove_dir_all(parent).ok();
+    }
 }
