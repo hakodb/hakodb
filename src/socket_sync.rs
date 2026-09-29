@@ -42,18 +42,17 @@ enum SockPacket {
     Data { collection: String, ops: Vec<WalOp> },
 }
 
-async fn send_packet<W>(stream: &mut W, pkt: &SockPacket) -> std::io::Result<()>
-where
-    W: AsyncWriteExt + Unpin,
-{
+/// Frame a packet (length-prefix + bincode), pure bytes for the channel.
+fn frame_packet(pkt: &SockPacket) -> std::io::Result<Vec<u8>> {
     let bytes = bincode::serialize(pkt)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if bytes.len() > MAX_FRAME {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too large"));
     }
-    stream.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
-    stream.write_all(&bytes).await?;
-    Ok(())
+    let mut frame = Vec::with_capacity(4 + bytes.len());
+    frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&bytes);
+    Ok(frame)
 }
 
 /// One side of a socket peering: shared tailer + ingest state. Both the
@@ -206,17 +205,32 @@ fn snapshot_collection(db: &Arc<Hako>, col: &str) -> Vec<WalOp> {
 
 async fn handle_conn(st: Shared, stream: UnixStream, label: String) {
     let (rd, wr) = stream.into_split();
-    // Reunite halves behind one mutex: hello handshake is request/response
-    // ordered, tailer and reader share the write half afterwards.
-    let wr = Arc::new(tokio::sync::Mutex::new(wr));
+    // Single writer task per connection (tokio MutexGuard doesn't forward
+    // AsyncWrite): hello/snapshot/tailer all send framed bytes through
+    // this channel; a dead peer ends the writer, which ends the tailer.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let writer = tokio::spawn(async move {
+        let mut wr = wr;
+        while let Some(frame) = rx.recv().await {
+            if wr.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
+    });
+    let send = |pkt: &SockPacket| {
+        frame_packet(pkt)
+            .ok()
+            .and_then(|f| tx.send(f).ok())
+            .is_some()
+    };
+    // Tailer gets its own sender: writer death (peer gone) fails sends
+    // and ends the tailer too.
+    let tx_tail = tx.clone();
 
     // 1. Hello exchange (both directions).
     let versions = st.db.get_version_map();
-    {
-        let mut w = wr.lock().await;
-        if send_packet(&mut w, &SockPacket::Hello { versions }).await.is_err() {
-            return;
-        }
+    if !send(&SockPacket::Hello { versions }) {
+        return;
     }
     let mut rd_buf = ReadHalf { inner: rd };
     let _peer_versions = match rd_buf.recv().await {
@@ -235,15 +249,15 @@ async fn handle_conn(st: Shared, stream: UnixStream, label: String) {
         if ops.is_empty() {
             continue;
         }
-        let mut w = wr.lock().await;
-        if send_packet(&mut w, &SockPacket::Snapshot { collection: col, ops }).await.is_err() {
+        if !send(&SockPacket::Snapshot { collection: col, ops }) {
             break;
         }
     }
 
     // 3. Live tail (500ms, mesh cadence) + read loop, until stop/error.
+    // The tailer sends through the channel; if the writer died (peer
+    // gone), sends fail and the tailer exits too.
     let st_tail = st.clone();
-    let wr_tail = wr.clone();
     let tailer = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
         loop {
@@ -293,8 +307,11 @@ async fn handle_conn(st: Shared, stream: UnixStream, label: String) {
                 if logical.is_empty() {
                     continue;
                 }
-                let mut w = wr_tail.lock().await;
-                if send_packet(&mut w, &SockPacket::Data { collection: col, ops: logical }).await.is_err() {
+                if frame_packet(&SockPacket::Data { collection: col, ops: logical })
+                    .ok()
+                    .and_then(|f| tx_tail.send(f).ok())
+                    .is_none()
+                {
                     return;
                 }
             }
@@ -302,6 +319,7 @@ async fn handle_conn(st: Shared, stream: UnixStream, label: String) {
     });
 
     // 4. Read loop: ingest snapshots + data through the shared path.
+    // Ending here drops our senders; the writer then drains and ends.
     loop {
         if !st.running.load(Ordering::Acquire) {
             break;
@@ -315,6 +333,7 @@ async fn handle_conn(st: Shared, stream: UnixStream, label: String) {
         }
     }
     tailer.abort();
+    writer.abort();
     st.peers.lock().unwrap().remove(&label);
 }
 
