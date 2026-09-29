@@ -25,6 +25,9 @@ memmap2 = "0.9"
 crc32fast = "1"
 serde = { version = "1", features=["derive", "rc"] }
 serde_json = "1"
+# Single-pass JSON writer (write_json): itoa already unified via
+# serde_json — feature unification only, nothing new to download.
+itoa = "1"
 parking_lot = "0.12"
 thiserror = "1"
 rand = "0.8"

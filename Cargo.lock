@@ -648,6 +648,7 @@ dependencies = [
  "fxhash",
  "gethostname",
  "hashbrown 0.14.5",
+ "itoa",
  "local-ip-address",
  "mdns-sd",
  "memmap2",

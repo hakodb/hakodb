@@ -134,6 +134,175 @@ impl HakoDoc {
         serde_json::Value::Object(map)
     }
 
+    /// Single-pass JSON serialization: the same bytes `to_json()` +
+    /// `serde_json::to_vec` produce, without the intermediate Map, key
+    /// Strings, and Value tree. One buffer append per piece; keys borrow
+    /// the interned Arcs. Read-path only — storage stays binary.
+    ///
+    /// Byte-equality contract (pinned by tests): `serde_json::Map` is a
+    /// BTreeMap, so `_time` merges at its sorted position among the
+    /// (already sorted) fields; floats render through serde_json's own
+    /// Number (exponent `e+`, non-finite as null); strings escape identically.
+    pub fn write_json(&self, out: &mut Vec<u8>) {
+        out.push(b'{');
+        let mut first = true;
+        let mut time_written = false;
+        // BTreeMap<String> order is plain byte order; fields arrive sorted.
+        for (k, v) in &self.fields {
+            if !time_written && k.as_ref() > "_time" {
+                Self::write_time(out, &mut first, self._time);
+                time_written = true;
+            }
+            if !time_written && k.as_ref() == "_time" {
+                // A literal "_time" field overwrites the timestamp in the
+                // map (insert order loses); the ts is dropped, not doubled.
+                time_written = true;
+            }
+            if !first {
+                out.push(b',');
+            }
+            first = false;
+            Self::write_json_str(out, k);
+            out.push(b':');
+            Self::write_json_value(out, v);
+        }
+        if !time_written {
+            Self::write_time(out, &mut first, self._time);
+        }
+        out.push(b'}');
+    }
+
+    fn write_time(out: &mut Vec<u8>, first: &mut bool, ts: i64) {
+        if !*first {
+            out.push(b',');
+        }
+        *first = false;
+        out.extend_from_slice(b"\"_time\":");
+        Self::push_int(out, ts);
+    }
+
+    /// Owned convenience for response paths.
+    pub fn to_json_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        self.write_json(&mut out);
+        out
+    }
+
+/// JSON string escaping, byte-identical to serde_json: `"`, `\` and
+/// U+0000–U+001F escape (`\b \f \n \r \t` short, rest `\u00XX` lowercase);
+/// all other bytes (including multi-byte UTF-8, never split: only ASCII
+/// is special-cased) pass through raw.
+fn write_json_str(out: &mut Vec<u8>, s: &str) {
+    out.push(b'"');
+    Self::write_json_raw(out, s);
+    out.push(b'"');
+}
+
+/// Escaping core without quotes (lets Reference write `col/id` under one
+/// open quote — byte-identical to escaping the joined string).
+fn write_json_raw(out: &mut Vec<u8>, s: &str) {
+    for &b in s.as_bytes() {
+        match b {
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x0C => out.extend_from_slice(b"\\f"),
+            0x00..=0x1F => {
+                out.extend_from_slice(b"\\u00");
+                out.push(b"0123456789abcdef"[(b >> 4) as usize]);
+                out.push(b"0123456789abcdef"[(b & 0xF) as usize]);
+            }
+            _ => out.push(b),
+        }
+    }
+}
+
+fn push_int(out: &mut Vec<u8>, n: i64) {
+    out.extend_from_slice(itoa::Buffer::new().format(n).as_bytes());
+}
+
+/// Single-pass Value writer: mirrors `Value::to_json` arm for arm
+/// (including nested-map key sorting and BlobLink/Reference shapes).
+fn write_json_value(out: &mut Vec<u8>, v: &Value) {
+    use crate::document::value::Value::*;
+    match v {
+        Null | ServerTimestamp => out.extend_from_slice(b"null"),
+        Bool(true) => out.extend_from_slice(b"true"),
+        Bool(false) => out.extend_from_slice(b"false"),
+        Int(n) => Self::push_int(out, *n),
+        Float(f) => {
+            // Delegate to serde_json's own float rendering (ryu-finite with
+            // exponent post-processing like `1e+100`, non-finite as null).
+            // One small alloc per float, floats are rare; byte-equality by
+            // construction instead of by careful imitation.
+            match serde_json::Number::from_f64(*f) {
+                Some(n) => out.extend_from_slice(n.to_string().as_bytes()),
+                None => out.extend_from_slice(b"null"),
+            }
+        }
+        String(s) => Self::write_json_str(out, s),
+        Binary(bytes) => {
+            out.push(b'[');
+            for (i, b) in bytes.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(itoa::Buffer::new().format(*b).as_bytes());
+            }
+            out.push(b']');
+        }
+        Timestamp(micros) => Self::push_int(out, *micros),
+        Reference { collection, doc_id } => {
+            // Escaping is char-local and '/' never escapes: writing the
+            // parts under one open quote equals escaping "col/id" whole
+            // (what to_json formats first), with zero alloc.
+            out.extend_from_slice(b"{\"__ref__\":\"");
+            Self::write_json_raw(out, collection);
+            out.push(b'/');
+            Self::write_json_raw(out, doc_id);
+            out.extend_from_slice(b"\"}");
+        }
+        BlobLink { offset, len } => {
+            // Shape mirrors to_json exactly: {"__blob__":{"len":N,"offset":N}}
+            // (BTreeMap order at both levels: "__blob__" sole key; "len" < "offset").
+            out.extend_from_slice(b"{\"__blob__\":{\"len\":");
+            out.extend_from_slice(itoa::Buffer::new().format(*len).as_bytes());
+            out.extend_from_slice(b",\"offset\":");
+            out.extend_from_slice(itoa::Buffer::new().format(*offset).as_bytes());
+            out.extend_from_slice(b"}}");
+        }
+        Map(fields) => {
+            // to_json rebuilds a BTreeMap: sort borrowed keys, no allocs.
+            let mut items: Vec<(&str, &Value)> =
+                fields.iter().map(|(k, v)| (k.as_ref(), v)).collect();
+            items.sort_by(|a, b| a.0.cmp(b.0));
+            out.push(b'{');
+            for (i, (k, v)) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                Self::write_json_str(out, k);
+                out.push(b':');
+                Self::write_json_value(out, v);
+            }
+            out.push(b'}');
+        }
+        Array(values) => {
+            out.push(b'[');
+            for (i, v) in values.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                Self::write_json_value(out, v);
+            }
+            out.push(b']');
+        }
+    }
+}
+
     pub fn to_json_with_id(&self, id: &str) -> serde_json::Value {
         let mut json = self.to_json();
         if let Some(obj) = json.as_object_mut() {
