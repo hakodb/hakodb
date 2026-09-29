@@ -74,10 +74,10 @@ async fn socket_snapshot_and_live_both_directions() {
         b.get("c", "k2").ok().flatten().is_some()
     });
     {
-        let shard = b.get_shard("c").unwrap();
-        let guard = shard.read().unwrap();
-        let keys: Vec<_> = guard.index.keys().cloned().collect();
-        eprintln!("DEBUG B index keys: {keys:?}");
+        // DEBUG: which key form resolves?
+        let bare = b.get("c", "k1").ok().flatten().is_some();
+        let namespaced = b.get("c", "c:k1").ok().flatten().is_some();
+        eprintln!("DEBUG B k1 bare={bare} namespaced={namespaced}");
     }
     assert_eq!(
         b.get("c", "k1").unwrap().unwrap().get("v"),
