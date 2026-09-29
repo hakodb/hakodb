@@ -3506,6 +3506,7 @@ pub extern "C" fn hk_net_syncer_free(syncer: *mut HK_NetSyncer) {
 
 // SOCKET SYNC (unix-only): co-located instances, explicit paths.
 #[cfg(all(unix, feature = "socket-sync"))]
+#[allow(non_camel_case_types)]
 pub struct HK_SocketSync {
     inner: std::sync::Arc<crate::socket_sync::SocketSync>,
 }
