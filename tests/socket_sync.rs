@@ -73,11 +73,17 @@ async fn socket_snapshot_and_live_both_directions() {
     poll_until("snapshot k2", || {
         b.get("c", "k2").ok().flatten().is_some()
     });
+    // BISECT (temporary): halt all sync activity, then observe stability.
+    // If k1 survives halted, the deleter is ongoing background work.
+    // If k1 still vanishes, the deleter already ran (ingest/snapshot).
+    sa.stop();
+    sb.stop();
+    tokio::time::sleep(Duration::from_millis(300)).await;
     {
         // DEBUG: which key form resolves?
         let bare = b.get("c", "k1").ok().flatten().is_some();
         let namespaced = b.get("c", "c:k1").ok().flatten().is_some();
-        eprintln!("DEBUG B k1 bare={bare} namespaced={namespaced}");
+        eprintln!("DEBUG B k1 bare={bare} namespaced={namespaced} (sync halted)");
     }
     assert_eq!(
         b.get("c", "k1").unwrap().unwrap().get("v"),
