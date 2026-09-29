@@ -59,9 +59,11 @@ async fn socket_snapshot_and_live_both_directions() {
     let a = open_db(&dir_a);
     let b = open_db(&dir_b);
 
-    // A holds data before peering; B starts empty.
+    // A holds data before peering; B starts empty. Flush so the file
+    // tailer (not just the snapshot path) observes a deterministic state.
     put_kv(&a, "c", "k1", "one");
     put_kv(&a, "c", "k2", "two");
+    a.flush().unwrap();
 
     let sa = SocketSync::new(a.clone(), vec![]);
     let sb = SocketSync::new(b.clone(), vec![]);
@@ -75,13 +77,10 @@ async fn socket_snapshot_and_live_both_directions() {
         b.get("c", "k1").ok().flatten().is_some()
     })
     .await;
-    // PROBE (temporary): sample presence over time to classify the
-    // disappearance as transient (cache/version race) or permanent.
-    for i in 0..10 {
-        let present = b.get("c", "k1").ok().flatten().is_some();
-        eprintln!("PROBE k1 t+{i} present={present}");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    poll_until("snapshot k2", || {
+        b.get("c", "k2").ok().flatten().is_some()
+    })
+    .await;
     poll_until("snapshot k2", || {
         b.get("c", "k2").ok().flatten().is_some()
     })
@@ -93,6 +92,7 @@ async fn socket_snapshot_and_live_both_directions() {
 
     // Live write B -> A (reverse direction over the same peering).
     put_kv(&b, "c", "k3", "three");
+    b.flush().unwrap();
     poll_until("live k3", || {
         a.get("c", "k3").ok().flatten().is_some()
     })
@@ -100,19 +100,17 @@ async fn socket_snapshot_and_live_both_directions() {
 
     // Live write A -> B.
     put_kv(&a, "c", "k4", "four");
+    a.flush().unwrap();
     poll_until("live k4", || {
         b.get("c", "k4").ok().flatten().is_some()
     })
     .await;
 
-    // Delete propagates. NOTE the sleep: Interval flushes on append only
-    // past the 5ms group-commit window — an append landing within 5ms of
-    // the last flush sits in RAM, invisible to the file-tailing live path
-    // (same quiet-window class as insiden-hako-wal-20260928; the 2-c tick
-    // covers it in production within 500ms). Sleep past the window so the
-    // delete's own append flushes deterministically.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Delete propagates (flushed: the live tailer reads the WAL file,
+    // so the delete must be on disk, not just in the write buffer —
+    // same visibility rule as production Interval mode).
     a.delete("c", "k1").unwrap();
+    a.flush().unwrap();
     poll_until("delete k1", || {
         b.get("c", "k1").ok().flatten().is_none()
     })
