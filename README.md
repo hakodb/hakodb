@@ -2,15 +2,24 @@
 
 **HakoDB is an embedded, Firestore-style document database written in Rust.**
 
-It stores typed JSON-like documents in binary form, runs **fully in-process** like SQLite (no server process, no daemon, no network config), and exposes a **flat C ABI** (`include/hakodb.h`) so any language can embed it. Ready-made SDKs live in their own repos — Go, JavaScript/TypeScript, Pascal/Lazarus, Tauri, and more (see [Repositories](#repositories)).
+It stores typed JSON-like documents in binary form, runs **fully in-process** like SQLite (no server process, no daemon, no network config), and exposes a **flat C ABI** (`hakodb.h`, generated per-target by the build) so any language can embed it. Ready-made SDKs live in their own repos — Go, JavaScript/TypeScript, Pascal/Lazarus, Tauri, and more (see [Repositories](#repositories)).
 
 HakoDB speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.9.0 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.9.1 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.9.0)
+## What's new (0.7.2 → 0.9.1)
+
+### v0.9.1 — per-target headers, no checked-in header
+- Deleted `include/hakodb.h`: one file pretending to serve all targets
+  caused the stale socket-API incident. `build.rs` now copies the cbindgen
+  output next to the binaries (`target/<...>/hakodb.h`); every release
+  bundle carries the header from the build that produced it, and the flat
+  release `hakodb.h` is the Linux-generated superset. FFI test links
+  per-OS (`hakodb.dll` Windows, `hakodb` elsewhere).
+- No engine changes since 0.9.0.
 
 ### v0.9.0 — sync becomes a core (`sync_core` + `socket_sync`)
 - `sync_core`: timestamp decode, echo discipline, send-side blob
@@ -89,7 +98,7 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
 
 ### v0.8.21 — rebrand to HakoDB
 - Crate `hakodb`, main type `Hako` (`HakoConfig`, `HakoDoc`,
-  `HakoError`), FFI prefix `HK_*`/`hk_*`, header `include/hakodb.h`,
+  `HakoError`), FFI prefix `HK_*`/`hk_*`, header `hakodb.h` (per-target generated),
   binaries `hakodb.dll` / `libhakodb.so`.
 - Data plane migrates on open: `__firelite_*` directories become their
   `__hako_*` canonical names with data intact (both-present keeps
@@ -236,12 +245,12 @@ See [`example/rust/basic`](example/rust/basic) for a complete, working example o
 
 ## Multi-language platform support (C ABI)
 
-HakoDB exposes a flat C ABI for embedding in other languages and integration layers. Opaque handle types are defined in `include/hakodb.h`. Language SDKs wrapping this ABI live in their own repos — see [Repositories](#repositories).
+HakoDB exposes a flat C ABI for embedding in other languages and integration layers. Opaque handle types are defined in `hakodb.h` — generated per target by `build.rs` + `cbindgen.toml` next to the binaries (`target/<...>/hakodb.h`); release bundles carry the header from the build that produced them, and the flat release `hakodb.h` is the Linux-generated superset. There is no checked-in header since 0.9.1. Language SDKs wrapping this ABI live in their own repos — see [Repositories](#repositories).
 
 ### Build artifacts
 
 - Cargo crate types: `cdylib` (dynamic library consumers) and `rlib` (Rust consumers).
-- Auto-generated C header via `build.rs` + `cbindgen.toml`: `include/hakodb.h`.
+- Auto-generated C header via `build.rs` + `cbindgen.toml`: `target/<...>/hakodb.h` (per-target, next to binaries).
 
 ```bash
 cargo build --release
@@ -589,7 +598,7 @@ API (HakoDB + FFI + SDKs)
 | Indexing | `src/index/*` | Implemented |
 | Query planner/executor | `src/query/*` | Implemented |
 | Document model | `src/document/*` | Implemented |
-| C-FFI | `src/ffi.rs`, `include/hakodb.h` | Implemented |
+| C-FFI | `src/ffi.rs`, per-target `hakodb.h` | Implemented |
 
 ---
 

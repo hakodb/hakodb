@@ -1,11 +1,5 @@
 fn main() {
-    // (touch: force build-script rerun after OUT_DIR migration)
     let crate_dir = std::env::var("CARGO_MANIFEST_DIR").expect("manifest dir should exist");
-    // ponytail: generated header goes to OUT_DIR, never the source tree —
-    // `cargo publish --verify` (and good hygiene generally) forbids build
-    // scripts from touching anything outside OUT_DIR. The checked-in
-    // include/hako.h that C consumers actually use is refreshed explicitly:
-    // HAKODB_REGEN_HEADER=1 cargo build. CI/on-demand diff keeps it honest.
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR should exist");
     let output = std::path::Path::new(&out_dir).join("hakodb.h");
 
@@ -26,15 +20,17 @@ fn main() {
         .generate()
         .expect("Unable to generate C header")
         .write_to_file(&output);
-    // Opt-in refresh of the checked-in header for C consumers + release
-    // assets. Deliberately env-gated so normal builds (and publish verify)
-    // stay side-effect free.
-    if std::env::var("HAKODB_REGEN_HEADER").is_ok() {
-        let checked_in = std::path::Path::new(&crate_dir)
-            .join("include")
-            .join("hakodb.h");
-        std::fs::copy(&output, &checked_in).expect("refresh checked-in hakodb.h");
-        println!("cargo:warning=refreshed include/hakodb.h from cbindgen output");
+    // ponytail: stable per-target copy next to the binaries. OUT_DIR hides
+    // under target/<triple>/<profile>/build/<pkg>-<hash>/out — unusable as
+    // a consumer path. The profile dir (3 ancestors up) is stable across
+    // hosts, triples, and profiles, so release CI, sync scripts, and the
+    // C++ bench all take `target/<...>/hakodb.h` from the build that
+    // produced it. There is no checked-in header anymore (deleted in
+    // 0.9.1: one header pretending to serve all targets caused the stale
+    // socket-API incident). Writing inside target/ keeps `cargo publish
+    // --verify` and source-tree hygiene intact.
+    if let Some(profile_dir) = std::path::Path::new(&out_dir).ancestors().nth(3) {
+        let _ = std::fs::copy(&output, profile_dir.join("hakodb.h"));
     }
 
 // ponytail: a stale unprefixed import lib SHADOWS the fresh .dll in

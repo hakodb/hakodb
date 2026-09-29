@@ -1,11 +1,13 @@
-// FFI round-trip tests. These bind to hakodb.dll via extern "C" and exercise
+// FFI round-trip tests. These bind to the cdylib via extern "C" and exercise
 // the slab-allocated result set path we just shipped in v0.7.2. The point is
 // to catch any future FFI refactor that silently breaks the C ABI contract:
 // the test should panic / abort / fail, not pass with corrupted memory.
 //
-// Tests assume the DLL is already built at target/release/hakodb.dll (cargo
-// build --release does this for us). If the DLL isn't present, the linker
-// fails on test binary build and the test target is skipped.
+// Tests assume the library is already built (cargo build does this):
+// Windows `target/release/hakodb.dll`, Linux `target/release/libhakodb.so`
+// (run tests with LD_LIBRARY_PATH set to that dir). If the library isn't
+// present, the linker fails on test binary build and the test target is
+// skipped. Android: manual runs only (no device harness in CI).
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
@@ -23,7 +25,11 @@ use std::path::PathBuf;
 // ponytail: link the always-fresh dll.lib by its MSVC name — plain
 // "hakodb" resolves hakodb.lib, which build.rs deletes on purpose
 // (it shadowed the DLL with stale symbols; MinGW links the DLL direct).
-#[link(name = "hakodb.dll", kind = "dylib")]
+// Non-Windows: plain "hakodb" finds libhakodb.so. Run Linux with
+// LD_LIBRARY_PATH=target/debug (or release); Android runs manually
+// (no device harness in CI).
+#[cfg_attr(windows, link(name = "hakodb.dll", kind = "dylib"))]
+#[cfg_attr(not(windows), link(name = "hakodb", kind = "dylib"))]
 extern "C" {
     fn hk_engine_open(path: *const c_char) -> *mut HK_Engine;
     fn hk_engine_free(engine: *mut HK_Engine);
@@ -600,8 +606,9 @@ fn transaction_get_put_commit() {
 
     // tx_begin / tx_get / tx_put / tx_commit. If the FFI signature
     // changes, this fails to link — which is the whole point.
-    // (hakodb.dll: fresh import lib, see top of file.)
-    #[link(name = "hakodb.dll", kind = "dylib")]
+    // (hakodb.dll on Windows: fresh import lib, see top of file.)
+    #[cfg_attr(windows, link(name = "hakodb.dll", kind = "dylib"))]
+    #[cfg_attr(not(windows), link(name = "hakodb", kind = "dylib"))]
     extern "C" {
         fn hk_transaction_begin(engine: *mut HK_Engine) -> *mut HK_Transaction;
         fn hk_transaction_get(engine: *mut HK_Engine, tx: *mut HK_Transaction, coll: *const c_char, id: *const c_char) -> *mut HK_Doc;

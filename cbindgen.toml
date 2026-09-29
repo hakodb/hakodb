@@ -10,6 +10,16 @@ pragma_once = true
 [parse]
 parse_deps = false
 
+# NOTE: no [defines] section on purpose. cbindgen evaluates neither
+# feature nor target cfgs here, so every build emits the full API as
+# unconditional declarations — including unix-only items on Windows
+# builds. That is the documented contract: declarations without
+# definitions are harmless unless called (link error, fail-closed).
+# An explicit [defines] map was tried in 0.9.1 and reverted: it wrapped
+# everything in #ifdefs nobody defines, hiding the whole sync API.
+# Per-target bundles still carry the header from their own build so
+# provenance is honest even when the bytes are identical.
+
 [fn]
 rename_args = "snake_case"
 
