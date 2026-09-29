@@ -73,6 +73,12 @@ async fn socket_snapshot_and_live_both_directions() {
     poll_until("snapshot k2", || {
         b.get("c", "k2").ok().flatten().is_some()
     });
+    {
+        let shard = b.get_shard("c").unwrap();
+        let guard = shard.read().unwrap();
+        let keys: Vec<_> = guard.index.keys().cloned().collect();
+        eprintln!("DEBUG B index keys: {keys:?}");
+    }
     assert_eq!(
         b.get("c", "k1").unwrap().unwrap().get("v"),
         Some(&Value::String("one".into()))
