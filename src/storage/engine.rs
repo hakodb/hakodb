@@ -106,13 +106,18 @@ impl StorageEngine {
         // markers) hold bytes of data — a multi-MB WAL headroom per system
         // shard is phantom size (sparse zeros still count in logical length).
         let wal_reserve = if logical_name.starts_with("__") { 0 } else { cfg.wal_reserve_bytes };
-        let wal = Wal::open(
+        let mut wal = Wal::open(
             base_dir.as_ref().join("wal.log"),
             cfg.durability_mode,
             cfg.group_commit_max_ops,
             encryption.clone(),
             wal_reserve,
         )?;
+        // Per-instance group-commit window (cluster fsync staggering).
+        // Clamped: see HakoConfig::group_commit_interval_ms.
+        wal.set_group_commit_interval(std::time::Duration::from_millis(
+            crate::config::clamp_group_commit_interval_ms(cfg.group_commit_interval_ms),
+        ));
 
         let mut segments = HashMap::new();
         let mut max_id = 0;
@@ -1222,5 +1227,30 @@ mod tests {
             assert_eq!(len > 0, expect_bytes, "mode {mode:?}: file len {len}");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// Configured interval gates flushing: a huge window holds appends in
+    /// RAM (precondition for cluster fsync staggering — instances flush on
+    /// their own cadence, not on every write).
+    #[test]
+    fn configured_interval_holds_and_releases() {
+        let dir = tmp("interval");
+        let mut cfg = HakoConfig {
+            durability_mode: DurabilityMode::Interval,
+            wal_reserve_bytes: 0,
+            auto_compaction_threshold_bytes: 1024,
+            group_commit_interval_ms: 30_000,
+            ..Default::default()
+        };
+        // Clamp is honored at open (not just documented).
+        cfg.group_commit_interval_ms = crate::config::clamp_group_commit_interval_ms(cfg.group_commit_interval_ms);
+        let mut eng = StorageEngine::open(&dir, &cfg, "c".into(), None).unwrap();
+        eng.put("k".into(), b"value-bytes").unwrap();
+        assert!(eng.wal.has_pending(), "30s window must buffer, not flush");
+        assert_eq!(eng.wal.data_len(), 0);
+        eng.flush_all().unwrap();
+        assert!(!eng.wal.has_pending());
+        assert!(eng.wal.data_len() > 0, "explicit flush lands");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

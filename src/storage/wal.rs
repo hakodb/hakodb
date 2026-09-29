@@ -523,6 +523,12 @@ impl Wal {
         self.mode = mode;
     }
 
+    /// Group-commit window (Interval mode). Applied from
+    /// `HakoConfig::group_commit_interval_ms` at engine open (clamped).
+    pub fn set_group_commit_interval(&mut self, d: Duration) {
+        self.group_commit_interval = d;
+    }
+
     pub fn tail(&self, start_offset: u64) -> Result<(Vec<WalOp>, u64)> {
         // ponytail: fresh read handle per tail, never touch self.file's
         // cursor. try_clone shares the file position (DuplicateHandle/dup),

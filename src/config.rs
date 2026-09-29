@@ -17,6 +17,13 @@ pub struct HakoConfig {
     pub auto_compaction_threshold_bytes: usize,
     pub durability_mode: DurabilityMode,
     pub group_commit_max_ops: usize,
+    /// Group-commit time window in ms (Interval mode): an append flushes
+    /// when this long passed since the last flush. Default 5. Cluster
+    /// use-case (hakocluster): per-instance intervals (+ staggered starts)
+    /// spread fsync storms. Clamped to 1..=30_000 at open — larger would
+    /// approach Manual durability without saying so (unbounded loss
+    /// window); use Manual + explicit flush if you really mean it.
+    pub group_commit_interval_ms: u64,
     pub encryption_key: Option<String>,
     pub encrypted_cols: Option<HashSet<String>>,
     pub enable_audit_log: bool,
@@ -69,6 +76,7 @@ impl Default for HakoConfig {
             auto_compaction_threshold_bytes: 8 * 1024 * 1024,
             durability_mode: DurabilityMode::Interval,
             group_commit_max_ops: 128,
+            group_commit_interval_ms: 5,
             encryption_key: None,
             encrypted_cols: None,
             enable_audit_log: false,
@@ -79,8 +87,29 @@ impl Default for HakoConfig {
 value_blob_threshold_bytes: 16 * 1024,
 replication_collections: None,
 wal_reserve_bytes: 4 * 1024 * 1024,
-background_maintenance: true,
-sync_excluded: Vec::new(),
+    background_maintenance: true,
+    sync_excluded: Vec::new(),
         }
+    }
+}
+
+/// Clamp for `group_commit_interval_ms` (see field docs). Pure for testing.
+pub fn clamp_group_commit_interval_ms(ms: u64) -> u64 {
+    ms.clamp(1, 30_000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interval_clamp_bounds() {
+        assert_eq!(clamp_group_commit_interval_ms(0), 1);
+        assert_eq!(clamp_group_commit_interval_ms(1), 1);
+        assert_eq!(clamp_group_commit_interval_ms(5), 5);
+        assert_eq!(clamp_group_commit_interval_ms(30_000), 30_000);
+        // Unbounded windows approach Manual without saying so: capped.
+        assert_eq!(clamp_group_commit_interval_ms(999_999), 30_000);
+        assert_eq!(HakoConfig::default().group_commit_interval_ms, 5);
     }
 }
