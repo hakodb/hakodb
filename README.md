@@ -6,11 +6,21 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 HakoDB speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.9.1 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.9.2 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.9.1)
+## What's new (0.7.2 → 0.9.2)
+
+### v0.9.2 — single-pass JSON + strict-time intervals
+- `HakoDoc::write_json`: same bytes as `to_json`+serialize at 1.89x
+  (measured, release): no Map/key-String/Value-tree allocs. FFI unified
+  onto it (`doc_to_json` + bulk renderer now carry `_time`, sync-safe;
+  accepted break, no external consumers yet).
+- Custom `group_commit_interval_ms` switches Interval to strict-time
+  (count/size triggers off, clock + 16MB emergency cap only); default 5ms
+  keeps legacy triple-trigger byte-for-byte. Maintenance tick enforces
+  the same window. Tight-loop writes +1.5-2.4x on deferred fsync.
 
 ### v0.9.1 — per-target headers, no checked-in header
 - Deleted `include/hakodb.h`: one file pretending to serve all targets
