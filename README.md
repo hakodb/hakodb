@@ -6,11 +6,19 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 HakoDB speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.9.2 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.9.3 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.9.2)
+## What's new (0.7.2 → 0.9.3)
+
+### v0.9.3 — read-only enforcement + interval observability
+- `Hako::set_read_only/is_read_only`: one guard at the `write_batch`
+  admission gate refuses every local write kind; replicated ingest
+  bypasses it by design, so read-only replicas keep converging. Reads
+  never check the flag. Built for hakocluster replicas + failover.
+- `Hako::group_commit_interval_ms()`: reports the configured window
+  (fleet stagger verification from outside the crate).
 
 ### v0.9.2 — single-pass JSON + strict-time intervals
 - `HakoDoc::write_json`: same bytes as `to_json`+serialize at 1.89x

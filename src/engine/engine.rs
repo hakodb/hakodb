@@ -358,6 +358,11 @@ pub struct Hako {
     /// ponytail: lock-free gate for allowed(). The common case (no rules)
     /// skips the RwLock acquisition on every op; set alongside the rules.
     security_enabled: std::sync::atomic::AtomicBool,
+    /// Read-only enforcement (hakocluster phase 3): when set, write_batch
+    /// — the single admission gate for ALL local writes — refuses, while
+    /// replicated ingest (apply_replicated_batch, bypasses write_batch by
+    /// design) keeps converging. Reads never check this.
+    read_only: std::sync::atomic::AtomicBool,
     audit_data: Arc<RwLock<Vec<AuditEntry>>>,
     audit_tx: Sender<AuditEntry>,
     pub(crate) index_tx: Sender<IndexOp>,
@@ -639,6 +644,7 @@ impl Hako {
             global_version: AtomicU64::new(1),
             security_rules: RwLock::new(Vec::new()),
             security_enabled: std::sync::atomic::AtomicBool::new(false),
+            read_only: std::sync::atomic::AtomicBool::new(false),
             audit_tx,
             index_tx,
             index_inflight,
@@ -860,6 +866,13 @@ impl Hako {
     }
 
     pub fn write_batch(&self, mutations: Vec<BatchMutation>) -> Result<Vec<String>> {
+        // Read-only enforcement: one guard at the admission gate covers
+        // put/put_owned/delete/patch/delete_where/tx (all route here).
+        // Replicated ingest bypasses write_batch by design (see field).
+        if self.read_only.load(Ordering::Relaxed) {
+            self.record_audit(AuditEntry { op: AccessOp::Batch, collection: "<sharded>".into(), doc_id: None, ok: false });
+            return Err(HakoError::Corrupt("ReadOnly".into()));
+        }
         // 1. Security Check
         if !mutations.iter().all(|m| self.allowed(self.get_col(m), AccessOp::Batch)) {
             self.record_audit(AuditEntry { op: AccessOp::Batch, collection: "<sharded>".into(), doc_id: None, ok: false });
@@ -1897,6 +1910,24 @@ impl Hako {
     pub fn set_security_rules(&self, rules: Vec<SecurityRule>) {
         self.security_enabled.store(!rules.is_empty(), std::sync::atomic::Ordering::Relaxed);
         *self.security_rules.write().unwrap() = rules;
+    }
+
+    /// Read-only enforcement switch (hakocluster: replicas + failover).
+    /// Refuses local writes at the write_batch gate; replicated ingest
+    /// and all reads are unaffected. Reversible.
+    pub fn set_read_only(&self, ro: bool) {
+        self.read_only.store(ro, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Read-only state (see [`Self::set_read_only`]).
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Configured group-commit window in ms (observability for fleet
+    /// stagger checks, e.g. hakocluster PerInstance verification).
+    pub fn group_commit_interval_ms(&self) -> u64 {
+        self.config.group_commit_interval_ms
     }
 
     pub fn execute_aggregation(&self, query: Query) -> Result<HashMap<String, f64>> {
