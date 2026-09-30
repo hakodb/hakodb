@@ -108,6 +108,49 @@ pub fn write_stats_report() -> String {
     s
 }
 
+// --- Lock-wait accounting (ponytail) ---
+// Time BLOCKED acquiring shard locks (wait, not hold): the contention
+// signal for mixed read/write load. Write hold times are already split
+// in WRITE_STATS (wal/apply/cache/...); read hold is decode-dominated
+// and mostly outside the guard (borrowed Inlined bytes), so wait-only is
+// the honest metric. Same always-on discipline as WRITE_STATS (a pair of
+// Instant reads + Relaxed adds per acquisition). Read via
+// `lock_stats_report()` (resets), e.g. from a test or a mixed-load probe.
+// Sampling points (not exhaustive — the three that gate mixed r/w):
+// write_batch apply (shard write), Hako::get (shard read), query scan
+// (storage read in execute Phase 1).
+pub(crate) struct LockPhaseStats {
+    pub write_wait_ns: AtomicU64,
+    pub write_acqs: AtomicU64,
+    pub read_wait_ns: AtomicU64,
+    pub read_acqs: AtomicU64,
+}
+pub(crate) static LOCK_STATS: LockPhaseStats = LockPhaseStats {
+    write_wait_ns: AtomicU64::new(0),
+    write_acqs: AtomicU64::new(0),
+    read_wait_ns: AtomicU64::new(0),
+    read_acqs: AtomicU64::new(0),
+};
+
+/// Human-readable lock-wait table + reset. `avg` per acquisition —
+/// ~0 when free, >> 0 under contention.
+pub fn lock_stats_report() -> String {
+    let wacq = LOCK_STATS.write_acqs.load(Ordering::Relaxed);
+    let racq = LOCK_STATS.read_acqs.load(Ordering::Relaxed);
+    let ww = LOCK_STATS.write_wait_ns.load(Ordering::Relaxed);
+    let rw = LOCK_STATS.read_wait_ns.load(Ordering::Relaxed);
+    let s = format!(
+        "lock profile: {wacq} write acqs, {racq} read acqs\n  write {wacq} total wait {:.2}us avg\n  read  {racq} total wait {:.2}us avg\n",
+        ww as f64 / 1000.0 / wacq.max(1) as f64,
+        rw as f64 / 1000.0 / racq.max(1) as f64,
+    );
+    for v in [&LOCK_STATS.write_wait_ns, &LOCK_STATS.write_acqs,
+        &LOCK_STATS.read_wait_ns, &LOCK_STATS.read_acqs] {
+        v.store(0, Ordering::Relaxed);
+    }
+    s
+}
+
 // --- Data Types ---
 
 #[derive(Debug, Clone)]
@@ -1000,7 +1043,12 @@ impl Hako {
 
             let t_apply = Instant::now();
             {
+                // ponytail: lock-wait sample — time blocked on the shard
+                // write lock (the mixed r/w contention signal).
+                let t_lock = Instant::now();
                 let mut shard = shard_arc.write().unwrap();
+                LOCK_STATS.write_wait_ns.fetch_add(t_lock.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                LOCK_STATS.write_acqs.fetch_add(1, Ordering::Relaxed);
             
                 // OPTIMIZATION: Only run the delete-resolution scan if there are actually 
                 // deletes in this specific shard's work.
@@ -1177,7 +1225,12 @@ impl Hako {
         }
 
         let shard = self.get_shard(collection)?;
+        // ponytail: lock-wait sample — readers blocked here are queued
+        // behind the writer's flush (the mixed r/w contention signal).
+        let t_lock = Instant::now();
         let storage = shard.safe_read()?;
+        LOCK_STATS.read_wait_ns.fetch_add(t_lock.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        LOCK_STATS.read_acqs.fetch_add(1, Ordering::Relaxed);
         // ponytail: decode borrowed from the shared Arc — the old
         // storage.get() cloned the full bytes into a transient Vec just
         // to decode and drop them (one alloc + memcpy per get, found by
@@ -1236,7 +1289,11 @@ impl Hako {
         }
 
         let shard = self.get_shard(collection)?;
+        // ponytail: lock-wait sample (same signal as get()).
+        let t_lock = Instant::now();
         let storage = shard.safe_read()?;
+        LOCK_STATS.read_wait_ns.fetch_add(t_lock.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        LOCK_STATS.read_acqs.fetch_add(1, Ordering::Relaxed);
         let res = storage.get_shared(doc_id)?.and_then(|b| {
             crate::document::hako_doc::DocView::new(b)
         });

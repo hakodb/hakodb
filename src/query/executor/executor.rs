@@ -133,7 +133,12 @@ impl ParallelQueryExecutor {
         // 1. PHASE 1: INDEX SCAN
         // Fetch physical pointers from the RAM Index
         let keys_from_index = {
+            // ponytail: lock-wait sample — query scans blocked here are
+            // queued behind the writer (same mixed r/w signal as get).
+            let t_lock = std::time::Instant::now();
             let storage = storage_arc.read().unwrap();
+            crate::engine::engine::LOCK_STATS.read_wait_ns.fetch_add(t_lock.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::engine::engine::LOCK_STATS.read_acqs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.execute_single_scan(
                 &storage,
                 indexes,
