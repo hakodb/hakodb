@@ -252,13 +252,39 @@ impl QueryPlanner {
                 if matches!(filter.op, Operator::Eq) {
                     if let Some(sec_map) = indexes.secondary.get(&query.collection) {
                         if sec_map.contains_key(&filter.field) {
-                            let is_ambiguous = match &filter.value {
-                                Value::String(s) => s.parse::<i64>().is_ok(),
-                                _ => false
+                            // Ambiguous-class values (numeric strings AND
+                            // bare Int/Float: the stored side may encode
+                            // the number differently) take the alternatives
+                            // union instead of one exact bucket — the DHP
+                            // `passw` hole was a single-key trust here.
+                            // Union scans verify downstream; the single-key
+                            // path below keeps its trust (same-type keys
+                            // are exact by tag).
+                            let ambiguous = match &filter.value {
+                                Value::String(s) => {
+                                    s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok()
+                                }
+                                Value::Int(_) | Value::Float(_) => true,
+                                _ => false,
                             };
-
-                            if !is_ambiguous {
-                                let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
+                            if ambiguous {
+                                if let Some(scan) = Self::get_single_filter_scan(
+                                    &query.collection,
+                                    &filter.field,
+                                    &filter.value,
+                                    indexes,
+                                    query,
+                                ) {
+                                    // Union (or composite-first single):
+                                    // verify downstream, no limit pushdown
+                                    // (verification may drop rows).
+                                    return Self::make_plan(
+                                        query, scan, None, false, false,
+                                    );
+                                }
+                                continue;
+                            }
+                            let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
                                 
                                 // CRITICAL FIX: Mark filters satisfied if this is the ONLY filter
                                 let filters_satisfied = query.filters.len() == 1 && query.or_groups.is_empty();
@@ -278,7 +304,6 @@ impl QueryPlanner {
                                     false, 
                                     filters_satisfied
                                 );
-                            }
                         }
                     }
                 }
@@ -393,6 +418,56 @@ impl QueryPlanner {
         None
     }
 
+    /// Cross-type Eq alternatives (mirrors compare_values numeric arms):
+    /// the stored side may carry the number as a String (legacy imports,
+    /// CSV seeds) or float, so an exact-key index probe must try every
+    /// encoding the semantic compare would accept. Original first; order
+    /// otherwise irrelevant (union dedups nothing — keys are type-tagged,
+    /// so alternatives never collide).
+    fn numeric_alternatives(val: &Value) -> Vec<Value> {
+        let mut out = vec![val.clone()];
+        match val {
+            Value::String(s) => {
+                if let Ok(i) = s.parse::<i64>() {
+                    out.push(Value::Int(i));
+                }
+                if let Ok(f) = s.parse::<f64>() {
+                    if f.is_finite() {
+                        out.push(Value::Float(f));
+                    }
+                }
+            }
+            Value::Int(i) => {
+                out.push(Value::String(i.to_string()));
+                // Lossless only: past 2^53 the float can't name this int.
+                let f = *i as f64;
+                if f as i64 == *i {
+                    out.push(Value::Float(f));
+                }
+            }
+            Value::Float(f) => {
+                // String form is best-effort (float textual forms are
+                // unbounded: "4.75" vs "4.750" vs "4.75e0" all parse equal
+                // but key differently — a miss here falls through to the
+                // executor's empty-index sweep fallback, still correct).
+                out.push(Value::String(f.to_string()));
+                if f.is_finite() {
+                    // Integral floats name an int ("4" for 4.0 — matches a
+                    // stored String("4") via parse, and stored Int(4) via
+                    // total_cmp). Non-integral floats have no int form.
+                    if f.fract() == 0.0
+                        && *f >= i64::MIN as f64
+                        && *f <= i64::MAX as f64
+                    {
+                        out.push(Value::Int(*f as i64));
+                    }
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
     fn get_single_filter_scan(
         col: &str,
         field: &str,
@@ -400,18 +475,10 @@ impl QueryPlanner {
         indexes: &IndexManager,
         _query: &Query,
     ) -> Option<ScanType> {
-        let mut alternatives = Vec::new();
-        alternatives.push(val.clone());
-
-        // 1. Generate alternatives for number-like strings
-        match val {
-            Value::String(s) => {
-                if let Ok(i) = s.parse::<i64>() { alternatives.push(Value::Int(i)); }
-                if let Ok(f) = s.parse::<f64>() { alternatives.push(Value::Float(f)); }
-            }
-            Value::Int(i) => { alternatives.push(Value::String(i.to_string())); }
-            _ => {}
-        }
+        // Cross-type alternatives (Int/String/Float closure — see
+        // numeric_alternatives): the stored side may encode the number
+        // differently than the filter does.
+        let alternatives = Self::numeric_alternatives(val);
 
         let mut sub_scans = Vec::new();
         for alt_val in &alternatives {
@@ -575,15 +642,11 @@ impl QueryPlanner {
             return None;
         }
 
-        // 1. Probing: Prepare alternate types for the FIRST filter field
+        // 1. Probing: alternate types for the FIRST filter field (shared
+        // numeric closure — the stored side may encode the number
+        // differently than the filter does).
         let first_filter = &query.filters[0];
-        let mut alternatives = Vec::new();
-        alternatives.push(first_filter.value.clone());
-        match &first_filter.value {
-            Value::String(s) => { if let Ok(i) = s.parse::<i64>() { alternatives.push(Value::Int(i)); } }
-            Value::Int(i) => { alternatives.push(Value::String(i.to_string())); }
-            _ => {}
-        }
+        let alternatives = Self::numeric_alternatives(&first_filter.value);
 
         let mut sub_scans = Vec::new();
 
@@ -737,8 +800,10 @@ mod tests {
     #[test]
     fn ordered_eq_no_limit_pushdown() {
         // Single Eq on a secondary-only field + ORDER BY on another field:
-        // P6 SecondaryIndex is NOT in sort order, so pushing limit would
-        // truncate before the executor sort (wrong TOP-N). scan_limit None.
+        // Int filters route to the alternatives union (cross-type safety —
+        // the stored side may encode the number differently), which
+        // verifies downstream, so pushing limit would truncate before the
+        // executor sort AND verification (wrong TOP-N). scan_limit None.
         let mut m = IndexManager::default();
         m.create_secondary_index("bench", "age");
         let q = Query::new("bench")
@@ -747,14 +812,31 @@ mod tests {
             .limit(20);
         let plan = QueryPlanner::plan(&q, &m, 1000, 8, true);
         assert!(
-            matches!(plan.scan, ScanType::SecondaryIndex { .. }),
-            "should fall to P6 secondary, got {:?}",
+            matches!(plan.scan, ScanType::UnionIndex { .. }),
+            "ambiguous Int should take the alternatives union, got {:?}",
             plan.scan
         );
         assert_eq!(plan.scan_limit, None);
-        // Same shape unordered keeps the pushdown.
+        // Same shape unordered: union too (verify downstream), no pushdown.
         let q2 = Query::new("bench").where_eq("age", Value::Int(30)).limit(20);
-        assert_eq!(QueryPlanner::plan(&q2, &m, 1000, 8, true).scan_limit, Some(20));
+        let plan2 = QueryPlanner::plan(&q2, &m, 1000, 8, true);
+        assert!(
+            matches!(plan2.scan, ScanType::UnionIndex { .. }),
+            "unordered ambiguous Int also unions, got {:?}",
+            plan2.scan
+        );
+        assert_eq!(plan2.scan_limit, None);
+        // Non-numeric strings keep the single-key trust + pushdown.
+        let q3 = Query::new("bench")
+            .where_eq("tenant", Value::String("x".into()))
+            .limit(20);
+        let m2 = bench_manager();
+        let plan3 = QueryPlanner::plan(&q3, &m2, 1000, 8, true);
+        assert!(
+            matches!(plan3.scan, ScanType::SecondaryIndex { .. }),
+            "plain strings keep single-key trust, got {:?}",
+            plan3.scan
+        );
     }
 
     #[test]

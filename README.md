@@ -6,11 +6,27 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 HakoDB speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.9.4 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.9.5 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.9.4)
+## What's new (0.7.2 → 0.9.5)
+
+### v0.9.5 — cross-type `==` correctness (DHP login fix)
+- Eq fast paths (byte memcmp, single-key secondary trust) no longer
+  reject on byte-miss: undecided filters fall back to the semantic
+  compare (`compare_values` numeric arms), and `Ne` left the byte path
+  entirely (a byte-miss is not a semantic mismatch). Stored-Int vs
+  String-filter (and vice versa) now behaves exactly like the `>=`+`<=`
+  workaround, indexed or not.
+- Planner P6 routes ambiguous-class Eq (Int/Float/numeric-string) to
+  the alternatives union (shared `numeric_alternatives` closure, also
+  used by composite-eq); union scans verify downstream, no limit
+  pushdown there. Executor re-sweeps with verification when an
+  index-trusting scan returns empty on ambiguous values (float textual
+  forms, stale entries) — same-type misses keep index speed.
+- Regression suite `tests/eq_crosstype.rs`: stored×filter type matrix,
+  indexed variants, exact login combo, Ne semantics.
 
 ### v0.9.4 — adaptive JSON emit + restart-safe versions
 - `HakoDoc::to_json_bytes_auto`: byte-identical either way; walks value

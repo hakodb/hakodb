@@ -118,6 +118,35 @@ fn top_keys(view: &HakoDocView, orders: &[OrderBy]) -> Vec<TopKey> {
 }
 
 impl ParallelQueryExecutor {
+    /// True when an empty exact-key index result may hide cross-type
+    /// matches: an Eq filter whose value has a numeric twin (bare Int /
+    /// Float, or a string that parses as one). Mirrors the planner's
+    /// ambiguous class — the sweep fallback only fires for these, and
+    /// only on empty, so same-type point lookups never pay it.
+    fn index_may_hide_xtype(plan: &QueryPlan) -> bool {
+        if !matches!(
+            plan.scan,
+            ScanType::SecondaryIndex { .. }
+                | ScanType::CompositeIndex { .. }
+                | ScanType::CompositeIndexRange { .. }
+                | ScanType::UnionIndex { .. }
+        ) {
+            return false;
+        }
+        if !plan.or_groups.is_empty() {
+            return false;
+        }
+        use crate::query::filter::Operator;
+        plan.filters.iter().any(|f| {
+            matches!(f.op, Operator::Eq)
+                && match &f.value {
+                    Value::Int(_) | Value::Float(_) => true,
+                    Value::String(s) => s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok(),
+                    _ => false,
+                }
+        })
+    }
+
     pub fn new(workers: usize) -> Self {
         Self {
             workers: workers.max(1),
@@ -128,11 +157,11 @@ impl ParallelQueryExecutor {
         &self,
         storage_arc: Arc<RwLock<StorageEngine>>,
         indexes: &IndexManager,
-        plan: QueryPlan,
+        mut plan: QueryPlan,
     ) -> Result<Vec<(String, HakoDoc)>> {
         // 1. PHASE 1: INDEX SCAN
         // Fetch physical pointers from the RAM Index
-        let keys_from_index = {
+        let mut keys_from_index = {
             // ponytail: lock-wait sample — query scans blocked here are
             // queued behind the writer (same mixed r/w signal as get).
             let t_lock = std::time::Instant::now();
@@ -148,6 +177,30 @@ impl ParallelQueryExecutor {
                 plan.offset,
             )?
         };
+
+        if keys_from_index.is_empty() && Self::index_may_hide_xtype(&plan) {
+            // Exact-key index buckets miss cross-type values (stored Int
+            // vs String filter) while the semantic compare would hit —
+            // the DHP `passw` hole. The planner routes ambiguous values
+            // to unions, but float textual forms, stale entries, or a
+            // planner miss can still land here empty. Redo as a full
+            // sweep WITH verification (flip the trust flag: the sweep
+            // must re-check, the index proved nothing). Only the
+            // ambiguous class pays this, and only when empty — same-type
+            // misses keep index speed. No limit pushdown on the redo
+            // (verification may drop rows); downstream truncates.
+            let storage = storage_arc.read().unwrap();
+            keys_from_index = self.execute_single_scan(
+                &storage,
+                indexes,
+                &ScanType::FullCollection,
+                &plan.collection,
+                None,
+                plan.offset,
+            )?;
+            plan.scan = ScanType::FullCollection;
+            plan.filters_satisfied_by_index = false;
+        }
 
         if keys_from_index.is_empty() {
             return Ok(Vec::new());

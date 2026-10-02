@@ -218,23 +218,30 @@ pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::que
         return None; 
     }
 
-    // 2. Fast path eligibility: no ORs, every undecided filter byte-checkable.
+    // 2. Fast path eligibility: no ORs, every undecided filter an Eq on a
+    // byte-encodable scalar. Ne stays OUT: a byte-miss means "different
+    // bytes", but cross-type values (Int 7 vs String "7") compare EQUAL
+    // semantically — trusting the miss would wrongly KEEP the row, and the
+    // add-only match buffers cannot retract it. Ne always verifies below.
     let mut fast = plan.or_groups.is_empty();
     if fast {
         for (i, f) in plan.filters.iter().enumerate() {
             if match_bufs.and_matches[i] || f.field == "id" || f.field == "_time" { continue; }
-            if !(matches!(f.op, Operator::Eq | Operator::Ne) && byte_safe(&f.value)) {
+            if !(matches!(f.op, Operator::Eq) && byte_safe(&f.value)) {
                 fast = false;
                 break;
             }
         }
     }
 
+    // PASS 1 (fast only): match on encoded bytes — exact-type equality is
+    // provably identical to the semantic compare (deterministic encoding),
+    // so hits are final. Misses are NOT final: a cross-type value encodes
+    // differently yet compares equal (the DHP `passw` hole: stored Int vs
+    // String filter matched `>=` but `==` returned nothing). Undecided
+    // filters fall through to the semantic compare in the body scan.
+    let mut verified = false;
     if fast {
-        // PASS 1: match on encoded bytes, no decode, no allocation, no
-        // UTF-8 validation (raw key bytes compared directly; rows this
-        // accepts are validated by the owned body scan below, rejected
-        // rows are discarded either way — same outcomes, less work).
         ENC_SCRATCH.with(|scratch| {
             let mut enc = scratch.borrow_mut();
             for (key, tag, data) in view.iter_raw() {
@@ -243,31 +250,32 @@ pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::que
                     enc.clear();
                     HakoDoc::encode_value_to(&f.value, &mut enc);
                     let hit = enc.first().copied() == Some(tag) && &enc[1..] == data;
-                    if (hit && f.op == Operator::Eq) || (!hit && f.op == Operator::Ne) {
+                    if hit && f.op == Operator::Eq {
                         match_bufs.and_matches[i] = true;
                     }
                 }
             }
         });
         // Missing field => stays false => rejected, same as the old path.
-        if !validate_final_match(plan, &match_bufs.and_matches, &match_bufs.or_group_results) {
-            return None;
-        }
+        verified = validate_final_match(plan, &match_bufs.and_matches, &match_bufs.or_group_results);
     }
 
     // 2/3. Body Field Scanning (Decodes every field for the final object).
     // Slow path reaches here directly; fast path only for proven winners.
+    // Unverified fast queries re-verify the undecided filters semantically
+    // here (decode is already paid for the object; apply_filter_logic only
+    // ever ADDS matches, so byte-proven hits stay proven).
     let mut fields = Vec::with_capacity(view.field_count()); 
     for (key, tag, data) in view.iter() {
         let val = crate::document::hako_doc::decode_value(tag, data)?;
 
-        if !fast {
+        if !verified {
             apply_filter_logic(key, &val, plan, &mut match_bufs.and_matches, &mut match_bufs.or_group_results);
         }
         fields.push((crate::document::hako_doc::intern_field(key), val));
     }
 
-    if fast || validate_final_match(plan, &match_bufs.and_matches, &match_bufs.or_group_results) {
+    if verified || validate_final_match(plan, &match_bufs.and_matches, &match_bufs.or_group_results) {
         Some(HakoDoc { fields, _time: view._time })
     } else {
         None
