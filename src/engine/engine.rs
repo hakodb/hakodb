@@ -684,7 +684,16 @@ impl Hako {
             tx_lock: Mutex::new(()),
             listeners: Mutex::new(HashMap::new()),
             doc_versions,
-            global_version: AtomicU64::new(1),
+            // ponytail: seed from wall-clock micros, not 1. Versions back
+            // ETags and the doc_cache: restarting at 1 reissues small
+            // versions that collide with pre-restart ETags held by polling
+            // clients (daily reboots made this a real 304-stale hole, not
+            // theoretical). Micros always advance across restarts, so fresh
+            // versions can never equal pre-restart ones (same-process
+            // uniqueness still comes from fetch_add). Caveat: a clock
+            // stepped BACKWARD past the last run reopens the hole —
+            // ETag users with strict needs should add a boot epoch.
+            global_version: AtomicU64::new(crate::util::clock::now_micros().max(1) as u64),
             security_rules: RwLock::new(Vec::new()),
             security_enabled: std::sync::atomic::AtomicBool::new(false),
             read_only: std::sync::atomic::AtomicBool::new(false),
@@ -2918,5 +2927,30 @@ mod profile_tests {
     fn profile_write_phases_always() {
         let rep = profile_puts(DurabilityMode::Always, 50);
         eprintln!("\n[Always 50x put_owned]\n{rep}");
+    }
+
+    /// Version seed: micros-scale (never the old restart-at-1), strictly
+    /// increasing per mutation. A restart can never reissue a version an
+    /// ETag holder already saw (the 304-stale hole that killed naive
+    /// counter ETags under daily reboots).
+    #[test]
+    fn versions_seeded_from_wall_clock() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("fl-verseed-{nanos}"));
+        let mut cfg = HakoConfig::default();
+        cfg.durability_mode = DurabilityMode::Manual;
+        let db = Hako::open(&dir, cfg).expect("open");
+        db.put_owned("c", "k", test_doc(1)).expect("put");
+        let v1 = db.current_version("k").expect("version after write");
+        // Micros since 2026 ≈ 1.78e15: proves the wall-clock seed (the old
+        // code issued 1 here). Deterministic: no timing involved.
+        assert!(v1 > 1_000_000_000_000_000, "seeded, not restarted-at-1: {v1}");
+        db.put_owned("c", "k", test_doc(2)).expect("put");
+        let v2 = db.current_version("k").expect("version after rewrite");
+        assert!(v2 > v1, "strictly increasing per mutation");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

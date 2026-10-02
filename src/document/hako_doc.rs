@@ -188,6 +188,72 @@ impl HakoDoc {
         out
     }
 
+    /// Crossover (bytes): a single String/Binary run longer than this emits
+    /// faster via serde's SIMD scan than the write_json byte-loop. Duel
+    /// bench `json_emit` pins both sides: 250 B ties (either arm within
+    /// 10%), 7 KB differs 2.8x in serde's favor, everything smaller favors
+    /// write_json up to 5.7x. 512 sits in the empty middle with 2x+ margins.
+    pub const JSON_EMIT_BUDGET: usize = 512;
+
+    /// Adaptive JSON emit, byte-identical to [`Self::to_json_bytes`] either
+    /// way. Walks value tags only (length reads, no byte scan, early-out
+    /// past budget: ~100-300 ns vs µs-scale emits), then takes the faster
+    /// arm. Non-finite floats can make serde fail where write_json emits
+    /// null — the fallback keeps totality (same bytes as before).
+    pub fn to_json_bytes_auto(&self) -> Vec<u8> {
+        if self.max_blob_run() > Self::JSON_EMIT_BUDGET {
+            let dom = self.to_json();
+            serde_json::to_vec(&dom).unwrap_or_else(|_| self.to_json_bytes())
+        } else {
+            self.to_json_bytes()
+        }
+    }
+
+    /// Longest single String/Binary run anywhere in the doc (early-out past
+    /// budget — the common small-doc case walks every tag once, ~ns each).
+    fn max_blob_run(&self) -> usize {
+        fn run_in_value(v: &Value, best: &mut usize) {
+            match v {
+                Value::String(s) => {
+                    if s.len() > *best {
+                        *best = s.len();
+                    }
+                }
+                Value::Binary(b) => {
+                    // itoa-per-byte is even slower than string escaping.
+                    if b.len() > *best {
+                        *best = b.len();
+                    }
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        run_in_value(item, best);
+                        if *best > HakoDoc::JSON_EMIT_BUDGET {
+                            return;
+                        }
+                    }
+                }
+                Value::Map(fields) => {
+                    for (_, fv) in fields {
+                        run_in_value(fv, best);
+                        if *best > HakoDoc::JSON_EMIT_BUDGET {
+                            return;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut best = 0;
+        for (_, v) in &self.fields {
+            run_in_value(v, &mut best);
+            if best > Self::JSON_EMIT_BUDGET {
+                break;
+            }
+        }
+        best
+    }
+
 /// JSON string escaping, byte-identical to serde_json: `"`, `\` and
 /// U+0000–U+001F escape (`\b \f \n \r \t` short, rest `\u00XX` lowercase);
 /// all other bytes (including multi-byte UTF-8, never split: only ASCII

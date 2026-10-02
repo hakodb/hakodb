@@ -159,13 +159,11 @@ fn value_to_json(v: &Value) -> serde_json::Value {
 
 fn doc_to_json(doc: &HakoDoc) -> Result<String, String> {
     safety_shield!(Err("Internal Panic".into()), {
-        // Unified on HakoDoc::write_json (0.9.x): full shape WITH `_time`,
-        // byte-identical to to_json()+serialize. The old hand-rolled writer
-        // omitted `_time`, which made FFI-serialized docs second-class on
-        // sync re-entry (LWW needs the timestamp). Breaking the old shape
-        // is accepted: no external consumers exist yet.
-        let mut out = Vec::with_capacity(256);
-        doc.write_json(&mut out);
+        // Adaptive emit (0.9.4): byte-identical to write_json either way
+        // (same shape WITH `_time`, same contract as below) — serde's SIMD
+        // scan wins past ~512 B single-string runs, the byte-loop wins
+        // below. Duel bench `json_emit` pins both sides of the crossover.
+        let out = doc.to_json_bytes_auto();
         String::from_utf8(out).map_err(|e| e.to_string())
     })
 }
@@ -3815,5 +3813,35 @@ mod ffi_json_tests {
         // Spot-check the binary arm shape (no spaces, plain digits) + _time.
         assert!(expected.contains("\"v\":[0,1,9,10,99,100,171,255]"));
         assert!(expected.contains("\"_time\":12345"));
+    }
+
+    /// Adaptive emit stays byte-identical on both arms: big-string docs
+    /// (serde arm), non-finite floats (null on both), and a literal "_time"
+    /// field (timestamp dropped, not doubled — the write_json rule).
+    #[test]
+    fn doc_to_json_auto_matches_both_arms() {
+        let mut big = HakoDoc::default();
+        big.insert("content", Value::String("<p>html</p>".repeat(1000)));
+        big.insert("n", Value::Int(7));
+        big._time = 999;
+        let mut out = Vec::new();
+        big.write_json(&mut out);
+        assert_eq!(doc_to_json(&big).unwrap().as_bytes(), out.as_slice());
+
+        let mut edge = HakoDoc::default();
+        edge.insert("nan", Value::Float(f64::NAN));
+        edge.insert("inf", Value::Float(f64::INFINITY));
+        edge.insert("_time", Value::String("literal".into()));
+        // Big string forces the serde arm: null parity must hold there too
+        // (to_json maps non-finite to Null, so to_vec cannot fail).
+        edge.insert("pad", Value::String("x".repeat(2048)));
+        edge._time = 42;
+        let mut out2 = Vec::new();
+        edge.write_json(&mut out2);
+        let s = doc_to_json(&edge).unwrap();
+        assert_eq!(s.as_bytes(), out2.as_slice());
+        // null parity + single _time (the timestamp, not the literal).
+        assert!(s.contains("\"nan\":null") && s.contains("\"inf\":null"));
+        assert_eq!(s.matches("\"_time\"").count(), 1);
     }
 }

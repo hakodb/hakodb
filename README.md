@@ -6,11 +6,23 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 HakoDB speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.9.3 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.9.4 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.9.3)
+## What's new (0.7.2 → 0.9.4)
+
+### v0.9.4 — adaptive JSON emit + restart-safe versions
+- `HakoDoc::to_json_bytes_auto`: byte-identical either way; walks value
+  tags only (~100-300 ns, early-out) and picks `write_json` below ~512 B
+  single-string runs, serde's SIMD emit above. Duel bench `json_emit`
+  (6 shapes) pins both sides: write_json wins to 5.7x on int-heavy,
+  serde wins 2.8x on 7 KB-HTML docs. FFI `doc_to_json` uses it.
+- `global_version` seeded from wall-clock micros, not 1: restarting no
+  longer reissues small versions that collide with pre-restart ETags
+  held by polling clients (a real 304-stale hole under daily reboots).
+  Same-process uniqueness still comes from `fetch_add`.
+- `util::clock::now_micros`: the `_time`/LWW clock unit in one place.
 
 ### v0.9.3 — read-only enforcement + interval observability
 - `Hako::set_read_only/is_read_only`: one guard at the `write_batch`

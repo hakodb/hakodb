@@ -301,6 +301,124 @@ fn bench_query_offset_big(c: &mut Criterion) {
     cleanup("qoff_big");
 }
 
+// ---------------------------------------------------------------------------
+// 7. JSON emit duel: write_json (single-pass, no DOM) vs to_json + serde
+//    to_vec (DOM + SIMD emit). Four shapes — the winner depends on the
+//    shape, so both stay until the data says otherwise (see 0.9.4 notes).
+// ---------------------------------------------------------------------------
+
+fn shape_small() -> HakoDoc {
+    make_doc(7)
+}
+
+fn shape_ints() -> HakoDoc {
+    let mut doc = HakoDoc::default();
+    for i in 0..50 {
+        let key = format!("f{i}");
+        doc.insert(key.as_str(), Value::Int(i as i64 * 7919));
+    }
+    doc
+}
+
+fn shape_html() -> HakoDoc {
+    // Mirrors a real 8 KB CMS post: one 7 KB HTML string + metadata.
+    let mut doc = HakoDoc::default();
+    doc.insert("title", Value::String("Bagaimana Parasetamol Dibuat?".into()));
+    doc.insert("slug", Value::String("bagaimana-parasetamol-dibuat".into()));
+    doc.insert("status", Value::String("published".into()));
+    doc.insert("authorId", Value::String("3HRIrshDM8MqyyGXP8CFZvGeXl62".into()));
+    doc.insert("tags", Value::Array(vec![
+        Value::String("sintesis".into()),
+        Value::String("obat".into()),
+        Value::String("reaksi".into()),
+    ]));
+    doc.insert("content", Value::String("<p>Pernahkah Anda sakit kepala, menelan sebutir parasetamol dan bertanya-tanya dari mana obat kecil itu berasal?</p>".repeat(40)));
+    doc.insert("views", Value::Int(123456));
+    doc.insert("rating", Value::Float(4.75));
+    doc
+}
+
+fn shape_nested() -> HakoDoc {
+    let leaf = Value::Map(vec![
+        (std::sync::Arc::from("a"), Value::Int(1)),
+        (std::sync::Arc::from("b"), Value::String("deep".into())),
+        (std::sync::Arc::from("c"), Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)])),
+    ]);
+    let mid = Value::Map(vec![
+        (std::sync::Arc::from("left"), leaf.clone()),
+        (std::sync::Arc::from("right"), leaf),
+    ]);
+    let mut doc = HakoDoc::default();
+    doc.insert("top", Value::String("nest".into()));
+    doc.insert("mid", mid);
+    doc.insert(
+        "list",
+        Value::Array((0..20).map(|i| Value::Map(vec![
+            (std::sync::Arc::from("id"), Value::Int(i)),
+            (std::sync::Arc::from("v"), Value::String(format!("item-{i}"))),
+        ])).collect()),
+    );
+    doc
+}
+
+fn shape_medium() -> HakoDoc {
+    // ~1.2 KB mixed: four 250 B strings + ints — brackets the crossover.
+    let mut doc = HakoDoc::default();
+    for i in 0..4 {
+        let key = format!("body{i}");
+        doc.insert(key.as_str(), Value::String("lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ".repeat(2)));
+    }
+    for i in 0..10 {
+        let key = format!("n{i}");
+        doc.insert(key.as_str(), Value::Int(i * 31));
+    }
+    doc
+}
+
+fn shape_strarray() -> HakoDoc {
+    // ~2.2 KB: a hundred small strings — DOM-alloc-heavy for serde.
+    let mut doc = HakoDoc::default();
+    doc.insert(
+        "items",
+        Value::Array((0..100).map(|i| Value::String(format!("item-{i:03}-pad"))).collect()),
+    );
+    doc.insert("count", Value::Int(100));
+    doc
+}
+
+fn bench_json_emit(c: &mut Criterion) {
+    let shapes: Vec<(&str, HakoDoc)> = vec![
+        ("small", shape_small()),
+        ("ints", shape_ints()),
+        ("medium", shape_medium()),
+        ("strarray", shape_strarray()),
+        ("html", shape_html()),
+        ("nested", shape_nested()),
+    ];
+    // Sanity first: both paths emit identical bytes (byte-equality is the
+    // write_json contract — the duel is only about speed).
+    for (name, doc) in &shapes {
+        let a = doc.to_json_bytes();
+        let b = serde_json::to_vec(&doc.to_json()).expect("serde");
+        assert_eq!(a, b, "emit mismatch on {name}");
+    }
+    let mut group = c.benchmark_group("json_emit");
+    for (name, doc) in &shapes {
+        group.throughput(Throughput::Bytes(doc.to_json_bytes().len() as u64));
+        group.bench_with_input(BenchmarkId::new("write_json", name), doc, |b, doc| {
+            b.iter(|| {
+                criterion::black_box(doc.to_json_bytes());
+            });
+        });
+        group.bench_with_input(BenchmarkId::new("serde", name), doc, |b, doc| {
+            b.iter(|| {
+                criterion::black_box(serde_json::to_vec(&doc.to_json()).expect("serde"));
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     name = benches;
     config = Criterion::default()
@@ -314,5 +432,6 @@ criterion_group!(
         bench_query_offset,
         bench_query_cursor,
         bench_query_offset_big,
+        bench_json_emit,
 );
 criterion_main!(benches);
