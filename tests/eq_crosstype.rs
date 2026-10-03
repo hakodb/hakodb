@@ -191,3 +191,81 @@ fn ne_cross_type_verifies() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Scale probe: 25k docs (DHP mahasiswa shape) + composite(passw,nim) +
+/// secondary(nim). Times combo (union path) vs nim-only (secondary trust)
+/// vs the same combo with the composite dropped (sweep+verify).
+#[test]
+fn scale_union_vs_secondary() {
+    use std::time::Instant;
+    let dir = tmp("scale25k");
+    let db = open_db(&dir);
+    const N: usize = 25_000;
+    let mut batch = Vec::with_capacity(N);
+    for i in 0..N {
+        let mut doc = HakoDoc::default();
+        doc.insert("nim", Value::String(format!("F{i:09}")));
+        doc.insert("passw", Value::String(format!("{}", 15000000 + (i % 9999))));
+        doc.insert("nama", Value::String(format!("Nama {i}")));
+        batch.push(BatchMutation::Put {
+            collection: "mhs".into(),
+            doc_id: format!("d{i:06}"),
+            doc,
+        });
+    }
+    db.write_batch(batch).expect("seed");
+    db.create_index("mhs", "nim").expect("sec nim");
+    db.create_index("mhs", "passw").expect("sec passw");
+    db.create_composite_index(
+        "mhs",
+        vec![
+            ("passw".to_string(), hakodb::index::composite::definition::SortDirection::Asc),
+            ("nim".to_string(), hakodb::index::composite::definition::SortDirection::Asc),
+        ],
+    )
+    .expect("composite");
+    // Target row: deterministic pick.
+    let target = 12345usize;
+    let tnim = format!("F{target:09}");
+    let tpass = format!("{}", 15000000 + (target % 9999));
+    let q_nim = || {
+        Query::new("mhs")
+            .where_eq("nim", Value::String(tnim.clone()))
+            .limit(1)
+    };
+    let q_combo = || {
+        Query::new("mhs")
+            .where_eq("nim", Value::String(tnim.clone()))
+            .where_filter("passw", Operator::Eq, Value::String(tpass.clone()))
+            .limit(1)
+    };
+    // Wait for index backfills (else we time contention, not queries).
+    let t0 = std::time::Instant::now();
+    loop {
+        if db.quiescence_status().index_backfills == 0 {
+            break;
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(120),
+            "backfill never drains"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Warmup.
+    assert_eq!(count(&db, q_nim()), 1);
+    assert_eq!(count(&db, q_combo()), 1);
+    let t = Instant::now();
+    let mut n = 0;
+    for _ in 0..50 {
+        n += count(&db, q_nim());
+    }
+    let nim_us = t.elapsed().as_micros() / 50;
+    let t = Instant::now();
+    for _ in 0..50 {
+        n += count(&db, q_combo());
+    }
+    let combo_us = t.elapsed().as_micros() / 50;
+    eprintln!("SCALE nim-only={nim_us}us/req combo={combo_us}us/req rows={n}");
+    assert_eq!(n, 100);
+    let _ = std::fs::remove_dir_all(&dir);
+}
