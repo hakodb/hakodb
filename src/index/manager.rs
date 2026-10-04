@@ -173,7 +173,11 @@ impl IndexManager {
     }
 
     pub fn export_state(&self) -> Result<Vec<u8>, HakoError> {
-        bincode::serialize(&(&self.secondary, &self.fts))
+        // Composite rides along (hakodb#4): without it every restart
+        // emptied composite indexes (probes missed -> full-sweep fallback
+        // while secondary/fts survived). Old two-element files still load
+        // via the legacy branch of import_state.
+        bincode::serialize(&(&self.secondary, &self.fts, self.composite.export_snapshot()))
             .map_err(|e| HakoError::Corrupt(format!("Index export failed: {}", e)))
     }
 
@@ -190,32 +194,154 @@ impl IndexManager {
     //     self.fts = fts;
     //     Ok(())
     // }
-     pub fn import_state(&mut self, bytes: &[u8]) -> Result<(), HakoError> {
+     pub fn import_state(&mut self, bytes: &[u8]) -> Result<bool, HakoError> {
+        // Returns whether composite trees came from the snapshot. New
+        // three-element files restore everything; legacy two-element
+        // files restore secondary/fts and report false so the caller can
+        // backfill composites from data (one-time upgrade path).
+        // Completely unreadable files Err: the caller rebuilds from scan.
+        type Trees = HashMap<u32, crate::index::composite::composite_index::CompositeIndex>;
+        if let Ok((sec, fts, (trees, next_id))) = bincode::deserialize::<(
+            HashMap<String, HashMap<String, crate::index::secondary_index::SecondaryIndex>>,
+            HashMap<String, HashMap<String, crate::index::inverted_index::InvertedIndex>>,
+            (Trees, u32),
+        )>(bytes)
+        {
+            Self::merge_maps(&mut self.secondary, sec);
+            Self::merge_maps(&mut self.fts, fts);
+            self.composite.import_snapshot(trees, next_id);
+            return Ok(true);
+        }
         let (sec, fts): (
             HashMap<String, HashMap<String, crate::index::secondary_index::SecondaryIndex>>,
-            HashMap<String, HashMap<String, crate::index::inverted_index::InvertedIndex>>
+            HashMap<String, HashMap<String, crate::index::inverted_index::InvertedIndex>>,
         ) = bincode::deserialize(bytes)
             .map_err(|e| HakoError::Corrupt(format!("Index import failed: {}", e)))?;
-        
-        // Merge the RAM data into existing definitions instead of blindly overwriting
-        for (col, fields) in sec {
-            let col_map = self.secondary.entry(col).or_default();
+        Self::merge_maps(&mut self.secondary, sec);
+        Self::merge_maps(&mut self.fts, fts);
+        Ok(false)
+    }
+
+    fn merge_maps<K, V>(into: &mut HashMap<String, HashMap<K, V>>, from: HashMap<String, HashMap<K, V>>)
+    where
+        K: std::hash::Hash + Eq,
+    {
+        for (col, fields) in from {
+            let col_map = into.entry(col).or_default();
             for (field, index) in fields {
                 if let Some(existing_index) = col_map.get_mut(&field) {
                     *existing_index = index;
                 }
             }
         }
+    }
+}
 
-        for (col, fields) in fts {
-            let col_map = self.fts.entry(col).or_default();
-            for (field, index) in fields {
-                if let Some(existing_index) = col_map.get_mut(&field) {
-                    *existing_index = index;
-                }
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::value::Value;
+    use crate::index::composite::definition::SortDirection;
 
-        Ok(())
+    fn doc(passw: &str, nim: &str) -> HakoDoc {
+        let mut d = HakoDoc::default();
+        d.insert("passw", Value::String(passw.into()));
+        d.insert("nim", Value::String(nim.into()));
+        d
+    }
+
+    fn manager_with_entries() -> IndexManager {
+        let mut m = IndexManager::default();
+        m.create_secondary_index("students", "nim");
+        let id = m.create_index(
+            CompositeIndexDefinition::new("students")
+                .with_fields(vec![
+                    ("passw".to_string(), SortDirection::Asc),
+                    ("nim".to_string(), SortDirection::Asc),
+                ]),
+        );
+        assert_eq!(id, 1);
+        m.index_document("students", "d1", &doc("28021988", "F1"));
+        m.index_document("students", "d2", &doc("28021988", "F2"));
+        m
+    }
+
+    #[test]
+    fn export_import_round_trip_keeps_composite() {
+        let m = manager_with_entries();
+        let bytes = m.export_state().expect("export");
+        // Fresh manager with the SAME definitions (as restored from
+        // definitions.json before import runs in open()).
+        let mut m2 = IndexManager::default();
+        m2.create_secondary_index("students", "nim");
+        m2.create_index(
+            CompositeIndexDefinition::new("students")
+                .with_fields(vec![
+                    ("passw".to_string(), SortDirection::Asc),
+                    ("nim".to_string(), SortDirection::Asc),
+                ]),
+        );
+        assert!(m2.import_state(&bytes).expect("import"));
+        // Trees restored verbatim: point probe finds both rows.
+        let ids = m2
+            .composite
+            .exact_match_doc_ids(
+                "students",
+                &["passw".to_string(), "nim".to_string()],
+                &[Value::String("28021988".into()), Value::String("F1".into())],
+            )
+            .expect("probe");
+        assert_eq!(ids.len(), 1);
+        assert_eq!(&*ids[0], "d1");
+    }
+
+    #[test]
+    fn import_legacy_two_element_file_reports_false() {
+        let m = manager_with_entries();
+        // Legacy shape: secondary + fts only (pre-fix files).
+        let legacy: Vec<u8> =
+            bincode::serialize(&(&m.secondary, &m.fts)).expect("legacy export");
+        let mut m2 = IndexManager::default();
+        m2.create_secondary_index("students", "nim");
+        m2.create_index(
+            CompositeIndexDefinition::new("students")
+                .with_fields(vec![
+                    ("passw".to_string(), SortDirection::Asc),
+                    ("nim".to_string(), SortDirection::Asc),
+                ]),
+        );
+        assert!(!m2.import_state(&legacy).expect("legacy import"));
+        // Secondary restored, composite untouched (empty, awaiting backfill).
+        assert!(m2.secondary.get("students").is_some_and(|mm| mm.contains_key("nim")));
+        assert!(m2
+            .composite
+            .exact_match_doc_ids(
+                "students",
+                &["passw".to_string(), "nim".to_string()],
+                &[Value::String("28021988".into()), Value::String("F1".into())],
+            )
+            .map_or(true, |v| v.is_empty()));
+    }
+
+    #[test]
+    fn import_skips_definition_mismatch() {
+        let m = manager_with_entries();
+        let bytes = m.export_state().expect("export");
+        // Same id, DIFFERENT fields: stale entry must not overwrite.
+        let mut m2 = IndexManager::default();
+        m2.create_secondary_index("students", "nim");
+        m2.create_index(
+            CompositeIndexDefinition::new("students")
+                .with_fields(vec![("passw".to_string(), SortDirection::Asc)]),
+        );
+        assert!(m2.import_state(&bytes).expect("import"));
+        assert!(m2
+            .composite
+            .exact_match_doc_ids(
+                "students",
+                &["passw".to_string()],
+                &[Value::String("28021988".into())],
+            )
+            .map_or(true, |v| v.is_empty()));
     }
 }
