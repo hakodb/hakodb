@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::sync::Arc;
 
 use crate::document::hako_doc::HakoDoc;
@@ -8,7 +8,7 @@ use super::composite_index::CompositeIndex;
 use super::definition::CompositeIndexDefinition;
 use super::range_builder::build_prefix_range;
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct CompositeIndexManager {
     next_id: u32,
     by_id: HashMap<u32, CompositeIndex>,
@@ -16,6 +16,28 @@ pub struct CompositeIndexManager {
 }
 
 impl CompositeIndexManager {
+    /// Snapshot for persistence: full trees keyed by index id, plus the
+    /// id allocator (definitions themselves live in definitions.json).
+    pub(crate) fn export_snapshot(&self) -> (HashMap<u32, CompositeIndex>, u32) {
+        (self.by_id.clone(), self.next_id)
+    }
+
+    /// Merge persisted trees back in. Only ids that exist in the current
+    /// definitions (restored from definitions.json first) and whose
+    /// definition still matches are overwritten — anything else is a
+    /// stale/foreign entry and stays out. Allocator takes the max so a
+    /// future create never reuses a live id.
+    pub(crate) fn import_snapshot(&mut self, trees: HashMap<u32, CompositeIndex>, next_id: u32) {
+        for (id, index) in trees {
+            if let Some(existing) = self.by_id.get(&id) {
+                if existing.definition == index.definition {
+                    self.by_id.insert(id, index);
+                }
+            }
+        }
+        self.next_id = self.next_id.max(next_id);
+    }
+
     pub fn create_index(&mut self, mut definition: CompositeIndexDefinition) -> u32 {
         self.next_id += 1;
         definition.id = self.next_id;

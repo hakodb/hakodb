@@ -8,7 +8,7 @@ use crate::document::value::Value;
 use super::definition::CompositeIndexDefinition;
 use super::key_encoder::encode_composite_key;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompositeIndex {
     pub definition: CompositeIndexDefinition,
     // pub tree: BTreeMap<Vec<u8>, String>,

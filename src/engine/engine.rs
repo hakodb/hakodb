@@ -1,6 +1,6 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock, Once};
 use std::thread;
@@ -725,6 +725,7 @@ impl Hako {
         let indexes_ptr = Arc::clone(&db.indexes);
         let persist_ptr = Arc::clone(&db.index_storage);
         let config_thread = config.clone();
+        let backfill_ptr = Arc::clone(&db.backfill_inflight);
         
         // Capture the new Crossbeam Sender
         let blob_tx_thread = db.blob_tx.clone(); 
@@ -735,11 +736,16 @@ impl Hako {
         thread::spawn(move || {
             // --- STEP A: Try to load RAM Snapshot FIRST ---
             let mut snapshot_loaded = false;
+            // True when the snapshot already carried composite trees (new
+            // format). Legacy files restore secondary/fts only; composites
+            // backfill below (one-time upgrade path).
+            let mut composite_restored = false;
             if snapshot_path.exists() {
                 if let Ok(bytes) = std::fs::read(&snapshot_path) {
                     let mut mgr = indexes_ptr.write().unwrap();
-                    if mgr.import_state(&bytes).is_ok() {
+                    if let Ok(restored) = mgr.import_state(&bytes) {
                         snapshot_loaded = true;
+                        composite_restored = restored;
                     }
                 }
             }
@@ -807,6 +813,40 @@ impl Hako {
                 };
                 let mut mgr = indexes_ptr.write().unwrap();
                 let _ = crate::index::storage::index_recovery::replay_log(&log_path, &mut mgr.composite);
+            }
+
+            // --- STEP E: legacy snapshot upgrade — secondary/fts came
+            // from the file but composite trees did not (pre-fix format).
+            // Backfill every registered composite from data (one-time;
+            // quiescence covers it, queries sweep meanwhile, same as a
+            // fresh create). Fresh-format snapshots skip this entirely.
+            if snapshot_loaded && !composite_restored {
+                let targets: Vec<(String, u32)> = {
+                    match indexes_ptr.read() {
+                        Ok(mgr) => mgr
+                            .composite
+                            .all_indexes()
+                            .map(|idx| (idx.definition.collection.clone(), idx.definition.id))
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    }
+                };
+                for (col, id) in targets {
+                    let shard_opt = shards_ptr
+                        .read()
+                        .ok()
+                        .and_then(|shards| shards.get(&col).cloned());
+                    if let Some(shard_arc) = shard_opt {
+                        Self::spawn_composite_backfill(
+                            Arc::clone(&indexes_ptr),
+                            Arc::clone(&persist_ptr),
+                            config_thread.encryption_key.clone(),
+                            Arc::clone(&backfill_ptr),
+                            shard_arc,
+                            id,
+                        );
+                    }
+                }
             }
             
             // indexes are ready
@@ -2336,34 +2376,19 @@ impl Hako {
         Ok(())
     }
 
-    pub fn create_composite_index(&self, col: &str, fields: Vec<(String, SortDirection)>) -> Result<u32> {
-        {
-            let mgr = self.indexes.read().unwrap();
-            for idx in mgr.indexes_for_collection(col) {
-                let same = idx.definition.fields.len() == fields.len()
-                    && idx
-                        .definition
-                        .fields
-                        .iter()
-                        .zip(fields.iter())
-                        .all(|(a, b)| a.field == b.0 && a.direction == b.1);
-                if same {
-                    return Ok(idx.definition.id);
-                }
-            }
-        }
-
-        let def = CompositeIndexDefinition::new(col).with_fields(fields);
-        let index_id = self.indexes.write().unwrap().create_index(def);
-
-        let shard_arc = self.get_shard(col)?;
-        let idx_mgr = Arc::clone(&self.indexes);
-        let persist_ptr = Arc::clone(&self.index_storage); // <--- Required for persistence
-        
-        let enc_key = self.config.encryption_key.clone();
-        let backfill_count = Arc::clone(&self.backfill_inflight);
+    /// Shared composite backfill spawner: used at explicit creation AND
+    /// at open when a legacy snapshot restored secondary/fts but no
+    /// composite trees (pre-fix files). Same chunks/yield discipline
+    /// either way; quiescence covers it via backfill_inflight.
+    fn spawn_composite_backfill(
+        idx_mgr: Arc<RwLock<IndexManager>>,
+        persist_ptr: Arc<Mutex<IndexStorage>>,
+        enc_key: Option<String>,
+        backfill_count: Arc<AtomicUsize>,
+        shard_arc: Arc<RwLock<StorageEngine>>,
+        index_id: u32,
+    ) {
         backfill_count.fetch_add(1, Ordering::Relaxed);
-
         thread::spawn(move || {
             let _guard = BackfillGuard { counter: backfill_count };
             let pointers = {
@@ -2415,6 +2440,37 @@ impl Hako {
                 thread::yield_now();
             }
         });
+    }
+
+    pub fn create_composite_index(&self, col: &str, fields: Vec<(String, SortDirection)>) -> Result<u32> {
+        {
+            let mgr = self.indexes.read().unwrap();
+            for idx in mgr.indexes_for_collection(col) {
+                let same = idx.definition.fields.len() == fields.len()
+                    && idx
+                        .definition
+                        .fields
+                        .iter()
+                        .zip(fields.iter())
+                        .all(|(a, b)| a.field == b.0 && a.direction == b.1);
+                if same {
+                    return Ok(idx.definition.id);
+                }
+            }
+        }
+
+        let def = CompositeIndexDefinition::new(col).with_fields(fields);
+        let index_id = self.indexes.write().unwrap().create_index(def);
+
+        let shard_arc = self.get_shard(col)?;
+        Self::spawn_composite_backfill(
+            Arc::clone(&self.indexes),
+            Arc::clone(&self.index_storage),
+            self.config.encryption_key.clone(),
+            Arc::clone(&self.backfill_inflight),
+            shard_arc,
+            index_id,
+        );
 
         let _ = self.persist_index_defs();
         self.plan_cache.invalidate();
