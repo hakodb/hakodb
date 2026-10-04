@@ -6,11 +6,24 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 HakoDB speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.9.5 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.9.6 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.9.5)
+## What's new (0.7.2 → 0.9.6)
+
+### v0.9.6 — composite indexes survive restarts
+- `export_state`/`import_state` now carry composite trees (merge-by-id
+  on matching definitions, allocator max). Before, only secondary/fts
+  persisted, so every restart emptied composites: probes missed and the
+  empty-sweep fallback scanned everything (~38 ms vs ~10 us on 25k docs
+  for the same login-shaped query) with correct results.
+- Legacy two-element snapshot files still load (secondary/fts) and
+  trigger a one-time backfill of registered composites; unreadable files
+  keep the rebuild-from-scan path. Downgrade-safe (old readers ignore
+  trailing bytes). No planner/executor change.
+- Regression suite `tests/composite_persist_restart.rs` (drop + reopen
+  without re-creating) plus export/import round-trip unit tests.
 
 ### v0.9.5 — cross-type `==` correctness (DHP login fix)
 - Eq fast paths (byte memcmp, single-key secondary trust) no longer
