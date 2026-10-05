@@ -1,0 +1,33 @@
+# Quick gate for branch protection (required check on main).
+#
+# Deliberately NOT the full matrix (release.yml owns that) and NOT fmt
+# (the tree is not rustfmt-clean; enforcing it now would land a giant
+# format diff — style stays advisory until someone opts the tree in).
+# This job answers one question fast: does it still compile (locked)?
+# Cache makes PR runs incremental; ubuntu-only (platform breakage is
+# release.yml's beat, not the merge gate's).
+
+name: ci-quick
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: quick-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: check (locked, no codegen)
+        run: cargo check --locked --all-targets
