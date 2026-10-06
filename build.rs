@@ -1,4 +1,40 @@
 fn main() {
+    // Dev-loop shortcut: HAKODB_SKIP_CBINDGEN=1 skips header generation
+    // (seconds per rebuild on big trees). CI/release never set it, so
+    // shipped headers always regenerate. Env-gated (not a feature):
+    // features would fork dependent builds, env stays local.
+    // ponytail: explicit early scope, not a flag threaded through —
+    // link-search + lib hygiene below always run (dependents link
+    // against them even in dev loops).
+    if std::env::var("HAKODB_SKIP_CBINDGEN").is_err() {
+        gen_header();
+    }
+    println!("cargo:rerun-if-changed=src/");
+    println!("cargo:rerun-if-changed=cbindgen.toml");
+
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR should exist");
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "release".to_string());
+    let target_dir = std::path::Path::new("target").join(&profile);
+
+// ponytail: a stale unprefixed import lib SHADOWS the fresh .dll in
+// MinGW ld search order (it ran BEFORE rustc linked, so it always lagged
+// a build behind), producing undefined-reference ghosts for new symbols.
+// Delete it — MinGW ld falls through to hakodb.dll directly (always
+// fresh). MSVC consumers link rustc's `hakodb.dll.lib` (shipped renamed
+// as `hakodb.lib`), so the delete below runs on GNU/MinGW targets only.
+#[cfg(windows)]
+{
+let target = std::env::var("TARGET").unwrap_or_default();
+if !target.contains("msvc") {
+    let dst = target_dir.join("hakodb.lib");
+    let _ = std::fs::remove_file(&dst);
+}
+}
+    // Allow integration tests to find hakodb.dll when invoked from anywhere.
+    println!("cargo:rustc-link-search=native={}", target_dir.display());
+}
+
+fn gen_header() {
     let crate_dir = std::env::var("CARGO_MANIFEST_DIR").expect("manifest dir should exist");
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR should exist");
     let output = std::path::Path::new(&out_dir).join("hakodb.h");
@@ -32,23 +68,4 @@ fn main() {
     if let Some(profile_dir) = std::path::Path::new(&out_dir).ancestors().nth(3) {
         let _ = std::fs::copy(&output, profile_dir.join("hakodb.h"));
     }
-
-// ponytail: a stale unprefixed import lib SHADOWS the fresh .dll in
-// MinGW ld search order (it ran BEFORE rustc linked, so it always lagged
-// a build behind), producing undefined-reference ghosts for new symbols.
-// Delete it — MinGW ld falls through to hakodb.dll directly (always
-// fresh). MSVC consumers link rustc's `hakodb.dll.lib` (shipped renamed
-// as `hakodb.lib`), so the delete below runs on GNU/MinGW targets only.
-let profile = std::env::var("PROFILE").unwrap_or_else(|_| "release".to_string());
-let target_dir = std::path::Path::new("target").join(&profile);
-#[cfg(windows)]
-{
-let target = std::env::var("TARGET").unwrap_or_default();
-if !target.contains("msvc") {
-    let dst = target_dir.join("hakodb.lib");
-    let _ = std::fs::remove_file(&dst);
-}
-}
-    // Allow integration tests to find hakodb.dll when invoked from anywhere.
-    println!("cargo:rustc-link-search=native={}", target_dir.display());
 }
