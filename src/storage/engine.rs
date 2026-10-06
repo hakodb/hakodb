@@ -1023,6 +1023,9 @@ impl StorageEngine {
 
     pub fn set_durability_mode(&mut self, mode: DurabilityMode) { self.wal.set_durability_mode(mode); }
 
+    /// Live group-commit window (clamped inside the WAL call, same as open).
+    pub fn set_group_commit_interval_ms(&mut self, ms: u64) { self.wal.set_group_commit_interval(ms); }
+
     pub fn base_dir(&self) -> &Path { &self.base_dir }
 
     pub fn backup(&mut self, destination_path: impl AsRef<Path>) -> Result<()> {

@@ -388,6 +388,10 @@ impl Drop for BackfillGuard {
 
 pub struct Hako {
     root_path: PathBuf,    pub(crate) config: HakoConfig,
+    /// Live group-commit window ms (Interval mode). Initialized from the
+    /// clamped open-time config; the runtime setter below keeps this and
+    /// every shard WAL in lockstep (atomic, no lock on the read path).
+    group_commit_interval_ms: AtomicU64,
     pub(crate) shards: Arc<RwLock<HashMap<String, Arc<RwLock<StorageEngine>>>>>, // The only storage
     index_storage: Arc<Mutex<IndexStorage>>,
     pub(crate) indexes: Arc<RwLock<IndexManager>>,
@@ -677,6 +681,9 @@ impl Hako {
         let db = Self {
             root_path: root_path.clone(),
             config: config.clone(),
+            group_commit_interval_ms: AtomicU64::new(crate::config::clamp_group_commit_interval_ms(
+                config.group_commit_interval_ms,
+            )),
             shards,
             index_storage: Arc::clone(&index_storage),
             indexes,
@@ -2030,10 +2037,26 @@ impl Hako {
         self.read_only.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Configured group-commit window in ms (observability for fleet
-    /// stagger checks, e.g. hakocluster PerInstance verification).
+    /// Live group-commit window in ms (Interval mode). Reads the atomic,
+    /// so it reflects runtime changes (see setter), not just open-time
+    /// config (observability for fleet stagger checks, e.g. hakocluster
+    /// PerInstance verification).
     pub fn group_commit_interval_ms(&self) -> u64 {
-        self.config.group_commit_interval_ms
+        self.group_commit_interval_ms.load(Ordering::Relaxed)
+    }
+
+    /// Set the group-commit window live on every shard (admin plane for
+    /// out-of-tree gateways, mirroring [`Self::set_durability_mode_all`]).
+    /// Clamped like open-time config (1..=30000); arming/disarming
+    /// strict-time follows automatically. Best-effort per shard.
+    pub fn set_group_commit_interval_ms_all(&self, ms: u64) {
+        let ms = crate::config::clamp_group_commit_interval_ms(ms);
+        self.group_commit_interval_ms.store(ms, Ordering::Relaxed);
+        for shard in self.shards.read().unwrap().values() {
+            if let Ok(mut s) = shard.write() {
+                s.set_group_commit_interval_ms(ms);
+            }
+        }
     }
 
     pub fn execute_aggregation(&self, query: Query) -> Result<HashMap<String, f64>> {
@@ -2990,8 +3013,7 @@ mod profile_tests {
     /// ETag holder already saw (the 304-stale hole that killed naive
     /// counter ETags under daily reboots).
     #[test]
-    fn versions_seeded_from_wall_clock() {
-        let nanos = std::time::SystemTime::now()
+    fn versions_seeded_from_wall_clock() {        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
@@ -3007,6 +3029,30 @@ mod profile_tests {
         db.put_owned("c", "k", test_doc(2)).expect("put");
         let v2 = db.current_version("k").expect("version after rewrite");
         assert!(v2 > v1, "strictly increasing per mutation");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Runtime group-commit setter: default from open config, live after
+    /// set, clamped like open (1..=30000). The getter reads the live
+    /// value, so fleet stagger checks observe runtime changes.
+    #[test]
+    fn group_commit_interval_runtime_setter() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("fl-gciset-{nanos}"));
+        let db = Hako::open(&dir, HakoConfig::default()).expect("open");
+        assert_eq!(
+            db.group_commit_interval_ms(),
+            crate::config::DEFAULT_GROUP_COMMIT_INTERVAL_MS
+        );
+        db.set_group_commit_interval_ms_all(50);
+        assert_eq!(db.group_commit_interval_ms(), 50);
+        db.set_group_commit_interval_ms_all(0);
+        assert_eq!(db.group_commit_interval_ms(), 1);
+        db.set_group_commit_interval_ms_all(999_999);
+        assert_eq!(db.group_commit_interval_ms(), 30_000);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
