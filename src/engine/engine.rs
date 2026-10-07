@@ -1171,19 +1171,23 @@ impl Hako {
     fn backfill_lazy_collection(&self, collection: &str, shard_arc: &Arc<RwLock<StorageEngine>>) {
         if let Ok(storage) = shard_arc.read() {
             // ponytail: same scan-decode-index shape as recovery STEP C
-            // (encrypted bytes fail decode and are skipped there too) —
-            // but selective: only indexed fields materialize.
+            // (encrypted bytes fail decode and are skipped there too).
             if let Ok(data) = storage.scan_prefix("") {
                 if let Ok(mut mgr) = self.indexes.write() {
-                    let wanted = Self::indexed_fields_for(&mgr, collection);
-                    // ponytail: no registered indexes = nothing to fill
-                    // (composites ride the dedicated spawner below).
-                    if wanted.is_empty() {
-                        return;
-                    }
-                    for (doc_id, bytes) in &data {
-                        if let Some(doc) = HakoDoc::decode_projected(bytes, &wanted) {
-                            mgr.index_document(collection, doc_id, &doc);
+                    // Borrowed secondary fast path when it covers the
+                    // whole job (secondary-only collection); otherwise
+                    // the owned path below (identical entries).
+                    if !IndexingService::backfill_secondary_borrowed(&mut mgr, collection, &data) {
+                        let wanted = Self::indexed_fields_for(&mgr, collection);
+                        // ponytail: no registered indexes = nothing to fill
+                        // (composites ride the dedicated spawner below).
+                        if wanted.is_empty() {
+                            return;
+                        }
+                        for (doc_id, bytes) in &data {
+                            if let Some(doc) = HakoDoc::decode_projected(bytes, &wanted) {
+                                mgr.index_document(collection, doc_id, &doc);
+                            }
                         }
                     }
                 }
@@ -3763,6 +3767,101 @@ mod profile_tests {
         let _ = saw_progress;
         db.unload_collection("arc").expect("unload");
         assert!(db.is_lazy_unloaded("arc"));
+        drop(db);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Borrowed secondary backfill on wide docs: same entries as the
+    /// owned path (single hit per unique value), exercising the fast
+    /// path that skips full decode.
+    #[test]
+    fn borrowed_backfill_matches_owned_on_wide_docs() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("fl-spike-{nanos}"));
+        {
+            let mut cfg = HakoConfig::default();
+            cfg.durability_mode = DurabilityMode::Manual;
+            let db = Hako::open(&dir, cfg).expect("open");
+            for i in 0..15_000u32 {
+                let mut d = HakoDoc::default();
+                d.insert("no", Value::String(format!("W{i:06}")));
+                for f in 0..30 {
+                    d.insert(
+                        format!("pad{f:02}"),
+                        Value::String(format!("padding value {i} field {f} xxxxxxxxxx")),
+                    );
+                }
+                db.put_owned("big", &format!("w{i:05}"), d).expect("put");
+            }
+            db.create_index("big", "no").expect("secondary");
+            assert!(db.await_quiescent(std::time::Duration::from_secs(120)));
+        }
+        let mut cfg = HakoConfig::default();
+        cfg.durability_mode = DurabilityMode::Manual;
+        cfg.lazy_collections = vec!["big*".to_string()];
+        let db = Hako::open(&dir, cfg).expect("open");
+        assert!(db.is_lazy_unloaded("big"));
+        assert!(db.get("big", "w00000").expect("get").is_some());
+        assert!(db.await_quiescent(std::time::Duration::from_secs(120)));
+        let enc =
+            crate::index::index_key::encode_scalar(&Value::String("W000001".into()));
+        let hits = db
+            .indexes
+            .read()
+            .unwrap()
+            .lookup_secondary("big", "no", &enc)
+            .unwrap_or_default();
+        assert_eq!(hits.len(), 1);
+        drop(db);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Borrowed path maps virtual id/_time from doc_id/_time, never from
+    /// a literal same-named field (owned parity).
+    #[test]
+    fn borrowed_backfill_virtual_id_wins_over_literal() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("fl-virt-{nanos}"));
+        {
+            let mut cfg = HakoConfig::default();
+            cfg.durability_mode = DurabilityMode::Manual;
+            let db = Hako::open(&dir, cfg).expect("open");
+            let mut d = HakoDoc::default();
+            d.insert("id", Value::String("WRONG".into()));
+            d.insert("v", Value::Int(1));
+            db.put_owned("c", "real-id", d).expect("put");
+            db.create_index("c", "id").expect("secondary");
+            assert!(db.await_quiescent(std::time::Duration::from_secs(30)));
+        }
+        let mut cfg = HakoConfig::default();
+        cfg.durability_mode = DurabilityMode::Manual;
+        cfg.lazy_collections = vec!["c*".to_string()];
+        let db = Hako::open(&dir, cfg).expect("open");
+        assert!(db.get("c", "real-id").expect("get").is_some());
+        assert!(db.await_quiescent(std::time::Duration::from_secs(30)));
+        let enc = crate::index::index_key::encode_scalar(&Value::String("real-id".into()));
+        let hits = db
+            .indexes
+            .read()
+            .unwrap()
+            .lookup_secondary("c", "id", &enc)
+            .unwrap_or_default();
+        assert_eq!(hits.len(), 1);
+        let enc_wrong =
+            crate::index::index_key::encode_scalar(&Value::String("WRONG".into()));
+        assert!(db
+            .indexes
+            .read()
+            .unwrap()
+            .lookup_secondary("c", "id", &enc_wrong)
+            .unwrap_or_default()
+            .is_empty());
         drop(db);
         std::fs::remove_dir_all(&dir).ok();
     }
