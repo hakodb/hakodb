@@ -242,7 +242,7 @@ async fn handle_conn(st: Shared, stream: UnixStream, label: String) {
     // 2. Full snapshot, both directions handled by symmetric send here
     // (the peer sends theirs; LWW dedups on ingest).
     for col in st.db.sync_collections().unwrap_or_default() {
-        if st.excluded.contains(&col) {
+        if st.excluded.contains(&col) || st.db.is_sync_withheld(&col) {
             continue;
         }
         let ops = snapshot_collection(&st.db, &col);
@@ -266,7 +266,7 @@ async fn handle_conn(st: Shared, stream: UnixStream, label: String) {
                 break;
             }
             for col in st_tail.db.sync_collections().unwrap_or_default() {
-                if st_tail.excluded.contains(&col) {
+                if st_tail.excluded.contains(&col) || st_tail.db.is_sync_withheld(&col) {
                     continue;
                 }
                 let shard_arc = match st_tail.db.get_shard(&col) {

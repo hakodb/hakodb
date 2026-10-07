@@ -72,6 +72,14 @@ pub background_maintenance: bool,
 /// planes (e.g. cloudserver declares its room/user/group stores here so
 /// the guarantee never depends on naming conventions). Default empty.
 pub sync_excluded: Vec<String>,
+/// Archive-group collections, skipped at recovery until touched: exact
+/// names plus trailing-`*` prefixes (e.g. `archive_2023*`). A matching
+/// on-disk collection is not opened, WAL-replayed, indexed or
+/// backfilled at startup — the dir merely existing suffices — and it is
+/// withheld from sync until loaded. First touch (`get`, `put`, explicit
+/// `load_collection`, ...) opens + replays + backfills it fully.
+/// Default empty (everything eager, legacy behavior).
+pub lazy_collections: Vec<String>,
 }
 
 impl Default for HakoConfig {
@@ -97,6 +105,7 @@ replication_collections: None,
 wal_reserve_bytes: 4 * 1024 * 1024,
     background_maintenance: true,
     sync_excluded: Vec::new(),
+    lazy_collections: Vec::new(),
         }
     }
 }
@@ -107,6 +116,16 @@ pub const DEFAULT_GROUP_COMMIT_INTERVAL_MS: u64 = 5;
 /// Clamp for `group_commit_interval_ms` (see field docs). Pure for testing.
 pub fn clamp_group_commit_interval_ms(ms: u64) -> u64 {
     ms.clamp(1, 30_000)
+}
+
+/// True when `name` matches the lazy archive group: an exact entry, or
+/// a trailing-`*` entry as a plain prefix (`archive_*` matches
+/// `archive_2023` and `archiveX`, but not `other`).
+pub fn lazy_pattern_match(patterns: &[String], name: &str) -> bool {
+    patterns.iter().any(|p| match p.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => p == name,
+    })
 }
 
 #[cfg(test)]
@@ -122,5 +141,15 @@ mod tests {
         // Unbounded windows approach Manual without saying so: capped.
         assert_eq!(clamp_group_commit_interval_ms(999_999), 30_000);
         assert_eq!(HakoConfig::default().group_commit_interval_ms, DEFAULT_GROUP_COMMIT_INTERVAL_MS);
+    }
+
+    #[test]
+    fn lazy_pattern_match_exact_and_prefix() {
+        let pats = vec!["archive_2023".to_string(), "cold_*".to_string()];
+        assert!(lazy_pattern_match(&pats, "archive_2023"));
+        assert!(!lazy_pattern_match(&pats, "archive_2024"));
+        assert!(lazy_pattern_match(&pats, "cold_storage"));
+        assert!(!lazy_pattern_match(&pats, "hot"));
+        assert!(!lazy_pattern_match(&[], "archive_2023"));
     }
 }

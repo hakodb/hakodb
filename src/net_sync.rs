@@ -946,7 +946,7 @@ async fn handle_peer(
                     }
                     
                     for (col, remote_time) in versions {
-                        if excluded.contains(&col) { continue; }
+                        if excluded.contains(&col) || db.is_sync_withheld(&col) { continue; }
                         // if db.get_collection_version(&col) > remote_time {
                         //     handle_delta_send(&db, &peers_map, &peer_id, &col, remote_time).await;
                         // }
@@ -964,7 +964,7 @@ async fn handle_peer(
                     handle_bootstrap(&db, &peers_map, &peer_id, &excluded, &caps).await;
                 }
                 NetPacket::Replication { msg_id, collection, ops } => {
-                    if excluded.contains(&collection) {continue;}
+                    if excluded.contains(&collection) || db.is_sync_withheld(&collection) {continue;}
                     // Check Cache
                     if msg_id != 0 {
                         let mut cache = seen_cache.lock().await;
@@ -1060,7 +1060,7 @@ async fn handle_bootstrap(db: &Arc<Hako>, peers: &Arc<AsyncMutex<HashMap<String,
     let local_fp = sync_guard::local_fingerprint(db.config.encryption_key.as_deref());
 
     for col in cols {
-        if excluded.contains(&col) { continue; }
+        if excluded.contains(&col) || db.is_sync_withheld(&col) { continue; }
         if !peer_may_send(db, caps, peer_id, &col, local_fp) {
             continue;
         }
