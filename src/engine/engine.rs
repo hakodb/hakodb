@@ -421,6 +421,10 @@ pub struct Hako {
     /// that exists-but-is-backfilling otherwise serves partial results
     /// with no signal at all.
     pub(crate) backfill_inflight: Arc<std::sync::atomic::AtomicUsize>,
+    /// Per-collection lazy-load backfill progress (done, total). Present
+    /// only while a `start_collection_load` thread runs; removed on
+    /// completion or unload-abort. Poll via `collection_load_progress`.
+    backfill_progress: Arc<Mutex<HashMap<String, (usize, usize)>>>,
     pub(crate) blob_tx: crossbeam_channel::Sender<BlobWork>,
     system_stop: Mutex<Option<Sender<()>>>,
     system_handle: Mutex<Option<thread::JoinHandle<()>>>,
@@ -720,6 +724,7 @@ impl Hako {
             index_tx,
             index_inflight,
             backfill_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            backfill_progress: Arc::new(Mutex::new(HashMap::new())),
             blob_tx: btx.clone(),
             audit_data,
             system_stop: Mutex::new(Some(system_stop_tx)),
@@ -911,33 +916,167 @@ impl Hako {
         }
 
         // 2. Creation Path (Outside of write lock to prevent poisoning during IO)
-        let path = self.root_path.join(collection);
-        let encryption = self.get_encryption_for_col(collection);
-        
-        // This is where the security Err() bubbles up from Wal::replay
-        let mut storage = StorageEngine::open(
-            path, 
-            &self.config, 
-            collection.to_string(), 
-            encryption
-        )?; 
-        
-        storage.blob_tx = Some(self.blob_tx.clone());
-        let shard_arc = Arc::new(RwLock::new(storage));
-
-        // 3. Insert into map with Write Lock
-        let mut shards = self.shards.write().map_err(|_| HakoError::LockPoisoned("shards".into()))?;
-        let inserted = shards.entry(collection.to_string()).or_insert(shard_arc.clone()).clone();
-        drop(shards);
+        let (shard_arc, created) = self.open_shard_new(collection)?;
         // Touch-load indexing: a lazily-opened collection carries real data
         // the recovery skip never indexed — backfill RAM secondary/FTS (+
         // composite trees; set semantics, so a snapshot that already held
         // entries stays correct) and durable composite backfills. Without
         // this the touch degrades to FullCollection scans.
-        if self.is_lazy_collection(collection) && Arc::ptr_eq(&inserted, &shard_arc) {
-            self.backfill_lazy_collection(collection, &inserted);
+        if created && self.is_lazy_collection(collection) {
+            self.backfill_lazy_collection(collection, &shard_arc);
         }
-        Ok(inserted)
+        Ok(shard_arc)
+    }
+
+    /// Open + insert without any indexing. Returns the authoritative Arc
+    /// and whether this call created it (a racing thread may have won —
+    /// its load path owns indexing then).
+    fn open_shard_new(&self, collection: &str) -> Result<(Arc<RwLock<StorageEngine>>, bool)> {
+        let path = self.root_path.join(collection);
+        let encryption = self.get_encryption_for_col(collection);
+
+        // This is where the security Err() bubbles up from Wal::replay
+        let mut storage = StorageEngine::open(
+            path,
+            &self.config,
+            collection.to_string(),
+            encryption
+        )?;
+
+        storage.blob_tx = Some(self.blob_tx.clone());
+        let shard_arc = Arc::new(RwLock::new(storage));
+
+        let mut shards = self.shards.write().map_err(|_| HakoError::LockPoisoned("shards".into()))?;
+        if let Some(existing) = shards.get(collection) {
+            return Ok((Arc::clone(existing), false));
+        }
+        shards.insert(collection.to_string(), Arc::clone(&shard_arc));
+        Ok((shard_arc, true))
+    }
+
+    /// Explicit async load: opens the collection now, backfills RAM
+    /// indexes in a background thread. Returns false when already
+    /// loaded (no-op). Queries during the build safely sweep (the
+    /// `index_query_ready` gate); poll `collection_load_progress` for
+    /// (done, total). Unloading mid-build aborts the thread at the
+    /// next chunk. Composites ride the existing durable spawner.
+    pub fn start_collection_load(&self, collection: &str) -> Result<bool> {
+        {
+            let shards = self.shards.read().map_err(|_| HakoError::LockPoisoned("shards".into()))?;
+            if shards.contains_key(collection) {
+                return Ok(false);
+            }
+        }
+        let (shard_arc, created) = self.open_shard_new(collection)?;
+        if !created {
+            return Ok(false);
+        }
+        Self::spawn_lazy_backfill(
+            Arc::clone(&self.indexes),
+            Arc::clone(&self.backfill_inflight),
+            Arc::clone(&self.shards),
+            Arc::clone(&self.backfill_progress),
+            collection.to_string(),
+            shard_arc.clone(),
+        );
+        // Durable lean keys for this collection's registered composites
+        // (same spawner the sync path uses).
+        let ids: Vec<u32> = match self.indexes.read() {
+            Ok(mgr) => mgr
+                .composite
+                .all_indexes()
+                .filter(|idx| idx.definition.collection == collection)
+                .map(|idx| idx.definition.id)
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        for id in ids {
+            Self::spawn_composite_backfill(
+                Arc::clone(&self.indexes),
+                Arc::clone(&self.index_storage),
+                self.config.encryption_key.clone(),
+                Arc::clone(&self.backfill_inflight),
+                shard_arc.clone(),
+                id,
+            );
+        }
+        Ok(true)
+    }
+
+    /// Backfill progress (done, total), or None when no load thread runs
+    /// for the collection (never started, finished, or aborted).
+    pub fn collection_load_progress(&self, collection: &str) -> Option<(usize, usize)> {
+        self.backfill_progress.lock().ok()?.get(collection).copied()
+    }
+
+    /// Background RAM-index build for one freshly opened collection.
+    /// Chunked scan-resolve-decode over secondary/FTS (set semantics,
+    /// snapshot-safe); composite trees ride along via backfill_composite
+    /// while lean keys go through the dedicated spawner.
+    fn spawn_lazy_backfill(
+        idx_mgr: Arc<RwLock<IndexManager>>,
+        backfill_count: Arc<AtomicUsize>,
+        shards_map: Arc<RwLock<HashMap<String, Arc<RwLock<StorageEngine>>>>>,
+        progress: Arc<Mutex<HashMap<String, (usize, usize)>>>,
+        collection: String,
+        shard_arc: Arc<RwLock<StorageEngine>>,
+    ) {
+        backfill_count.fetch_add(1, Ordering::Relaxed);
+        thread::spawn(move || {
+            let _guard = BackfillGuard { counter: backfill_count };
+            let pointers = {
+                let storage = shard_arc.read().unwrap();
+                storage.get_physical_index_snapshot()
+            };
+            let total = pointers.len();
+            // ponytail: register BEFORE the first chunk so pollers never
+            // see a running-but-unregistered build.
+            if let Ok(mut p) = progress.lock() {
+                p.insert(collection.clone(), (0, total));
+            }
+            let mut done = 0usize;
+            for chunk in pointers.chunks(500) {
+                // Unload-abort: the map no longer holds our shard.
+                let still_mapped = shards_map
+                    .read()
+                    .map(|m| m.get(&collection).map(|s| Arc::ptr_eq(s, &shard_arc)).unwrap_or(false))
+                    .unwrap_or(false);
+                if !still_mapped {
+                    break;
+                }
+                let mut resolved_docs = Vec::new();
+                {
+                    let storage = shard_arc.read().unwrap();
+                    for (key, ptr) in chunk {
+                        if let Ok(Some(bytes)) = storage.read_pointer_internal(ptr, false) {
+                            resolved_docs.push((key.clone(), bytes));
+                        }
+                    }
+                }
+                let mut decoded_docs = Vec::new();
+                for (doc_id, bytes) in &resolved_docs {
+                    if let Some(doc) = HakoDoc::decode(bytes) {
+                        decoded_docs.push((doc_id.as_str(), doc));
+                    }
+                }
+                {
+                    let mut mgr = idx_mgr.write().unwrap();
+                    let refs: Vec<(&str, &HakoDoc)> =
+                        decoded_docs.iter().map(|(id, d)| (*id, d)).collect();
+                    IndexingService::backfill_secondary(&mut mgr, &collection, refs.iter().copied());
+                    IndexingService::backfill_fts(&mut mgr, &collection, refs.iter().copied());
+                    IndexingService::backfill_composite(&mut mgr, &collection, refs.iter().copied());
+                }
+                done += chunk.len();
+                if let Ok(mut p) = progress.lock() {
+                    p.insert(collection.clone(), (done.min(total), total));
+                }
+                thread::yield_now();
+            }
+            if let Ok(mut p) = progress.lock() {
+                p.remove(&collection);
+            }
+        });
     }
 
     /// Full index load for one lazily-opened collection (see `get_shard`).
@@ -3409,6 +3548,71 @@ mod profile_tests {
         // Explicit refusals.
         assert!(db.relocate_docs("src", "src", &["k1".to_string()]).is_err());
         assert!(db.relocate_docs("__users", "dst", &["k1".to_string()]).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Background lazy load: start_collection_load opens now and
+    /// backfills async with pollable progress; queries sweep meanwhile
+    /// and index correctly after. Unloaded again via unload_collection.
+    #[test]
+    fn bg_lazy_load_progress_and_correctness() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("fl-bgload-{nanos}"));
+        {
+            let mut cfg = HakoConfig::default();
+            cfg.durability_mode = DurabilityMode::Manual;
+            let db = Hako::open(&dir, cfg).expect("open");
+            for i in 0..8_000u32 {
+                let mut d = HakoDoc::default();
+                d.insert("kind", Value::String(format!("k{}", i % 8)));
+                d.insert("v", Value::Int(i as i64));
+                db.put_owned("arc", &format!("d{i:05}"), d).expect("put");
+            }
+            db.create_index("arc", "kind").expect("secondary");
+            assert!(db.await_quiescent(std::time::Duration::from_secs(30)));
+        }
+        let mut cfg = HakoConfig::default();
+        cfg.durability_mode = DurabilityMode::Manual;
+        cfg.lazy_collections = vec!["arc*".to_string()];
+        let db = Hako::open(&dir, cfg).expect("open");
+        assert!(db.is_lazy_unloaded("arc"));
+        assert!(db.collection_load_progress("arc").is_none());
+        assert!(db.collection_load_progress("nope").is_none());
+        assert!(db.start_collection_load("arc").expect("start"));
+        // Second start while loading-or-loaded is a no-op false.
+        let _ = db.start_collection_load("arc").expect("second");
+        // Either we observe progress mid-build, or the build already
+        // finished on a fast box — both converge below.
+        let t0 = std::time::Instant::now();
+        let mut saw_progress = false;
+        while t0.elapsed() < std::time::Duration::from_secs(15) {
+            if let Some((done, total)) = db.collection_load_progress("arc") {
+                saw_progress = true;
+                assert!(done <= total);
+                if done == total {
+                    break;
+                }
+            } else if db.await_quiescent(std::time::Duration::from_secs(1)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(db.await_quiescent(std::time::Duration::from_secs(30)));
+        assert!(db.collection_load_progress("arc").is_none());
+        assert!(!db.is_lazy_unloaded("arc"));
+        // Index correct post-build (no FullCollection degradation).
+        let enc = crate::index::index_key::encode_scalar(&Value::String("k3".into()));
+        let hits = db.indexes.read().unwrap()
+            .lookup_secondary("arc", "kind", &enc)
+            .unwrap_or_default();
+        assert_eq!(hits.len(), 1000);
+        let _ = saw_progress;
+        db.unload_collection("arc").expect("unload");
+        assert!(db.is_lazy_unloaded("arc"));
+        drop(db);
         std::fs::remove_dir_all(&dir).ok();
     }
 
