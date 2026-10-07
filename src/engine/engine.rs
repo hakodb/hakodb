@@ -813,10 +813,16 @@ impl Hako {
                     if !snapshot_loaded {
                         if let Ok(data) = storage.scan_prefix("") {
                             let mut mgr = indexes_ptr.write().unwrap();
-                            for (doc_id, bytes) in data {
-                                if let Some(doc) = HakoDoc::decode(&bytes) {
-                                    // doc_id is already the naked ID
-                                    mgr.index_document(&col_name, &doc_id, &doc);
+                            // ponytail: selective decode — only indexed
+                            // fields materialize (same index state, no
+                            // value allocs for the rest).
+                            let wanted = Hako::indexed_fields_for(&mgr, &col_name);
+                            if !wanted.is_empty() {
+                                for (doc_id, bytes) in data {
+                                    if let Some(doc) = HakoDoc::decode_projected(&bytes, &wanted) {
+                                        // doc_id is already the naked ID
+                                        mgr.index_document(&col_name, &doc_id, &doc);
+                                    }
                                 }
                             }
                         }
@@ -1035,6 +1041,12 @@ impl Hako {
                 p.insert(collection.clone(), (0, total));
             }
             let mut done = 0usize;
+            // Wanted set once up front (a concurrently created index
+            // spawns its own backfill thread, so nothing is missed).
+            let wanted: Vec<String> = idx_mgr
+                .read()
+                .map(|mgr| Self::indexed_fields_for(&mgr, &collection))
+                .unwrap_or_default();
             for chunk in pointers.chunks(500) {
                 // Unload-abort: the map no longer holds our shard.
                 let still_mapped = shards_map
@@ -1055,7 +1067,7 @@ impl Hako {
                 }
                 let mut decoded_docs = Vec::new();
                 for (doc_id, bytes) in &resolved_docs {
-                    if let Some(doc) = HakoDoc::decode(bytes) {
+                    if let Some(doc) = HakoDoc::decode_projected(bytes, &wanted) {
                         decoded_docs.push((doc_id.as_str(), doc));
                     }
                 }
@@ -1082,14 +1094,44 @@ impl Hako {
     /// Full index load for one lazily-opened collection (see `get_shard`).
     /// Best-effort: the shard itself is usable regardless; a failed scan
     /// just leaves queries sweeping until the next touch.
+    /// Union of registered index fields for `collection` (secondary +
+    /// FTS + composite): the exact set a backfill must decode. Everything
+    /// else is framing-skipped via `decode_projected` — same index state,
+    /// no value allocs for unindexed fields. Empty = no indexes (decode
+    /// path falls back to full, identical to today).
+    pub(crate) fn indexed_fields_for(mgr: &IndexManager, collection: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(sec_map) = mgr.secondary.get(collection) {
+            out.extend(sec_map.keys().cloned());
+        }
+        if let Some(fts_map) = mgr.fts.get(collection) {
+            out.extend(fts_map.keys().cloned());
+        }
+        for idx in mgr.composite.all_indexes() {
+            if idx.definition.collection == collection {
+                out.extend(idx.definition.fields.iter().map(|f| f.field.clone()));
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     fn backfill_lazy_collection(&self, collection: &str, shard_arc: &Arc<RwLock<StorageEngine>>) {
         if let Ok(storage) = shard_arc.read() {
             // ponytail: same scan-decode-index shape as recovery STEP C
-            // (encrypted bytes fail decode and are skipped there too).
+            // (encrypted bytes fail decode and are skipped there too) —
+            // but selective: only indexed fields materialize.
             if let Ok(data) = storage.scan_prefix("") {
                 if let Ok(mut mgr) = self.indexes.write() {
+                    let wanted = Self::indexed_fields_for(&mgr, collection);
+                    // ponytail: no registered indexes = nothing to fill
+                    // (composites ride the dedicated spawner below).
+                    if wanted.is_empty() {
+                        return;
+                    }
                     for (doc_id, bytes) in &data {
-                        if let Some(doc) = HakoDoc::decode(bytes) {
+                        if let Some(doc) = HakoDoc::decode_projected(bytes, &wanted) {
                             mgr.index_document(collection, doc_id, &doc);
                         }
                     }
@@ -2716,6 +2758,12 @@ impl Hako {
             };
 
             // Process in chunks to avoid blocking
+            // ponytail: selective decode — a new index only needs the
+            // registered fields (same entries, no value allocs for rest).
+            let wanted: Vec<String> = idx_mgr
+                .read()
+                .map(|mgr| Self::indexed_fields_for(&mgr, &col_name))
+                .unwrap_or_default();
             for chunk in pointers.chunks(200) {
                 let mut resolved_docs = Vec::new();
                 {
@@ -2730,7 +2778,7 @@ impl Hako {
                 let mut mgr = idx_mgr.write().unwrap();
                 let mut decoded_docs = Vec::new();
                 for (full_key, bytes) in resolved_docs {
-                    if let Some(doc) = HakoDoc::decode(&bytes) {
+                    if let Some(doc) = HakoDoc::decode_projected(&bytes, &wanted) {
                         decoded_docs.push((full_key, doc));
                     }
                 }
@@ -2781,6 +2829,11 @@ impl Hako {
             };
 
             // Step B: Process documents in chunks
+            // ponytail: selective decode (see create_index above).
+            let wanted: Vec<String> = idx_mgr
+                .read()
+                .map(|mgr| Self::indexed_fields_for(&mgr, &col_name))
+                .unwrap_or_default();
             for chunk in pointers.chunks(100) {
                 let mut resolved_docs = Vec::new();
 
@@ -2799,7 +2852,7 @@ impl Hako {
                 let mut mgr = idx_mgr.write().unwrap();
                 let mut decoded_docs = Vec::new();
                 for (full_key, bytes) in resolved_docs {
-                    if let Some(mut doc) = HakoDoc::decode(&bytes) {
+                    if let Some(mut doc) = HakoDoc::decode_projected(&bytes, &wanted) {
                         let _ = resolve_doc_static(&mut doc, &shard_arc, enc_key.as_deref());
                         decoded_docs.push((full_key, doc));
                     }
@@ -3549,6 +3602,32 @@ mod profile_tests {
         assert!(db.relocate_docs("src", "src", &["k1".to_string()]).is_err());
         assert!(db.relocate_docs("__users", "dst", &["k1".to_string()]).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Selective decode keeps indexed entries identical while skipping
+    /// value allocs for the rest (backfill paths feed it only registered
+    /// fields — see indexed_fields_for).
+    #[test]
+    fn decode_projected_matches_full_on_wanted() {
+        let mut d = HakoDoc::default();
+        d.insert("a", Value::String("x".into()));
+        d.insert("b", Value::Int(7));
+        d.insert("c", Value::Bool(true));
+        let bytes = d.encode_buffered();
+        let sub = HakoDoc::decode_projected(&bytes, &["b".to_string()]).expect("decode");
+        assert_eq!(sub.get("b"), Some(&Value::Int(7)));
+        assert!(sub.get("a").is_none());
+        assert!(sub.get("c").is_none());
+        assert_eq!(sub._time, d._time);
+        // Empty projection = full decode (safe fallback everywhere).
+        let full = HakoDoc::decode_projected(&bytes, &[]).expect("decode");
+        assert_eq!(full.get("a"), Some(&Value::String("x".into())));
+        assert_eq!(full.get("c"), Some(&Value::Bool(true)));
+        // Same strictness as full decode on corrupt input.
+        let mut bad = bytes.clone();
+        bad.truncate(bad.len() - 2);
+        assert!(HakoDoc::decode(&bad).is_none());
+        assert!(HakoDoc::decode_projected(&bad, &["b".to_string()]).is_none());
     }
 
     /// Background lazy load: start_collection_load opens now and
