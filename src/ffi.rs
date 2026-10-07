@@ -2919,8 +2919,12 @@ pub extern "C" fn hk_transaction_get(
     collection: *const c_char,
     doc_id: *const c_char,
 ) -> *mut HK_Doc {
-    let engine = unsafe { &*engine };
-    let tx = unsafe { &mut *tx };
+    // ponytail: shielded like commit — an unwinding panic through this
+    // frame into C++ is UB (destructors skipped, locks leaked); fail
+    // null instead. Hot path: shield costs nothing when no panic.
+    safety_shield!(ptr::null_mut(), {
+        let engine = unsafe { &*engine };
+        let tx = unsafe { &mut *tx };
     let col = match cstr_to_string(collection) {
         Ok(v) => v,
         Err(_) => return ptr::null_mut(),
@@ -2934,6 +2938,7 @@ pub extern "C" fn hk_transaction_get(
         Ok(Some(doc)) => Box::into_raw(Box::new(HK_Doc { doc, id: id.clone() })),
         _ => ptr::null_mut(),
     }
+    })
 }
 
 #[no_mangle]
@@ -2943,7 +2948,9 @@ pub extern "C" fn hk_transaction_set(
     doc_id: *const c_char,
     doc: *const HK_Doc,
 ) -> i32 {
-    let tx = unsafe { &mut *tx };
+    // ponytail: shielded (see hk_transaction_get).
+    safety_shield!(-1, {
+        let tx = unsafe { &mut *tx };
     let col = match cstr_to_string(collection) {
         Ok(v) => v,
         Err(_) => return -1,
@@ -2956,6 +2963,7 @@ pub extern "C" fn hk_transaction_set(
 
     tx.tx.put(&col, &id, doc.doc.clone());
     0
+    })
 }
 
 #[no_mangle]
