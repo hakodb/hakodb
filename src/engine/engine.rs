@@ -619,13 +619,18 @@ impl Hako {
         });
 
         // --- WORKER 3: BLOB WORKER (IO Queue) ---
-        let shards_blob_clone = Arc::clone(&shards);
-        let trigger_for_blobs_w3 = Arc::clone(&trigger_flush);
+        let shards_blob_clone = Arc::clone(&shards);        let trigger_for_blobs_w3 = Arc::clone(&trigger_flush);
         let blob_worker_handle = thread::spawn(move || {
             // Stop is a one-shot message: once observed it must stay
             // observed, otherwise a busy shutdown iteration consumes the
             // signal and the worker idles forever (teardown hang).
             let mut stop_latched = false;
+            // Meta-update completions waiting on a contended shard lock.
+            // The worker NEVER blocks: a contended shard is skipped and
+            // retried next tick (entries stay BlobPending, served from
+            // their Arc — reads stay correct meanwhile). Bounded: each
+            // item is carried at most until its shard frees.
+            let mut carry: Vec<(Arc<RwLock<StorageEngine>>, String, Vec<u8>, i64, usize)> = Vec::new();
             loop {
                 stop_latched = stop_latched || stop_rx.try_recv().is_ok();
                 let shutting_down = stop_latched;
@@ -634,7 +639,34 @@ impl Hako {
                 let active_shards = { shards_blob_clone.read().unwrap().values().cloned().collect::<Vec<_>>() };
                 let mut processed_any = false;
 
+                // 0. Retry carried-over meta updates first (one try
+                // each; still-contended items ride to the next tick).
+                if !carry.is_empty() {
+                    let due = std::mem::take(&mut carry);
+                    for (shard_arc, key, skeleton, timestamp, len) in due {
+                        // ponytail: try on a clone so the Err arm can move
+                        // the original back without fighting the guard borrow.
+                        match Arc::clone(&shard_arc).try_write() {
+                            Ok(mut shard) => {
+                                Self::apply_blob_meta(&mut shard, key, skeleton, timestamp, len);
+                                processed_any = true;
+                            }
+                            Err(_) => carry.push((shard_arc, key, skeleton, timestamp, len)),
+                        }
+                    }
+                }
+
                 for shard_arc in &active_shards {
+                    // Clone the manager without holding any guard across
+                    // IO: a contended shard is skipped whole, nothing is
+                    // popped and nothing is lost.
+                    let bm = match shard_arc.try_read() {
+                        Ok(shard) => match shard.blob_manager.clone() {
+                            Some(bm) => bm,
+                            None => continue,
+                        },
+                        Err(_) => continue,
+                    };
                     let batch = {
                         if let Ok(mut shard) = shard_arc.try_write() {
                             let mut b = Vec::with_capacity(128);
@@ -649,7 +681,6 @@ impl Hako {
                     if batch.is_empty() { continue; }
                     processed_any = true;
 
-                    let bm = shard_arc.read().unwrap().blob_manager.clone().unwrap();
                     let mut completed_keys = Vec::with_capacity(batch.len());
 
                     for work in batch {
@@ -661,21 +692,15 @@ impl Hako {
                         }
                     }
 
-                    // 2. ATOMIC META UPDATE (One lock per batch)
+                    // 2. ATOMIC META UPDATE (One lock per batch, never blocking)
                     if !completed_keys.is_empty() {
-                        if let Ok(mut shard) = shard_arc.write() {
+                        if let Ok(mut shard) = shard_arc.try_write() {
                             for (key, skeleton, timestamp, len) in completed_keys {
-                                shard.total_pending_blob_bytes.fetch_sub(len, Ordering::Relaxed);
-
-                                // Check if this is still the active version of the doc
-                                if let Some(Pointer::BlobPending(active_doc)) = shard.index.get(&key) {
-                                    if active_doc.get_logical_time() == timestamp {
-                                        // Transition: Pending (Arc) -> Inlined (Bytes)
-                                        // We use the skeleton bytes already calculated by main thread
-                                        shard.update_index_entry(key, Some(Pointer::Inlined(Arc::new(skeleton))));
-                                        // NOTE: We DO NOT write to WAL here. Main thread already did it.
-                                    }
-                                }
+                                Self::apply_blob_meta(&mut shard, key, skeleton, timestamp, len);
+                            }
+                        } else {
+                            for (key, skeleton, timestamp, len) in completed_keys {
+                                carry.push((Arc::clone(shard_arc), key, skeleton, timestamp, len));
                             }
                         }
                     }
@@ -685,7 +710,11 @@ impl Hako {
                 if !processed_any && !triggered {
                     thread::sleep(Duration::from_millis(20));
                 }
-                if shutting_down && !processed_any { break; }
+                // Exit only fully drained: a carried meta still owes its
+                // index flip (Drop's own drain covers the queue itself).
+                // At shutdown the system is quiescing, so a transiently
+                // contended shard frees within ticks.
+                if shutting_down && !processed_any && carry.is_empty() { break; }
             }
         });
 
@@ -912,6 +941,28 @@ impl Hako {
     //         Arc::new(RwLock::new(storage))
     //     }).clone()
     // }
+    /// Blob meta-update for one physically-written item: backpressure
+    /// accounting plus the Pending(Arc) -> Inlined(Bytes) transition when
+    /// still current. WAL already holds the op (main thread wrote it).
+    fn apply_blob_meta(
+        shard: &mut StorageEngine,
+        key: String,
+        skeleton: Vec<u8>,
+        timestamp: i64,
+        len: usize,
+    ) {
+        shard.total_pending_blob_bytes.fetch_sub(len, Ordering::Relaxed);
+        // Check if this is still the active version of the doc
+        if let Some(Pointer::BlobPending(active_doc)) = shard.index.get(&key) {
+            if active_doc.get_logical_time() == timestamp {
+                // Transition: Pending (Arc) -> Inlined (Bytes)
+                // We use the skeleton bytes already calculated by main thread
+                shard.update_index_entry(key, Some(Pointer::Inlined(Arc::new(skeleton))));
+                // NOTE: We DO NOT write to WAL here. Main thread already did it.
+            }
+        }
+    }
+
     pub(crate) fn get_shard(&self, collection: &str) -> Result<Arc<RwLock<StorageEngine>>> {
         // 1. Check with Read Lock (Fast Path)
         {
@@ -3044,27 +3095,48 @@ impl Hako {
     }
 
     fn resolve_doc(&self, doc: &mut HakoDoc, collection: &str) -> Result<()> {
-        // PASS 1: Collect mutable references once. 
+        // Single acquisition: snapshot queue + manager under one read
+        // guard, then resolve without holding any lock. Re-acquiring
+        // inside resolve (nested read behind a queued writer) is a
+        // self-deadlock under writer-preference RwLocks — never do it.
+        let shard_arc = self.get_shard(collection)?;
+        let (blob_manager, queue_snapshot) = {
+            let shard = shard_arc.read().map_err(|_| HakoError::LockPoisoned("shard".into()))?;
+            Self::snapshot_blob_state(&shard)
+        };
+        Self::apply_blob_snapshot(self, doc, blob_manager, queue_snapshot)
+    }
+
+    /// Snapshot the blob state needed for resolve: manager handle plus
+    /// not-yet-flushed queue bytes by offset. Call under a read guard;
+    /// the returned Arcs outlive it.
+    fn snapshot_blob_state(
+        shard: &StorageEngine,
+    ) -> (Option<Arc<BlobManager>>, HashMap<u64, Arc<Vec<u8>>>) {
+        let mut in_memory = HashMap::new();
+        for work in &shard.blob_flush_queue {
+            if let BlobWork::PutRaw { offset, data, .. } = work {
+                in_memory.insert(*offset, Arc::clone(data));
+            }
+        }
+        (shard.blob_manager.clone(), in_memory)
+    }
+
+    /// Pure resolve step: no locks taken. Missing-file bytes are an
+    /// error (same as before); absent links stay untouched.
+    fn apply_blob_snapshot(
+        &self,
+        doc: &mut HakoDoc,
+        blob_manager: Option<Arc<BlobManager>>,
+        queue_snapshot: HashMap<u64, Arc<Vec<u8>>>,
+    ) -> Result<()> {
+        // PASS 1: Collect mutable references once.
         let blob_values: Vec<&mut Value> = doc.fields.iter_mut()
             .map(|(_, v)| v)
             .filter(|v| matches!(v, Value::BlobLink { offset, .. } if *offset != u64::MAX))
             .collect();
 
         if blob_values.is_empty() { return Ok(()); }
-
-        let shard_arc = self.get_shard(collection)?;
-
-        // PASS 2: Snapshot Shard State
-        let (blob_manager, queue_snapshot) = {
-            let shard = shard_arc.read().unwrap();
-            let mut in_memory = HashMap::new();
-            for work in &shard.blob_flush_queue {
-                if let BlobWork::PutRaw { offset, data, .. } = work {
-                    in_memory.insert(*offset, Arc::clone(data));
-                }
-            }
-            (shard.blob_manager.clone(), in_memory)
-        };
 
         let bm = blob_manager.ok_or(HakoError::StorageError("No blob manager".into()))?;
 
