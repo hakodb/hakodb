@@ -216,7 +216,11 @@ impl StorageEngine {
     }
 
     fn recover(&mut self) -> Result<()> {
-        self.index.reserve(1024);
+        // ponytail: size the map from the WAL footprint (avoids rehash
+        // churn on big replays; ops average well above 64B, so this
+        // under-reserves rather than over-).
+        let est = (self.wal.data_len() / 64).clamp(1024, 1_000_000) as usize;
+        self.index.reserve(est);
         for op in self.wal.replay()? {
             match op {
                 WalOp::Put { key, segment_id, segment_offset, len } => {
@@ -225,18 +229,18 @@ impl StorageEngine {
                         offset: segment_offset,
                         len
                     };
-                    self.update_index_entry(key, Some(pointer));
+                    self.update_index_entry_nosort(key, pointer);
                 }
                 WalOp::Delete { key, timestamp  } => {
-                    self.update_index_entry(key, Some(Pointer::Deleted { timestamp }));
+                    self.update_index_entry_nosort(key, Pointer::Deleted { timestamp });
                 }
                 WalOp::BeginTx { .. } | WalOp::CommitTx { .. } => {}
                 WalOp::PutInlined { key, value } => {
                     let pointer = Pointer::Inlined(Arc::new(value));
-                    self.update_index_entry(key, Some(pointer));
+                    self.update_index_entry_nosort(key, pointer);
                 }
                 WalOp::PutBlob { key, offset, len } => {
-                    self.update_index_entry(key, Some(Pointer::Blob { offset, len }));
+                    self.update_index_entry_nosort(key, Pointer::Blob { offset, len });
                 }
             }
         }
@@ -277,6 +281,27 @@ impl StorageEngine {
             self.update_index_entry(k, None);
         }
         n
+    }
+
+    /// Bulk replay path: map insert + inlined-bytes accounting only.
+    /// Skips `sorted_keys` maintenance AND live-count churn — `recover()`
+    /// rebuilds both once afterwards. Routing replay through the regular
+    /// path is O(N²) Vec memmoves on unsorted WAL order plus a key clone
+    /// per op. Old-pointer bytes ARE unaccounted (overwrites during
+    /// replay must net out, or the snapshot heuristic misfires).
+    fn update_index_entry_nosort(&mut self, key: String, new_pointer: Pointer) {
+        match &new_pointer {
+            Pointer::Inlined(d) => { self.inlined_bytes += d.len(); }
+            Pointer::BlobPendingData { skeleton, .. } => { self.inlined_bytes += skeleton.len(); }
+            _ => {}
+        }
+        if let Some(old) = self.index.insert(key, new_pointer) {
+            match old {
+                Pointer::Inlined(d) => { self.inlined_bytes = self.inlined_bytes.saturating_sub(d.len()); }
+                Pointer::BlobPendingData { skeleton, .. } => { self.inlined_bytes = self.inlined_bytes.saturating_sub(skeleton.len()); }
+                _ => {}
+            }
+        }
     }
 
     pub(crate) fn update_index_entry(&mut self, key: String, new_pointer: Option<Pointer>) {
