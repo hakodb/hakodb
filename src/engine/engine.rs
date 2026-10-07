@@ -455,6 +455,13 @@ pub struct Hako {
     pub(crate) local_only_keys: RwLock<HashSet<String>>,
 }
 
+/// Relocate report: moved ids + ids missing at source.
+#[derive(Debug, Clone, Default)]
+pub struct RelocateReport {
+    pub moved: Vec<String>,
+    pub missing: Vec<String>,
+}
+
 impl Hako {
     pub fn open(path: impl AsRef<Path>, config: HakoConfig) -> Result<Self> {
 
@@ -611,8 +618,13 @@ impl Hako {
         let shards_blob_clone = Arc::clone(&shards);
         let trigger_for_blobs_w3 = Arc::clone(&trigger_flush);
         let blob_worker_handle = thread::spawn(move || {
+            // Stop is a one-shot message: once observed it must stay
+            // observed, otherwise a busy shutdown iteration consumes the
+            // signal and the worker idles forever (teardown hang).
+            let mut stop_latched = false;
             loop {
-                let shutting_down = stop_rx.try_recv().is_ok();
+                stop_latched = stop_latched || stop_rx.try_recv().is_ok();
+                let shutting_down = stop_latched;
                 let triggered = trigger_for_blobs_w3.swap(false, Ordering::Acquire);
                 
                 let active_shards = { shards_blob_clone.read().unwrap().values().cloned().collect::<Vec<_>>() };
@@ -1324,6 +1336,118 @@ impl Hako {
         }
 
         Ok(assigned_ids)
+    }
+
+    /// Move documents between collections (archive/restore) as paired
+    /// operations through existing machinery — never memcpy. Per doc,
+    /// in order: timestamp-preserving put at dest FIRST (duplicate-
+    /// transient), then a fresh-timestamp tombstone at src. Stored
+    /// bytes stay identical across moves (only live versions/caches
+    /// advance); retry with the same ids is idempotent. An existing
+    /// dest doc with the same id is overwritten (operator-explicit).
+    /// Refuses the whole call when either side is sync-excluded or
+    /// local-only, or when src == dst. Needs no new wire kinds:
+    /// watchers see Put (dst) + Delete (src), sync converges via WAL.
+    pub fn relocate_docs(&self, src: &str, dst: &str, ids: &[String]) -> Result<RelocateReport> {
+        if src == dst {
+            return Err(HakoError::Corrupt("relocate: src == dst".into()));
+        }
+        if self.read_only.load(Ordering::Relaxed) {
+            return Err(HakoError::Corrupt("read-only".into()));
+        }
+        for col in [src, dst] {
+            if self.is_sync_withheld(col) || self.is_collection_local(col) {
+                return Err(HakoError::Corrupt(format!("relocate: excluded collection `{col}`")));
+            }
+        }
+        if !self.allowed(src, AccessOp::Delete) || !self.allowed(dst, AccessOp::Put) {
+            return Err(HakoError::Corrupt("Denied".into()));
+        }
+        if !self.allowed(src, AccessOp::Get) {
+            return Err(HakoError::Corrupt("Denied".into()));
+        }
+        let threshold = self.config.value_blob_threshold_bytes;
+        let mut report = RelocateReport::default();
+        for id in ids {
+            let Some(mut doc) = self.get(src, id)? else {
+                report.missing.push(id.clone());
+                continue;
+            };
+            // Dest put, timestamp preserved (no restamp — LWW identity
+            // is the move's whole point). Mirrors the write-batch put
+            // prep; blob offsets re-reserve in the DEST file.
+            let key_arc: Arc<str> = Arc::from(id.as_str());
+            let dst_arc = self.get_shard(dst)?;
+            let blob_work = dst_arc
+                .read()
+                .unwrap()
+                .blob_manager
+                .clone()
+                .map(|bm| self.process_doc_blobs(dst, id, &mut doc, &bm, threshold))
+                .unwrap_or_default();
+            let skeleton = doc.encode_buffered();
+            let doc_arc = Arc::new(doc);
+            {
+                let mut shard = dst_arc.write().unwrap();
+                let tx_id = shard.next_tx_id;
+                shard.next_tx_id += 1;
+                shard.wal.append_batch_fast(
+                    tx_id,
+                    &[WalOp::PutInlined { key: id.clone(), value: skeleton.clone() }],
+                    false,
+                )?;
+                shard.update_index_entry(id.clone(), Some(Pointer::Inlined(Arc::new(skeleton))));
+                let mut b_bytes = 0usize;
+                for b in blob_work {
+                    if let BlobWork::PutRaw { len, .. } = &b {
+                        b_bytes += *len as usize;
+                    }
+                    shard.blob_flush_queue.push_back(b);
+                }
+                shard.total_pending_blob_bytes.fetch_add(b_bytes, Ordering::Relaxed);
+            }
+            self.bump_versions_by_keys(vec![key_arc.clone()]);
+            // Indexer gets the put (secondary/FTS/composite would
+            // otherwise miss the moved doc until backfill). Same
+            // in-flight accounting as the write path (refund on dead
+            // worker so quiescence never wedges).
+            self.index_inflight.fetch_add(1, Ordering::Relaxed);
+            if self
+                .index_tx
+                .send(IndexOp::Update {
+                    collection: dst.to_string(),
+                    puts: Arc::new(vec![(id.clone(), Arc::clone(&doc_arc))]),
+                    deletes: vec![],
+                })
+                .is_err()
+            {
+                self.index_inflight.fetch_sub(1, Ordering::Relaxed);
+            }
+            {
+                let mut cache = self.doc_cache.write().unwrap();
+                if !cache.is_empty() {
+                    cache.remove(&format!("{dst}\0{id}"));
+                }
+            }
+            if self.config.enable_audit_log {
+                self.record_audit(AuditEntry {
+                    op: AccessOp::Put,
+                    collection: dst.into(),
+                    doc_id: Some(id.clone()),
+                    ok: true,
+                });
+            }
+            self.notify_watchers(
+                dst,
+                ChangeEvent { path: key_arc.clone(), kind: ChangeKind::Put },
+            );
+            // Src tombstone with FRESH timestamp via the normal delete
+            // path (WAL + index + versions + cache + watchers + audit).
+            self.delete(src, id)?;
+            self.trigger_blob_flush.store(true, Ordering::Release);
+            report.moved.push(id.clone());
+        }
+        Ok(report)
     }
 
     // Fix signature for public helper
@@ -3231,6 +3355,60 @@ mod profile_tests {
         assert_eq!(db.group_commit_interval_ms(), 1);
         db.set_group_commit_interval_ms_all(999_999);
         assert_eq!(db.group_commit_interval_ms(), 30_000);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Relocate: paired put-preserving-timestamp + fresh tombstone.
+    /// Roundtrip keeps stored bytes identical, versions advance,
+    /// retry is idempotent, refusals are explicit.
+    #[test]
+    fn relocate_docs_roundtrip() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("fl-reloc-{nanos}"));
+        let mut cfg = HakoConfig::default();
+        cfg.durability_mode = DurabilityMode::Manual;
+        let db = Hako::open(&dir, cfg).expect("open");
+        let mut d = HakoDoc::default();
+        d.insert("v", Value::String("one".into()));
+        // Big value forces the blob path (re-extract at dest).
+        d.insert("big", Value::String("B".repeat(20_000)));
+        db.put_owned("src", "k1", d).expect("seed");
+        db.put_owned("src", "k2", test_doc(2)).expect("seed");
+
+        let rep = db
+            .relocate_docs("src", "dst", &["k1".to_string(), "ghost".to_string()])
+            .expect("relocate");
+        assert_eq!(rep.moved, vec!["k1".to_string()]);
+        assert_eq!(rep.missing, vec!["ghost".to_string()]);
+        // Src tombstoned, dst identical (fields + _time preserved).
+        assert!(db.get("src", "k1").expect("get").is_none());
+        let back = db.get("dst", "k1").expect("get").expect("moved");
+        assert_eq!(back.get("v"), Some(&Value::String("one".into())));
+        assert_eq!(back.get("big").map(|v| match v {
+            Value::String(s) => s.len(),
+            _ => 0,
+        }), Some(20_000));
+        let orig_time = back._time;
+        // Versions advanced on the moved identity.
+        assert!(db.current_version("k1").is_some());
+        // Idempotent retry: already moved + still missing.
+        let rep2 = db
+            .relocate_docs("src", "dst", &["k1".to_string(), "ghost".to_string()])
+            .expect("retry");
+        assert!(rep2.moved.is_empty());
+        assert_eq!(rep2.missing.len(), 2);
+        // Restore: identical bytes again (same _time).
+        let rep3 = db.relocate_docs("dst", "src", &["k1".to_string()]).expect("restore");
+        assert_eq!(rep3.moved, vec!["k1".to_string()]);
+        let home = db.get("src", "k1").expect("get").expect("restored");
+        assert_eq!(home._time, orig_time);
+        assert!(db.get("dst", "k1").expect("get").is_none());
+        // Explicit refusals.
+        assert!(db.relocate_docs("src", "src", &["k1".to_string()]).is_err());
+        assert!(db.relocate_docs("__users", "dst", &["k1".to_string()]).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
