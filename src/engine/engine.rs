@@ -763,8 +763,13 @@ impl Hako {
                 for entry in entries.flatten() {
                     if entry.path().is_dir() {
                         let name = entry.file_name().to_string_lossy().to_string();
-                        // Ignore system folders
-                        if !name.starts_with('_') && name != "snapshots" {
+                        // Ignore system folders — and the lazy archive
+                        // group (no WAL replay, sort, index or composite
+                        // backfill, no blob setup; the dir merely existing
+                        // suffices until first touch).
+                        if !name.starts_with('_') && name != "snapshots"
+                            && !crate::config::lazy_pattern_match(&config_thread.lazy_collections, &name)
+                        {
                             discovered.push(name);
                         }
                     }
@@ -910,7 +915,95 @@ impl Hako {
 
         // 3. Insert into map with Write Lock
         let mut shards = self.shards.write().map_err(|_| HakoError::LockPoisoned("shards".into()))?;
-        Ok(shards.entry(collection.to_string()).or_insert(shard_arc).clone())
+        let inserted = shards.entry(collection.to_string()).or_insert(shard_arc.clone()).clone();
+        drop(shards);
+        // Touch-load indexing: a lazily-opened collection carries real data
+        // the recovery skip never indexed — backfill RAM secondary/FTS (+
+        // composite trees; set semantics, so a snapshot that already held
+        // entries stays correct) and durable composite backfills. Without
+        // this the touch degrades to FullCollection scans.
+        if self.is_lazy_collection(collection) && Arc::ptr_eq(&inserted, &shard_arc) {
+            self.backfill_lazy_collection(collection, &inserted);
+        }
+        Ok(inserted)
+    }
+
+    /// Full index load for one lazily-opened collection (see `get_shard`).
+    /// Best-effort: the shard itself is usable regardless; a failed scan
+    /// just leaves queries sweeping until the next touch.
+    fn backfill_lazy_collection(&self, collection: &str, shard_arc: &Arc<RwLock<StorageEngine>>) {
+        if let Ok(storage) = shard_arc.read() {
+            // ponytail: same scan-decode-index shape as recovery STEP C
+            // (encrypted bytes fail decode and are skipped there too).
+            if let Ok(data) = storage.scan_prefix("") {
+                if let Ok(mut mgr) = self.indexes.write() {
+                    for (doc_id, bytes) in &data {
+                        if let Some(doc) = HakoDoc::decode(bytes) {
+                            mgr.index_document(collection, doc_id, &doc);
+                        }
+                    }
+                }
+            }
+        }
+        // Durable lean keys for this collection's registered composites
+        // (mirrors the legacy-upgrade STEP E spawner).
+        let ids: Vec<u32> = match self.indexes.read() {
+            Ok(mgr) => mgr
+                .composite
+                .all_indexes()
+                .filter(|idx| idx.definition.collection == collection)
+                .map(|idx| idx.definition.id)
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        for id in ids {
+            Self::spawn_composite_backfill(
+                Arc::clone(&self.indexes),
+                Arc::clone(&self.index_storage),
+                self.config.encryption_key.clone(),
+                Arc::clone(&self.backfill_inflight),
+                Arc::clone(shard_arc),
+                id,
+            );
+        }
+    }
+
+    /// Explicit load of one collection (archive use): opens + replays +
+    /// backfills when needed, no-op when already loaded. Also opens plain
+    /// (non-lazy) collections on demand.
+    pub fn load_collection(&self, collection: &str) -> Result<()> {
+        self.get_shard(collection)?;
+        Ok(())
+    }
+
+    /// Explicit evict of one lazy collection (after archive use): flushes
+    /// it like Drop, drops it from the map, evicts its cached docs and
+    /// plans. Data stays on disk; next touch reloads. Refuses non-lazy
+    /// collections so a hot store can't be evicted by accident.
+    pub fn unload_collection(&self, collection: &str) -> Result<()> {
+        if !self.is_lazy_collection(collection) {
+            return Err(HakoError::Corrupt(format!("unload: `{collection}` not in lazy_collections")));
+        }
+        let removed = self
+            .shards
+            .write()
+            .map_err(|_| HakoError::LockPoisoned("shards".into()))?
+            .remove(collection);
+        if let Some(shard_arc) = removed {
+            if let Ok(mut storage) = shard_arc.write() {
+                let _ = storage.drain_blob_queue();
+                let _ = storage.rewrite_wal_snapshot();
+                let _ = storage.flush_all();
+            }
+            if let Ok(mut cache) = self.doc_cache.write() {
+                if !cache.is_empty() {
+                    let prefix = format!("{collection}\0");
+                    cache.retain(|k, _| !k.starts_with(&prefix));
+                }
+            }
+            self.plan_cache.invalidate();
+        }
+        Ok(())
     }
 
     pub(crate) fn get_encryption_for_col(&self, collection: &str) -> Option<EncryptionContext> {
@@ -1844,6 +1937,24 @@ impl Hako {
         for (name, shard) in shards.iter() {
             shard.write().unwrap().backup(dest.as_ref().join(name))?;
         }
+        drop(shards);
+        // FS-aware tail: unopened (lazy-skipped or never-touched)
+        // collections are absent from the map, but their bytes are real —
+        // copy them with the same *.dat + wal.log filter the per-shard
+        // backup uses (their WAL is untouched, so no flush is owed).
+        let loaded: std::collections::HashSet<String> =
+            self.shards.read().unwrap().keys().cloned().collect();
+        if let Ok(entries) = std::fs::read_dir(&self.root_path) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name == "_indices" || name == "snapshots" || loaded.contains(&name) {
+                    continue;
+                }
+                if entry.path().is_dir() {
+                    copy_collection_dir(&entry.path(), &dest.as_ref().join(&name))?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1991,10 +2102,58 @@ impl Hako {
         is_sync_excluded(col) || self.config.sync_excluded.iter().any(|c| c == col)
     }
 
+    /// True when `col` matches `HakoConfig::lazy_collections` (exact name
+    /// or trailing-`*` prefix). Static config truth, no locks.
+    pub fn is_lazy_collection(&self, col: &str) -> bool {
+        crate::config::lazy_pattern_match(&self.config.lazy_collections, col)
+    }
+
+    /// True when `col` is lazy AND not currently loaded (absent from the
+    /// shard map). The dynamic half of the sync gate: archived data never
+    /// meshes until touched, then normal rules apply.
+    pub fn is_lazy_unloaded(&self, col: &str) -> bool {
+        self.is_lazy_collection(col)
+            && !self
+                .shards
+                .read()
+                .map(|m| m.contains_key(col))
+                .unwrap_or(true)
+    }
+
+    /// The one sync-withholding gate every transport, tailer, handshake
+    /// and enumerator consults: static exclusions plus lazy-unloaded.
+    /// (Handshake constructors keep seeding their static `excluded` sets
+    /// from `is_sync_excluded_effective`; per-message checks use this.)
+    pub fn is_sync_withheld(&self, col: &str) -> bool {
+        self.is_sync_excluded_effective(col) || self.is_lazy_unloaded(col)
+    }
+
+    /// Archive-group collections present on disk but not loaded — the
+    /// stats surface for "marked unloaded" (sync/backup consult the gate
+    /// directly, not this listing).
+    pub fn unloaded_lazy_collections(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let loaded = self.shards.read().map(|m| m.keys().cloned().collect::<std::collections::HashSet<_>>()).unwrap_or_default();
+        if let Ok(entries) = std::fs::read_dir(&self.root_path) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if entry.path().is_dir()
+                    && !loaded.contains(&name)
+                    && self.is_lazy_collection(&name)
+                {
+                    out.push(name);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
     /// Sync enumeration: EVERY collection on disk (including `_`-hidden
-    /// ones) minus the explicit excluded plane. Sync is opt-out, not
-    /// opt-in — `list_collections()` stays the user-visible listing with
-    /// `_` hiding, but sync must never depend on naming conventions.
+    /// ones) minus the withheld plane (static exclusions + lazy-unloaded).
+    /// Sync is opt-out, not opt-in — `list_collections()` stays the
+    /// user-visible listing with `_` hiding, but sync must never depend
+    /// on naming conventions.
     pub fn sync_collections(&self) -> Result<Vec<String>> {
         let mut cols = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&self.root_path) {
@@ -2002,7 +2161,7 @@ impl Hako {
                 if let Ok(meta) = entry.metadata() {
                     if meta.is_dir() {
                         let name = entry.file_name().to_string_lossy().to_string();
-                        if name != "snapshots" && !self.is_sync_excluded_effective(&name) {
+                        if name != "snapshots" && !self.is_sync_withheld(&name) {
                             cols.push(name);
                         }
                     }
@@ -2870,6 +3029,25 @@ impl Drop for Hako {
 }
 
 // --- Internal Helper Functions ---
+
+/// Plain recursive copy of one unopened collection dir, mirroring the
+/// `StorageEngine::backup` file filter (data segments + WAL only).
+fn copy_collection_dir(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            copy_collection_dir(&entry.path(), &dst.join(entry.file_name()))?;
+        } else {
+            let n = entry.file_name().to_string_lossy().into_owned();
+            if n.ends_with(".dat") || n == "wal.log" {
+                std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn resolve_doc_static(
     doc: &mut HakoDoc, 
     shard_arc: &Arc<RwLock<StorageEngine>>, 
@@ -3053,6 +3231,79 @@ mod profile_tests {
         assert_eq!(db.group_commit_interval_ms(), 1);
         db.set_group_commit_interval_ms_all(999_999);
         assert_eq!(db.group_commit_interval_ms(), 30_000);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Lazy archive group: skipped at recovery, withheld from sync until
+    /// touched, fully indexed on touch (no FullCollection degradation),
+    /// evictable, and covered by FS-aware backup while unopened.
+    #[test]
+    fn lazy_collections_skip_touch_sync_backup() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("fl-lazy-{nanos}"));
+        // Phase 1: seed eager (so recovery has something to skip later).
+        {
+            let mut cfg = HakoConfig::default();
+            cfg.durability_mode = DurabilityMode::Manual;
+            let db = Hako::open(&dir, cfg).expect("open");
+            let mut a1 = HakoDoc::default();
+            a1.insert("kind", Value::String("report".into()));
+            a1.insert("big", Value::String("B".repeat(20_000)));
+            db.put_owned("archive", "a1", a1).expect("seed");
+            let mut a2 = HakoDoc::default();
+            a2.insert("kind", Value::String("memo".into()));
+            db.put_owned("archive", "a2", a2).expect("seed");
+            db.put_owned("hot", "h1", test_doc(1)).expect("seed");
+            db.create_index("archive", "kind").expect("secondary");
+            assert!(db.await_quiescent(std::time::Duration::from_secs(10)));
+        }
+        // Phase 2: reopen with the archive group lazy.
+        let mut cfg = HakoConfig::default();
+        cfg.durability_mode = DurabilityMode::Manual;
+        cfg.lazy_collections = vec!["archive*".to_string()];
+        let db = Hako::open(&dir, cfg).expect("open");
+        assert!(db.is_lazy_unloaded("archive"));
+        assert!(!db.is_lazy_unloaded("hot"));
+        // Listing is normal (hidden rule only); sync withholds unloaded.
+        assert!(db.list_collections().unwrap().contains(&"archive".to_string()));
+        let sync = db.sync_collections().unwrap();
+        assert!(!sync.contains(&"archive".to_string()));
+        assert!(sync.contains(&"hot".to_string()));
+        assert_eq!(db.unloaded_lazy_collections(), vec!["archive".to_string()]);
+        // Phase 3: touch loads fully (data + blob + RAM indexes).
+        let got = db.get("archive", "a1").expect("get").expect("touched");
+        assert_eq!(got.get("kind"), Some(&Value::String("report".into())));
+        assert_eq!(got.get("big").map(|v| match v {
+            Value::String(s) => s.len(),
+            _ => 0,
+        }), Some(20_000));
+        assert!(!db.is_lazy_unloaded("archive"));
+        assert!(db.await_quiescent(std::time::Duration::from_secs(10)));
+        let enc = crate::index::index_key::encode_scalar(&Value::String("report".into()));
+        let hits = db.indexes.read().unwrap()
+            .lookup_secondary("archive", "kind", &enc)
+            .unwrap_or_default();
+        assert!(hits.iter().any(|id| id.as_ref() == "a1"));
+        assert!(db.sync_collections().unwrap().contains(&"archive".to_string()));
+        // Phase 4: evict → withheld again, data intact, hot protected.
+        db.unload_collection("archive").expect("unload");
+        db.unload_collection("archive").expect("idempotent");
+        assert!(db.is_lazy_unloaded("archive"));
+        assert!(!db.sync_collections().unwrap().contains(&"archive".to_string()));
+        assert!(db.unload_collection("hot").is_err());
+        // Phase 5: backup covers the unopened archive bytes too.
+        let bdir = std::env::temp_dir().join(format!("fl-lazybak-{nanos}"));
+        db.backup(&bdir).expect("backup");
+        assert!(bdir.join("archive").join("wal.log").exists());
+        assert!(bdir.join("hot").join("wal.log").exists());
+        // Phase 6: re-touch after evict → identical data.
+        let back = db.get("archive", "a2").expect("get").expect("reloaded");
+        assert_eq!(back.get("kind"), Some(&Value::String("memo".into())));
+        std::fs::remove_dir_all(&bdir).ok();
+        drop(db);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

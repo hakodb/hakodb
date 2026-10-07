@@ -754,8 +754,8 @@ impl CloudSync {
             // poisoning every room member's real store. The outbound
             // tailers already skip these; this is the receipt-side choke
             // point both directions route through.
-            if db.is_sync_excluded_effective(&plain_col)
-                || db.is_sync_excluded_effective(&storage_col)
+            if db.is_sync_withheld(&plain_col)
+                || db.is_sync_withheld(&storage_col)
             {
                 continue;
             }
@@ -1405,8 +1405,8 @@ kind,
         // Sync-excluded plane is never served, in either namespace: a room
         // collection unfortunately named like an excluded store must not
         // reach members that would apply it unprefixed.
-        if db.is_sync_excluded_effective(plain_col)
-            || db.is_sync_excluded_effective(storage_col)
+        if db.is_sync_withheld(plain_col)
+            || db.is_sync_withheld(storage_col)
         {
             return;
         }
@@ -1472,7 +1472,7 @@ kind,
                     // named "__groups"): recipients apply it unprefixed and
                     // would poison their real store. Receipt-side drops it
                     // too — this stops it at the source for unpatched peers.
-                    if db.is_sync_excluded_effective(&plain_col) {
+                    if db.is_sync_withheld(&plain_col) {
                         continue;
                     }
 
@@ -1742,7 +1742,7 @@ kind,
         // Sync-excluded plane never pushes upstream (defense in depth:
         // enumeration already drops it, but an explicit check keeps it
         // true if collection routing ever bypasses enumeration).
-        if db.is_sync_excluded_effective(collection) {
+        if db.is_sync_withheld(collection) {
             return;
         }
         let ops = Self::collect_catchup_ops(db, collection, collection, server_ts);
@@ -1784,7 +1784,7 @@ kind,
                     // Sync-state, room registry, and admin credential stores
                     // never leave the device. (`__hako_security` keeps
                     // flowing — policies replicate.)
-                    if db.is_sync_excluded_effective(&col) {
+                    if db.is_sync_withheld(&col) {
                         continue;
                     }
                     // NOTE: no encryption gate here by design. This client
