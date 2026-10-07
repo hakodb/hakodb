@@ -3412,6 +3412,53 @@ mod profile_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Relocate refuses every sync-excluded side (config, builtin,
+    /// whole-collection local-only, unloaded-lazy) in lockstep with what
+    /// sync withholds — a move must never launder data onto the mesh.
+    #[test]
+    fn relocate_refuses_excluded_sides() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("fl-relocgate-{nanos}"));
+        {
+            let mut cfg = HakoConfig::default();
+            cfg.durability_mode = DurabilityMode::Manual;
+            let db = Hako::open(&dir, cfg).expect("open");
+            let mut d = HakoDoc::default();
+            d.insert("v", Value::String("x".into()));
+            for (c, id) in [("hot", "h1"), ("nope", "n1"), ("cold", "c1")] {
+                db.put_owned(c, id, d.clone()).expect("seed");
+            }
+        }
+        let mut cfg = HakoConfig::default();
+        cfg.durability_mode = DurabilityMode::Manual;
+        cfg.sync_excluded = vec!["nope".to_string()];
+        cfg.lazy_collections = vec!["cold*".to_string()];
+        let db = Hako::open(&dir, cfg).expect("open");
+        db.set_collection_local("loc", true);
+        // Every excluded side refused, both directions.
+        assert!(db.relocate_docs("nope", "hot", &["n1".to_string()]).is_err());
+        assert!(db.relocate_docs("hot", "nope", &["h1".to_string()]).is_err());
+        assert!(db.relocate_docs("__groups", "hot", &["g".to_string()]).is_err());
+        assert!(db.relocate_docs("loc", "hot", &["l".to_string()]).is_err());
+        assert!(db.relocate_docs("cold", "hot", &["c1".to_string()]).is_err());
+        // Sync withholds exactly the same set (loc is enumerator-listed
+        // but per-op filters drop it on every transport; relocate refuses).
+        let sync = db.sync_collections().unwrap();
+        for c in ["nope", "__groups", "cold"] {
+            assert!(!sync.contains(&c.to_string()));
+            assert!(db.is_sync_withheld(c));
+        }
+        assert!(sync.contains(&"hot".to_string()));
+        // And the normal path still moves.
+        let rep = db.relocate_docs("hot", "hot2", &["h1".to_string()]).expect("move");
+        assert_eq!(rep.moved, vec!["h1".to_string()]);
+        drop(db);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Lazy archive group: skipped at recovery, withheld from sync until
     /// touched, fully indexed on touch (no FullCollection degradation),
     /// evictable, and covered by FS-aware backup while unopened.
