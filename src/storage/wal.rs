@@ -536,6 +536,13 @@ impl Wal {
         self.data_len
     }
 
+    /// Physical file length (includes preallocated headroom): paired with
+    /// data_len as the snapshot-staleness fingerprint. A WAL reset changes
+    /// this even when record bytes coincide, so equal pairs mean untouched.
+    pub fn file_len(&self) -> u64 {
+        self.file.metadata().map(|m| m.len()).unwrap_or(0)
+    }
+
     /// Buffered-but-unflushed bytes exist (the quiet-window at risk on SIGKILL).
     pub fn has_pending(&self) -> bool {
         !self.write_buffer.is_empty()

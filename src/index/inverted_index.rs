@@ -25,6 +25,11 @@ impl InvertedIndex {
         }
     }
 
+    /// Drop all entries, keep the registration (stale-snapshot rescan).
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+
     pub fn search(&self, query_text: &str) -> Option<BTreeSet<String>> {
         let words = self.tokenize(query_text);
         if words.is_empty() { return None; }

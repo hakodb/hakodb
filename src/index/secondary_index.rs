@@ -43,4 +43,9 @@ impl SecondaryIndex {
             .flat_map(|(_, ids)| ids.iter().cloned())
             .collect()
     }
+
+    /// Drop all entries, keep the registration (stale-snapshot rescan).
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
 }

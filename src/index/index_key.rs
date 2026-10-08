@@ -203,7 +203,6 @@ pub fn decode_scalar_as_f64(bytes: &[u8]) -> Option<f64> {
 mod tests {
     use super::*;
     use crate::document::hako_doc::decode_value;
-    use crate::document::value::Value;
 
     /// Borrowed encoding must equal owned decode-then-encode for every
     /// scalar shape, and both must fail together on truncations.

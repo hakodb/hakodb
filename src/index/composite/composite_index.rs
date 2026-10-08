@@ -23,6 +23,11 @@ impl CompositeIndex {
         }
     }
 
+    /// Drop all entries, keep the definition (stale-snapshot rescan).
+    pub fn clear(&mut self) {
+        self.tree.clear();
+    }
+
     pub fn document_values(&self, doc_id: &str, doc: &HakoDoc) -> Option<Vec<Value>> {
         let mut values = Vec::with_capacity(self.definition.fields.len());
 
