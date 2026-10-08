@@ -919,6 +919,140 @@ pub extern "C" fn hk_engine_vacuum_collection(
     }
 }
 
+/// Relocate docs by id from one collection to another (same engine).
+/// `ids_json`: JSON array of doc ids, e.g. `["a","b"]`. Returns a JSON
+/// report `{"moved":[...],"missing":[...]}`, or NULL on error (refusals:
+/// excluded sides, src == dst). Caller frees with `hk_string_free`.
+#[no_mangle]
+pub extern "C" fn hk_engine_relocate_docs(
+    engine: *mut HK_Engine,
+    src: *const c_char,
+    dst: *const c_char,
+    ids_json: *const c_char,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error("null engine handle");
+            return std::ptr::null_mut();
+        }
+        let src = match cstr_to_string(src) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(e);
+                return std::ptr::null_mut();
+            }
+        };
+        let dst = match cstr_to_string(dst) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(e);
+                return std::ptr::null_mut();
+            }
+        };
+        let ids_raw = match cstr_to_string(ids_json) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(e);
+                return std::ptr::null_mut();
+            }
+        };
+        let ids: Vec<String> = match serde_json::from_str(&ids_raw) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(format!("ids_json must be a JSON string array: {e}"));
+                return std::ptr::null_mut();
+            }
+        };
+        let engine = unsafe { &*engine };
+        match engine.db.relocate_docs(&src, &dst, &ids) {
+            Ok(rep) => {
+                let json = serde_json::json!({"moved": rep.moved, "missing": rep.missing}).to_string();
+                match CString::new(json) {
+                    Ok(c_str) => {
+                        clear_last_error();
+                        c_str.into_raw()
+                    }
+                    Err(_) => std::ptr::null_mut(),
+                }
+            }
+            Err(e) => {
+                set_last_error(e.to_string());
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Load a lazy collection's snapshot into the index now (synchronous).
+/// Returns 0, or -1 on error (e.g. not a lazy collection).
+#[no_mangle]
+pub extern "C" fn hk_engine_load_collection(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+) -> i32 {
+    if engine.is_null() {
+        return set_last_error("null engine handle");
+    }
+    let collection = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(e) => return set_last_error(e),
+    };
+    let engine = unsafe { &*engine };
+    match engine.db.load_collection(&collection) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(e) => set_last_error(e.to_string()),
+    }
+}
+
+/// Unload a lazy collection from the index (frees RAM; snapshot stays).
+/// Returns 0, or -1 on error (e.g. not a lazy collection).
+#[no_mangle]
+pub extern "C" fn hk_engine_unload_collection(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+) -> i32 {
+    if engine.is_null() {
+        return set_last_error("null engine handle");
+    }
+    let collection = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(e) => return set_last_error(e),
+    };
+    let engine = unsafe { &*engine };
+    match engine.db.unload_collection(&collection) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(e) => set_last_error(e.to_string()),
+    }
+}
+
+/// List lazy collections currently unloaded (not in the index), as a
+/// JSON array. Caller frees with `hk_string_free`.
+#[no_mangle]
+pub extern "C" fn hk_engine_unloaded_collections(engine: *mut HK_Engine) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error("null engine handle");
+            return std::ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let cols = engine.db.unloaded_lazy_collections();
+        let json = serde_json::to_string(&cols).unwrap_or_else(|_| "[]".to_string());
+        match CString::new(json) {
+            Ok(c_str) => {
+                clear_last_error();
+                c_str.into_raw()
+            }
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn hk_batch_new() -> *mut HK_Batch {
     Box::into_raw(Box::new(HK_Batch { ops: Vec::new() }))
