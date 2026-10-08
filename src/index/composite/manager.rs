@@ -16,6 +16,23 @@ pub struct CompositeIndexManager {
 }
 
 impl CompositeIndexManager {
+    /// Clear the ENTRIES of every tree registered for `collection`,
+    /// keeping definitions and registrations (rescan refills them).
+    pub fn clear_collection(&mut self, collection: &str) {
+        if let Some(ids) = self.by_collection.get(collection) {
+            for id in ids.clone() {
+                if let Some(idx) = self.by_id.get_mut(&id) {
+                    idx.clear();
+                }
+            }
+        }
+    }
+
+    /// True when any tree is registered for `collection`.
+    pub fn has_collection(&self, collection: &str) -> bool {
+        self.by_collection.contains_key(collection)
+    }
+
     /// Snapshot for persistence: full trees keyed by index id, plus the
     /// id allocator (definitions themselves live in definitions.json).
     pub(crate) fn export_snapshot(&self) -> (HashMap<u32, CompositeIndex>, u32) {

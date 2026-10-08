@@ -19,6 +19,11 @@ pub struct IndexManager {
     pub fts: HashMap<String, HashMap<String, InvertedIndex>>,
 }
 
+/// WAL tails at snapshot time, per collection: (wal data_len, wal
+/// file_len). Lets recovery tell a fresh snapshot from a stale one
+/// (crash after the last snapshot) without trusting timestamps.
+pub type WalTails = HashMap<String, (u64, u64)>;
+
 impl IndexManager {
     pub fn create_fts_index(&mut self, collection: &str, field: &str) {
         self.fts
@@ -181,6 +186,38 @@ impl IndexManager {
             .map_err(|e| HakoError::Corrupt(format!("Index export failed: {}", e)))
     }
 
+    /// WAL tails at export, per collection: (wal data_len, wal file_len).
+    /// Lets recovery tell a fresh snapshot from a stale one (crash after
+    /// the last snapshot) without trusting timestamps.
+    pub fn export_state_with_tails(&self, tails: &WalTails) -> Result<Vec<u8>, HakoError> {
+        bincode::serialize(&(&self.secondary, &self.fts, self.composite.export_snapshot(), tails))
+            .map_err(|e| HakoError::Corrupt(format!("Index export failed: {}", e)))
+    }
+
+    /// True when the manager holds any RAM entries for `collection`
+    /// (secondary, fts, or composite trees).
+    pub fn has_collection(&self, collection: &str) -> bool {
+        self.secondary.contains_key(collection)
+            || self.fts.contains_key(collection)
+            || self.composite.has_collection(collection)
+    }
+
+    /// Drop every RAM entry for `collection` while keeping all index
+    /// registrations (rescan refills them). Definitions are untouched.
+    pub fn clear_collection(&mut self, collection: &str) {
+        if let Some(sec_map) = self.secondary.get_mut(collection) {
+            for idx in sec_map.values_mut() {
+                idx.clear();
+            }
+        }
+        if let Some(fts_map) = self.fts.get_mut(collection) {
+            for idx in fts_map.values_mut() {
+                idx.clear();
+            }
+        }
+        self.composite.clear_collection(collection);
+    }
+
     // pub fn import_state(&mut self, bytes: &[u8]) -> Result<(), HakoError> {
     //     // By importing hashbrown::HashMap at the top, 'HashMap' here 
     //     // now correctly refers to the hashbrown version.
@@ -194,13 +231,26 @@ impl IndexManager {
     //     self.fts = fts;
     //     Ok(())
     // }
-     pub fn import_state(&mut self, bytes: &[u8]) -> Result<bool, HakoError> {
-        // Returns whether composite trees came from the snapshot. New
-        // three-element files restore everything; legacy two-element
-        // files restore secondary/fts and report false so the caller can
-        // backfill composites from data (one-time upgrade path).
+     pub fn import_state(&mut self, bytes: &[u8]) -> Result<(bool, Option<WalTails>), HakoError> {
+        // Returns (composite trees came from the snapshot, WAL tails or
+        // None when the file predates them). Four-element files are
+        // current; three-element restore everything but report no tails
+        // (caller rescans — one-time upgrade cost); legacy two-element
+        // files restore secondary/fts and backfill composites from data.
         // Completely unreadable files Err: the caller rebuilds from scan.
         type Trees = HashMap<u32, crate::index::composite::composite_index::CompositeIndex>;
+        if let Ok((sec, fts, (trees, next_id), tails)) = bincode::deserialize::<(
+            HashMap<String, HashMap<String, crate::index::secondary_index::SecondaryIndex>>,
+            HashMap<String, HashMap<String, crate::index::inverted_index::InvertedIndex>>,
+            (Trees, u32),
+            WalTails,
+        )>(bytes)
+        {
+            Self::merge_maps(&mut self.secondary, sec);
+            Self::merge_maps(&mut self.fts, fts);
+            self.composite.import_snapshot(trees, next_id);
+            return Ok((true, Some(tails)));
+        }
         if let Ok((sec, fts, (trees, next_id))) = bincode::deserialize::<(
             HashMap<String, HashMap<String, crate::index::secondary_index::SecondaryIndex>>,
             HashMap<String, HashMap<String, crate::index::inverted_index::InvertedIndex>>,
@@ -210,7 +260,7 @@ impl IndexManager {
             Self::merge_maps(&mut self.secondary, sec);
             Self::merge_maps(&mut self.fts, fts);
             self.composite.import_snapshot(trees, next_id);
-            return Ok(true);
+            return Ok((true, None));
         }
         let (sec, fts): (
             HashMap<String, HashMap<String, crate::index::secondary_index::SecondaryIndex>>,
@@ -219,7 +269,7 @@ impl IndexManager {
             .map_err(|e| HakoError::Corrupt(format!("Index import failed: {}", e)))?;
         Self::merge_maps(&mut self.secondary, sec);
         Self::merge_maps(&mut self.fts, fts);
-        Ok(false)
+        Ok((false, None))
     }
 
     fn merge_maps<K, V>(into: &mut HashMap<String, HashMap<K, V>>, from: HashMap<String, HashMap<K, V>>)
@@ -281,7 +331,7 @@ mod tests {
                     ("nim".to_string(), SortDirection::Asc),
                 ]),
         );
-        assert!(m2.import_state(&bytes).expect("import"));
+        assert!(m2.import_state(&bytes).expect("import").0);
         // Trees restored verbatim: point probe finds both rows.
         let ids = m2
             .composite
@@ -310,7 +360,7 @@ mod tests {
                     ("nim".to_string(), SortDirection::Asc),
                 ]),
         );
-        assert!(!m2.import_state(&legacy).expect("legacy import"));
+        assert!(!m2.import_state(&legacy).expect("legacy import").0);
         // Secondary restored, composite untouched (empty, awaiting backfill).
         assert!(m2.secondary.get("students").is_some_and(|mm| mm.contains_key("nim")));
         assert!(m2
@@ -334,7 +384,7 @@ mod tests {
             CompositeIndexDefinition::new("students")
                 .with_fields(vec![("passw".to_string(), SortDirection::Asc)]),
         );
-        assert!(m2.import_state(&bytes).expect("import"));
+        assert!(m2.import_state(&bytes).expect("import").0);
         assert!(m2
             .composite
             .exact_match_doc_ids(
@@ -343,5 +393,30 @@ mod tests {
                 &[Value::String("28021988".into())],
             )
             .map_or(true, |v| v.is_empty()));
+    }
+
+    #[test]
+    fn tails_roundtrip_and_clear_collection() {
+        let m = manager_with_entries();
+        let mut tails = WalTails::new();
+        tails.insert("students".to_string(), (1234, 5678));
+        let bytes = m.export_state_with_tails(&tails).expect("export");
+        let mut m2 = IndexManager::default();
+        let (restored, got) = m2.import_state(&bytes).expect("import");
+        assert!(restored);
+        assert_eq!(got.expect("tails").get("students"), Some(&(1234, 5678)));
+        assert!(m2.has_collection("students"));
+        m2.clear_collection("students");
+        // Entries gone, registrations kept (rescan refills them).
+        assert!(m2.has_collection("students"));
+        assert!(m2
+            .secondary
+            .get("students")
+            .is_some_and(|mm| mm.values().all(|idx| idx.get_map().is_empty())));
+        // Legacy three-element files report no tails (caller rescans).
+        let legacy3 = m.export_state().expect("export");
+        let mut m3 = IndexManager::default();
+        let (_, tails3) = m3.import_state(&legacy3).expect("import");
+        assert!(tails3.is_none());
     }
 }

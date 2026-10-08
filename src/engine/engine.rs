@@ -604,10 +604,11 @@ impl Hako {
                     }
                     
                     // Periodically snapshot RAM indexes (prevent loss on crash)
-                    let snapshot_path = root_path_sys.join("_indices").join("ram_indexes.bin");
-                    if let Ok(mgr) = indexes_sys_ptr.try_read() {
-                        if let Ok(bytes) = mgr.export_state() { let _ = std::fs::write(snapshot_path, bytes); }
-                    }
+                    let _ = Self::write_index_snapshot(
+                        &root_path_sys,
+                        &shards_sys_clone,
+                        &indexes_sys_ptr,
+                    );
 
                     trigger_for_system.store(true, Ordering::Release);
                     last_maint = Instant::now();
@@ -793,12 +794,16 @@ impl Hako {
             // format). Legacy files restore secondary/fts only; composites
             // backfill below (one-time upgrade path).
             let mut composite_restored = false;
+            // WAL tails at snapshot time (None when the file predates
+            // them): per-collection freshness for the STEP C decision.
+            let mut snap_tails: Option<crate::index::manager::WalTails> = None;
             if snapshot_path.exists() {
                 if let Ok(bytes) = std::fs::read(&snapshot_path) {
                     let mut mgr = indexes_ptr.write().unwrap();
-                    if let Ok(restored) = mgr.import_state(&bytes) {
+                    if let Ok((restored, tails)) = mgr.import_state(&bytes) {
                         snapshot_loaded = true;
                         composite_restored = restored;
+                        snap_tails = tails;
                     }
                 }
             }
@@ -838,10 +843,20 @@ impl Hako {
                     // Use the Crossbeam Sender for background blob offloading
                     storage.blob_tx = Some(blob_tx_thread.clone());
                     
-                    // REBUILD ONLY IF SNAPSHOT FAILED
-                    if !snapshot_loaded {
+                    // REBUILD ONLY IF STALE: a fresh snapshot (WAL tails
+                    // equal) means the RAM entries are complete — skip the
+                    // scan. Anything else (no snapshot, legacy file, crash
+                    // after the last snapshot) clears and rebuilds, so
+                    // post-snapshot deletes leave no ghosts.
+                    let fresh = snap_tails.as_ref().and_then(|t| t.get(&col_name)).is_some_and(
+                        |(d, f)| {
+                            *d == storage.wal.data_len() && *f == storage.wal.file_len()
+                        },
+                    );
+                    if !fresh {
                         if let Ok(data) = storage.scan_prefix("") {
                             let mut mgr = indexes_ptr.write().unwrap();
+                            mgr.clear_collection(&col_name);
                             // ponytail: selective decode — only indexed
                             // fields materialize (same index state, no
                             // value allocs for the rest).
@@ -1174,6 +1189,16 @@ impl Hako {
             // (encrypted bytes fail decode and are skipped there too).
             if let Ok(data) = storage.scan_prefix("") {
                 if let Ok(mut mgr) = self.indexes.write() {
+                    // Clear-then-fill: the snapshot may hold stale
+                    // entries (post-snapshot deletes, or a restart
+                    // mid-backfill) — refilling over them would leave
+                    // ghosts, and there is no per-collection completion
+                    // marker to trust instead. Unload/retouch cycles pay
+                    // a full rebuild; explicit background load covers the
+                    // latency for viewers.
+                    if mgr.has_collection(collection) {
+                        mgr.clear_collection(collection);
+                    }
                     // Borrowed secondary fast path when it covers the
                     // whole job (secondary-only collection); otherwise
                     // the owned path below (identical entries).
@@ -3031,6 +3056,52 @@ impl Hako {
     }
 
     /// Explicitly trigger a snapshot (called by Maintenance Thread or FFI)
+    /// Snapshot the RAM index state (secondary/fts/composite) plus per-
+    /// collection WAL tails, atomically (tmp + rename + fsync) so a power
+    /// loss never leaves a half-written file (import falls back to full
+    /// rescan on anything unreadable).
+    pub fn export_index_snapshot(&self) -> Result<()> {
+        Self::write_index_snapshot(&self.root_path, &self.shards, &self.indexes)
+    }
+
+    fn write_index_snapshot(
+        root_path: &std::path::Path,
+        shards: &Arc<RwLock<HashMap<String, Arc<RwLock<StorageEngine>>>>>,
+        indexes: &Arc<RwLock<IndexManager>>,
+    ) -> Result<()> {
+        use crate::index::manager::WalTails;
+        let tails: WalTails = shards
+            .read()
+            .map(|m| {
+                m.iter()
+                    .map(|(name, shard)| {
+                        let (data_len, file_len) = shard
+                            .read()
+                            .map(|s| (s.wal.data_len(), s.wal.file_len()))
+                            .unwrap_or((0, 0));
+                        (name.clone(), (data_len, file_len))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let bytes = indexes
+            .read()
+            .map_err(|_| HakoError::LockPoisoned("indexes".into()))?
+            .export_state_with_tails(&tails)?;
+        let dir = root_path.join("_indices");
+        let _ = std::fs::create_dir_all(&dir);
+        let tmp = dir.join("ram_indexes.bin.tmp");
+        let dst = dir.join("ram_indexes.bin");
+        std::fs::write(&tmp, &bytes)?;
+        // ponytail: best-effort durability only — a failed sync still
+        // leaves the previous good snapshot (rename is atomic).
+        if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) {
+            let _ = f.sync_all();
+        }
+        std::fs::rename(&tmp, &dst)?;
+        Ok(())
+    }
+
     pub fn save_index_snapshots(&self) -> Result<()> {
         let persist = self.index_storage.lock().unwrap();
         // Snapshot the primary composite index (ID 1)
@@ -3390,10 +3461,9 @@ impl Drop for Hako {
         if let Some(tx) = self.blob_stop_tx.lock().unwrap().take() { let _ = tx.send(()); }
         if let Some(h) = self.blob_worker_handle.lock().unwrap().take() { let _ = h.join(); }
 
-        // 4. SAVE RAM INDEXES
-        let snapshot_path = self.root_path.join("_indices").join("ram_indexes.bin");
+        // 4. SAVE RAM INDEXES (+ WAL tails, atomically)
+        let _ = Self::write_index_snapshot(&self.root_path, &self.shards, &self.indexes);
         if let Ok(mgr) = self.indexes.read() {
-            if let Ok(bytes) = mgr.export_state() { let _ = std::fs::write(snapshot_path, bytes); }
             let _ = self.persist_index_defs_with_guard(&mgr); 
         }
 
@@ -3863,6 +3933,66 @@ mod profile_tests {
             .unwrap_or_default()
             .is_empty());
         drop(db);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Crash-after-snapshot: WAL moves past the last RAM snapshot
+    /// without the index worker (simulated via a raw StorageEngine that
+    /// bypasses RAM state, exactly like a kill -9). Reopen must rescan
+    /// the stale collection: new docs indexed, deleted docs gone (no
+    /// ghosts), byte-identical data.
+    #[test]
+    fn crash_stale_snapshot_rescans_clean() {
+        use crate::storage::engine::StorageEngine;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("fl-crash-{nanos}"));
+        let mk = |kind: &str| {
+            let mut d = HakoDoc::default();
+            d.insert("kind", Value::String(kind.into()));
+            d
+        };
+        // Phase 1: live DB, indexed, clean shutdown (fresh snapshot).
+        {
+            let mut cfg = HakoConfig::default();
+            cfg.durability_mode = DurabilityMode::Manual;
+            let db = Hako::open(&dir, cfg).expect("open");
+            db.put_owned("c", "a1", mk("x")).expect("put");
+            db.put_owned("c", "a2", mk("y")).expect("put");
+            db.create_index("c", "kind").expect("secondary");
+            assert!(db.await_quiescent(std::time::Duration::from_secs(30)));
+        }
+        // Phase 2: raw engine moves WAL past the snapshot (no RAM index
+        // involved) — then drops (WAL flushed, snapshot untouched).
+        {
+            let cfg = HakoConfig::default();
+            let mut eng =
+                StorageEngine::open(dir.join("c"), &cfg, "c".to_string(), None).expect("open");
+            eng.put("a3".to_string(), &mk("x").encode_buffered())
+                .expect("put");
+            eng.delete("a1").expect("delete");
+        }
+        // Phase 3: reopen detects staleness via WAL tails and rescans.
+        {
+            let mut cfg = HakoConfig::default();
+            cfg.durability_mode = DurabilityMode::Manual;
+            let db = Hako::open(&dir, cfg).expect("open");
+            assert!(db.await_quiescent(std::time::Duration::from_secs(30)));
+            let enc = crate::index::index_key::encode_scalar(&Value::String("x".into()));
+            let hits = db
+                .indexes
+                .read()
+                .unwrap()
+                .lookup_secondary("c", "kind", &enc)
+                .unwrap_or_default();
+            // a3 joined, a1's ghost gone — exactly one live "x".
+            assert_eq!(hits.len(), 1);
+            assert!(db.get("c", "a1").expect("get").is_none());
+            assert!(db.get("c", "a3").expect("get").is_some());
+            drop(db);
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
