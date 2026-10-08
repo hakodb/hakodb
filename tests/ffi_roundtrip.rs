@@ -74,6 +74,11 @@ extern "C" {
     fn hk_result_set_get_doc(rs: *mut HK_ResultSet, index: usize) -> *mut HK_Doc;
     fn hk_result_set_free(rs: *mut HK_ResultSet);
 
+    fn hk_engine_relocate_docs(engine: *mut HK_Engine, src: *const c_char, dst: *const c_char, ids_json: *const c_char) -> *mut c_char;
+    fn hk_engine_load_collection(engine: *mut HK_Engine, collection: *const c_char) -> c_int;
+    fn hk_engine_unload_collection(engine: *mut HK_Engine, collection: *const c_char) -> c_int;
+    fn hk_engine_unloaded_collections(engine: *mut HK_Engine) -> *mut c_char;
+
     fn hk_string_free(s: *mut c_char);
 }
 
@@ -139,6 +144,69 @@ fn get_and_put_round_trip() {
     assert!(json.contains("hello"), "json missing hello: {json}");
     assert!(json.contains("42"), "json missing n: {json}");
     unsafe { hk_doc_free(got) };
+
+    unsafe {
+        hk_engine_free(engine);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn archive_relocate_load_unload_round_trip() {
+    let dir = temp_dir("arch");
+    let path = cs(dir.to_str().unwrap());
+    let engine = unsafe { hk_engine_open(path.as_ptr()) };
+    assert!(!engine.is_null(), "engine open");
+
+    // seed arch/a + arch/b via batch
+    for id in ["a", "b"] {
+        let cid = cs(id);
+        let coll = cs("arch");
+        let doc = unsafe { hk_doc_new() };
+        unsafe {
+            hk_doc_insert_int(doc, cs("x").as_ptr(), 1);
+            let batch = hk_batch_new();
+            hk_batch_set(batch, coll.as_ptr(), cid.as_ptr(), doc);
+            assert_eq!(hk_batch_commit(engine, batch), 0, "seed {id}");
+        }
+    }
+
+    // relocate a + ghost -> arc2; report must list moved + missing
+    let rep = read_cstr(unsafe {
+        hk_engine_relocate_docs(
+            engine,
+            cs("arch").as_ptr(),
+            cs("arc2").as_ptr(),
+            cs(r#"["a","ghost"]"#).as_ptr(),
+        )
+    });
+    assert!(rep.contains("\"a\"") && rep.contains("ghost"), "report: {rep}");
+    assert!(rep.contains("moved") && rep.contains("missing"), "shape: {rep}");
+
+    // source drained, dest readable
+    let gone = unsafe { hk_engine_get(engine, cs("arch").as_ptr(), cs("a").as_ptr()) };
+    assert!(gone.is_null(), "source must be drained");
+    let back = unsafe { hk_engine_get(engine, cs("arc2").as_ptr(), cs("a").as_ptr()) };
+    assert!(!back.is_null(), "dest must hold relocated doc");
+    unsafe { hk_doc_free(back) };
+
+    // load is a touch (always Ok); only unload refuses non-lazy (wiring check)
+    assert_eq!(
+        unsafe { hk_engine_load_collection(engine, cs("arc2").as_ptr()) },
+        0,
+        "load touch"
+    );
+    assert_eq!(
+        unsafe { hk_engine_unload_collection(engine, cs("arc2").as_ptr()) },
+        -1,
+        "unload non-lazy"
+    );
+    // nothing lazy here: unloaded list is empty
+    assert_eq!(
+        read_cstr(unsafe { hk_engine_unloaded_collections(engine) }),
+        "[]",
+        "unloaded list"
+    );
 
     unsafe {
         hk_engine_free(engine);
