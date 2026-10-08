@@ -421,6 +421,12 @@ pub struct Hako {
     /// that exists-but-is-backfilling otherwise serves partial results
     /// with no signal at all.
     pub(crate) backfill_inflight: Arc<std::sync::atomic::AtomicUsize>,
+    /// Collections whose RAM index was (re)built by a touch/load AFTER
+    /// open, newer than any snapshot import. Recovery import skips them
+    /// (import-then-touch and touch-then-import converge identically;
+    /// without this the late import clobbers fresh fills with stale
+    /// snapshot state — a load-bearing race on every lazy touch).
+    index_touched: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Per-collection lazy-load backfill progress (done, total). Present
     /// only while a `start_collection_load` thread runs; removed on
     /// completion or unload-abort. Poll via `collection_load_progress`.
@@ -755,6 +761,7 @@ impl Hako {
             index_inflight,
             backfill_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             backfill_progress: Arc::new(Mutex::new(HashMap::new())),
+            index_touched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             blob_tx: btx.clone(),
             audit_data,
             system_stop: Mutex::new(Some(system_stop_tx)),
@@ -780,6 +787,7 @@ impl Hako {
         let persist_ptr = Arc::clone(&db.index_storage);
         let config_thread = config.clone();
         let backfill_ptr = Arc::clone(&db.backfill_inflight);
+        let index_touched_ptr = Arc::clone(&db.index_touched);
         
         // Capture the new Crossbeam Sender
         let blob_tx_thread = db.blob_tx.clone(); 
@@ -800,7 +808,12 @@ impl Hako {
             if snapshot_path.exists() {
                 if let Ok(bytes) = std::fs::read(&snapshot_path) {
                     let mut mgr = indexes_ptr.write().unwrap();
-                    if let Ok((restored, tails)) = mgr.import_state(&bytes) {
+                    // Collections touched after open are newer than any
+                    // snapshot — leave their entries alone (both orders
+                    // converge; otherwise a late import clobbers fresh
+                    // fills with stale state).
+                    let skip = index_touched_ptr.lock().map(|g| g.clone()).unwrap_or_default();
+                    if let Ok((restored, tails)) = mgr.import_state(&bytes, &skip) {
                         snapshot_loaded = true;
                         composite_restored = restored;
                         snap_tails = tails;
@@ -1048,6 +1061,7 @@ impl Hako {
             Arc::clone(&self.backfill_inflight),
             Arc::clone(&self.shards),
             Arc::clone(&self.backfill_progress),
+            Arc::clone(&self.index_touched),
             collection.to_string(),
             shard_arc.clone(),
         );
@@ -1090,12 +1104,18 @@ impl Hako {
         backfill_count: Arc<AtomicUsize>,
         shards_map: Arc<RwLock<HashMap<String, Arc<RwLock<StorageEngine>>>>>,
         progress: Arc<Mutex<HashMap<String, (usize, usize)>>>,
+        touched: Arc<Mutex<std::collections::HashSet<String>>>,
         collection: String,
         shard_arc: Arc<RwLock<StorageEngine>>,
     ) {
         backfill_count.fetch_add(1, Ordering::Relaxed);
         thread::spawn(move || {
             let _guard = BackfillGuard { counter: backfill_count };
+            // Mark first: a concurrent recovery import skips marked
+            // collections (same race as the sync touch path).
+            if let Ok(mut t) = touched.lock() {
+                t.insert(collection.clone());
+            }
             let pointers = {
                 let storage = shard_arc.read().unwrap();
                 storage.get_physical_index_snapshot()
@@ -1184,6 +1204,11 @@ impl Hako {
     }
 
     fn backfill_lazy_collection(&self, collection: &str, shard_arc: &Arc<RwLock<StorageEngine>>) {
+        // Mark first: a concurrent recovery import skips marked
+        // collections (its snapshot state is older by construction).
+        if let Ok(mut touched) = self.index_touched.lock() {
+            touched.insert(collection.to_string());
+        }
         if let Ok(storage) = shard_arc.read() {
             // ponytail: same scan-decode-index shape as recovery STEP C
             // (encrypted bytes fail decode and are skipped there too).
@@ -3994,6 +4019,84 @@ mod profile_tests {
             drop(db);
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Early termination (issue #22): unordered bounded queries return
+    /// the scan-order prefix — identical rows to full scan + truncate.
+    #[test]
+    fn early_termination_matches_full_scan() {
+        use crate::query::filter::Operator;
+        use crate::query::query::Query;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("fl-early-{nanos}"));
+        {
+            let mut cfg = HakoConfig::default();
+            cfg.durability_mode = DurabilityMode::Manual;
+            let db = Hako::open(&dir, cfg).expect("open");
+            for i in 0..5_000u32 {
+                let mut d = HakoDoc::default();
+                d.insert("g", Value::Int((i % 10) as i64));
+                db.put_owned("t", &format!("d{i:05}"), d).expect("put");
+            }
+            assert!(db.await_quiescent(std::time::Duration::from_secs(60)));
+        }
+        let mut cfg = HakoConfig::default();
+        cfg.durability_mode = DurabilityMode::Manual;
+        let db = Hako::open(&dir, cfg).expect("open");
+        assert!(db.await_quiescent(std::time::Duration::from_secs(60)));
+        let full: Vec<String> = db
+            .query(Query::new("t").where_filter("g", Operator::Gte, Value::Int(0)).limit(5000))
+            .expect("query")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(full.len() > 100);
+        // Bounded page equals the full-scan prefix (limit and limit+offset).
+        let page: Vec<String> = db
+            .query(Query::new("t").where_filter("g", Operator::Gte, Value::Int(0)).limit(20))
+            .expect("query")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(page, full[..20].to_vec());
+        let page_off: Vec<String> = db
+            .query(
+                Query::new("t")
+                    .where_filter("g", Operator::Gte, Value::Int(0))
+                    .offset(50)
+                    .limit(20),
+            )
+            .expect("query")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(page_off, full[50..70].to_vec());
+        drop(db);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Borrowed secondary backfill inserts the same entries as the
+    /// owned path (unit level; end-to-end covered by the lazy tests).
+    #[test]
+    fn borrowed_backfill_unit() {
+        use crate::index::service::IndexingService;
+        let mut mgr = crate::index::manager::IndexManager::default();
+        mgr.create_secondary_index("c", "kind");
+        let mut d1 = HakoDoc::default();
+        d1.insert("kind", Value::String("x".into()));
+        let mut d2 = HakoDoc::default();
+        d2.insert("kind", Value::String("y".into()));
+        let docs = vec![
+            ("a1".to_string(), d1.encode_buffered()),
+            ("a2".to_string(), d2.encode_buffered()),
+        ];
+        assert!(IndexingService::backfill_secondary_borrowed(&mut mgr, "c", &docs));
+        let enc = crate::index::index_key::encode_scalar(&Value::String("x".into()));
+        let hits = mgr.lookup_secondary("c", "kind", &enc).unwrap_or_default();
+        assert_eq!(hits.len(), 1);
     }
 
     /// Relocate refuses every sync-excluded side (config, builtin,

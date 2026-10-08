@@ -55,6 +55,26 @@ impl CompositeIndexManager {
         self.next_id = self.next_id.max(next_id);
     }
 
+    /// Filtered import: trees for skipped collections (rebuilt newer by
+    /// a touch/load) are left alone. Same definition-match rule as above.
+    pub(crate) fn import_snapshot_filtered(
+        &mut self,
+        trees: HashMap<u32, CompositeIndex>,
+        next_id: u32,
+        skip: &std::collections::HashSet<String>,
+    ) {
+        for (id, index) in trees {
+            if let Some(existing) = self.by_id.get(&id) {
+                if existing.definition == index.definition
+                    && !skip.contains(&existing.definition.collection)
+                {
+                    self.by_id.insert(id, index);
+                }
+            }
+        }
+        self.next_id = self.next_id.max(next_id);
+    }
+
     pub fn create_index(&mut self, mut definition: CompositeIndexDefinition) -> u32 {
         self.next_id += 1;
         definition.id = self.next_id;
