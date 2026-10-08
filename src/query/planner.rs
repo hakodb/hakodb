@@ -247,11 +247,21 @@ impl QueryPlanner {
         }
 
         // 6. PRIORITY 6: Simple Secondary Index (Equality)
+        // ponytail: probe posting sizes, ride the smallest. The old code
+        // took the FIRST Eq filter's posting, so filter ORDER decided cost
+        // (30x measured hot-first vs rare-first on 20k rows, 634ms vs
+        // 21ms). One BTree get per candidate is O(log n); ties keep the
+        // first filter (same plan as before). Single-Eq is unchanged.
+        // No sweep fallback: measured index wins even at 90% selectivity
+        // unbounded (454ms vs 802ms) — the premise in #22 was wrong.
         if use_index_heuristic {
-            for filter in &query.filters {
+            // (posting_len, filter_idx, encoded value) — index, not &Filter,
+            // so the build below stays a plain move.
+            let mut best: Option<(usize, usize, Vec<u8>)> = None;
+            for (fi, filter) in query.filters.iter().enumerate() {
                 if matches!(filter.op, Operator::Eq) {
                     if let Some(sec_map) = indexes.secondary.get(&query.collection) {
-                        if sec_map.contains_key(&filter.field) {
+                        if let Some(sec) = sec_map.get(&filter.field) {
                             // Ambiguous-class values (numeric strings AND
                             // bare Int/Float: the stored side may encode
                             // the number differently) take the alternatives
@@ -285,7 +295,16 @@ impl QueryPlanner {
                                 continue;
                             }
                             let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
-                                
+                            let len = sec.get_map().get(&val_bytes).map(|s| s.len()).unwrap_or(0);
+                            if best.as_ref().map_or(true, |(l, _, _)| len < *l) {
+                                best = Some((len, fi, val_bytes));
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((_, fi, val_bytes)) = best {
+                let filter = &query.filters[fi];
                                 // CRITICAL FIX: Mark filters satisfied if this is the ONLY filter
                                 let filters_satisfied = query.filters.len() == 1 && query.or_groups.is_empty();
                                 // ponytail: no limit pushdown under ORDER BY — the
@@ -304,9 +323,6 @@ impl QueryPlanner {
                                     false, 
                                     filters_satisfied
                                 );
-                        }
-                    }
-                }
             }
         }
 
