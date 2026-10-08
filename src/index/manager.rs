@@ -231,13 +231,15 @@ impl IndexManager {
     //     self.fts = fts;
     //     Ok(())
     // }
-     pub fn import_state(&mut self, bytes: &[u8]) -> Result<(bool, Option<WalTails>), HakoError> {
+     pub fn import_state(&mut self, bytes: &[u8], skip: &std::collections::HashSet<String>) -> Result<(bool, Option<WalTails>), HakoError> {
         // Returns (composite trees came from the snapshot, WAL tails or
         // None when the file predates them). Four-element files are
         // current; three-element restore everything but report no tails
         // (caller rescans — one-time upgrade cost); legacy two-element
         // files restore secondary/fts and backfill composites from data.
-        // Completely unreadable files Err: the caller rebuilds from scan.
+        // Collections in `skip` were (re)built by a touch/load after
+        // open — newer than any snapshot — so their entries are left
+        // alone (both orders converge identically this way).
         type Trees = HashMap<u32, crate::index::composite::composite_index::CompositeIndex>;
         if let Ok((sec, fts, (trees, next_id), tails)) = bincode::deserialize::<(
             HashMap<String, HashMap<String, crate::index::secondary_index::SecondaryIndex>>,
@@ -246,9 +248,9 @@ impl IndexManager {
             WalTails,
         )>(bytes)
         {
-            Self::merge_maps(&mut self.secondary, sec);
-            Self::merge_maps(&mut self.fts, fts);
-            self.composite.import_snapshot(trees, next_id);
+            Self::merge_maps_skipping(&mut self.secondary, sec, skip);
+            Self::merge_maps_skipping(&mut self.fts, fts, skip);
+            self.composite.import_snapshot_filtered(trees, next_id, skip);
             return Ok((true, Some(tails)));
         }
         if let Ok((sec, fts, (trees, next_id))) = bincode::deserialize::<(
@@ -257,9 +259,9 @@ impl IndexManager {
             (Trees, u32),
         )>(bytes)
         {
-            Self::merge_maps(&mut self.secondary, sec);
-            Self::merge_maps(&mut self.fts, fts);
-            self.composite.import_snapshot(trees, next_id);
+            Self::merge_maps_skipping(&mut self.secondary, sec, skip);
+            Self::merge_maps_skipping(&mut self.fts, fts, skip);
+            self.composite.import_snapshot_filtered(trees, next_id, skip);
             return Ok((true, None));
         }
         let (sec, fts): (
@@ -267,9 +269,30 @@ impl IndexManager {
             HashMap<String, HashMap<String, crate::index::inverted_index::InvertedIndex>>,
         ) = bincode::deserialize(bytes)
             .map_err(|e| HakoError::Corrupt(format!("Index import failed: {}", e)))?;
-        Self::merge_maps(&mut self.secondary, sec);
-        Self::merge_maps(&mut self.fts, fts);
+        Self::merge_maps_skipping(&mut self.secondary, sec, skip);
+        Self::merge_maps_skipping(&mut self.fts, fts, skip);
         Ok((false, None))
+    }
+
+    fn merge_maps_skipping<K, V>(
+        into: &mut HashMap<String, HashMap<K, V>>,
+        from: HashMap<String, HashMap<K, V>>,
+        skip: &std::collections::HashSet<String>,
+    )
+    where
+        K: std::hash::Hash + Eq,
+    {
+        for (col, fields) in from {
+            if skip.contains(&col) {
+                continue;
+            }
+            let col_map = into.entry(col).or_default();
+            for (field, index) in fields {
+                if let Some(existing_index) = col_map.get_mut(&field) {
+                    *existing_index = index;
+                }
+            }
+        }
     }
 
     fn merge_maps<K, V>(into: &mut HashMap<String, HashMap<K, V>>, from: HashMap<String, HashMap<K, V>>)
@@ -331,7 +354,7 @@ mod tests {
                     ("nim".to_string(), SortDirection::Asc),
                 ]),
         );
-        assert!(m2.import_state(&bytes).expect("import").0);
+        assert!(m2.import_state(&bytes, &std::collections::HashSet::new()).expect("import").0);
         // Trees restored verbatim: point probe finds both rows.
         let ids = m2
             .composite
@@ -360,7 +383,7 @@ mod tests {
                     ("nim".to_string(), SortDirection::Asc),
                 ]),
         );
-        assert!(!m2.import_state(&legacy).expect("legacy import").0);
+        assert!(!m2.import_state(&legacy, &std::collections::HashSet::new()).expect("legacy import").0);
         // Secondary restored, composite untouched (empty, awaiting backfill).
         assert!(m2.secondary.get("students").is_some_and(|mm| mm.contains_key("nim")));
         assert!(m2
@@ -384,7 +407,7 @@ mod tests {
             CompositeIndexDefinition::new("students")
                 .with_fields(vec![("passw".to_string(), SortDirection::Asc)]),
         );
-        assert!(m2.import_state(&bytes).expect("import").0);
+        assert!(m2.import_state(&bytes, &std::collections::HashSet::new()).expect("import").0);
         assert!(m2
             .composite
             .exact_match_doc_ids(
@@ -402,7 +425,7 @@ mod tests {
         tails.insert("students".to_string(), (1234, 5678));
         let bytes = m.export_state_with_tails(&tails).expect("export");
         let mut m2 = IndexManager::default();
-        let (restored, got) = m2.import_state(&bytes).expect("import");
+        let (restored, got) = m2.import_state(&bytes, &std::collections::HashSet::new()).expect("import");
         assert!(restored);
         assert_eq!(got.expect("tails").get("students"), Some(&(1234, 5678)));
         assert!(m2.has_collection("students"));
@@ -416,7 +439,24 @@ mod tests {
         // Legacy three-element files report no tails (caller rescans).
         let legacy3 = m.export_state().expect("export");
         let mut m3 = IndexManager::default();
-        let (_, tails3) = m3.import_state(&legacy3).expect("import");
+        let (_, tails3) = m3.import_state(&legacy3, &std::collections::HashSet::new()).expect("import");
         assert!(tails3.is_none());
+    }
+
+    #[test]
+    fn import_skips_touched_collections() {
+        let m = manager_with_entries();
+        let bytes = m.export_state().expect("export");
+        let mut skip = std::collections::HashSet::new();
+        skip.insert("students".to_string());
+        let mut m2 = IndexManager::default();
+        m2.create_secondary_index("students", "nim");
+        let (restored, _) = m2.import_state(&bytes, &skip).expect("import");
+        assert!(restored);
+        // Untouched families still merge; skipped collection stays empty.
+        assert!(m2
+            .secondary
+            .get("students")
+            .is_some_and(|mm| mm.values().all(|idx| idx.get_map().is_empty())));
     }
 }

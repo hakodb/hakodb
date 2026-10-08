@@ -236,6 +236,19 @@ impl ParallelQueryExecutor {
             return self.execute_topn(storage_arc, &plan, keys_from_index);
         }
 
+        // --- EARLY TERMINATION (issue #22): unordered (or order-satisfied)
+        // scans with bounded need stop at the page. Output-identical to
+        // full scan + truncate (scan-order prefix); cursor-bounded shapes
+        // keep the legacy full path (post-filters could drop rows).
+        let early_need: Option<usize> = match (
+            plan.limit,
+            plan.order_by.is_empty() || plan.order_by_satisfied,
+            plan.has_cursor_bounds,
+        ) {
+            (Some(l), true, false) => Some(l + plan.offset.unwrap_or(0)),
+            _ => None,
+        };
+
         // --- THE FAST PATH: satisfied scans skip the heavy machinery ---
         // Bypasses physical sorting, String re-clones, rayon dispatch, and
         // HashMap recreation overhead. Small queries always qualify
@@ -280,6 +293,13 @@ impl ParallelQueryExecutor {
                         if let Ok(Some(bytes)) = storage_guard.read_pointer(&other) {
                             push_row(id, &bytes, &mut results);
                         }
+                    }
+                }
+                // Early termination: the page is full (see above for why
+                // the prefix is output-identical).
+                if let Some(need) = early_need {
+                    if results.len() >= need {
+                        break;
                     }
                 }
             }
@@ -356,12 +376,40 @@ impl ParallelQueryExecutor {
             _ => 0,
         });
 
-        let docs_to_fetch: Vec<(String, Pointer)> = work_items
+        let mut docs_to_fetch: Vec<(String, Pointer)> = work_items
             .iter()
             .map(|(_, k, p)| (k.clone(), p.clone()))
             .collect();
 
+        // Early-termination probe (issue #22): unordered (or order-
+        // satisfied), bounded need, no cursor bounds → scan the first
+        // PROBE_ROWS sequentially. A full page here skips the parallel
+        // machinery below entirely; otherwise the remainder proceeds
+        // normally and merges in scan order. Output-identical either
+        // way (scan-order prefix); bounded regret when sparse (one
+        // sequential probe window, then full parallelism as today).
+        const PROBE_ROWS: usize = 2000;
+        let mut probe_results: Vec<(String, HakoDoc)> = Vec::new();
+        if let Some(need) = early_need {
+            if need < docs_to_fetch.len() {
+                let probe_len = PROBE_ROWS.min(docs_to_fetch.len());
+                let probe_rows: Vec<(String, Pointer)> =
+                    docs_to_fetch.drain(..probe_len).collect();
+                probe_results = run_task(QueryTask {
+                    docs: probe_rows,
+                    plan: plan.clone(),
+                    storage: Some(storage_arc.clone()),
+                });
+            }
+        }
+
         // 4. PHASE 4: ADAPTIVE WORKER DISPATCH
+        // Probe already full: drop the remainder, the page is complete.
+        if let Some(need) = early_need {
+            if probe_results.len() >= need {
+                docs_to_fetch.clear();
+            }
+        }
         let doc_count = docs_to_fetch.len();
 
         // Decide how many workers to use based on result set density
@@ -417,6 +465,14 @@ impl ParallelQueryExecutor {
                 .map(|(_, k, d)| (k, d))
                 .collect()
         };
+
+        // Probe prefix first (scan order), parallel remainder after —
+        // together exactly the scan-order sequence truncation expects.
+        if !probe_results.is_empty() {
+            let mut combined = std::mem::take(&mut probe_results);
+            combined.extend(results);
+            results = combined;
+        }
 
         // 6. PHASE 6: FINAL SORTING & SLICING
         // Manual sort if the Index couldn't satisfy the order_by clause
@@ -875,6 +931,21 @@ impl ParallelQueryExecutor {
             }
             (v, storage.blob_manager.clone())
         };
+        // Early termination for satisfied scans (issue #22): every staged
+        // row matches by construction, so truncating pointers pre-decode
+        // is output-identical. Unordered-or-satisfied only, no cursors
+        // (same rule as the sequential lane).
+        let early_all_match = (plan.order_by.is_empty() || plan.order_by_satisfied)
+            && !plan.has_cursor_bounds;
+        let mut staged = staged;
+        if early_all_match {
+            if let Some(l) = plan.limit {
+                let need = l + plan.offset.unwrap_or(0);
+                if staged.len() > need {
+                    staged.truncate(need);
+                }
+            }
+        }
         let mut results: Vec<(String, HakoDoc)> = staged
             .into_par_iter()
             .filter_map(|(id, bytes)| HakoDoc::decode(&bytes).map(|doc| (id, doc)))
