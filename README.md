@@ -6,165 +6,31 @@ It stores typed JSON-like documents in binary form, runs **fully in-process** li
 
 HakoDB speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
-> **Current status: v0.9.6 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
+> **Current status: v0.12.3 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, **archive collections** (`relocate_docs`, `lazy_collections` with load/unload), a **selectivity-aware planner** (smallest-posting Eq, early sweep termination), and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
 ---
 
-## What's new (0.7.2 → 0.9.6)
+## What's new (latest three — full history in [CHANGELOG](CHANGELOG.md))
 
-### v0.9.6 — composite indexes survive restarts
-- `export_state`/`import_state` now carry composite trees (merge-by-id
-  on matching definitions, allocator max). Before, only secondary/fts
-  persisted, so every restart emptied composites: probes missed and the
-  empty-sweep fallback scanned everything (~38 ms vs ~10 us on 25k docs
-  for the same login-shaped query) with correct results.
-- Legacy two-element snapshot files still load (secondary/fts) and
-  trigger a one-time backfill of registered composites; unreadable files
-  keep the rebuild-from-scan path. Downgrade-safe (old readers ignore
-  trailing bytes). No planner/executor change.
-- Regression suite `tests/composite_persist_restart.rs` (drop + reopen
-  without re-creating) plus export/import round-trip unit tests.
+### v0.12.3 — archive C ABI
+- `hk_engine_relocate_docs(src, dst, ids_json)` → JSON
+  `{moved:[...],missing:[...]}`; `hk_engine_load/unload_collection`
+  (0/−1); `hk_engine_unloaded_collections` (JSON array). Wired the same
+  week into Go, JS, Pascal and the CLI. No behavior change.
 
-### v0.9.5 — cross-type `==` correctness (DHP login fix)
-- Eq fast paths (byte memcmp, single-key secondary trust) no longer
-  reject on byte-miss: undecided filters fall back to the semantic
-  compare (`compare_values` numeric arms), and `Ne` left the byte path
-  entirely (a byte-miss is not a semantic mismatch). Stored-Int vs
-  String-filter (and vice versa) now behaves exactly like the `>=`+`<=`
-  workaround, indexed or not.
-- Planner P6 routes ambiguous-class Eq (Int/Float/numeric-string) to
-  the alternatives union (shared `numeric_alternatives` closure, also
-  used by composite-eq); union scans verify downstream, no limit
-  pushdown there. Executor re-sweeps with verification when an
-  index-trusting scan returns empty on ambiguous values (float textual
-  forms, stale entries) — same-type misses keep index speed.
-- Regression suite `tests/eq_crosstype.rs`: stored×filter type matrix,
-  indexed variants, exact login combo, Ne semantics.
+### v0.12.2 — recovery racefix + early termination + selectivity probe
+- A late recovery import clobbered fresh lazy fills with stale snapshot
+  state — fixed via the `index_touched` set (both orders converge).
+- Unordered bounded sweeps stop at the page (−70% measured); P6 rides
+  the smallest Eq posting (30× filter-order lottery fixed).
+- Box A/B over FFI: multi-Eq hot-first 142 → 2400 qps (~17×);
+  standard gate PASS 14/14, no regression.
 
-### v0.9.4 — adaptive JSON emit + restart-safe versions
-- `HakoDoc::to_json_bytes_auto`: byte-identical either way; walks value
-  tags only (~100-300 ns, early-out) and picks `write_json` below ~512 B
-  single-string runs, serde's SIMD emit above. Duel bench `json_emit`
-  (6 shapes) pins both sides: write_json wins to 5.7x on int-heavy,
-  serde wins 2.8x on 7 KB-HTML docs. FFI `doc_to_json` uses it.
-- `global_version` seeded from wall-clock micros, not 1: restarting no
-  longer reissues small versions that collide with pre-restart ETags
-  held by polling clients (a real 304-stale hole under daily reboots).
-  Same-process uniqueness still comes from `fetch_add`.
-- `util::clock::now_micros`: the `_time`/LWW clock unit in one place.
-
-### v0.9.3 — read-only enforcement + interval observability
-- `Hako::set_read_only/is_read_only`: one guard at the `write_batch`
-  admission gate refuses every local write kind; replicated ingest
-  bypasses it by design, so read-only replicas keep converging. Reads
-  never check the flag. Built for hakocluster replicas + failover.
-- `Hako::group_commit_interval_ms()`: reports the configured window
-  (fleet stagger verification from outside the crate).
-
-### v0.9.2 — single-pass JSON + strict-time intervals
-- `HakoDoc::write_json`: same bytes as `to_json`+serialize at 1.89x
-  (measured, release): no Map/key-String/Value-tree allocs. FFI unified
-  onto it (`doc_to_json` + bulk renderer now carry `_time`, sync-safe;
-  accepted break, no external consumers yet).
-- Custom `group_commit_interval_ms` switches Interval to strict-time
-  (count/size triggers off, clock + 16MB emergency cap only); default 5ms
-  keeps legacy triple-trigger byte-for-byte. Maintenance tick enforces
-  the same window. Tight-loop writes +1.5-2.4x on deferred fsync.
-
-### v0.9.1 — per-target headers, no checked-in header
-- Deleted `include/hakodb.h`: one file pretending to serve all targets
-  caused the stale socket-API incident. `build.rs` now copies the cbindgen
-  output next to the binaries (`target/<...>/hakodb.h`); every release
-  bundle carries the header from the build that produced it, and the flat
-  release `hakodb.h` is the Linux-generated superset. FFI test links
-  per-OS (`hakodb.dll` Windows, `hakodb` elsewhere).
-- No engine changes since 0.9.0.
-
-### v0.9.0 — sync becomes a core (`sync_core` + `socket_sync`)
-- `sync_core`: timestamp decode, echo discipline, send-side blob
-  inflation, and the full replicated ingest (LWW + tombstones + echo +
-  WAL + index + watchers) hoisted out of `net_sync` — one path for all
-  transports. `net_sync` rewired onto it (behavior verbatim); cloud keeps
-  its own batching architecture.
-- `socket_sync` (new, `socket-sync` feature, unix-only): co-located
-  instance sync over unix sockets — length-prefix framing, hello +
-  full-snapshot + 500ms live tail, same LWW/echo rules. Built for a
-  single-writer balancer fleet. FFI: `hk_socket_sync_*`.
-- Fixed along the way: replicated deletes never bumped versions, so
-  `Hako::get` served the tombstoned doc from `doc_cache` forever
-  (stale reads on mesh too, not just socket). Now bumped; covered by a
-  shared-ingest contract test plus a two-engine socket e2e.
-
-### v0.8.29 — cheaper batch path (apply −23%, seed −10%)
-- Apply zips WAL ops with index puts positionally (lockstep push order)
-  instead of building a per-batch key HashMap; hot-cache invalidation
-  skips entirely when the cache is empty; shard-map entry no longer
-  clones the collection key on hit. Server seed: 0.122→0.111s with
-  apply 30→23ms and cache 5.3→0ms (single-fsync variance aside).
-
-### v0.8.28 — zero-clone query fan-out (−20% unindexed scans)
-- Task sharding moves id Strings (`drain`, no `to_vec` re-clone),
-  matched ids move (no `to_string` per row), single-worker queries skip
-  the HashMap order-restoration round-trip (2 hashes/row, only needed
-  for parallel completion order). Server bench-lab: filter-eq
-  0.020→0.015s ×3 runs, all other lanes flat, gate PASS.
-
-### v0.8.27 — FxHash interning (+7–14% decode-heavy queries)
-- Field-name interning pool moves from std `HashMap` (SipHash) to
-  `FxHashMap`: every decoded field paid a SipHash before. hakobench gate
-  A/B on quiet hardware: Qry +7%, Cmp +14%, Off/Cur +10%, Batch +14%,
-  point-get flat (cache-hit, no decode). Zero behavior change.
-
-### v0.8.26 — get fast path (lock-free gates, contention-free populate)
-- `allowed()`: atomic no-rules gate skips the RwLock on every op when no
-  security rules are set (get/query/batch all benefit).
-- `get()`: hot-cache key alloc deferred until a version exists to compare;
-  cache populate uses `try_write` so a contended cache no longer serializes
-  concurrent readers (read hits 8-thread scaling).
-
-### v0.8.25 — TopN heap for unindexed order+limit
-- Unsatisfied `ORDER BY` + `LIMIT` no longer decodes every doc + full sort:
-  key-only scan via views, bounded heap (limit+offset), exact stable-sort
-  parity (scan-seq tiebreak), corrupt-row backfill. ~3-4x on 2000-doc
-  ordered pages; over-fetch and cursor shapes keep the legacy path.
-- Linux release matrix per distro family (glibc floors: EL8/Ubuntu22/
-  Ubuntu24/Arch) + static musl-core (rlib-only) + existing Windows/Android.
-
-### v0.8.24 — ordered limit-pushdown correctness + public Linux matrix
-- Planner no longer pushes scan limits under unsatisfied `ORDER BY`
-  (was wrong TOP-N for direct callers); per-distro Linux release assets.
-
-### v0.8.23 — header rename + query-decode micro-opts
-- C header renamed `hako.h` → `hakodb.h` (guard `HAKODB_H`); release
-  bundles and satellite sync scripts follow the new filename.
-- Query decode paths shed per-row allocs (projection borrow-compare,
-  header-sized output Vec, thread-local match scratch) plus lazy filter
-  key matching and dotted-path pulls (`DocView::get_path`, ~18× vs
-  whole-subtree decode on nested fixtures).
-- `cbindgen.toml` actually loads now (absolute path, valid keys); the
-  generated header is real C with `extern "C"` guards.
-
-### v0.8.22 — pre-rebrand aliases removed
-- `SYNC_EXCLUDED` no longer recognizes the `__firelite_*` spellings;
-  the open-time migration (`__firelite_*` → `__hako_*`) stays as the
-  upgrade path — databases last opened by ≤0.8.20 migrate on first open
-  with 0.8.21+. Leftover orphans from downgrade cycles are ordinary
-  collection names now: remove them manually.
-- Satellite repos renamed dash-less (`hakocli`, `hakocloudserver`,
-  `hakotauri`, `hakobench`, `hakogo`, `hakojs`, `hakopascal`,
-  `hakotaurits`); `hakodb 0.8.21` published to crates.io,
-  `@hakodb/client` + `@hakodb/tauri` to npm.
-
-### v0.8.21 — rebrand to HakoDB
-- Crate `hakodb`, main type `Hako` (`HakoConfig`, `HakoDoc`,
-  `HakoError`), FFI prefix `HK_*`/`hk_*`, header `hakodb.h` (per-target generated),
-  binaries `hakodb.dll` / `libhakodb.so`.
-- Data plane migrates on open: `__firelite_*` directories become their
-  `__hako_*` canonical names with data intact (both-present keeps
-  canonical; old spellings stay sync-excluded as aliases).
-- Fixed along the way: `cbindgen.toml` never loaded (relative path +
-  unknown fields → silent C++ defaults for years); the header is real
-  C now, with `extern "C"` guards for C++ consumers.
+### v0.12.0 — recovery/query perf series + snapshot freshness
+- Bulk replay path (−22% touch), background lazy load with progress,
+  selective decode (−42% wide-doc), hang hardening (10/10 gaming loops
+  clean), v4 snapshot tails with stale-only rescan. (v0.12.1 added
+  borrowed secondary inserts on top.)
 
 ## Table of Contents
 
@@ -581,17 +447,18 @@ HakoDB lives under the [`hakodb`](https://github.com/hakodb) organization
 
 | Repo | Delivers | Version |
 |---|---|---|
-| [`hakodb/hakodb`](https://github.com/hakodb/hakodb) | Core library: engine, storage, query, FFI (`hakodb.h`), net/cloud sync | 0.8.23 |
-| [`hakodb/hakocli`](https://github.com/hakodb/hakocli) | Command-line manager + serve REPL | 0.2.1 |
+| [`hakodb/hakodb`](https://github.com/hakodb/hakodb) | Core library: engine, storage, query, FFI (`hakodb.h`), net/cloud sync | 0.12.3 |
+| [`hakodb/hakocli`](https://github.com/hakodb/hakocli) | Command-line manager + serve REPL | 0.2.4 |
+| [`hakodb/hakocluster`](https://github.com/hakodb/hakocluster) | In-process dispatcher over N instances + socket sync | 0.3.5 |
 | [`hakodb/hakocloudserver`](https://github.com/hakodb/hakocloudserver) | Managed sync hub + admin console | 0.1.1 |
-| [`hakodb/hakotauri`](https://github.com/hakodb/hakotauri) | Tauri gateway crate (Rust) | 0.2.0 |
-| [`hakodb/hakotaurits`](https://github.com/hakodb/hakotaurits) | Tauri client (`@hakodb/tauri`) | 0.2.0 |
+| [`hakodb/hakotauri`](https://github.com/hakodb/hakotauri) | Tauri gateway crate (Rust) | 0.4.2 |
+| [`hakodb/hakotaurits`](https://github.com/hakodb/hakotaurits) | Tauri client (`@hakodb/tauri`) | 0.3.1 |
 | [`hakodb/hakobench`](https://github.com/hakodb/hakobench) | C++ benchmark harnesses + SQLite duel | 0.1.1 |
-| [`hakodb/hakogo`](https://github.com/hakodb/hakogo) | Go SDK (cgo) | 0.1.2 |
-| [`hakodb/hakojs`](https://github.com/hakodb/hakojs) | JS/TS SDK (`@hakodb/client`, Node + Bun) | 0.5.13 |
-| [`hakodb/hakopascal`](https://github.com/hakodb/hakopascal) | Lazarus/FPC wrapper + components | 0.1.1 |
-| [`hakodb/hakobackend`](https://github.com/hakodb/hakobackend) | Universal HTTP backend gateway + plug-and-play DBs | 0.1.0 |
-| [`hakodb/hakobackend-ts`](https://github.com/hakodb/hakobackend-ts) | Backend TS client (`@hakodb/backend`) | 0.1.0 |
+| [`hakodb/hakogo`](https://github.com/hakodb/hakogo) | Go SDK (cgo) | 0.1.3 |
+| [`hakodb/hakojs`](https://github.com/hakodb/hakojs) | JS/TS SDK (`@hakodb/client`, Node + Bun) | 0.5.15 |
+| [`hakodb/hakopascal`](https://github.com/hakodb/hakopascal) | Lazarus/FPC wrapper + components (+ cluster unit) | 0.1.3 |
+| [`hakodb/hakobackend`](https://github.com/hakodb/hakobackend) | Universal HTTP backend gateway + plug-and-play DBs | 0.6.1 |
+| [`hakodb/hakobackend-ts`](https://github.com/hakodb/hakobackend-ts) | Backend TS client (`@hakodb/backend`) | 0.3.1 |
 
 Branches: **`main`** (stable — merged releases only) and **`cloud_sync`**
 (active development). Before v0.8.20 the project was developed privately

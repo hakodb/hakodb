@@ -2,6 +2,94 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.12.3 — archive C ABI
+- `hk_engine_relocate_docs(src, dst, ids_json)` → JSON
+  `{moved:[...],missing:[...]}`; `hk_engine_load/unload_collection`
+  (0/-1); `hk_engine_unloaded_collections` (JSON array). Wired the same
+  week into Go, JS, Pascal and the CLI.
+- cdylib round-trip test `archive_relocate_load_unload_round_trip`
+  (11/11 FFI target green). No behavior change.
+
+### v0.12.2 — racefix + early sweep termination + selectivity probe
+- **Correctness fix (recovery)**: a late recovery import clobbered fresh
+  lazy fills with stale snapshot state (deterministic fast-fail, not a
+  flake). `index_touched` set: import skips touched collections, both
+  orders converge; `clear_collection` keeps registrations.
+- **Early termination** for unordered bounded sweeps (sequential break,
+  parallel probe window): −70% measured on all-match sweep-limit20.
+- **Selectivity probe**: P6 rides the smallest Eq posting instead of the
+  first filter — 30× filter-order lottery fixed (634 ms → 45 ms, 20k
+  rows). Deliberately no sweep fallback: index beats sweep even at 90%
+  selectivity unbounded (454 ms vs 802 ms).
+- Box A/B (hako-backend, FFI, steady-state): multi-Eq hot-first 142 →
+  2400 qps (~17×); standard gate PASS 14/14, no regression.
+
+### v0.12.1 — borrowed secondary inserts
+- `insert_borrowed`: hot values hit the existing BTree entry (no key
+  Vec alloc); doc ids ride an `Arc<str>` shared across every secondary
+  field of the doc. Fuzz-locked (`borrowed_backfill` unit).
+
+### v0.12.0 — recovery/query perf series + snapshot freshness
+- **Replay bulk path** (`update_index_entry_nosort`): −22% touch time.
+- **Background load** (`start_collection_load` + progress) for lazy
+  collections; **selective decode** (indexed fields only): −42% wide-doc
+  backfill.
+- **Hang hardening**: non-blocking blob worker, single-guard resolve,
+  Tx FFI shields; 10/10 gaming loops clean, full matrix no regression.
+- **Snapshot freshness**: v4 WAL tails (data/file len), stale-only
+  rescan, atomic tmp/rename/fsync, crash-sim test.
+- **Gate test**: relocate refuses every sync-excluded side (no laundering).
+
+### v0.11.0 — relocate_docs + lazy_collections
+- `relocate_docs(src, dst, ids)` with moved/missing report; refuses
+  excluded (sync-withheld/local-only) sides.
+- `lazy_collections`: archived groups skipped at recovery until touched
+  (touch-backfill, `load`/`unload_collection`), FS-aware backup, sync
+  gate unified as `is_sync_withheld`.
+- Blob-worker stop latch (hang fix).
+
+### v0.10.1 — build trim
+- Lockfile sync; box `--locked` build verifies.
+
+### v0.10.0 — runtime group-commit setter + CI quick gate
+- Admin-plane setter for gateways; `cargo check` locked all-targets gate.
+
+### v0.9.6 — composite indexes survive restarts
+- `export_state`/`import_state` carry composite trees (merge-by-id);
+  legacy files trigger one-time backfill. `tests/composite_persist_restart.rs`.
+
+### v0.9.5 — cross-type `==` correctness
+- Byte/index fast paths fall back to semantic compare on undecided;
+  ambiguous-class Eq routes to the alternatives union.
+  `tests/eq_crosstype.rs`.
+
+### v0.9.4 — adaptive JSON emit + restart-safe versions
+- `to_json_bytes_auto` (write_json vs serde by size); `global_version`
+  seeded from wall-clock (no ETag collisions across reboots).
+
+### v0.9.3 — read-only enforcement + interval observability
+- `set_read_only` gate at `write_batch` admission (replicas still
+  converge); lock-wait instrumentation.
+
+### v0.9.2 — single-pass JSON + strict-time intervals
+- `write_json` (1.89×) with byte-parity tests; count/size triggers off,
+  tick interval-aware; `explain()` API + index_routing probe.
+
+### v0.9.1 — per-target headers, portable FFI test
+- No checked-in header (per-target `target/<...>/hakodb.h`); MSVC
+  import-lib naming; MinGW stale-shadow delete.
+
+### v0.9.0 — sync becomes a core (`sync_core` + `socket_sync`)
+- Fase A+B: WAL-tail replication core + co-located socket sync lane.
+
+### v0.8.22 – v0.8.29 — query/decode micro-opts + hardening
+- v0.8.29 cheaper batch path (apply −23%, seed −10%); v0.8.28 zero-clone
+  query fan-out (−20% unindexed scans); v0.8.27 FxHash interning (+7–14%
+  decode-heavy); v0.8.26 get fast path (lock-free gates); v0.8.25 TopN
+  heap for unindexed order+limit; v0.8.24 ordered limit-pushdown
+  correctness + public Linux matrix; v0.8.23 header rename +
+  query-decode micro-opts; v0.8.22 pre-rebrand alias removal.
+
 ### v0.8.21 — rebrand to HakoDB
 - Crate `hakodb`, main type `Hako` (`HakoConfig`, `HakoDoc`,
   `HakoError`), FFI prefix `HK_*`/`hk_*`, header `include/hako.h`,
