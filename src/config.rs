@@ -42,10 +42,14 @@ pub struct HakoConfig {
 pub value_blob_threshold_bytes: usize,
 pub replication_collections: Option<Vec<String>>,
 /// WAL headroom reservation in bytes (default 4MB since v0.8.18).
-/// When set, preallocated ahead of the write position so steady-state
-/// appends never extend the file (fewer tiny extensions => less
-/// fragmentation => cheaper per-commit fsync on durable modes). Sparse:
-/// consumes no disk until written. Measured: no delta on fast local
+/// Honored by Always/OnCommit only: preallocated ahead of the write position
+/// so steady-state appends never extend the file (fewer tiny extensions =>
+/// less fragmentation => cheaper per-commit fsync on durable modes).
+/// Interval (batched, rare syncs) and Manual (never syncs mid-session) skip
+/// it — their files grow exactly with the data, no phantom size. Sparse:
+/// consumes no disk until written on filesystems with sparse-file support
+/// (ext4/xfs/APFS); NTFS allocates set_len extensions as real clusters, so
+/// keep the knob small there. Measured: no delta on fast local
 /// disks (v0.7.12 A/B), but decisive on cloud disks with slow
 /// file-growth metadata — Codespace Always singles went 1417us to
 /// 855us wal phase with 16MB reserved, and 2MB performs identically
@@ -57,7 +61,7 @@ pub replication_collections: Option<Vec<String>>,
 /// --no-maintenance, 3 runs/arm): no reserve delta locally, consistent
 /// with v0.7.12 — the Codespace figures above are cloud-disk-specific
 /// (and predate the flush fix, so were measured at 2x WAL bytes).
-/// Ignored for Manual.
+/// Ignored for Interval/Manual.
 pub wal_reserve_bytes: u64,
 /// Background maintenance (5s system tick: checkpoint, compaction,
 /// tombstone purge, index snapshots). Disable for deterministic
