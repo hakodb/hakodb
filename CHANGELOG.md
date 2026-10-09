@@ -2,6 +2,18 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.12.4 — WAL reserve ratchet fix (insiden-hako-wal-20261009)
+- **Root cause**: `Wal::open` grew every `wal.log` by `wal_reserve_bytes`
+  on EVERY open (vacuous `len < end + reserve` guard) — consumer DB hit
+  ~1GB of zero padding (exact 4MB multiples per collection) with near-zero
+  real data. Reservation now tops up once for fresh/tiny files only.
+- **Interval follows data**: headroom is honored by Always/OnCommit only
+  (per-commit fsync is where it pays); Interval/Manual files grow exactly
+  with real bytes, and compact/rewrite leaves them data-sized. No measured
+  Interval benefit to lose (local A/B: no delta).
+- NTFS note: `set_len` extensions allocate real clusters there (sparse
+  claim in docs corrected). No contract change; full suite green.
+
 ### v0.12.3 — archive C ABI
 - `hk_engine_relocate_docs(src, dst, ids_json)` → JSON
   `{moved:[...],missing:[...]}`; `hk_engine_load/unload_collection`
