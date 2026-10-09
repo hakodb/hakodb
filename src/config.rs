@@ -45,7 +45,9 @@ pub replication_collections: Option<Vec<String>>,
 /// When set, preallocated ahead of the write position so steady-state
 /// appends never extend the file (fewer tiny extensions => less
 /// fragmentation => cheaper per-commit fsync on durable modes). Sparse:
-/// consumes no disk until written. Measured: no delta on fast local
+/// consumes no disk until written on filesystems with sparse-file support
+/// (ext4/xfs/APFS); NTFS allocates set_len extensions as real clusters, so
+/// keep the knob small there. Measured: no delta on fast local
 /// disks (v0.7.12 A/B), but decisive on cloud disks with slow
 /// file-growth metadata — Codespace Always singles went 1417us to
 /// 855us wal phase with 16MB reserved, and 2MB performs identically

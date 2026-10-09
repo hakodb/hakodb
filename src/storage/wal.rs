@@ -93,22 +93,26 @@ impl Wal {
         .write(true)
         .open(path)?;
 
-        // ponytail: keep `reserve_bytes` of headroom ahead of the write
-        // position so steady-state appends never extend the file. Thousands
-        // of 1KB extensions fragment the file and inflate every fsync (which
-        // must flush file metadata too). One reservation per open amortizes
-        // it. 0 disables. The config default also skips Manual (never
-        // syncs mid-session — reserving there only inflates apparent size).
-        // The zero padding is replay-safe: record headers are never
-        // all-zero (every op encodes to >= 1 byte), so readers treat an
-        // all-zero header as clean end-of-records and never truncate the
-        // reservation (see replay()/tail()).
-        // Writer position stays at the end of REAL data, never inside the
-        // padding — otherwise replay would stop early and lose records.
+        // ponytail: reserve headroom ONLY for fresh/tiny files (top-up to
+        // one reserve, never stack). `end == len` always here, so the old
+        // `len < end + reserve` condition was vacuously true and grew the
+        // file by `reserve_bytes` on EVERY open — exact 4MB multiples per
+        // launch in the wild (insiden-hako-wal-20261009: 14 collections x
+        // ~21 launches = ~1GB of zero padding; NTFS allocates set_len
+        // extensions as real clusters, so it cost real disk, not just
+        // apparent size). Existing files already carry padding from their
+        // first reservation; replay repositions the writer at end-of-real-
+        // data so appends reuse it without extending the file. The zero
+        // padding stays replay-safe: record headers are never all-zero
+        // (every op encodes to >= 1 byte), so readers treat an all-zero
+        // header as clean end-of-records (see replay()/tail()).
         let end = file.seek(SeekFrom::End(0))?;
         // Skipped for Manual regardless of the knob (never fsyncs).
-        if mode != DurabilityMode::Manual && reserve_bytes > 0 && file.metadata()?.len() < end.saturating_add(reserve_bytes) {
-            let _ = file.set_len(end.saturating_add(reserve_bytes));
+        if mode != DurabilityMode::Manual
+            && reserve_bytes > 0
+            && file.metadata()?.len() < reserve_bytes
+        {
+            let _ = file.set_len(reserve_bytes);
         }
         file.seek(SeekFrom::Start(end))?;
 
@@ -877,6 +881,32 @@ mod tests {
     use crate::config::DurabilityMode;
 
     use super::{Wal, WalOp};
+
+    #[test]
+    fn reserve_does_not_stack_across_opens() {
+        // Regression test (insiden-hako-wal-20261009): the open-time
+        // reservation used to add `reserve_bytes` on EVERY open (the
+        // `len < end + reserve` guard was vacuously true since end == len),
+        // so each app launch grew every collection wal.log by 4MB of zeros.
+        let path = std::env::temp_dir().join(format!(
+            "hako-wal-reserve-{}.log",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let reserve: u64 = 4 * 1024 * 1024;
+
+        for _ in 0..3 {
+            let wal = Wal::open(&path, DurabilityMode::Interval, 2, None, reserve)
+                .expect("open");
+            drop(wal);
+        }
+        let len = fs::metadata(&path).expect("meta").len();
+        assert_eq!(len, reserve, "reservation must top-up once, not stack per open");
+
+        fs::remove_file(path).expect("cleanup");
+    }
 
     #[test]
     fn replay_ignores_uncommitted_transaction() {
