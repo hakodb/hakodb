@@ -78,6 +78,18 @@ fn is_zero_header(header: &[u8; 8]) -> bool {
     header.iter().all(|&b| b == 0)
 }
 
+/// Modes whose sync pattern benefits from WAL headroom: fsync happens per
+/// commit, so avoiding file-growth metadata on the hot path pays off.
+/// Interval (batched, rare syncs) and Manual (no mid-session sync) grow
+/// the file with the data instead — no phantom size.
+#[inline]
+fn reserves_for_mode(mode: DurabilityMode) -> bool {
+    matches!(
+        mode,
+        DurabilityMode::Always | DurabilityMode::OnCommit
+    )
+}
+
 impl Wal {
     pub fn open(
         path: impl AsRef<Path>,
@@ -107,8 +119,11 @@ impl Wal {
         // (every op encodes to >= 1 byte), so readers treat an all-zero
         // header as clean end-of-records (see replay()/tail()).
         let end = file.seek(SeekFrom::End(0))?;
-        // Skipped for Manual regardless of the knob (never fsyncs).
-        if mode != DurabilityMode::Manual
+        // Only Always/OnCommit reserve (see reserves_for_mode): the headroom
+        // amortizes per-commit fsync metadata. Interval batches + rarely
+        // syncs and Manual never syncs mid-session, so for them the file
+        // grows with the data — reserving there only inflates apparent size.
+        if reserves_for_mode(mode)
             && reserve_bytes > 0
             && file.metadata()?.len() < reserve_bytes
         {
@@ -520,9 +535,9 @@ impl Wal {
         self.file.set_len(0)?;
         // ponytail: re-reserve headroom after the wipe (see open()) —
         // metadata-only, so post-checkpoint appends don't regrow 1KB at a
-        // time. Skipped for Manual (never fsyncs; reservation would only
-        // inflate apparent DB size). Position stays at 0 where records begin.
-        if self.mode != DurabilityMode::Manual && self.reserve_bytes > 0 {
+        // time. Skipped unless the mode reserves (Interval/Manual files stay
+        // exactly data-sized after compact/rewrite). Position stays at 0.
+        if reserves_for_mode(self.mode) && self.reserve_bytes > 0 {
             let _ = self.file.set_len(self.reserve_bytes);
         }
         self.file.seek(SeekFrom::Start(0))?;
@@ -888,22 +903,32 @@ mod tests {
         // reservation used to add `reserve_bytes` on EVERY open (the
         // `len < end + reserve` guard was vacuously true since end == len),
         // so each app launch grew every collection wal.log by 4MB of zeros.
-        let path = std::env::temp_dir().join(format!(
-            "hako-wal-reserve-{}.log",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        // Always still tops up once; Interval never reserves (size follows
+        // data) — both stable across reopens.
         let reserve: u64 = 4 * 1024 * 1024;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
 
+        let path = std::env::temp_dir().join(format!("hako-wal-reserve-{stamp}.log"));
+        for _ in 0..3 {
+            let wal = Wal::open(&path, DurabilityMode::Always, 2, None, reserve)
+                .expect("open");
+            drop(wal);
+        }
+        let len = fs::metadata(&path).expect("meta").len();
+        assert_eq!(len, reserve, "reservation must top-up once, not stack per open");
+        fs::remove_file(&path).expect("cleanup");
+
+        let path = std::env::temp_dir().join(format!("hako-wal-noreserve-{stamp}.log"));
         for _ in 0..3 {
             let wal = Wal::open(&path, DurabilityMode::Interval, 2, None, reserve)
                 .expect("open");
             drop(wal);
         }
         let len = fs::metadata(&path).expect("meta").len();
-        assert_eq!(len, reserve, "reservation must top-up once, not stack per open");
+        assert_eq!(len, 0, "Interval must not reserve: {len}");
 
         fs::remove_file(path).expect("cleanup");
     }
