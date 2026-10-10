@@ -80,6 +80,12 @@ impl IndexingService {
         if manager.fts.contains_key(collection) {
             return false;
         }
+        // Vector defs need the owned path too: embeddings decode through
+        // index_document's HNSW hook, which the byte-level path below
+        // never touches.
+        if manager.vector.contains_key(collection) {
+            return false;
+        }
         if manager
             .composite
             .all_indexes()
