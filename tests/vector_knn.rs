@@ -34,11 +34,13 @@ fn vdoc(emb: &[f32], grp: &str) -> HakoDoc {
 
 /// Recovery runs on a background thread and flips `indexes_ready` when
 /// done; until then the planner fail-closes to FullCollection (same rule
-/// as FTS). Every test waits past that window before asserting.
+/// as FTS). Index creation backfills HNSW on a second background thread
+/// (covered by `index_backfills`). Every test waits past both windows
+/// before asserting.
 fn wait_ready(db: &Hako) {
     let t0 = std::time::Instant::now();
     loop {
-        if db.is_indexes_ready() {
+        if db.is_indexes_ready() && db.quiescence_status().index_backfills == 0 {
             return;
         }
         assert!(

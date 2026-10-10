@@ -1612,21 +1612,56 @@ impl ParallelQueryExecutor {
             }
 
             ScanType::VectorKnn { field, query, metric, extra } => {
-                // P0 exact: score every live doc, full sort nearest-first
-                // (n log n — P1 HNSW replaces the scan, not the contract).
-                // `extra` (non-Near filters) verifies HERE: the plan is
-                // marked satisfied so downstream never re-verifies, and the
-                // scan takes no filter list. Ties break on doc id so KNN
-                // paging is deterministic across runs.
+                // P1: ANN prunes, exact rescores. Candidates come from a
+                // COMPLETE, non-empty HNSW graph when one exists; otherwise
+                // every live key (P0 exact path). Either way each candidate
+                // is liveness-checked, filter-verified, and EXACT-rescored
+                // below — ANN can only drop rows, never invent them, and
+                // the rescore keeps surviving rows in exact order. Ties
+                // break on doc id so KNN paging stays deterministic.
+                // Hybrid (extra filters) always brute-forces: ANN ranks
+                // unfiltered, so post-filtering its top-ef could strand
+                // matches it never surfaced — no ef multiplier can promise
+                // otherwise. Pure KNN keeps the speedup.
                 use crate::index::vector::{decode_f32s, distance};
                 use crate::query::filter::compare_values;
                 let qv = decode_f32s(query).unwrap_or_default();
+                let ef = max_ids.saturating_mul(4).clamp(64, 10_000);
+                let use_ann = extra.is_empty();
+                let cand_ids: Option<Vec<String>> = indexes
+                    .hnsw
+                    .get(collection)
+                    .and_then(|m| m.get(field))
+                    .filter(|g| use_ann && g.complete() && !g.is_empty())
+                    .map(|g| {
+                        g.search(&qv, ef)
+                            .iter()
+                            .map(|(_, idx)| g.id_of(*idx).to_string())
+                            .collect()
+                    });
+                let pairs: Vec<(String, Pointer)> = match &cand_ids {
+                    Some(ids) => ids
+                        .iter()
+                        .filter_map(|id| {
+                            storage.index.get(id.as_str()).and_then(|ptr| {
+                                if matches!(ptr, Pointer::Deleted { .. }) {
+                                    None
+                                } else {
+                                    Some((id.clone(), ptr.clone()))
+                                }
+                            })
+                        })
+                        .collect(),
+                    None => storage
+                        .index
+                        .iter()
+                        .filter(|(_, p)| !matches!(p, Pointer::Deleted { .. }))
+                        .map(|(k, p)| (k.clone(), p.clone()))
+                        .collect(),
+                };
                 let mut scored: Vec<(f64, String, Pointer)> = Vec::new();
-                for (key, ptr) in storage.index.iter() {
-                    if matches!(ptr, Pointer::Deleted { .. }) {
-                        continue;
-                    }
-                    let bytes = match storage.read_pointer(ptr) {
+                for (key, ptr) in pairs {
+                    let bytes = match storage.read_pointer(&ptr) {
                         Ok(Some(b)) => b,
                         _ => continue,
                     };

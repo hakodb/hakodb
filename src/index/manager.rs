@@ -7,7 +7,7 @@ use std::sync::Arc;
 use super::composite::definition::CompositeIndexDefinition;
 use super::composite::manager::CompositeIndexManager;
 use super::inverted_index::InvertedIndex;
-use super::vector::{validate_dim, Metric, VectorDef};
+use super::vector::{decode_f32s, validate_dim, HnswIndex, Metric, VectorDef};
 use crate::index::composite::composite_index::CompositeIndex;
 use crate::index::secondary_index::SecondaryIndex;
 
@@ -22,6 +22,10 @@ pub struct IndexManager {
     /// (the exact scan needs dim/metric, no RAM structure); P1's HNSW
     /// hangs off this same registry.
     pub vector: HashMap<String, HashMap<String, VectorDef>>,
+    /// P1 HNSW graphs, keyed identically to `vector`. Derived state:
+    /// never snapshotted (rebuilt from docs on open/create); `complete`
+    /// tells the executor whether ANN may run or exact must.
+    pub hnsw: HashMap<String, HashMap<String, HnswIndex>>,
 }
 
 /// WAL tails at snapshot time, per collection: (wal data_len, wal
@@ -53,6 +57,49 @@ impl IndexManager {
             .or_default()
             .insert(field.to_string(), VectorDef { dim, metric });
         Ok(())
+    }
+
+    /// Ensure an (empty, incomplete) HNSW graph for a registered def.
+    /// Called at create/restore before any backfill fills it.
+    pub fn ensure_vector_graph(&mut self, collection: &str, field: &str) {
+        let def = match self.vector.get(collection).and_then(|m| m.get(field)) {
+            Some(d) => (d.dim as usize, d.metric),
+            None => return,
+        };
+        self.hnsw
+            .entry(collection.to_string())
+            .or_default()
+            .entry(field.to_string())
+            .or_insert_with(|| HnswIndex::new(def.0, def.1));
+    }
+
+    /// Upsert one doc's embedding into every HNSW graph of `collection`
+    /// that indexes its field. Wrong-dim / non-binary values are ignored
+    /// (fail-closed, same rule as the planner gate). Deletes need no
+    /// hook: graph nodes are never removed, the executor filters
+    /// candidates against storage liveness.
+    pub fn index_vector(&mut self, collection: &str, doc_id: &str, doc: &HakoDoc) {
+        if let Some(graphs) = self.hnsw.get_mut(collection) {
+            for (field_name, graph) in graphs.iter_mut() {
+                if let Some(Value::Binary(b)) = doc.get(field_name) {
+                    if let Ok(v) = decode_f32s(b) {
+                        graph.upsert(doc_id, v);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mark every graph of `collection` complete after a full pass
+    /// (create backfill / recovery rescan) flowed through `index_vector`.
+    pub fn complete_vector(&mut self, collection: &str) {
+        if let Some(graphs) = self.hnsw.get_mut(collection) {
+            for graph in graphs.values_mut() {
+                if !graph.is_empty() {
+                    graph.set_complete(true);
+                }
+            }
+        }
     }
 
     pub fn indexes_for_collection(
@@ -138,6 +185,11 @@ impl IndexManager {
                 }
             });
         }
+
+        // 4. Vector HNSW (P1): upsert the embedding when the doc carries
+        // an indexed binary field. Deletes intentionally need no hook
+        // (liveness is external — see HnswIndex docs).
+        self.index_vector(collection, doc_id, doc);
     }
 
     pub fn index_batch<'a, I>(&mut self, collection: &str, docs: I)
@@ -238,6 +290,14 @@ impl IndexManager {
         if let Some(fts_map) = self.fts.get_mut(collection) {
             for idx in fts_map.values_mut() {
                 idx.clear();
+            }
+        }
+        // Vector defs stay registered; graphs reset to incomplete (the
+        // recovery rescan refills them via index_document, then marks
+        // complete — same order as every other family).
+        if let Some(graphs) = self.hnsw.get_mut(collection) {
+            for graph in graphs.values_mut() {
+                graph.clear();
             }
         }
         self.composite.clear_collection(collection);

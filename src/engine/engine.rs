@@ -903,6 +903,10 @@ impl Hako {
                                     }
                                 }
                             }
+                            // Vector graphs refilled above through the
+                            // index_document hook — mark complete so ANN
+                            // may serve this collection.
+                            mgr.complete_vector(&col_name);
                         }
                     }
 
@@ -914,6 +918,50 @@ impl Hako {
                         // (recovery is async, so this race was always possible
                         // under Manual durability where writes never fsync).
                         shards.entry(col_name.clone()).or_insert_with(|| Arc::new(RwLock::new(storage)));
+                    }
+                }
+            }
+
+            // --- STEP C2: vector rebuild for collections whose rescan was
+            // skipped (a fresh snapshot carries no HNSW bytes in P1) or
+            // whose graphs are otherwise incomplete. Without this, graphs
+            // stay incomplete forever and every KNN brute-forces. Runs
+            // under backfill_inflight (queries fail-closed meanwhile —
+            // same rule as creation). Collections rescanned in STEP C
+            // already flipped `complete` above and are skipped here.
+            {
+                let targets: Vec<String> = match indexes_ptr.read() {
+                    Ok(mgr) => mgr
+                        .vector
+                        .keys()
+                        .filter(|col| {
+                            mgr.hnsw.get(*col).map_or(true, |graphs| {
+                                mgr.vector
+                                    .get(*col)
+                                    .map_or(false, |defs| {
+                                        defs.keys().any(|f| {
+                                            graphs.get(f).map_or(true, |g| !g.complete())
+                                        })
+                                    })
+                            })
+                        })
+                        .cloned()
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+                for col in targets {
+                    let shard_opt = shards_ptr
+                        .read()
+                        .ok()
+                        .and_then(|shards| shards.get(&col).cloned());
+                    if let Some(shard_arc) = shard_opt {
+                        Self::spawn_vector_backfill(
+                            Arc::clone(&indexes_ptr),
+                            Arc::clone(&backfill_ptr),
+                            config_thread.encryption_key.clone(),
+                            shard_arc,
+                            col,
+                        );
                     }
                 }
             }
@@ -1219,6 +1267,12 @@ impl Hako {
                 out.extend(idx.definition.fields.iter().map(|f| f.field.clone()));
             }
         }
+        // Vector fields must materialize too: recovery STEP C refills
+        // HNSW graphs through index_document, and the create-time backfill
+        // needs the embedding bytes (framing-skipped otherwise).
+        if let Some(vec_map) = mgr.vector.get(collection) {
+            out.extend(vec_map.keys().cloned());
+        }
         out.sort();
         out.dedup();
         out
@@ -1260,6 +1314,10 @@ impl Hako {
                                 mgr.index_document(collection, doc_id, &doc);
                             }
                         }
+                        // Owned refill flowed through the HNSW hook — the
+                        // graphs are whole again (borrowed path above never
+                        // runs when vector defs exist, see its guard).
+                        mgr.complete_vector(collection);
                     }
                 }
             }
@@ -2788,7 +2846,9 @@ impl Hako {
         }
 
         // 2b. Populate vector defs. Invalid entries (bad dim/metric from
-        // a newer writer) are skipped, never fatal to open.
+        // a newer writer) are skipped, never fatal to open. Graphs are
+        // ensured empty here; STEP C(2) fills them (rescan hook or
+        // rebuild) — never trust a snapshot for derived ANN state.
         for (collection, defs) in state.vector {
             for def in defs {
                 let metric = match def.metric.as_str() {
@@ -2796,6 +2856,7 @@ impl Hako {
                     _ => crate::index::vector::Metric::Cosine,
                 };
                 let _ = mgr.create_vector_index(&collection, &def.field, def.dim, metric);
+                mgr.ensure_vector_graph(&collection, &def.field);
             }
         }
 
@@ -3044,10 +3105,10 @@ impl Hako {
         Ok(())
     }
 
-    /// Register a vector index on `field` (P0: definition only — the exact
-    /// scan reads docs straight from storage, so there is no backfill
-    /// thread; P1's HNSW spawns its backfill here, mirroring
-    /// `create_fts_index`). Re-registering overwrites dim/metric.
+    /// Register a vector index on `field`. Registers the def, ensures an
+    /// (empty, incomplete) HNSW graph, and spawns the backfill that fills
+    /// it — queries fail-closed to exact until `complete` flips.
+    /// Re-registering overwrites dim/metric and rebuilds the graph.
     pub fn create_vector_index(
         &self,
         collection: &str,
@@ -3059,10 +3120,96 @@ impl Hako {
             .write()
             .unwrap()
             .create_vector_index(collection, field, dim, metric)?;
+        {
+            if let Ok(mut mgr) = self.indexes.write() {
+                mgr.ensure_vector_graph(collection, field);
+            }
+        }
+
+        let shard_arc = self.get_shard(collection)?;
+        Self::spawn_vector_backfill(
+            Arc::clone(&self.indexes),
+            Arc::clone(&self.backfill_inflight),
+            self.config.encryption_key.clone(),
+            shard_arc,
+            collection.to_string(),
+        );
 
         let _ = self.persist_index_defs();
         self.plan_cache.invalidate();
         Ok(())
+    }
+
+    /// Shared vector backfill spawner: full HNSW (re)build for one
+    /// collection. Used at explicit creation AND at open for collections
+    /// whose rescan was skipped (fresh snapshot carries no HNSW bytes in
+    /// P1). Same chunks/yield discipline as the FTS spawner; runs under
+    /// `backfill_inflight` so queries fail-closed meanwhile.
+    fn spawn_vector_backfill(
+        idx_mgr: Arc<RwLock<IndexManager>>,
+        backfill_count: Arc<AtomicUsize>,
+        enc_key: Option<String>,
+        shard_arc: Arc<RwLock<StorageEngine>>,
+        col_name: String,
+    ) {
+        backfill_count.fetch_add(1, Ordering::Relaxed);
+        thread::spawn(move || {
+            let _guard = BackfillGuard { counter: backfill_count };
+            // Graphs may predate this pass (re-registration) — reset to
+            // incomplete so a concurrent query can't ANN-serve a half
+            // graph; `complete` flips only after the full pass below.
+            {
+                if let Ok(mut mgr) = idx_mgr.write() {
+                    if let Some(graphs) = mgr.hnsw.get_mut(&col_name) {
+                        for graph in graphs.values_mut() {
+                            graph.clear();
+                        }
+                    }
+                    for field in mgr
+                        .vector
+                        .get(&col_name)
+                        .map(|m| m.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                    {
+                        mgr.ensure_vector_graph(&col_name, &field);
+                    }
+                }
+            }
+            let pointers = {
+                shard_arc.read().unwrap().get_physical_index_snapshot()
+            };
+            let wanted: Vec<String> = idx_mgr
+                .read()
+                .map(|mgr| Self::indexed_fields_for(&mgr, &col_name))
+                .unwrap_or_default();
+            for chunk in pointers.chunks(100) {
+                let mut resolved_docs = Vec::new();
+                {
+                    let storage = shard_arc.read().unwrap();
+                    for (key, ptr) in chunk {
+                        // Ghost guard: deleted docs must not enter the
+                        // graph (liveness filters them at query, but they
+                        // would still warp routing + waste RAM).
+                        if matches!(ptr, Pointer::Deleted { .. }) {
+                            continue;
+                        }
+                        if let Ok(Some(bytes)) = storage.read_pointer_internal(ptr, false) {
+                            resolved_docs.push((key.clone(), bytes));
+                        }
+                    }
+                }
+                let mut mgr = idx_mgr.write().unwrap();
+                for (doc_id, bytes) in resolved_docs {
+                    if let Some(mut doc) = HakoDoc::decode_projected(&bytes, &wanted) {
+                        let _ = resolve_doc_static(&mut doc, &shard_arc, enc_key.as_deref());
+                        mgr.index_vector(&col_name, &doc_id, &doc);
+                    }
+                }
+            }
+            if let Ok(mut mgr) = idx_mgr.write() {
+                mgr.complete_vector(&col_name);
+            }
+        });
     }
 
     /// Nearest-first KNN over a vector index (P0 exact brute-force). k
@@ -3094,6 +3241,19 @@ impl Hako {
             .where_filter(field, crate::query::filter::Operator::Near, Value::Binary(bytes))
             .limit(k);
         self.query(q)
+    }
+
+    /// Operational visibility for ANN state: true once the HNSW graph for
+    /// (collection, field) completed a full pass and may serve queries.
+    /// Tests poll this (with quiescence) to distinguish the ANN path from
+    /// the exact fallback; operators can gate dashboards on it.
+    pub fn vector_index_complete(&self, collection: &str, field: &str) -> bool {
+        self.indexes.read().map_or(false, |mgr| {
+            mgr.hnsw
+                .get(collection)
+                .and_then(|m| m.get(field))
+                .is_some_and(|g| g.complete() && !g.is_empty())
+        })
     }
 
     /// Shared composite backfill spawner: used at explicit creation AND
