@@ -2,6 +2,28 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.13.0 — NoSQL-native vector search (P0 exact, P1 HNSW, P2 polish)
+- **API**: `create_vector_index(col, field, dim, metric)` (cosine+L2),
+  `find_near(col, field, vec, k)` with hybrid Eq pre-filter, `where_near`
+  builder + FFI `hk_engine_create_vector_index` / `hk_query_where_near`.
+  Embeddings ride `Value::Binary` (LE f32); no new Value variant.
+- **P0 exact**: `Operator::Near` + `ScanType::VectorKnn` at planner P1
+  priority, fail-closed gate (unsupported shapes return empty, never
+  unranked rows), brute-force top-K with deterministic id tiebreak.
+- **P1 HNSW**: from-scratch in-RAM ANN (M16/ef200, heuristic selection,
+  fixed-seed deterministic); ANN prunes + exact rescores; `complete` flag
+  fail-closed with exact fallback; hybrid queries brute-force by design;
+  recovery STEP C completes + STEP C2 rebuilds (snapshots carry no HNSW
+  bytes); peers rebuild from replicated docs (no wire change).
+- **P2**: asymmetric int8 graph (1 byte/dim, cosine scale-free; measured
+  recall 1.000 dim32 / 0.94 dim128); inflate-on-index makes live writes
+  agree with backfill on blob-resident vectors. Drive-by root fix:
+  async recovery STEP C no longer wipes live RAM entries built from
+  RAM-buffered Manual writes (`index_touched` gate, additive refill).
+  Graph persistence skipped by measurement (rebuilds in seconds at
+  embedded scale).
+- Full suite green; no contract change outside the new vector surface.
+
 ### v0.12.4 — WAL reserve ratchet fix (insiden-hako-wal-20261009)
 - **Root cause**: `Wal::open` grew every `wal.log` by `wal_reserve_bytes`
   on EVERY open (vacuous `len < end + reserve` guard) — consumer DB hit
