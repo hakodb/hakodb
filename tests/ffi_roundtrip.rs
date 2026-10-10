@@ -411,16 +411,26 @@ fn deferred_blobs_skip_inflate_and_resolve() {
 
     wait_for_indexes(engine);
 
-    // 1. Default (eager): photo inflated inline.
+    // 1. Default (eager): photo inflated inline. The blob worker
+    // flushes async (~20ms poll), so poll until the bytes land instead
+    // of assuming flush order — on fast machines the query otherwise
+    // wins the race deterministically (box-observed, not flaky luck).
     let q = unsafe { hk_query_new(coll.as_ptr()) };
     unsafe { hk_query_limit(q, 10) };
-    let rs = unsafe { hk_query_execute_to_handles(engine, q) };
-    assert_eq!(unsafe { hk_result_set_count(rs) }, 1);
-    let d = unsafe { hk_result_set_get_doc(rs, 0) };
-    let j = read_cstr(unsafe { hk_doc_to_json(d) });
+    let t0 = std::time::Instant::now();
+    let j = loop {
+        let rs = unsafe { hk_query_execute_to_handles(engine, q) };
+        assert_eq!(unsafe { hk_result_set_count(rs) }, 1);
+        let d = unsafe { hk_result_set_get_doc(rs, 0) };
+        let j = read_cstr(unsafe { hk_doc_to_json(d) });
+        unsafe { hk_result_set_free(rs) };
+        if j.contains("PHOTO_") || t0.elapsed() > std::time::Duration::from_secs(10) {
+            break j;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     assert!(j.contains("PHOTO_"), "eager query should inflate photo");
     assert!(!j.contains("__blob__"), "eager query should have no placeholder, got len {}", j.len());
-    unsafe { hk_result_set_free(rs) };
     unsafe { hk_query_free(q) };
 
     // 2. Deferred: BlobLink placeholder, no 20KB payload.
