@@ -543,16 +543,90 @@ impl Hako {
         let idx_clone = Arc::clone(&indexes);
         let index_inflight_worker = Arc::clone(&index_inflight);
         let storage_persist = Arc::clone(&index_storage);
+        // P2: blob-resident embeddings resolve through the owning shard's
+        // blob manager (clone is one Arc bump; resolution itself is gated
+        // per-collection below).
+        let shards_for_index = Arc::clone(&shards);
         thread::spawn(move || {
             while let Ok(op) = index_rx.recv() {
                 match op {
                     IndexOp::Update { collection, puts, deletes } => {
+                        // P2: blob-resident embeddings must be durable
+                        // BEFORE the indexer resolves them — blob puts
+                        // land in an async flush queue, so resolving
+                        // straight from the link would read unwritten
+                        // regions (zeros/garbage indexed as vectors).
+                        // Drain first, then resolve. Gated: only when a
+                        // put actually carries a BlobLink in a vector
+                        // field (lock-free scan, no guard held while
+                        // draining — never nest index/shard locks).
+                        let vec_probe: Vec<String> = idx_clone
+                            .read()
+                            .map(|m| {
+                                m.vector
+                                    .get(&collection)
+                                    .map(|mm| mm.keys().cloned().collect())
+                                    .unwrap_or_default()
+                            })
+                            .unwrap_or_default();
+                        if !vec_probe.is_empty() {
+                            let mut need_drain = false;
+                            'scan: for (_, doc) in puts.iter() {
+                                for f in &vec_probe {
+                                    if matches!(doc.get(f), Some(Value::BlobLink { .. })) {
+                                        need_drain = true;
+                                        break 'scan;
+                                    }
+                                }
+                            }
+                            if need_drain {
+                                if let Some(sh) = shards_for_index
+                                    .read()
+                                    .ok()
+                                    .and_then(|s| s.get(&collection).cloned())
+                                {
+                                    if let Ok(mut g) = sh.write() {
+                                        let _ = g.drain_blob_queue();
+                                    }
+                                }
+                            }
+                        }
                         let mut mgr = match idx_clone.write() { Ok(g) => g, Err(_) => break };
+                        // P2 inflate-on-index: collections carrying vector
+                        // defs index the RESOLVED doc so live writes agree
+                        // with backfill (which resolves). Every other
+                        // collection skips this entirely (no clone, no
+                        // blob touch).
+                        let vec_fields: Vec<String> = mgr
+                            .vector
+                            .get(&collection)
+                            .map(|m| m.keys().cloned().collect())
+                            .unwrap_or_default();
+                        let blob_mgr = if vec_fields.is_empty() {
+                            None
+                        } else {
+                            shards_for_index
+                                .read()
+                                .ok()
+                                .and_then(|s| s.get(&collection).cloned())
+                                .and_then(|sh| {
+                                    sh.read().ok().and_then(|g| g.blob_manager.clone())
+                                })
+                        };
                         let mut persist = match storage_persist.lock() { Ok(g) => g, Err(_) => break };
                         for (id, doc) in puts.iter() {
-                            IndexingService::apply_put(&mut mgr, &collection, id, doc);
+                            // Resolved copy only when a vector field needs
+                            // it; otherwise the original Arc (zero extra
+                            // alloc on the hot path).
+                            let resolved = IndexingService::resolve_vector_blobs(
+                                doc,
+                                &vec_fields,
+                                blob_mgr.as_deref(),
+                            );
+                            let doc_ref: &HakoDoc = resolved.as_ref().unwrap_or(doc);
+                            IndexingService::apply_put(&mut mgr, &collection, id, doc_ref);
                             for idx in mgr.indexes_for_collection(&collection) {
-                                if let Some(vals) = idx.document_values(&id, &doc) {
+                                if let Some(vals) = idx.document_values(&id, doc_ref) {
                                     let key_bytes = crate::index::composite::key_encoder::encode_composite_key(&idx.definition, &vals, &id);
                                     let _ = persist.insert(idx.definition.id, key_bytes.to_vec(), id.clone());
                                 }
@@ -882,7 +956,20 @@ impl Hako {
                     // scan. Anything else (no snapshot, legacy file, crash
                     // after the last snapshot) clears and rebuilds, so
                     // post-snapshot deletes leave no ghosts.
-                    let fresh = snap_tails.as_ref().and_then(|t| t.get(&col_name)).is_some_and(
+                    //
+                    // P2 touched-branch: collections with post-open writes
+                    // ALWAYS rescan (fresh or not — a fresh snapshot plus
+                    // RAM-buffered Manual writes would otherwise skip both
+                    // import and rescan and lose old rows), but refill
+                    // ADDITIVELY: wiping would drop the live entries the
+                    // writes just built (disk is older by construction).
+                    // Crash-window ghosts from additive refill stay
+                    // invisible — every scan arm filters storage liveness.
+                    let touched_now = index_touched_ptr
+                        .lock()
+                        .map(|g| g.contains(&col_name))
+                        .unwrap_or(false);
+                    let fresh = !touched_now && snap_tails.as_ref().and_then(|t| t.get(&col_name)).is_some_and(
                         |(d, f)| {
                             *d == storage.wal.data_len() && *f == storage.wal.file_len()
                         },
@@ -890,7 +977,9 @@ impl Hako {
                     if !fresh {
                         if let Ok(data) = storage.scan_prefix("") {
                             let mut mgr = indexes_ptr.write().unwrap();
-                            mgr.clear_collection(&col_name);
+                            if !touched_now {
+                                mgr.clear_collection(&col_name);
+                            }
                             // ponytail: selective decode — only indexed
                             // fields materialize (same index state, no
                             // value allocs for the rest).
@@ -1564,6 +1653,17 @@ impl Hako {
 
         // --- APPLY SHARD CHANGES ---
         for (col_name, mut work) in shard_map {
+            // P2: mark first — a concurrent recovery rescan must ADD to
+            // (not wipe+rebuild) collections with post-open writes; disk
+            // state is older by construction (Manual WAL may still be
+            // RAM-buffered). Same `touched` set the snapshot import
+            // already honors; without the mark a late rescan silently
+            // drops freshly indexed rows from every RAM family.
+            if !work.ops.is_empty() {
+                if let Ok(mut touched) = self.index_touched.lock() {
+                    touched.insert(col_name.clone());
+                }
+            }
             let shard_arc = self.get_shard(&col_name)?;
             // let index_entries = work.index_puts; 
 
@@ -1775,7 +1875,11 @@ impl Hako {
             // Indexer gets the put (secondary/FTS/composite would
             // otherwise miss the moved doc until backfill). Same
             // in-flight accounting as the write path (refund on dead
-            // worker so quiescence never wedges).
+            // worker so quiescence never wedges). Marks touched like a
+            // write: recovery must add, not wipe, the dest's live rows.
+            if let Ok(mut touched) = self.index_touched.lock() {
+                touched.insert(dst.to_string());
+            }
             self.index_inflight.fetch_add(1, Ordering::Relaxed);
             if self
                 .index_tx

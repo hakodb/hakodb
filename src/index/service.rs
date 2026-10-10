@@ -26,6 +26,37 @@ impl IndexingService {
         manager.remove_document(collection, doc_id, doc);
     }
 
+    /// P2 inflate-on-index: resolve blob-resident values of `fields` so a
+    /// live write indexes exactly what backfill would (backfill resolves
+    /// before indexing). Returns None when nothing needs resolving
+    /// (caller indexes the original, zero extra alloc). Unresolvable
+    /// blobs become Null and are skipped downstream — same rule as the
+    /// read path, never a worker panic.
+    pub fn resolve_vector_blobs(
+        doc: &HakoDoc,
+        fields: &[String],
+        blob_mgr: Option<&crate::storage::blob::BlobManager>,
+    ) -> Option<HakoDoc> {
+        let mgr = blob_mgr?;
+        if !fields
+            .iter()
+            .any(|f| matches!(doc.get(f), Some(Value::BlobLink { .. })))
+        {
+            return None;
+        }
+        let mut out = doc.clone();
+        for f in fields {
+            if let Some(Value::BlobLink { offset, len }) = out.get(f) {
+                let (offset, len) = (*offset, *len);
+                let v = crate::query::executor::worker::resolve_single_blob_in_worker(
+                    mgr, offset, len,
+                );
+                out.insert(f.clone(), v);
+            }
+        }
+        Some(out)
+    }
+
     pub fn backfill_secondary<'a, I>(manager: &mut IndexManager, collection: &str, docs: I)
     where
         I: IntoIterator<Item = (&'a str, &'a HakoDoc)>,
