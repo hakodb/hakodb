@@ -610,7 +610,12 @@ impl StorageEngine {
         Ok(())
     }
 
-    pub fn run_background_maintenance(&mut self) -> Result<()> {
+    /// `defer_heavy`: skip segment spill + tier compaction (the two
+    /// I/O-heavy phases) while queries are in flight — the maintenance
+    /// tick sheds them. WAL flush + segment rotation stay (cheap, and
+    /// durability is never deferred). Bounded by the caller (max
+    /// consecutive skips) so backlog drains under sustained load.
+    pub fn run_background_maintenance(&mut self, defer_heavy: bool) -> Result<()> {
         // 2-c: Interval shards flush dirty buffers on the existing 500ms
         // system tick (off the request path) — closes the quiet-window where
         // a SIGKILL/power loss would take unflushed appends. Mode contracts
@@ -622,6 +627,9 @@ impl StorageEngine {
             let _ = self.wal.flush();
         }
         self.maybe_rotate_active_segment()?;
+        if defer_heavy {
+            return Ok(());
+        }
         // Check if RAM is full and spill to disk if needed
         self.checkpoint_inlined_data()?;
         self.compact_tiers_once().map(|_| ())
@@ -1254,7 +1262,7 @@ mod tests {
             // past the 5ms test window so Interval is due. Monotonic clock
             // makes this one-directional (slowness only helps).
             std::thread::sleep(std::time::Duration::from_millis(10));
-            eng.run_background_maintenance().unwrap();
+            eng.run_background_maintenance(false).unwrap();
             let len = std::fs::metadata(dir.join("wal.log")).unwrap().len();
             assert_eq!(len > 0, expect_bytes, "mode {mode:?}: file len {len}");
             let _ = std::fs::remove_dir_all(&dir);

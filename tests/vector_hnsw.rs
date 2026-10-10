@@ -29,7 +29,8 @@ fn tmp(label: &str) -> std::path::PathBuf {
 fn wait_ready(db: &Hako) {
     let t0 = std::time::Instant::now();
     loop {
-        if db.is_indexes_ready() && db.quiescence_status().index_backfills == 0 {
+        let q = db.quiescence_status();
+        if db.is_indexes_ready() && q.index_backfills == 0 && q.pending_index_ops == 0 {
             return;
         }
         assert!(t0.elapsed() < std::time::Duration::from_secs(60), "never ready");
@@ -162,6 +163,7 @@ fn update_moves_ranking() {
     doc.insert("emb", Value::Binary(encode_f32s(q)));
     doc.insert("grp", Value::String("ev".into()));
     db.put("pts", "d0042", &doc).expect("reput");
+    wait_ready(&db);
     pts[42] = q.clone();
     let live = vec![true; pts.len()];
     let got = knn_ids(&db, q, 5);

@@ -35,12 +35,15 @@ fn vdoc(emb: &[f32], grp: &str) -> HakoDoc {
 /// Recovery runs on a background thread and flips `indexes_ready` when
 /// done; until then the planner fail-closes to FullCollection (same rule
 /// as FTS). Index creation backfills HNSW on a second background thread
-/// (covered by `index_backfills`). Every test waits past both windows
-/// before asserting.
+/// (covered by `index_backfills`), and live writes index through a third
+/// (covered by `pending_index_ops` — the RAM graph lags storage by that
+/// window, same eventual-consistency rule as every other RAM family).
+/// Every test waits past all three windows before asserting.
 fn wait_ready(db: &Hako) {
     let t0 = std::time::Instant::now();
     loop {
-        if db.is_indexes_ready() && db.quiescence_status().index_backfills == 0 {
+        let q = db.quiescence_status();
+        if db.is_indexes_ready() && q.index_backfills == 0 && q.pending_index_ops == 0 {
             return;
         }
         assert!(
@@ -230,6 +233,9 @@ fn zero_vector_and_offset() {
     seed(&db);
     wait_ready(&db);
     db.put("pts", "z", &vdoc(&[0.0, 0.0], "x")).expect("put zero");
+    // The RAM graph lags storage by the async index-worker window —
+    // wait it out (same rule as every other RAM family).
+    wait_ready(&db);
     // Zero vector scores finite (1.0) — returned when k covers it.
     let got: Vec<String> = db
         .find_near("pts", "emb", &[1.0, 0.5], 10)
