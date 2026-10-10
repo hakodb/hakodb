@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{HakoConfig, DurabilityMode};
 use crate::error::{HakoError, Result};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 // use std::sync::atomic::Ordering;
 use std::time::UNIX_EPOCH;
 use crate::memory::page_cache::PageCache;
@@ -17,6 +17,16 @@ use super::wal::{Wal, WalOp};
 use crossbeam_channel::Sender as CrossbeamSender;
 use crate::document::hako_doc::HakoDoc;
 // use crate::document::value::Value;
+
+/// Successful narrow-lock tier merges since process start: test
+/// tripwire (a compaction race test that never merges is vacuous) and
+/// operational visibility. One Relaxed increment per merge.
+static TIER_COMPACTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many tier compactions completed (see above).
+pub fn tier_compactions() -> usize {
+    TIER_COMPACTIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 
 #[derive(Debug, Clone)] 
@@ -610,11 +620,12 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// `defer_heavy`: skip segment spill + tier compaction (the two
-    /// I/O-heavy phases) while queries are in flight — the maintenance
-    /// tick sheds them. WAL flush + segment rotation stay (cheap, and
-    /// durability is never deferred). Bounded by the caller (max
-    /// consecutive skips) so backlog drains under sustained load.
+    /// `defer_heavy`: skip the segment spill while queries are in flight
+    /// — the maintenance tick sheds it. Tier compaction left the &mut
+    /// world entirely (see try_compact_tiers: merge I/O never holds a
+    /// guard). WAL flush + segment rotation stay (cheap, and durability
+    /// is never deferred). Bounded by the caller (max consecutive skips)
+    /// so backlog drains under sustained load.
     pub fn run_background_maintenance(&mut self, defer_heavy: bool) -> Result<()> {
         // 2-c: Interval shards flush dirty buffers on the existing 500ms
         // system tick (off the request path) — closes the quiet-window where
@@ -630,9 +641,9 @@ impl StorageEngine {
         if defer_heavy {
             return Ok(());
         }
-        // Check if RAM is full and spill to disk if needed
+        // Check if RAM is full and spill to disk if needed.
         self.checkpoint_inlined_data()?;
-        self.compact_tiers_once().map(|_| ())
+        Ok(())
     }
 
     fn maybe_rotate_active_segment(&mut self) -> Result<()> {
@@ -671,81 +682,166 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn compact_tiers_once(&mut self) -> Result<bool> {
-        // 1. Find two immutable segments on the same level
-        let mut by_level: HashMap<u32, Vec<u64>> = HashMap::new();
-        for (id, meta) in &self.segments {
-            if *id == self.active_segment_id { continue; }
-            by_level.entry(meta.level).or_default().push(*id);
+    /// Narrow-lock tier compaction: reserve+collect (brief write) →
+    /// merge (NO lock: segment reads, new-file writes) → commit (brief
+    /// write: verify-then-swap + WAL rewrite/flush; old files closed and
+    /// deleted only AFTER the guard drops). The tick calls this without
+    /// holding any guard, so merge I/O never queues queries.
+    ///
+    /// Commit race rule: only entries whose live pointer still addresses
+    /// a merged segment are swapped. Puts/deletes that landed mid-merge
+    /// moved the pointer (or tombstoned it) — those keys are skipped:
+    /// their bytes live elsewhere now, and the merged copy is dead space
+    /// until this segment itself compacts (standard LSM behavior,
+    /// bounded). Sources that vanished (a concurrent full `compact` ate
+    /// them) abort the merge and delete the orphan target file.
+    pub fn try_compact_tiers(shard: &Arc<RwLock<StorageEngine>>) -> Result<bool> {
+        struct Prep {
+            level: u32,
+            s1: u64,
+            s2: u64,
+            target_level: u32,
+            target_id: u64,
+            base_dir: PathBuf,
+            encryption: Option<EncryptionContext>,
+            cache: Arc<Mutex<PageCache>>,
+            mmap_size: usize,
+            use_compression: bool,
         }
-
-        let mut candidate: Option<(u32, u64, u64)> = None;
-        for (level, ids) in by_level {
-            if ids.len() >= 2 {
-                candidate = Some((level, ids[0], ids[1]));
-                break;
+        // -- Phase 1: candidate + id reservation (brief write, metadata).
+        let prep = {
+            let mut storage = shard
+                .write()
+                .map_err(|_| HakoError::LockPoisoned("compact-prep".into()))?;
+            let mut by_level: HashMap<u32, Vec<u64>> = HashMap::new();
+            for (id, meta) in &storage.segments {
+                if *id == storage.active_segment_id {
+                    continue;
+                }
+                by_level.entry(meta.level).or_default().push(*id);
             }
-        }
-
-        let Some((level, s1, s2)) = candidate else { return Ok(false); };
-
-        // 2. Prepare merge
-        let target_level = level + 1;
-        let target_id = self.next_segment_id;
-        self.next_segment_id += 1;
-
-        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
-        for (key, pointer) in &self.index {
-            if let Pointer::Segment { segment_id, .. } = pointer {
-                if *segment_id == s1 || *segment_id == s2 {
-                    if let Some(value) = self.read_pointer(pointer)? {
-                        entries.push((key.clone(), value));
+            let mut candidate: Option<(u32, u64, u64)> = None;
+            for (level, ids) in by_level {
+                if ids.len() >= 2 {
+                    candidate = Some((level, ids[0], ids[1]));
+                    break;
+                }
+            }
+            let Some((level, s1, s2)) = candidate else {
+                return Ok(false);
+            };
+            let target_id = storage.next_segment_id;
+            storage.next_segment_id += 1;
+            Prep {
+                level,
+                s1,
+                s2,
+                target_level: level + 1,
+                target_id,
+                base_dir: storage.base_dir.clone(),
+                encryption: storage.encryption.clone(),
+                cache: Arc::clone(&storage.cache),
+                mmap_size: storage.mmap_size,
+                use_compression: storage.use_compression,
+            }
+        };
+        // -- Phase 2: collect + merge with NO lock held.
+        let entries: Vec<(String, Vec<u8>)> = {
+            let storage = shard
+                .read()
+                .map_err(|_| HakoError::LockPoisoned("compact-collect".into()))?;
+            let mut out = Vec::new();
+            for (key, pointer) in &storage.index {
+                if let Pointer::Segment { segment_id, .. } = pointer {
+                    if *segment_id == prep.s1 || *segment_id == prep.s2 {
+                        if let Some(value) = storage.read_pointer(pointer)? {
+                            out.push((key.clone(), value));
+                        }
                     }
                 }
             }
-        }
-
-        // 3. Perform merge with Compression support
-        let target_path = segment_path(&self.base_dir, target_level, target_id);
-        // FIX: Add missing 3 arguments
+            out
+        };
+        let target_path = segment_path(&prep.base_dir, prep.target_level, prep.target_id);
         let mut target = Segment::open(
-            target_path, 
-            target_id, 
-            self.encryption.clone(), 
-            Arc::clone(&self.cache), 
-            self.mmap_size
+            target_path.clone(),
+            prep.target_id,
+            prep.encryption,
+            prep.cache,
+            prep.mmap_size,
         )?;
         let mut new_index_subset = HashMap::new();
-
-        // FIX: Pass self.use_compression here!
-        compact_segment(&mut target, &entries, &mut new_index_subset, target_id, self.use_compression)?;
-
-        // 4. Cleanup old files
-        for id in &[s1, s2] {
-            if let Some(mut meta) = self.segments.remove(id) {
-                let path = meta.segment.path().to_path_buf();
-                meta.segment.close();
-                let _ = std::fs::remove_file(path);
+        if let Err(e) = compact_segment(
+            &mut target,
+            &entries,
+            &mut new_index_subset,
+            prep.target_id,
+            prep.use_compression,
+        ) {
+            drop(target);
+            let _ = std::fs::remove_file(&target_path);
+            return Err(e);
+        }
+        // -- Phase 3: commit (brief write). Verify-then-swap per key.
+        let mut target_opt = Some(target);
+        let olds: Option<Vec<SegmentMeta>> = {
+            let mut storage = shard
+                .write()
+                .map_err(|_| HakoError::LockPoisoned("compact-commit".into()))?;
+            let sources_ok = [prep.s1, prep.s2].iter().all(|id| {
+                matches!(storage.segments.get(id), Some(m) if m.level == prep.level)
+            });
+            if !sources_ok {
+                None
+            } else {
+                let mut olds = Vec::with_capacity(2);
+                for id in [prep.s1, prep.s2] {
+                    if let Some(meta) = storage.segments.remove(&id) {
+                        olds.push(meta);
+                    }
+                }
+                for (k, p) in new_index_subset {
+                    let still_merged = matches!(
+                        storage.index.get(&k),
+                        Some(Pointer::Segment { segment_id, .. })
+                            if *segment_id == prep.s1 || *segment_id == prep.s2
+                    );
+                    if still_merged {
+                        storage.index.insert(k, p);
+                    }
+                }
+                storage.segments.insert(
+                    prep.target_id,
+                    SegmentMeta {
+                        level: prep.target_level,
+                        segment: target_opt.take().expect("merge target"),
+                    },
+                );
+                storage.rewrite_wal_snapshot()?;
+                // Same staged-without-flush hazard as before: sync now
+                // (one fdatasync per compaction, not per write).
+                storage.wal.flush()?;
+                Some(olds)
+            }
+        };
+        match olds {
+            Some(olds) => {
+                // File teardown outside any guard (close/remove can block
+                // on some platforms — never hold a lock across it).
+                for mut meta in olds {
+                    let path = meta.segment.path().to_path_buf();
+                    meta.segment.close();
+                    let _ = std::fs::remove_file(path);
+                }
+                TIER_COMPACTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(true)
+            }
+            None => {
+                drop(target_opt);
+                let _ = std::fs::remove_file(&target_path);
+                Ok(false)
             }
         }
-
-        // 5. Update master index
-        for (k, p) in new_index_subset { self.index.insert(k, p); }
-        self.segments.insert(
-            target_id, 
-            SegmentMeta { 
-                // id: target_id, 
-                level: target_level, 
-                segment: target 
-            });
-        self.rewrite_wal_snapshot()?;
-        // 2-a: same staged-without-flush hazard as the open-time rewrite —
-        // the process keeps running here, but on a quiet server no later
-        // append would flush it before a SIGTERM. Sync it now (one fdatasync
-        // per compaction, not per write).
-        self.wal.flush()?;
-
-        Ok(true)
     }
 
     pub(crate) fn rewrite_wal_snapshot(&mut self) -> Result<()> {

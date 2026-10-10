@@ -1643,27 +1643,27 @@ impl ParallelQueryExecutor {
             }
 
             ScanType::VectorKnn { field, query, metric, extra } => {
-                // P1: ANN prunes, exact rescores. Candidates come from a
-                // COMPLETE, non-empty HNSW graph when one exists; otherwise
-                // every live key (P0 exact path). Either way each candidate
-                // is liveness-checked, filter-verified, and EXACT-rescored
-                // below — ANN can only drop rows, never invent them, and
-                // the rescore keeps surviving rows in exact order. Ties
-                // break on doc id so KNN paging stays deterministic.
+                // Two-stage rescore: the search's int8 distances prune to
+                // rescore_n, then exact rescore orders THOSE. ANN can only
+                // drop rows, never invent them — recall is gated by the
+                // duel harness (must hold 0.99). rescore_n always covers
+                // max_ids (deep pages can't under-fill) and never exceeds
+                // ef (never rescore more than surfaced). Fallback (no
+                // complete graph): every live key, exact by construction.
                 // Hybrid (extra filters) always brute-forces: ANN ranks
                 // unfiltered, so post-filtering its top-ef could strand
-                // matches it never surfaced — no ef multiplier can promise
-                // otherwise. Pure KNN keeps the speedup.
+                // matches it never surfaced. Ties break on doc id.
                 use crate::index::vector::{decode_f32s, distance};
                 use crate::query::filter::compare_values;
                 let qv = decode_f32s(query).unwrap_or_default();
                 // ef sizing (P3): int8 graph distances are approximate, so
-                // over-fetch generously — exact rescore downstream keeps
-                // order honest, and extras only cost doc reads. High dims
-                // compound routing error per hop (duel: recall 0.62 at
-                // D=384/ef128), so the floor steps 128→256 at D≥128.
+                // over-fetch generously. High dims compound routing error
+                // per hop (duel: recall 0.62 at D=384/ef128), so the floor
+                // steps 128→256 at D≥128.
                 let floor = if qv.len() >= 128 { 256 } else { 128 };
                 let ef = max_ids.saturating_mul(8).clamp(floor, 20_000);
+                let need = max_ids.min(ef);
+                let rescore_n = need.max((need.saturating_mul(4).max(32)).min(ef));
                 let use_ann = extra.is_empty();
                 let cand_ids: Option<Vec<String>> = indexes
                     .hnsw
@@ -1672,8 +1672,9 @@ impl ParallelQueryExecutor {
                     .filter(|g| use_ann && g.complete() && !g.is_empty())
                     .map(|g| {
                         g.search(&qv, ef)
-                            .iter()
-                            .map(|(_, idx)| g.id_of(*idx).to_string())
+                            .into_iter()
+                            .take(rescore_n)
+                            .map(|(_, idx)| g.id_of(idx).to_string())
                             .collect()
                     });
                 let pairs: Vec<(String, Pointer)> = match &cand_ids {

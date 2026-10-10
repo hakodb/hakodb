@@ -705,6 +705,12 @@ impl Hako {
                     }
                     let active_shards: Vec<Arc<RwLock<StorageEngine>>> = shards_sys_clone.read().unwrap().values().cloned().collect();
                     for s in active_shards {
+                        // Tier compaction runs lock-free (prepare/commit
+                        // only) and only when not shedding — merge I/O
+                        // never queues queries, guard held or not.
+                        if !shedding {
+                            let _ = StorageEngine::try_compact_tiers(&s);
+                        }
                         if let Ok(storage) = s.try_read() {
                             if let Some(ref bm) = storage.blob_manager { let _ = bm.file().sync_data(); }
                         }
