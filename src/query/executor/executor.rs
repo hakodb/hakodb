@@ -1626,11 +1626,13 @@ impl ParallelQueryExecutor {
                 use crate::index::vector::{decode_f32s, distance};
                 use crate::query::filter::compare_values;
                 let qv = decode_f32s(query).unwrap_or_default();
-                // ef sizing: int8 graph distances are approximate, so
+                // ef sizing (P3): int8 graph distances are approximate, so
                 // over-fetch generously — exact rescore downstream keeps
-                // order honest, and extras only cost doc reads. Floor 128
-                // (measured: dim-128 recall 0.94 at ef=100, 2000 docs).
-                let ef = max_ids.saturating_mul(8).clamp(128, 20_000);
+                // order honest, and extras only cost doc reads. High dims
+                // compound routing error per hop (duel: recall 0.62 at
+                // D=384/ef128), so the floor steps 128→256 at D≥128.
+                let floor = if qv.len() >= 128 { 256 } else { 128 };
+                let ef = max_ids.saturating_mul(8).clamp(floor, 20_000);
                 let use_ann = extra.is_empty();
                 let cand_ids: Option<Vec<String>> = indexes
                     .hnsw
