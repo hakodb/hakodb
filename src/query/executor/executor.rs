@@ -29,6 +29,31 @@ pub fn topn_runs() -> usize {
     TOPN_RUNS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Queries currently executing (any execute_* entry point). The
+/// maintenance tick sheds non-durability work while this is non-zero —
+/// queries never queue behind compaction/snapshot I/O. Best-effort
+/// signal (walk/aggregation paths also count via the same guard).
+static QUERIES_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current in-flight query count (see above).
+pub fn queries_inflight() -> usize {
+    QUERIES_INFLIGHT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// RAII bump for the in-flight counter — covers every return path.
+struct InflightGuard;
+impl InflightGuard {
+    fn take() -> Self {
+        QUERIES_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        QUERIES_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 use crate::index::index_key::decode_scalar_as_f64;
 
 pub struct ParallelQueryExecutor {
@@ -159,6 +184,7 @@ impl ParallelQueryExecutor {
         indexes: &IndexManager,
         mut plan: QueryPlan,
     ) -> Result<Vec<(String, HakoDoc)>> {
+        let _inflight = InflightGuard::take();
         // 1. PHASE 1: INDEX SCAN
         // Fetch physical pointers from the RAM Index
         let mut keys_from_index = {
@@ -628,6 +654,7 @@ impl ParallelQueryExecutor {
         indexes: &IndexManager,
         plan: QueryPlan,
     ) -> Result<Vec<(String, Arc<Vec<u8>>)>> {
+        let _inflight = InflightGuard::take();
         use crate::error::HakoError;
         if (!plan.filters.is_empty() || !plan.or_groups.is_empty())
             && !plan.filters_satisfied_by_index
@@ -701,6 +728,7 @@ impl ParallelQueryExecutor {
     where
         F: FnMut(&str, &[u8]) -> bool,
     {
+        let _inflight = InflightGuard::take();
         use crate::error::HakoError;
         // ponytail: reserved for the non-SortedKeys arms when the walk
         // grows beyond order-by-id (underscore until then, not dead).
@@ -776,6 +804,7 @@ impl ParallelQueryExecutor {
     where
         F: FnMut(&str, &DocView) -> bool,
     {
+        let _inflight = InflightGuard::take();
         use crate::error::HakoError;
         let _ = indexes;
         if (!plan.filters.is_empty() || !plan.or_groups.is_empty())
@@ -979,6 +1008,7 @@ impl ParallelQueryExecutor {
         plan: QueryPlan,
         ops: &[AggregateOp],
     ) -> Result<HashMap<String, f64>> {
+        let _inflight = InflightGuard::take();
         // --- 1. UNIFIED FAST PATH (Index-Only Aggregation) ---
         // Conditions: Only 1 op, no OR groups, and simple Equality filters
         if ops.len() == 1 && plan.or_groups.is_empty() {
@@ -1205,6 +1235,7 @@ impl ParallelQueryExecutor {
         indexes: &IndexManager,
         plan: QueryPlan,
     ) -> Result<Vec<(String, Vec<(String, Value)>)>> {
+        let _inflight = InflightGuard::take();
         let docs: Vec<(String, Pointer)> = {
             // Explicitly set the type
             let storage = storage_arc.read().unwrap();

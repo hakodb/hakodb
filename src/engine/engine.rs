@@ -667,6 +667,10 @@ impl Hako {
 
         let system_handle_thread = thread::spawn(move || {
             let mut last_maint = Instant::now();
+            // Query-aware shedding: consecutive ticks deferred while
+            // queries fly (see below). Bounded so backlog drains under
+            // sustained load instead of growing without limit.
+            let mut deferred_ticks: u32 = 0;
             loop {
                 while let Ok(entry) = audit_rx.try_recv() {
                     if let Ok(mut history) = audit_data_clone.write() { history.push(entry.clone()); }
@@ -685,31 +689,49 @@ impl Hako {
                     // the inner locks are try_-based, because readers still
                     // share page cache and IO bandwidth with it.
                     maintenance_for_system.store(true, Ordering::Release);
+                    // Query-aware shedding: queries in flight → skip the
+                    // NON-DURABILITY heavy work this tick (tier compaction,
+                    // segment spill, tombstone purge, both snapshots) so
+                    // queries never queue behind their I/O. WAL flush
+                    // stays (durability is never deferred). At most 3
+                    // consecutive sheds, then run regardless — backlog
+                    // must drain under sustained load.
+                    let shedding = crate::query::executor::executor::queries_inflight() > 0
+                        && deferred_ticks < 3;
+                    if shedding {
+                        deferred_ticks += 1;
+                    } else {
+                        deferred_ticks = 0;
+                    }
                     let active_shards: Vec<Arc<RwLock<StorageEngine>>> = shards_sys_clone.read().unwrap().values().cloned().collect();
                     for s in active_shards {
                         if let Ok(storage) = s.try_read() {
                             if let Some(ref bm) = storage.blob_manager { let _ = bm.file().sync_data(); }
                         }
                         if let Ok(mut storage) = s.try_write() {
-                            let _ = storage.run_background_maintenance(); 
-                            storage.purge_old_tombstones(Duration::from_secs(86400));
-                            
+                            let _ = storage.run_background_maintenance(shedding);
+                            if !shedding {
+                                storage.purge_old_tombstones(Duration::from_secs(86400));
+                            }
+
                             // 2. TRIGGER: If pending blob bytes > 16MB, touch the blob worker
                             if storage.total_pending_blob_bytes.load(Ordering::Relaxed) > 16 * 1024 * 1024 {
                                 trigger_for_system.store(true, Ordering::Release);
                             }
                         }
                     }
-                    if let Ok(mut persist) = index_sys_ptr.try_lock() {
-                        if let Ok(_) = persist.snapshot(1) { let _ = persist.reset_log(); }
+                    if !shedding {
+                        if let Ok(mut persist) = index_sys_ptr.try_lock() {
+                            if let Ok(_) = persist.snapshot(1) { let _ = persist.reset_log(); }
+                        }
+
+                        // Periodically snapshot RAM indexes (prevent loss on crash)
+                        let _ = Self::write_index_snapshot(
+                            &root_path_sys,
+                            &shards_sys_clone,
+                            &indexes_sys_ptr,
+                        );
                     }
-                    
-                    // Periodically snapshot RAM indexes (prevent loss on crash)
-                    let _ = Self::write_index_snapshot(
-                        &root_path_sys,
-                        &shards_sys_clone,
-                        &indexes_sys_ptr,
-                    );
 
                     trigger_for_system.store(true, Ordering::Release);
                     last_maint = Instant::now();
