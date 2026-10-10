@@ -3002,6 +3002,60 @@ pub extern "C" fn hk_engine_create_fts_index(
 }
 
 #[no_mangle]
+pub extern "C" fn hk_engine_create_vector_index(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    field: *const c_char,
+    dim: u32,
+    metric: u32,
+) -> i32 {
+    if engine.is_null() {
+        return -1;
+    }
+    let engine = unsafe { &*engine };
+    let col = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
+    let fld = match cstr_to_string(field) {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
+    let m = match crate::index::vector::Metric::from_u32(metric) {
+        Ok(v) => v,
+        Err(e) => return set_last_error(e.to_string()),
+    };
+    match engine.db.create_vector_index(&col, &fld, dim, m) {
+        Ok(_) => {
+            clear_last_error();
+            0
+        }
+        Err(e) => set_last_error(e.to_string()),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn hk_query_where_near(
+    query: *mut HK_Query,
+    field: *const c_char,
+    vec_ptr: *const f32,
+    vec_len: usize,
+) -> i32 {
+    if query.is_null() { return set_last_error("null query handle"); }
+    if vec_ptr.is_null() { return set_last_error("null vector pointer"); }
+    let field = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e), };
+    let slice = unsafe { std::slice::from_raw_parts(vec_ptr, vec_len) };
+    let query = unsafe { &mut *query };
+    query.query.filters.push(crate::query::filter::Filter {
+        field,
+        op: Operator::Near,
+        value: Value::Binary(crate::index::vector::encode_f32s(slice)),
+    });
+    clear_last_error();
+    0
+}
+
+#[no_mangle]
 pub extern "C" fn hk_engine_list_indexes(
     engine: *mut HK_Engine,
     collection: *const c_char,

@@ -5,3 +5,4 @@ pub mod manager;
 pub mod secondary_index;
 pub mod service;
 pub mod storage;
+pub mod vector;
