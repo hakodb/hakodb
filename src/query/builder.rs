@@ -61,6 +61,16 @@ impl<'a> QueryBuilder<'a> {
         self.where_filter(field, Operator::Gt, value)
     }
 
+    /// KNN filter: `query` f32s ride the filter as LE Binary (same carrier
+    /// as stored embeddings); k rides `.limit(k)`.
+    pub fn where_near(self, field: &str, query: &[f32]) -> Self {
+        self.where_filter(
+            field,
+            Operator::Near,
+            Value::Binary(crate::index::vector::encode_f32s(query)),
+        )
+    }
+
     pub fn order_by(mut self, field: &str, ascending: bool) -> Self {
         self.query = self.query.order_by(field, ascending);
         self

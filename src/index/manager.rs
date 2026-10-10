@@ -7,6 +7,7 @@ use std::sync::Arc;
 use super::composite::definition::CompositeIndexDefinition;
 use super::composite::manager::CompositeIndexManager;
 use super::inverted_index::InvertedIndex;
+use super::vector::{validate_dim, Metric, VectorDef};
 use crate::index::composite::composite_index::CompositeIndex;
 use crate::index::secondary_index::SecondaryIndex;
 
@@ -17,6 +18,10 @@ pub struct IndexManager {
     pub composite: CompositeIndexManager,
     pub secondary: HashMap<String, HashMap<String, SecondaryIndex>>,
     pub fts: HashMap<String, HashMap<String, InvertedIndex>>,
+    /// Vector definitions per (collection, field). P0: definitions only
+    /// (the exact scan needs dim/metric, no RAM structure); P1's HNSW
+    /// hangs off this same registry.
+    pub vector: HashMap<String, HashMap<String, VectorDef>>,
 }
 
 /// WAL tails at snapshot time, per collection: (wal data_len, wal
@@ -30,6 +35,24 @@ impl IndexManager {
             .entry(collection.to_string())
             .or_default()
             .insert(field.to_string(), InvertedIndex::default());
+    }
+
+    /// Register a vector definition (P0: no RAM structure — the exact scan
+    /// only needs dim + metric; dim mismatch at query time is fail-closed).
+    /// Re-registering overwrites (same overwrite rule as fts/secondary).
+    pub fn create_vector_index(
+        &mut self,
+        collection: &str,
+        field: &str,
+        dim: u32,
+        metric: Metric,
+    ) -> crate::error::Result<()> {
+        validate_dim(dim)?;
+        self.vector
+            .entry(collection.to_string())
+            .or_default()
+            .insert(field.to_string(), VectorDef { dim, metric });
+        Ok(())
     }
 
     pub fn indexes_for_collection(
@@ -195,11 +218,13 @@ impl IndexManager {
     }
 
     /// True when the manager holds any RAM entries for `collection`
-    /// (secondary, fts, or composite trees).
+    /// (secondary, fts, or composite trees). Vector counts as a
+    /// registration (P0 keeps no RAM entries — rescan trivially holds).
     pub fn has_collection(&self, collection: &str) -> bool {
         self.secondary.contains_key(collection)
             || self.fts.contains_key(collection)
             || self.composite.has_collection(collection)
+            || self.vector.contains_key(collection)
     }
 
     /// Drop every RAM entry for `collection` while keeping all index

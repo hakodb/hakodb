@@ -1,4 +1,5 @@
 use crate::document::value::Value;
+use crate::index::vector::Metric;
 use smallvec::SmallVec;
 use std::ops::Bound;
 
@@ -53,6 +54,19 @@ pub enum ScanType {
         field: String,
         query: String,
         prefix: bool,
+    },
+    /// Exact KNN (P0 brute-force; P1 swaps the scan internals for HNSW).
+    /// `query` is the raw LE-f32 Binary (mirrors the filter value); the
+    /// arm scores every doc and returns ids nearest-first. `metric` is
+    /// fixed by the index definition at plan time. `extra` carries the
+    /// plan's remaining (non-Near) filters — the arm verifies them
+    /// itself (the plan is marked satisfied, and `execute_single_scan`
+    /// takes no filter list, so they must ride the scan).
+    VectorKnn {
+        field: String,
+        query: Vec<u8>,
+        metric: Metric,
+        extra: Vec<Filter>,
     },
     // UPDATED: CursorIndex now defines a strict range
     CursorIndex {

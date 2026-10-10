@@ -94,13 +94,13 @@ fn hash_query(q: &Query) -> u64 {
     for f in &q.filters {
         f.field.hash(&mut h);
         (f.op as u8).hash(&mut h);
-        hash_value(&f.value, &mut h);
+        hash_filter_value(&f.op, &f.value, &mut h);
     }
     for g in &q.or_groups {
         for f in g {
             f.field.hash(&mut h);
             (f.op as u8).hash(&mut h);
-            hash_value(&f.value, &mut h);
+            hash_filter_value(&f.op, &f.value, &mut h);
         }
     }
     for o in &q.order_by {
@@ -154,6 +154,26 @@ fn hash_value(v: &crate::document::value::Value, h: &mut DefaultHasher) {
         crate::document::value::Value::Map(_) => 10u8.hash(h),
         crate::document::value::Value::ServerTimestamp => 11u8.hash(h),
     }
+}
+
+/// Per-filter value hash. Binary normally keys on length only (contents
+/// never change an exact-key plan) — EXCEPT under `Near`, where the query
+/// vector rides the Binary AND the plan embeds it (VectorKnn carries the
+/// bytes). Same-dim different-vector queries would otherwise share one
+/// plan and return each other's neighbors.
+fn hash_filter_value(
+    op: &crate::query::filter::Operator,
+    v: &crate::document::value::Value,
+    h: &mut DefaultHasher,
+) {
+    if matches!(op, crate::query::filter::Operator::Near) {
+        if let crate::document::value::Value::Binary(b) = v {
+            5u8.hash(h);
+            b.hash(h);
+            return;
+        }
+    }
+    hash_value(v, h);
 }
 
 fn hash_agg(a: &crate::query::query::AggregateOp, h: &mut DefaultHasher) {

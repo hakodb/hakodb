@@ -1,4 +1,4 @@
-use super::filter::Operator;
+use super::filter::{Filter, Operator};
 use super::plan::{QueryPlan, ScanType};
 use super::query::Query;
 use crate::document::value::Value;
@@ -44,6 +44,49 @@ impl QueryPlanner {
                             false,
                             false,
                         );
+                    }
+                }
+            }
+        }
+
+        // 1b. PRIORITY 1b: Vector KNN (exact, P0).
+        // Gate: exactly one Near filter, no OR groups, Binary LE-f32
+        // value, registered def with matching dim. Anything else falls
+        // through — Near is fail-closed in compare_values, so unsupported
+        // shapes return empty, never unranked rows.
+        let near_count = query.filters.iter().filter(|f| matches!(f.op, Operator::Near)).count();
+        if near_count == 1 && query.or_groups.is_empty() {
+            if let Some(nf) = query.filters.iter().find(|f| matches!(f.op, Operator::Near)) {
+                if let Value::Binary(qb) = &nf.value {
+                    let def = indexes.vector.get(&query.collection).and_then(|m| m.get(&nf.field));
+                    if let Some(def) = def {
+                        if qb.len() % 4 == 0 && qb.len() / 4 == def.dim as usize {
+                            let extra: Vec<Filter> = query
+                                .filters
+                                .iter()
+                                .filter(|f| !matches!(f.op, Operator::Near))
+                                .cloned()
+                                .collect();
+                            let mut plan = Self::make_plan(
+                                query,
+                                ScanType::VectorKnn {
+                                    field: nf.field.clone(),
+                                    query: qb.clone(),
+                                    metric: def.metric,
+                                    extra,
+                                },
+                                query.limit.map(|l| l + query.offset.unwrap_or(0)),
+                                false,
+                                true,
+                            );
+                            // The arm verifies everything itself (Near
+                            // scoring + remaining Eq filters), so strip
+                            // Near: downstream re-verify (incl. the
+                            // projected path) must only see boolean
+                            // filters.
+                            plan.filters.retain(|f| !matches!(f.op, Operator::Near));
+                            return plan;
+                        }
                     }
                 }
             }

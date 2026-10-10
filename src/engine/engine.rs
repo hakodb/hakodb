@@ -248,6 +248,16 @@ pub struct IndexList {
     pub secondary: HashMap<String, Vec<String>>,
     pub fts: HashMap<String, Vec<String>>,
     pub composite: Vec<CompositeIndexInfo>,
+    pub vector: HashMap<String, Vec<VectorIndexInfo>>,
+}
+
+/// One vector definition for list_indexes (additive key: older JSON
+/// consumers ignore unknown top-level keys).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VectorIndexInfo {
+    pub field: String,
+    pub dim: u32,
+    pub metric: String,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -255,6 +265,17 @@ struct PersistedIndexState {
     secondary: HashMap<String, Vec<String>>,
     fts: HashMap<String, Vec<String>>,
     composite: Vec<PersistedCompositeIndex>,
+    /// `default` = pre-vector files still load (whole-struct fallback
+    /// would otherwise wipe ALL defs on old files).
+    #[serde(default)]
+    vector: HashMap<String, Vec<PersistedVectorIndex>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedVectorIndex {
+    field: String,
+    dim: u32,
+    metric: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2719,7 +2740,21 @@ impl Hako {
             });
         }
 
-        let state = PersistedIndexState { secondary, fts, composite };
+        let mut vector: HashMap<String, Vec<PersistedVectorIndex>> = HashMap::new();
+        for (col, fields_map) in &mgr.vector {
+            let mut list: Vec<PersistedVectorIndex> = fields_map
+                .iter()
+                .map(|(f, d)| PersistedVectorIndex {
+                    field: f.clone(),
+                    dim: d.dim,
+                    metric: d.metric.name().to_string(),
+                })
+                .collect();
+            list.sort_by(|a, b| a.field.cmp(&b.field));
+            vector.insert(col.clone(), list);
+        }
+
+        let state = PersistedIndexState { secondary, fts, composite, vector };
         let path = self.index_defs_path();
         if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
         let json = serde_json::to_vec_pretty(&state).map_err(|e| HakoError::Corrupt(e.to_string()))?;
@@ -2749,6 +2784,18 @@ impl Hako {
             for field in fields {
                 mgr.fts.entry(collection.clone()).or_default()
                     .insert(field, crate::index::inverted_index::InvertedIndex::default());
+            }
+        }
+
+        // 2b. Populate vector defs. Invalid entries (bad dim/metric from
+        // a newer writer) are skipped, never fatal to open.
+        for (collection, defs) in state.vector {
+            for def in defs {
+                let metric = match def.metric.as_str() {
+                    "l2" => crate::index::vector::Metric::L2,
+                    _ => crate::index::vector::Metric::Cosine,
+                };
+                let _ = mgr.create_vector_index(&collection, &def.field, def.dim, metric);
             }
         }
 
@@ -2820,11 +2867,29 @@ impl Hako {
 
         composite.sort_by(|a, b| a.collection.cmp(&b.collection).then_with(|| a.id.cmp(&b.id)));
 
+        let mut vector: HashMap<String, Vec<VectorIndexInfo>> = HashMap::new();
+        for (col, fields_map) in &mgr.vector {
+            if let Some(target) = collection {
+                if target != col { continue; }
+            }
+            let mut infos: Vec<VectorIndexInfo> = fields_map
+                .iter()
+                .map(|(f, d)| VectorIndexInfo {
+                    field: f.clone(),
+                    dim: d.dim,
+                    metric: d.metric.name().to_string(),
+                })
+                .collect();
+            infos.sort_by(|a, b| a.field.cmp(&b.field));
+            vector.insert(col.clone(), infos);
+        }
+
         IndexList {
             simple: secondary.clone(),
             secondary,
             fts,
             composite,
+            vector,
         }
     }
 
@@ -2977,6 +3042,58 @@ impl Hako {
         let _ = self.persist_index_defs();
         self.plan_cache.invalidate();
         Ok(())
+    }
+
+    /// Register a vector index on `field` (P0: definition only — the exact
+    /// scan reads docs straight from storage, so there is no backfill
+    /// thread; P1's HNSW spawns its backfill here, mirroring
+    /// `create_fts_index`). Re-registering overwrites dim/metric.
+    pub fn create_vector_index(
+        &self,
+        collection: &str,
+        field: &str,
+        dim: u32,
+        metric: crate::index::vector::Metric,
+    ) -> Result<()> {
+        self.indexes
+            .write()
+            .unwrap()
+            .create_vector_index(collection, field, dim, metric)?;
+
+        let _ = self.persist_index_defs();
+        self.plan_cache.invalidate();
+        Ok(())
+    }
+
+    /// Nearest-first KNN over a vector index (P0 exact brute-force). k
+    /// rides the query limit. Dim mismatch against the definition is a
+    /// hard error (never silent truncation); querying an unindexed field
+    /// returns empty (fail-closed, like the planner gate).
+    pub fn find_near(
+        &self,
+        collection: &str,
+        field: &str,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<(String, HakoDoc)>> {
+        let dim = {
+            let mgr = self.indexes.read().unwrap();
+            match mgr.vector.get(collection).and_then(|m| m.get(field)) {
+                Some(def) => def.dim as usize,
+                None => return Ok(Vec::new()),
+            }
+        };
+        if query.len() != dim {
+            return Err(HakoError::Corrupt(format!(
+                "find_near dim mismatch: query {} vs index {dim} on {collection}.{field}",
+                query.len()
+            )));
+        }
+        let bytes = crate::index::vector::encode_f32s(query);
+        let q = Query::new(collection)
+            .where_filter(field, crate::query::filter::Operator::Near, Value::Binary(bytes))
+            .limit(k);
+        self.query(q)
     }
 
     /// Shared composite backfill spawner: used at explicit creation AND

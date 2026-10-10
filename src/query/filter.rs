@@ -18,6 +18,13 @@ pub enum Operator {
     ArrayContains,
     ArrayContainsAny,
     NotIn,
+    /// KNN marker (appended last: `as u8` discriminants of older variants
+    /// must stay stable for the plan-cache key). The query vector rides
+    /// `Filter.value` as `Value::Binary` (LE f32s); k rides the query
+    /// limit. Never a boolean predicate — only the VectorKnn scan
+    /// evaluates it; every other path treats it as unsatisfiable
+    /// (fail-closed: KNN without its scan returns nothing, not everything).
+    Near,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -32,7 +39,7 @@ pub struct FilterGroup {
     pub filters: Vec<Filter>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Filter {
     pub field: String,
     pub op: Operator,
@@ -231,6 +238,10 @@ fn eval_ordering(ord: Ordering, op: &Operator) -> bool {
         | Operator::In
         | Operator::NotIn
         | Operator::ArrayContains
-        | Operator::ArrayContainsAny => false,
+        | Operator::ArrayContainsAny
+        // Near is a scan, not a predicate: only the VectorKnn arm (which
+        // verifies everything itself and marks the plan satisfied) may
+        // produce rows for it. Any re-verification path answers false.
+        | Operator::Near => false,
     }
 }

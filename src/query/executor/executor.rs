@@ -1611,6 +1611,70 @@ impl ParallelQueryExecutor {
                 Ok(out)
             }
 
+            ScanType::VectorKnn { field, query, metric, extra } => {
+                // P0 exact: score every live doc, full sort nearest-first
+                // (n log n — P1 HNSW replaces the scan, not the contract).
+                // `extra` (non-Near filters) verifies HERE: the plan is
+                // marked satisfied so downstream never re-verifies, and the
+                // scan takes no filter list. Ties break on doc id so KNN
+                // paging is deterministic across runs.
+                use crate::index::vector::{decode_f32s, distance};
+                use crate::query::filter::compare_values;
+                let qv = decode_f32s(query).unwrap_or_default();
+                let mut scored: Vec<(f64, String, Pointer)> = Vec::new();
+                for (key, ptr) in storage.index.iter() {
+                    if matches!(ptr, Pointer::Deleted { .. }) {
+                        continue;
+                    }
+                    let bytes = match storage.read_pointer(ptr) {
+                        Ok(Some(b)) => b,
+                        _ => continue,
+                    };
+                    let doc = match HakoDoc::decode(&bytes) {
+                        Some(d) => d,
+                        None => continue,
+                    };
+                    let mut pass = true;
+                    for f in extra {
+                        match doc.get(&f.field) {
+                            Some(v) => {
+                                if !compare_values(v, &f.op, &f.value) {
+                                    pass = false;
+                                    break;
+                                }
+                            }
+                            // Missing field rejects (same rule as the
+                            // unified-match slow path).
+                            None => {
+                                pass = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !pass {
+                        continue;
+                    }
+                    // Missing / non-binary / dim-mismatched fields can't be
+                    // ranked — skip (fail-closed, same rule as the planner).
+                    let dv = match doc.get(field) {
+                        Some(Value::Binary(b)) => decode_f32s(b).unwrap_or_default(),
+                        _ => continue,
+                    };
+                    if dv.len() != qv.len() {
+                        continue;
+                    }
+                    scored.push((distance(*metric, &qv, &dv), key.clone(), ptr.clone()));
+                }
+                // NaN-free by construction (zero-norm guards in vector.rs),
+                // so total_cmp is a true order here.
+                scored.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                Ok(scored
+                    .into_iter()
+                    .take(max_ids)
+                    .map(|(_, k, p)| (k, p))
+                    .collect())
+            }
+
             ScanType::InvertedIndex { field, query, prefix } => {
                 let mut out = Vec::new();
                 if let Some(fts_map) = indexes.fts.get(collection) {
