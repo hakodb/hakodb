@@ -2,6 +2,15 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.13.1 — P3 dim-scaled HNSW (duel-driven recall fix)
+- Duel verdict (bench-lab, hakodb 0.13.0 vs Turso 0.9.30 @10k×384):
+  recall 0.62 vs 0.92 — fixed M=16 starved high-dim graphs.
+- M=`clamp(3√D,16,64)` (D=384→59, mirrors Turso `max_neighbors`),
+  ef_construction 200→300 and executor ef floor 128→256 for D≥128.
+  D≤16 behavior bit-identical. Result: recall 0.995 (beats Turso
+  0.925) at p50 7.95ms (still 2.6× faster), build 49s (4× faster),
+  size unchanged 15 MB (53× smaller). No API/contract change.
+
 ### v0.13.0 — NoSQL-native vector search (P0 exact, P1 HNSW, P2 polish)
 - **API**: `create_vector_index(col, field, dim, metric)` (cosine+L2),
   `find_near(col, field, vec, k)` with hybrid Eq pre-filter, `where_near`
