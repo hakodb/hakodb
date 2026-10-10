@@ -231,3 +231,59 @@ fn empty_graph_is_exact_trivially() {
     assert!(db.find_near("pts", "emb", &q, 5).expect("q").is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn blob_resident_vectors_index_on_live_writes() {
+    // Force embeddings over the blob threshold: at 64B a dim-32 vector
+    // (128B) is blob-resident. Index created FIRST on empty, then docs
+    // arrive via live puts — this exercises the worker inflate-on-index
+    // path, not the create backfill (which always resolved).
+    const BDIM: usize = 32;
+    let dir = tmp("blob");
+    let mut cfg = HakoConfig::default();
+    cfg.durability_mode = DurabilityMode::Manual;
+    cfg.value_blob_threshold_bytes = 64;
+    let db = Hako::open(&dir, cfg).expect("open");
+    db.create_vector_index("pts", "emb", BDIM as u32, Metric::Cosine).expect("create");
+    let mut rng = Rng(0x5EED);
+    let pts: Vec<Vec<f32>> = (0..50).map(|_| (0..BDIM).map(|_| rng.next_f32()).collect()).collect();
+    let batch = pts
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let mut doc = HakoDoc::default();
+            doc.insert("emb", Value::Binary(encode_f32s(p)));
+            BatchMutation::Put {
+                collection: "pts".into(),
+                doc_id: format!("d{i:04}"),
+                doc,
+            }
+        })
+        .collect();
+    db.write_batch(batch).expect("seed");
+    wait_complete(&db, "pts", "emb");
+    // Sanity: the vectors really live in the blob file.
+    let blob_len = std::fs::metadata(dir.join("pts").join("blobs.dat")).expect("blobs").len();
+    assert!(blob_len > 0, "embeddings must be blob-resident for this test");
+    // Oracle over f32 docs; engine must agree exactly (ANN engaged —
+    // wait_complete proved the flag — plus exact rescore).
+    let mut rng = Rng(0x60ED);
+    let live = vec![true; pts.len()];
+    for _ in 0..5 {
+        let q: Vec<f32> = (0..BDIM).map(|_| rng.next_f32()).collect();
+        let got: Vec<String> = db.find_near("pts", "emb", &q, 10).expect("knn").into_iter().map(|(id, _)| id).collect();
+        assert_eq!(got, brute_top_dim(&q, &pts, &live, 10));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn brute_top_dim(q: &[f32], pts: &[Vec<f32>], live: &[bool], k: usize) -> Vec<String> {
+    let mut scored: Vec<(f64, usize)> = pts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| live[*i])
+        .map(|(i, p)| (cosine(q, p), i))
+        .collect();
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    scored.into_iter().take(k).map(|(_, i)| format!("d{i:04}")).collect()
+}

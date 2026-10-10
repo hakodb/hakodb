@@ -149,9 +149,34 @@ const HNSW_MMAX0: usize = 32;
 const HNSW_EF_CONSTRUCTION: usize = 200;
 
 struct HnswNode {
-    vec: Vec<f32>,
+    /// int8-quantized vector + scale (dequant = iv * scale). Asymmetric
+    /// design: docs keep full f32 (exact rescore reads them), the graph
+    /// keeps 1 byte/dim. Cosine needs no dequant at all (scale cancels —
+    /// see node_dist); L2 folds the scale into one multiply per dim.
+    ivec: Vec<i8>,
+    scale: f32,
+    /// Scale-free shape norm Σivec² (f64: 127²·4096 ≈ 6.6e7 needs the
+    /// headroom). Precomputed once — every cosine call reuses it.
+    sum_sq: f64,
     /// links[level] = neighbor internal idxs.
     links: Vec<Vec<usize>>,
+}
+
+/// Symmetric int8 quantization: scale = max_abs/127 so the largest
+/// component maps exactly. Zero vector → all-zero + scale 1 (dequant
+/// stays exactly 0, cosine guards still apply downstream).
+fn quantize(v: &[f32]) -> (Vec<i8>, f32) {
+    let max = v.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+    if max == 0.0 {
+        return (vec![0; v.len()], 1.0);
+    }
+    let s = max / 127.0;
+    (
+        v.iter()
+            .map(|x| (x / s).round().clamp(-128.0, 127.0) as i8)
+            .collect(),
+        s,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -255,25 +280,78 @@ impl HnswIndex {
         (-self.next_random().ln() * self.level_mult) as usize
     }
 
-    fn dist_to(&self, q: &[f32], idx: usize) -> f64 {
-        distance(self.metric, q, &self.nodes[idx].vec)
+    /// Σq² for a full-precision query (precomputed once per search/insert,
+    /// reused by every distance call on the path).
+    fn query_norm_sq(q: &[f32]) -> f64 {
+        q.iter().map(|x| (*x as f64) * (*x as f64)).sum()
+    }
+
+    /// Query(full f32) vs node(int8): asymmetric by design — the query
+    /// stays full precision, the node dequantizes implicitly. Cosine's
+    /// scale cancels (shape-only); L2 folds scale into the dot term.
+    /// Zero-norm either side → 1.0 (cosine) — same guard as the exact path.
+    fn q_dist(&self, q: &[f32], qn: f64, idx: usize) -> f64 {
+        let n = &self.nodes[idx];
+        let mut dot = 0.0f64;
+        for i in 0..q.len() {
+            dot += q[i] as f64 * n.ivec[i] as f64;
+        }
+        match self.metric {
+            Metric::Cosine => {
+                let denom = qn.sqrt() * n.sum_sq.sqrt();
+                if denom == 0.0 { 1.0 } else { 1.0 - dot / denom }
+            }
+            Metric::L2 => {
+                let s = n.scale as f64;
+                qn + s * s * n.sum_sq - 2.0 * s * dot
+            }
+        }
+    }
+
+    /// Node vs node on quantized bytes (integer dot, exact): drives the
+    /// diversity heuristic and link shrinking without any dequant
+    /// temporaries.
+    fn node_dist(&self, a: usize, b: usize) -> f64 {
+        let (na, nb) = (&self.nodes[a], &self.nodes[b]);
+        let mut dot = 0i64;
+        for i in 0..na.ivec.len() {
+            dot += na.ivec[i] as i64 * nb.ivec[i] as i64;
+        }
+        match self.metric {
+            Metric::Cosine => {
+                let denom = (na.sum_sq * nb.sum_sq).sqrt();
+                if denom == 0.0 { 1.0 } else { 1.0 - dot as f64 / denom }
+            }
+            Metric::L2 => {
+                let (sa, sb) = (na.scale as f64, nb.scale as f64);
+                sa * sa * na.sum_sq + sb * sb * nb.sum_sq - 2.0 * sa * sb * dot as f64
+            }
+        }
     }
 
     /// Insert or update. Wrong-dim vectors are ignored (fail-closed, same
-    /// rule as the planner gate). Updates replace the vector in place and
-    /// keep existing links.
+    /// rule as the planner gate). Updates re-quantize in place and keep
+    /// existing links.
     pub fn upsert(&mut self, id: &str, vec: Vec<f32>) {
         if vec.len() != self.dim {
             return;
         }
         if let Some(&idx) = self.id_to_idx.get(id) {
-            self.nodes[idx].vec = vec;
+            let (ivec, scale) = quantize(&vec);
+            let n = &mut self.nodes[idx];
+            n.sum_sq = ivec.iter().map(|x| (*x as f64) * (*x as f64)).sum();
+            n.ivec = ivec;
+            n.scale = scale;
             return;
         }
         let level = self.random_level();
         let idx = self.nodes.len();
+        let (ivec, scale) = quantize(&vec);
+        let sum_sq = ivec.iter().map(|x| (*x as f64) * (*x as f64)).sum();
         self.nodes.push(HnswNode {
-            vec,
+            ivec,
+            scale,
+            sum_sq,
             links: vec![Vec::new(); level + 1],
         });
         self.id_to_idx.insert(id.to_string(), idx);
@@ -284,13 +362,15 @@ impl HnswIndex {
             return;
         };
         let top = self.nodes[cur].links.len() - 1;
+        // Insert-time routing uses the FULL-precision vector (better than
+        // the quantized copy the node now stores).
+        let qn = Self::query_norm_sq(&vec);
         // Greedy descent to the insertion levels.
         for l in ((level + 1)..=top).rev() {
-            cur = self.greedy_closest(&self.nodes[idx].vec.clone(), cur, l);
+            cur = self.greedy_closest(&vec, qn, cur, l);
         }
         for l in (0..=level.min(top)).rev() {
-            let q = self.nodes[idx].vec.clone();
-            let cand = self.search_layer(&q, &[cur], HNSW_EF_CONSTRUCTION, l);
+            let cand = self.search_layer(&vec, qn, &[cur], HNSW_EF_CONSTRUCTION, l);
             if cand.is_empty() {
                 continue;
             }
@@ -316,15 +396,15 @@ impl HnswIndex {
     }
 
     /// Greedy single-best descent at one level (ef=1 beam).
-    fn greedy_closest(&self, q: &[f32], entry: usize, level: usize) -> usize {
+    fn greedy_closest(&self, q: &[f32], qn: f64, entry: usize, level: usize) -> usize {
         let mut best = entry;
-        let mut best_d = self.dist_to(q, entry);
+        let mut best_d = self.q_dist(q, qn, entry);
         // ponytail: fixed-point loop, not a worklist — one pass per
         // improvement, terminates when no neighbor is closer.
         loop {
             let mut improved = false;
             for &nb in &self.nodes[best].links[level] {
-                let d = self.dist_to(q, nb);
+                let d = self.q_dist(q, qn, nb);
                 if d < best_d {
                     best_d = d;
                     best = nb;
@@ -343,6 +423,7 @@ impl HnswIndex {
     fn search_layer(
         &self,
         q: &[f32],
+        qn: f64,
         entries: &[usize],
         ef: usize,
         level: usize,
@@ -356,7 +437,7 @@ impl HnswIndex {
         for &e in entries {
             if e < self.nodes.len() && !visited[e] {
                 visited[e] = true;
-                let d = self.dist_to(q, e);
+                let d = self.q_dist(q, qn, e);
                 cands.push(Reverse(Cand { dist: d, idx: e }));
                 result.push(Cand { dist: d, idx: e });
                 if result.len() > ef {
@@ -377,7 +458,7 @@ impl HnswIndex {
             for &nb in &self.nodes[c.idx].links[level] {
                 if !visited[nb] {
                     visited[nb] = true;
-                    let d = self.dist_to(q, nb);
+                    let d = self.q_dist(q, qn, nb);
                     let mut push = result.len() < ef;
                     if !push {
                         if let Some(worst) = result.peek() {
@@ -408,9 +489,8 @@ impl HnswIndex {
         cand.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         let mut out: Vec<usize> = Vec::with_capacity(m);
         'next: for (d, idx) in cand {
-            let v = &self.nodes[idx].vec;
             for &kept in &out {
-                if distance(self.metric, v, &self.nodes[kept].vec) < d {
+                if self.node_dist(idx, kept) < d {
                     continue 'next;
                 }
             }
@@ -435,10 +515,9 @@ impl HnswIndex {
         if self.nodes[idx].links[level].len() <= mmax {
             return;
         }
-        let q = self.nodes[idx].vec.clone();
         let cand: Vec<(f64, usize)> = self.nodes[idx].links[level]
             .iter()
-            .map(|&nb| (distance(self.metric, &q, &self.nodes[nb].vec), nb))
+            .map(|&nb| (self.node_dist(idx, nb), nb))
             .collect();
         self.nodes[idx].links[level] = self.select_neighbors(cand, mmax);
     }
@@ -453,12 +532,13 @@ impl HnswIndex {
         if query.len() != self.dim {
             return Vec::new();
         }
+        let qn = Self::query_norm_sq(query);
         let top = self.nodes[entry].links.len() - 1;
         let mut cur = entry;
         for l in (1..=top).rev() {
-            cur = self.greedy_closest(query, cur, l);
+            cur = self.greedy_closest(query, qn, cur, l);
         }
-        self.search_layer(query, &[cur], ef, 0)
+        self.search_layer(query, qn, &[cur], ef, 0)
     }
 }
 
@@ -514,6 +594,21 @@ mod tests {
         assert_eq!(Metric::from_u32(1).expect("m"), Metric::L2);
         assert!(Metric::from_u32(7).is_err());
         assert_eq!(Metric::Cosine.name(), "cosine");
+    }
+
+    #[test]
+    fn quantize_error_bound() {
+        // Half-step bound: |dequant - x| <= s/2 (+ float dust).
+        let v: Vec<f32> = (0..64).map(|i| ((i * 37) % 101) as f32 / 50.0 - 1.0).collect();
+        let (iv, s) = quantize(&v);
+        assert_eq!(iv.len(), 64);
+        assert!((s - 1.0 / 127.0).abs() < 1e-9, "max_abs=1 => s=1/127, got {s}");
+        for (i, &x) in v.iter().enumerate() {
+            assert!((iv[i] as f32 * s - x).abs() <= s / 2.0 + 1e-6, "i={i} x={x}");
+        }
+        let (z, s0) = quantize(&vec![0.0; 8]);
+        assert!(z.iter().all(|&x| x == 0));
+        assert_eq!(s0, 1.0);
     }
 
     // --- P1 HNSW ---

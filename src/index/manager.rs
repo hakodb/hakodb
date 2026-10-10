@@ -92,12 +92,13 @@ impl IndexManager {
 
     /// Mark every graph of `collection` complete after a full pass
     /// (create backfill / recovery rescan) flowed through `index_vector`.
+    /// Emptiness is data, not incompleteness: an empty pass still flips
+    /// the flag, so later puts (hook-fed) serve ANN immediately instead
+    /// of stranding the graph incomplete forever.
     pub fn complete_vector(&mut self, collection: &str) {
         if let Some(graphs) = self.hnsw.get_mut(collection) {
             for graph in graphs.values_mut() {
-                if !graph.is_empty() {
-                    graph.set_complete(true);
-                }
+                graph.set_complete(true);
             }
         }
     }

@@ -1626,7 +1626,11 @@ impl ParallelQueryExecutor {
                 use crate::index::vector::{decode_f32s, distance};
                 use crate::query::filter::compare_values;
                 let qv = decode_f32s(query).unwrap_or_default();
-                let ef = max_ids.saturating_mul(4).clamp(64, 10_000);
+                // ef sizing: int8 graph distances are approximate, so
+                // over-fetch generously — exact rescore downstream keeps
+                // order honest, and extras only cost doc reads. Floor 128
+                // (measured: dim-128 recall 0.94 at ef=100, 2000 docs).
+                let ef = max_ids.saturating_mul(8).clamp(128, 20_000);
                 let use_ann = extra.is_empty();
                 let cand_ids: Option<Vec<String>> = indexes
                     .hnsw
@@ -1691,8 +1695,21 @@ impl ParallelQueryExecutor {
                     }
                     // Missing / non-binary / dim-mismatched fields can't be
                     // ranked — skip (fail-closed, same rule as the planner).
+                    // Blob-resident embeddings inflate here (durable: the
+                    // indexer drains the flush queue before resolving, so
+                    // by query time the bytes are on disk; a transient
+                    // miss resolves Null and skips — rebuilds converge).
                     let dv = match doc.get(field) {
                         Some(Value::Binary(b)) => decode_f32s(b).unwrap_or_default(),
+                        Some(Value::BlobLink { offset, len }) => {
+                            match storage.blob_manager.as_deref() {
+                                Some(bm) => match crate::query::executor::worker::resolve_single_blob_in_worker(bm, *offset, *len) {
+                                    Value::Binary(b) => decode_f32s(&b).unwrap_or_default(),
+                                    _ => continue,
+                                },
+                                None => continue,
+                            }
+                        }
                         _ => continue,
                     };
                     if dv.len() != qv.len() {
