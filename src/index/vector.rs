@@ -143,10 +143,31 @@ pub fn distance(metric: Metric, a: &[f32], b: &[f32]) -> f64 {
 //   persist if rebuild proves slow). Sync needs nothing: peers rebuild
 //   from the docs they already replicate.
 
-const HNSW_M: usize = 16;
-const HNSW_MMAX: usize = 16;
-const HNSW_MMAX0: usize = 32;
-const HNSW_EF_CONSTRUCTION: usize = 200;
+// P3: parameters scale with dim (duel verdict 2026-10-10: fixed M=16
+// starves high-dim graphs — recall 0.62 at D=384 vs Turso 0.92).
+// M ≈ 3√D mirrors Turso's max_neighbors default; ef_construction steps
+// up where int8 routing error compounds (D≥128). D≤16 keeps the old
+// values exactly (3√16=12 → clamped to 16; ef 200).
+const HNSW_M_MIN: usize = 16;
+const HNSW_M_MAX: usize = 64;
+const HNSW_EF_CONSTRUCTION_BASE: usize = 200;
+const HNSW_EF_CONSTRUCTION_HIGH_DIM: usize = 300;
+const HNSW_HIGH_DIM: usize = 128;
+
+/// Neighbor budget for `dim`: clamp(3√D, 16, 64). D=32→17, D=128→34,
+/// D=384→59, D=4096→64.
+pub fn hnsw_m_for_dim(dim: usize) -> usize {
+    let m = (3.0 * (dim as f64).sqrt()).round() as usize;
+    m.clamp(HNSW_M_MIN, HNSW_M_MAX)
+}
+
+fn hnsw_ef_construction_for_dim(dim: usize) -> usize {
+    if dim >= HNSW_HIGH_DIM {
+        HNSW_EF_CONSTRUCTION_HIGH_DIM
+    } else {
+        HNSW_EF_CONSTRUCTION_BASE
+    }
+}
 
 struct HnswNode {
     /// int8-quantized vector + scale (dequant = iv * scale). Asymmetric
@@ -210,6 +231,12 @@ impl Ord for Cand {
 pub struct HnswIndex {
     dim: usize,
     metric: Metric,
+    /// Per-dim budgets (see hnsw_m_for_dim): M neighbors kept,
+    /// Mmax/Mmax0 link caps, ef_construction beam at build.
+    m: usize,
+    mmax: usize,
+    mmax0: usize,
+    ef_construction: usize,
     level_mult: f64,
     nodes: Vec<HnswNode>,
     id_to_idx: std::collections::HashMap<String, usize>,
@@ -223,10 +250,15 @@ pub struct HnswIndex {
 
 impl HnswIndex {
     pub fn new(dim: usize, metric: Metric) -> Self {
+        let m = hnsw_m_for_dim(dim);
         Self {
             dim,
             metric,
-            level_mult: 1.0 / (HNSW_M as f64).ln(),
+            m,
+            mmax: m,
+            mmax0: 2 * m,
+            ef_construction: hnsw_ef_construction_for_dim(dim),
+            level_mult: 1.0 / (m as f64).ln(),
             nodes: Vec::new(),
             id_to_idx: std::collections::HashMap::new(),
             idx_to_id: Vec::new(),
@@ -370,17 +402,17 @@ impl HnswIndex {
             cur = self.greedy_closest(&vec, qn, cur, l);
         }
         for l in (0..=level.min(top)).rev() {
-            let cand = self.search_layer(&vec, qn, &[cur], HNSW_EF_CONSTRUCTION, l);
+            let cand = self.search_layer(&vec, qn, &[cur], self.ef_construction, l);
             if cand.is_empty() {
                 continue;
             }
-            let m = if l == 0 { HNSW_MMAX0 } else { HNSW_MMAX };
-            let neighbors = self.select_neighbors(cand, m.min(HNSW_M));
+            // Select M (link caps enforced separately by shrink).
+            let neighbors = self.select_neighbors(cand, self.m);
             if neighbors.is_empty() {
                 continue;
             }
             cur = neighbors[0];
-            let mmax = if l == 0 { HNSW_MMAX0 } else { HNSW_MMAX };
+            let mmax = if l == 0 { self.mmax0 } else { self.mmax };
             for nb in &neighbors {
                 self.add_link(idx, *nb, l);
                 self.add_link(*nb, idx, l);
@@ -594,6 +626,33 @@ mod tests {
         assert_eq!(Metric::from_u32(1).expect("m"), Metric::L2);
         assert!(Metric::from_u32(7).is_err());
         assert_eq!(Metric::Cosine.name(), "cosine");
+    }
+
+    #[test]
+    fn dim_scaled_params() {
+        // P3 duel verdict: clamp(3√D,16,64); D≤16 keeps legacy values.
+        assert_eq!(hnsw_m_for_dim(2), 16);
+        assert_eq!(hnsw_m_for_dim(16), 16);
+        assert_eq!(hnsw_m_for_dim(32), 17);
+        assert_eq!(hnsw_m_for_dim(128), 34);
+        assert_eq!(hnsw_m_for_dim(384), 59);
+        assert_eq!(hnsw_m_for_dim(4096), 64);
+        let lo = HnswIndex::new(8, Metric::Cosine);
+        assert_eq!((lo.m, lo.mmax, lo.mmax0, lo.ef_construction), (16, 16, 32, 200));
+        let hi = HnswIndex::new(384, Metric::Cosine);
+        assert_eq!((hi.m, hi.mmax, hi.mmax0, hi.ef_construction), (59, 59, 118, 300));
+    }
+
+    #[test]
+    fn hnsw_recall_high_dim() {
+        // P3 gate: 300 pts dim 128 (the slope that warned at 0.94) must
+        // clear 0.95 at the wider beam M=34/ef=256 pairing the executor
+        // now uses for D≥128.
+        let mut rng = FixtureRng(0x51);
+        let pts: Vec<Vec<f32>> = (0..300).map(|_| (0..128).map(|_| rng.next_f32()).collect()).collect();
+        let queries: Vec<Vec<f32>> = (0..10).map(|_| (0..128).map(|_| rng.next_f32()).collect()).collect();
+        let r = hnsw_recall(&pts, &queries, 10, Metric::Cosine, 256);
+        assert!(r >= 0.95, "high-dim recall {r}");
     }
 
     #[test]
