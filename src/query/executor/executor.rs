@@ -316,7 +316,8 @@ impl ParallelQueryExecutor {
                 match ptr {
                     Pointer::Inlined(shared) => push_row(id, &shared, &mut results),
                     other => {
-                        if let Ok(Some(bytes)) = storage_guard.read_pointer(&other) {
+                        // ponytail: shared read (see Inlined arm above).
+                        if let Ok(Some(bytes)) = storage_guard.read_pointer_shared(&other) {
                             push_row(id, &bytes, &mut results);
                         }
                     }
@@ -606,8 +607,9 @@ impl ParallelQueryExecutor {
         for e in entries {
             // ponytail: decode lazily in order; corrupt rows drop and the
             // page backfills from the heap remainder (same rows the legacy
-            // full-decode-then-sort would have kept).
-            let bytes = match storage.read_pointer(&e.ptr)? {
+            // full-decode-then-sort would have kept). Shared read: decode
+            // borrows, no per-row clone.
+            let bytes = match storage.read_pointer_shared(&e.ptr)? {
                 Some(b) => b,
                 None => continue,
             };
@@ -1127,7 +1129,8 @@ impl ParallelQueryExecutor {
             let storage_engine = task.storage.as_ref().unwrap().read().unwrap();
 
             for (id, pointer) in task.docs {
-                if let Ok(Some(bytes)) = storage_engine.read_pointer(&pointer) {
+                // ponytail: shared read — view matching borrows, no clone.
+                if let Ok(Some(bytes)) = storage_engine.read_pointer_shared(&pointer) {
                     // Check if the document matches the WHERE filters first
                     if matches_filters_view(&id, &bytes, &task.plan) {
                         if let Some(view) = HakoDocView::new(&bytes) {
@@ -1298,7 +1301,8 @@ impl ParallelQueryExecutor {
             let optimized_plan = crate::query::executor::worker::prepare_optimized_plan(&plan);
 
             for (id, pointer) in docs_to_process {
-                if let Ok(Some(bytes)) = storage_guard.read_pointer(&pointer) {
+                // ponytail: shared read — projected match borrows, no clone.
+                if let Ok(Some(bytes)) = storage_guard.read_pointer_shared(&pointer) {
                     if let Some(mut fields) = crate::query::executor::worker::unified_match_projected(&id, &bytes, &optimized_plan) {
                         if let Some(ref manager) = blob_manager {
                             for (_, val) in fields.iter_mut() {
@@ -1699,7 +1703,10 @@ impl ParallelQueryExecutor {
                 };
                 let mut scored: Vec<(f64, String, Pointer)> = Vec::new();
                 for (key, ptr) in pairs {
-                    let bytes = match storage.read_pointer(&ptr) {
+                    // ponytail: shared read — scoring decodes from the
+                    // live Arc, no per-row clone (same rule as every
+                    // other scan arm now).
+                    let bytes = match storage.read_pointer_shared(&ptr) {
                         Ok(Some(b)) => b,
                         _ => continue,
                     };
