@@ -2,6 +2,23 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.13.2 — query-tail + compaction + alloc hygiene (all box-verified)
+- **Query-aware maintenance shedding** (#43): the 5s tick sheds
+  non-durability heavy work (compaction, spill, purge, snapshots)
+  while queries fly; WAL flush stays, max 3 consecutive sheds.
+  Vector p99 13.89→~10.5 median-of-3; 90s soak shows no sustained
+  tail (p99 8.76).
+- **Two-stage KNN rescore** (#44): approx cut to rescore_n, exact
+  top-M; p50 ~8% better, recall 0.9950 unchanged on both reps.
+- **Narrow-lock tier compaction** (#44): prepare/commit only under
+  lock, verify-then-swap, orphan cleanup; 20s race test proves no
+  lost updates.
+- **Shared-bytes reads everywhere** (#45): decode borrows, zero
+  behavior change (measured ~0% on inlined workloads — the
+  remaining cost is owned decode output, by design).
+- No API break; two additive visibility fns (`queries_inflight`,
+  `tier_compactions`).
+
 ### v0.13.1 — P3 dim-scaled HNSW (duel-driven recall fix)
 - Duel verdict (bench-lab, hakodb 0.13.0 vs Turso 0.9.30 @10k×384):
   recall 0.62 vs 0.92 — fixed M=16 starved high-dim graphs.
