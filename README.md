@@ -41,6 +41,7 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
 - [Key features](#key-features)
 - [Quick Start (Rust)](#quick-start-rust)
 - [Rust usage](#rust-usage)
+- [Vector search (KNN)](#vector-search-knn)
 - [Multi-language platform support (C ABI)](#multi-language-platform-support-c-abi)
 - [Net Sync (LAN replication)](#net-sync-lan-replication)
 - [Cloud Sync (centralized replication)](#cloud-sync-centralized-replication)
@@ -94,7 +95,7 @@ Because it is a library, HakoDB has no "database server" to manage. Your app *is
 - **Encryption at rest** — optional key-based encryption (ChaCha20-Poly1305) for WAL and segment payloads; selectable encrypted collections.
 - **Transactions** — `begin_transaction` + staged mutations + `commit`; `begin_serializable_transaction` with conflict-aware commit validation (read/write version checks).
 - **Queries** — filters (`eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `notIn`, `arrayContains`, `arrayContainsAny`, `match`, `contains`, `startsWith`); ordering, limit, offset, cursor bounds (`startAt/startAfter/endAt/endBefore`); cost-aware parallel planner; predicate + projection pushdown; `count/sum/avg` aggregates.
-- **Indexing** — single-field secondary B-Tree indexes, composite indexes, inverted (full-text) indexes; async background index building.
+- **Indexing** — single-field secondary B-Tree indexes, composite indexes, inverted (full-text) indexes; vector (HNSW) indexes for KNN similarity search; async background index building.
 - **Zero-copy projection** — queries cherry-pick fields directly from memory-mapped binary slices without inflating full documents.
 - **Real-time watch streams** — `watch_collection` with change events; FFI bridge for cross-language reactive UIs.
 - **Subcollections** — `put/get/delete/query` on hierarchical nested collections.
@@ -165,6 +166,31 @@ See [`example/rust/basic`](example/rust/basic) for a complete, working example o
 > More Rust examples: [`example/rust/basic`](example/rust/basic) — a runnable
 > Cargo project (`cargo run`) covering open, CRUD, query, aggregation, batch,
 > transaction and the real-time watch channel.
+
+---
+
+## Vector search (KNN)
+
+`create_vector_index(collection, field, dim, metric)` + `find_near(collection,
+field, query, k)`: nearest-first hits over a binary LE-`f32` field, cosine or
+L2, HNSW graph with exact rescore (recall 0.995 @ 384d in the duel harness).
+
+> **The index does not embed.** HakoDB stores vectors and finds neighbors —
+> turning your text/images into vectors needs an **embedding model**, a
+> separate component you operate alongside the database:
+>
+> - Query and corpus **must share one model** (dimensions and geometry differ
+>   per model; a dim mismatch is a hard error, never silent truncation).
+> - Lightweight paths: a multilingual ONNX model (`paraphrase-multilingual-
+>   MiniLM`, 384d) as a tiny sidecar service, or a vendor embedding API
+>   (Gemini/OpenAI tiers) when data may leave the box.
+> - Changing models means re-embedding everything (vectors from model A are
+>   meaningless to model B).
+>
+> Without an embedding pipeline the vector index sits empty: it is storage +
+> search, not understanding. See `tests/vector_knn.rs` for the API shape and
+> `hakodb/hakobackend` HTTP_CONTRACT §3 for the HTTP contract (float arrays
+> over the wire, index-before-write order).
 
 ---
 
