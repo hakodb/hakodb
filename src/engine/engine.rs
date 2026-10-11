@@ -3388,6 +3388,23 @@ impl Hako {
         })
     }
 
+    /// Metric of a registered vector index, for FFI score recompute
+    /// (`hk_engine_find_near`): the query pipeline drops scores, so the
+    /// FFI layer recomputes the exact distance per hit from the stored
+    /// document vector — same `distance()` the rescore uses, O(k·D).
+    pub fn vector_metric(
+        &self,
+        collection: &str,
+        field: &str,
+    ) -> Option<crate::index::vector::Metric> {
+        self.indexes.read().ok().and_then(|mgr| {
+            mgr.vector
+                .get(collection)
+                .and_then(|m| m.get(field))
+                .map(|def| def.metric)
+        })
+    }
+
     /// Shared composite backfill spawner: used at explicit creation AND
     /// at open when a legacy snapshot restored secondary/fts but no
     /// composite trees (pre-fix files). Same chunks/yield discipline

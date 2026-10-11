@@ -3055,6 +3055,99 @@ pub extern "C" fn hk_query_where_near(
     0
 }
 
+/// One-shot KNN for FFI consumers (hakojs, hakogo, hakopascal):
+/// nearest-first `[{"id","score","doc"}]` as an owned string (free with
+/// `hk_string_free`). The query pipeline drops scores, so each hit's
+/// score is the exact metric distance recomputed against the stored
+/// document vector — same `distance()` the executor rescore uses, O(k·D),
+/// so the graph stays the only pruning stage. Dim mismatch is a hard
+/// error (null + `hk_last_error`); unindexed field returns `"[]"`
+/// (fail-closed, like `find_near`).
+#[no_mangle]
+pub extern "C" fn hk_engine_find_near(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    field: *const c_char,
+    vec_ptr: *const f32,
+    vec_len: usize,
+    k: usize,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error("null engine handle");
+            return ptr::null_mut();
+        }
+        if vec_ptr.is_null() {
+            set_last_error("null vector pointer");
+            return ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let col = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(e);
+                return ptr::null_mut();
+            }
+        };
+        let fld = match cstr_to_string(field) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(e);
+                return ptr::null_mut();
+            }
+        };
+        let query_vec = unsafe { std::slice::from_raw_parts(vec_ptr, vec_len) };
+        let metric = match engine.db.vector_metric(&col, &fld) {
+            Some(m) => m,
+            None => {
+                // Unindexed field: fail-closed empty, not an error.
+                clear_last_error();
+                return CString::new("[]")
+                    .map(|s| s.into_raw())
+                    .unwrap_or(ptr::null_mut());
+            }
+        };
+        let rows = match engine.db.find_near(&col, &fld, query_vec, k) {
+            Ok(r) => r,
+            Err(e) => {
+                set_last_error(e.to_string());
+                return ptr::null_mut();
+            }
+        };
+        let mut arr = Vec::with_capacity(rows.len());
+        for (id, doc) in &rows {
+            let score = match doc.get(&fld) {
+                Some(Value::Binary(b)) => {
+                    match crate::index::vector::decode_f32s(b) {
+                        Ok(stored)
+                            if stored.len() == query_vec.len() =>
+                        {
+                            crate::index::vector::distance(metric, query_vec, &stored)
+                        }
+                        _ => f64::INFINITY,
+                    }
+                }
+                _ => f64::INFINITY,
+            };
+            let doc_json: serde_json::Value = match doc_to_json(doc) {
+                Ok(s) => serde_json::from_str(&s).unwrap_or(serde_json::Value::Null),
+                Err(_) => serde_json::Value::Null,
+            };
+            arr.push(serde_json::json!({"id": id, "score": score, "doc": doc_json}));
+        }
+        match CString::new(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())) {
+            Ok(s) => {
+                clear_last_error();
+                s.into_raw()
+            }
+            Err(e) => {
+                set_last_error(e.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn hk_engine_list_indexes(
     engine: *mut HK_Engine,
