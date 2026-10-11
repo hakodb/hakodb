@@ -2,6 +2,17 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.13.3 — FFI one-shot KNN (satellite wiring enabler)
+- **`hk_engine_find_near`**: nearest-first `[{"id","score","doc"}]`
+  over the C ABI (owned string, `hk_string_free`); scores are the
+  exact metric distance recomputed per hit (same `distance()` as the
+  executor rescore, O(k·D)). Dim mismatch = hard error via
+  `hk_last_error`; unindexed field = `"[]"` (fail-closed).
+- **`Hako::vector_metric`** accessor behind it (index def metric for
+  the recompute; no pipeline change, scores were already dropped).
+- Tests: `tests/ffi_vector.rs` (order + exact scores, mismatch,
+  unindexed). Unblocks hakojs/hakogo/hakopascal (#47).
+
 ### v0.13.2 — query-tail + compaction + alloc hygiene (all box-verified)
 - **Query-aware maintenance shedding** (#43): the 5s tick sheds
   non-durability heavy work (compaction, spill, purge, snapshots)
