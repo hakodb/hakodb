@@ -86,7 +86,9 @@ pub fn run_task(task: QueryTask) -> Vec<(String, HakoDoc)> {
                 decode_row(id, &shared, &task.plan, &optimized_plan, &mut out);
             }
             other => {
-                if let Ok(Some(bytes)) = storage_guard.read_pointer(&other) {
+                // ponytail: shared read (see run_task above) — decode
+                // borrows, no per-row clone.
+                if let Ok(Some(bytes)) = storage_guard.read_pointer_shared(&other) {
                     decode_row(id, &bytes, &task.plan, &optimized_plan, &mut out);
                 }
             }
@@ -140,7 +142,8 @@ pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)
     let optimized_plan = prepare_optimized_plan(&task.plan);
 
     for (id, pointer) in task.docs {
-        if let Ok(Some(bytes)) = storage_guard.read_pointer(&pointer) {
+        // ponytail: shared read — the projected match borrows, no clone.
+        if let Ok(Some(bytes)) = storage_guard.read_pointer_shared(&pointer) {
             // HIGH PERFORMANCE: Single-pass filtering and partial decoding.
             if let Some(fields) = unified_match_projected(&id, &bytes, &optimized_plan) {
                 out.push((id, fields));
