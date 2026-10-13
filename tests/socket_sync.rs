@@ -131,3 +131,53 @@ async fn socket_snapshot_and_live_both_directions() {
         std::fs::remove_dir_all(parent).ok();
     }
 }
+
+/// Issue #51: index defs converge over the socket plane (IndexDefs packet
+/// after Hello). A creates a vector index; B dials; B's def appears and
+/// vectors written on B afterwards search correctly.
+#[tokio::test]
+async fn socket_index_defs_converge_vector() {
+    use hakodb::index::vector::{encode_f32s, Metric};
+
+    let dir_a = tmp("defs-a");
+    let dir_b = tmp("defs-b");
+    let sock = tmp("defs-sock").join("s.sock");
+    std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    let sock_str = sock.to_string_lossy().into_owned();
+
+    let a = open_db(&dir_a);
+    let b = open_db(&dir_b);
+    a.create_vector_index("pts", "emb", 2, Metric::Cosine).unwrap();
+
+    let sa = SocketSync::new(a.clone(), vec![]);
+    let sb = SocketSync::new(b.clone(), vec![]);
+    sa.serve(&sock_str).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    sb.dial(&sock_str).await.unwrap();
+
+    poll_until("vector def on b", || {
+        b.list_indexes(Some("pts"))
+            .vector
+            .get("pts")
+            .is_some_and(|v| v.iter().any(|d| d.field == "emb" && d.dim == 2))
+    })
+    .await;
+
+    for (id, p) in [("a", [1.0f32, 0.0]), ("b", [0.0, 1.0]), ("c", [1.0, 1.0])] {
+        let mut doc = HakoDoc::default();
+        doc.insert("emb", Value::Binary(encode_f32s(&p)));
+        b.put("pts", id, &doc).unwrap();
+    }
+    assert!(b.await_quiescent(Duration::from_secs(60)));
+    let hits = b.find_near("pts", "emb", &[1.0, 0.5], 2).unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].0, "c");
+
+    sa.stop();
+    sb.stop();
+    std::fs::remove_dir_all(&dir_a).ok();
+    std::fs::remove_dir_all(&dir_b).ok();
+    if let Some(parent) = sock.parent() {
+        std::fs::remove_dir_all(parent).ok();
+    }
+}

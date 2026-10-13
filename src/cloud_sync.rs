@@ -13,6 +13,7 @@ use crate::document::hako_doc::HakoDoc;
 use crate::document::value::Value;
 #[cfg(feature = "cloud-sync")]
 use crate::engine::engine::IndexOp;
+use crate::engine::engine::IndexList;
 #[cfg(feature = "cloud-sync")]
 use crate::engine::{BatchMutation, ChangeEvent, ChangeKind, Hako};
 #[cfg(feature = "cloud-sync")]
@@ -91,9 +92,15 @@ pub enum CloudPacket {
         success: bool,
         error: Option<String>,
     },
-    /// Version handshake exchanged symmetrically to catch up on missed deltas
+    /// Version handshake exchanged symmetrically to catch up on missed deltas.
+    /// `indexes` is additive (issue #51, serde default): old peers omit it
+    /// and converge doc bytes only. Names are room-plain on the wire (see
+    /// server_room_version_map); each side translates to its own storage
+    /// namespace before applying.
     VersionPing {
         versions: HashMap<String, i64>,
+        #[serde(default)]
+        indexes: Option<IndexList>,
     },
     /// Direct Replication Batch
     Replication {
@@ -1092,6 +1099,41 @@ kind,
         map
     }
 
+    /// Server-side index defs for one room, keyed by client-facing
+    /// (unprefixed) names (issue #51). Mirrors server_room_version_map:
+    /// each family map is re-keyed, composite entries rewritten.
+    fn server_room_index_list(db: &Arc<Hako>, prefix: &str) -> IndexList {
+        let full = db.list_indexes(None);
+        let marker = format!("{}_", prefix);
+        let plain = |col: &str| col.strip_prefix(&marker).map(str::to_string);
+        // IndexList maps are hashbrown (engine.rs); std maps won't assign.
+        let mut remap_map = |m: hashbrown::HashMap<String, Vec<String>>| {
+            m.into_iter()
+                .filter_map(|(col, v)| plain(&col).map(|p| (p, v)))
+                .collect::<hashbrown::HashMap<String, Vec<String>>>()
+        };
+        IndexList {
+            simple: remap_map(full.simple),
+            secondary: remap_map(full.secondary),
+            fts: remap_map(full.fts),
+            composite: full
+                .composite
+                .into_iter()
+                .filter_map(|mut c| {
+                    plain(&c.collection).map(|p| {
+                        c.collection = p;
+                        c
+                    })
+                })
+                .collect(),
+            vector: full
+                .vector
+                .into_iter()
+                .filter_map(|(col, v)| plain(&col).map(|p| (p, v)))
+                .collect(),
+        }
+    }
+
     async fn handle_server_client<S>(
         ws_stream: tokio_tungstenite::WebSocketStream<S>,
         ingest_tx: mpsc::Sender<IngestItem>,
@@ -1252,14 +1294,31 @@ kind,
                                         .await;
                                 }
                             }
-                            CloudPacket::VersionPing { versions: client_versions, .. } => {
+                            CloudPacket::VersionPing { versions: client_versions, indexes } => {
                                 let prefix = room_prefix.clone();
+
+                                // 0. Index defs converge (issue #51): client
+                                // names are room-plain; re-prefix to storage
+                                // namespace before applying.
+                                if let Some(idx) = indexes {
+                                    let marker = format!("{}_", prefix);
+                                    let mut namespaced = idx;
+                                    namespaced.simple = namespaced.simple.into_iter().map(|(c, v)| (format!("{marker}{c}"), v)).collect();
+                                    namespaced.secondary = namespaced.secondary.into_iter().map(|(c, v)| (format!("{marker}{c}"), v)).collect();
+                                    namespaced.fts = namespaced.fts.into_iter().map(|(c, v)| (format!("{marker}{c}"), v)).collect();
+                                    for comp in &mut namespaced.composite {
+                                        comp.collection = format!("{marker}{}", comp.collection);
+                                    }
+                                    namespaced.vector = namespaced.vector.into_iter().map(|(c, v)| (format!("{marker}{c}"), v)).collect();
+                                    crate::sync_core::apply_peer_index_defs(&db, &namespaced);
+                                }
 
                                 // 1. SYMMETRICAL REPLY: Send the Server's room-scoped
                                 //    VersionMap (plain collection names) back to Client
                                 let server_versions = Self::server_room_version_map(&db, &prefix);
                                 let reply = CloudPacket::VersionPing {
                                     versions: server_versions.clone(),
+                                    indexes: Some(Self::server_room_index_list(&db, &prefix)),
                                 };
                                 if let Ok(reply_bytes) = rmp_serde::to_vec_named(&reply) {
                                     let peers_guard = peers.read().await;
@@ -1663,6 +1722,7 @@ kind,
                     {
                         let ping = CloudPacket::VersionPing {
                             versions: db.get_version_map(),
+                            indexes: Some(db.list_indexes(None)),
                         };
                             let ping_bytes = rmp_serde::to_vec_named(&ping).unwrap();
                             let _ = ws_tx.send(Message::Binary(ping_bytes.into())).await;
@@ -1680,7 +1740,12 @@ kind,
                                         if let Message::Binary(b) = msg {
                                             if let Ok(packet) = rmp_serde::from_slice::<CloudPacket>(&b) {
                                                 match packet {
-                                                    CloudPacket::VersionPing { versions: server_versions } => {
+                                                    CloudPacket::VersionPing { versions: server_versions, indexes } => {
+                                                        // Server names are room-plain = client
+                                                        // namespace: apply directly (issue #51).
+                                                        if let Some(idx) = indexes {
+                                                            crate::sync_core::apply_peer_index_defs(&db, &idx);
+                                                        }
                                                         let client_versions = db.get_version_map();
                                                         for (col, client_ts) in client_versions {
                                                             let server_ts = server_versions.get(&col).copied().unwrap_or(0);
