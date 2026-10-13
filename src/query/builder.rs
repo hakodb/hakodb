@@ -32,6 +32,50 @@ impl<'a> Collection<'a> {
     }
 }
 
+/// Marker filter constructor (shared by the builder method and direct
+/// `Query::where_filter` users): anchor collection rides the filter
+/// field, the walk rides a Map value (`id`, `dir` 0/1/2, `edge`?,
+/// `depth`).
+pub fn traverse_filter(
+    start_col: &str,
+    start_id: &str,
+    direction: crate::index::traverse::TraverseDir,
+    edge_field: Option<&str>,
+    max_depth: usize,
+) -> crate::query::filter::Filter {
+    traverse_marker(start_col, start_id, direction, edge_field, max_depth)
+}
+
+fn traverse_marker(
+    start_col: &str,
+    start_id: &str,
+    direction: crate::index::traverse::TraverseDir,
+    edge_field: Option<&str>,
+    max_depth: usize,
+) -> crate::query::filter::Filter {
+    let dir_n = match direction {
+        crate::index::traverse::TraverseDir::Outgoing => 0,
+        crate::index::traverse::TraverseDir::Incoming => 1,
+        crate::index::traverse::TraverseDir::Both => 2,
+    };
+    let mut pairs: Vec<(std::sync::Arc<str>, Value)> = vec![
+        (std::sync::Arc::from("id"), Value::String(start_id.into())),
+        (std::sync::Arc::from("dir"), Value::Int(dir_n)),
+        (
+            std::sync::Arc::from("depth"),
+            Value::Int(max_depth as i64),
+        ),
+    ];
+    if let Some(f) = edge_field {
+        pairs.push((std::sync::Arc::from("edge"), Value::String(f.into())));
+    }
+    crate::query::filter::Filter {
+        field: start_col.to_string(),
+        op: Operator::Traverse,
+        value: Value::Map(pairs),
+    }
+}
+
 /// The stateful builder that carries the query and the database reference
 pub struct QueryBuilder<'a> {
     db: &'a Hako,
@@ -69,6 +113,25 @@ impl<'a> QueryBuilder<'a> {
             Operator::Near,
             Value::Binary(crate::index::vector::encode_f32s(query)),
         )
+    }
+
+    /// Graph-traversal marker (issue #53): BFS from (`start_col`,
+    /// `start_id`) in `direction`, following `edge_field` (None = any ref
+    /// field), up to `max_depth` (1..=32, hard error outside). Hits are
+    /// filtered to the queried collection; cross-collection paths ride
+    /// `find_paths`. Result cap rides `.limit(n)` (default 100 when
+    /// unset). Incoming needs `create_traverse_index` on the anchor
+    /// collection (fail-closed empty otherwise).
+    pub fn where_traverse(
+        self,
+        start_col: &str,
+        start_id: &str,
+        direction: crate::index::traverse::TraverseDir,
+        edge_field: Option<&str>,
+        max_depth: usize,
+    ) -> Self {
+        let f = traverse_marker(start_col, start_id, direction, edge_field, max_depth);
+        self.where_filter(&f.field.clone(), f.op, f.value)
     }
 
     pub fn order_by(mut self, field: &str, ascending: bool) -> Self {

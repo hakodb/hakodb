@@ -182,6 +182,7 @@ async fn cloud_index_defs_converge_vector() {
 
     let (db_a, dir_a) = temp_db("defs-a");
     db_a.create_vector_index("pts", "emb", 2, Metric::Cosine).unwrap();
+    db_a.create_traverse_index("pts").unwrap();
     let ca = CloudSync::new(db_a.clone(), CloudSyncMode::Client, "a", "alpha", "k1", "tok");
     ca.start(&format!("ws://{}", addr)).await.unwrap();
 
@@ -205,6 +206,10 @@ async fn cloud_index_defs_converge_vector() {
             .vector
             .get("pts")
             .is_some_and(|v| v.iter().any(|d| d.field == "emb" && d.dim == 2))
+    }, 8000)
+    .await;
+    wait_until("client B pts traverse", || {
+        db_b.list_indexes(Some("pts")).traverse.contains(&"pts".to_string())
     }, 8000)
     .await;
 

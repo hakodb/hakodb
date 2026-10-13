@@ -1440,6 +1440,7 @@ mod tests {
         let (b, _db) = temp_db("ping-b");
         a.create_vector_index("pts", "emb", 2, Metric::Cosine).unwrap();
         a.create_index("pts", "grp").unwrap();
+        a.create_traverse_index("pts").unwrap();
 
         let advertised = a.list_indexes(None);
         apply_peer_index_defs(&b, &advertised);
@@ -1454,6 +1455,10 @@ mod tests {
         assert!(
             listed.secondary.get("pts").is_some_and(|v| v.contains(&"grp".to_string())),
             "secondary arm must keep working"
+        );
+        assert!(
+            listed.traverse.contains(&"pts".to_string()),
+            "traverse targets must converge (issue #53)"
         );
 
         // Second Ping: guard skips the known def (no error, no dup).

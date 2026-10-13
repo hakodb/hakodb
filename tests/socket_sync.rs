@@ -16,6 +16,7 @@ use hakodb::config::{DurabilityMode, HakoConfig};
 use hakodb::document::hako_doc::HakoDoc;
 use hakodb::document::value::Value;
 use hakodb::engine::Hako;
+use hakodb::index::vector::Metric;
 use hakodb::socket_sync::SocketSync;
 
 fn tmp(label: &str) -> std::path::PathBuf {
@@ -148,6 +149,7 @@ async fn socket_index_defs_converge_vector() {
     let a = open_db(&dir_a);
     let b = open_db(&dir_b);
     a.create_vector_index("pts", "emb", 2, Metric::Cosine).unwrap();
+    a.create_traverse_index("pts").unwrap();
 
     let sa = SocketSync::new(a.clone(), vec![]);
     let sb = SocketSync::new(b.clone(), vec![]);
@@ -160,6 +162,11 @@ async fn socket_index_defs_converge_vector() {
             .vector
             .get("pts")
             .is_some_and(|v| v.iter().any(|d| d.field == "emb" && d.dim == 2))
+    })
+    .await;
+
+    poll_until("traverse target on b", || {
+        b.list_indexes(Some("pts")).traverse.contains(&"pts".to_string())
     })
     .await;
 

@@ -92,6 +92,72 @@ impl QueryPlanner {
             }
         }
 
+        // 1c. PRIORITY 1c: Graph traversal (issue #53, Phase A).
+        // Gate: exactly one Traverse filter, no OR groups, anchor
+        // collection in the field, Map value (id/dir/edge?/depth), sane
+        // depth, tracked start when incoming. Anything else falls through
+        // — Traverse is fail-closed in compare_values, so unsupported
+        // shapes return empty, never unranked rows. Combined Near+Traverse
+        // is unsupported (first marker wins, the other fail-closes).
+        let trav_count = query.filters.iter().filter(|f| matches!(f.op, Operator::Traverse)).count();
+        if trav_count == 1 && query.or_groups.is_empty() {
+            if let Some(tf) = query.filters.iter().find(|f| matches!(f.op, Operator::Traverse)) {
+                if !tf.field.is_empty() {
+                    if let Value::Map(pairs) = &tf.value {
+                        let str_of = |k: &str| {
+                            pairs.iter().find(|(kk, _)| kk.as_ref() == k).and_then(|(_, v)| {
+                                if let Value::String(s) = v { Some(s.clone()) } else { None }
+                            })
+                        };
+                        let int_of = |k: &str| {
+                            pairs.iter().find(|(kk, _)| kk.as_ref() == k).and_then(|(_, v)| {
+                                if let Value::Int(i) = v { Some(*i) } else { None }
+                            })
+                        };
+                        if let (Some(start_id), Some(depth)) = (str_of("id"), int_of("depth")) {
+                            let dir = int_of("dir").unwrap_or(0);
+                            let edge = str_of("edge");
+                            if depth >= 1 && depth <= crate::index::traverse::MAX_TRAVERSE_DEPTH as i64 {
+                                if let Ok(direction) = crate::index::traverse::TraverseDir::from_u32(dir as u32) {
+                                    let incoming_ok = !direction.uses_incoming()
+                                        || indexes.traverse.is_tracked(&tf.field);
+                                    if incoming_ok {
+                                        let extra: Vec<Filter> = query
+                                            .filters
+                                            .iter()
+                                            .filter(|f| !matches!(f.op, Operator::Traverse))
+                                            .cloned()
+                                            .collect();
+                                        let limit = query.limit.unwrap_or(100);
+                                        let spec = crate::index::traverse::TraverseSpec {
+                                            direction,
+                                            edge_field: edge,
+                                            max_depth: depth as usize,
+                                            limit,
+                                        };
+                                        let mut plan = Self::make_plan(
+                                            query,
+                                            ScanType::Traverse {
+                                                start_col: tf.field.clone(),
+                                                start_id,
+                                                spec,
+                                                extra,
+                                            },
+                                            query.limit.map(|l| l + query.offset.unwrap_or(0)),
+                                            false,
+                                            true,
+                                        );
+                                        plan.filters.retain(|f| !matches!(f.op, Operator::Traverse));
+                                        return plan;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // 2. PRIORITY 2: Composite Index (Now correctly handles id/_time via updated IndexManager)
         //
         // ponytail: unordered single-Eq lookups are cheaper via the simple

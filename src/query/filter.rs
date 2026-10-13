@@ -25,6 +25,12 @@ pub enum Operator {
     /// evaluates it; every other path treats it as unsatisfiable
     /// (fail-closed: KNN without its scan returns nothing, not everything).
     Near,
+    /// Graph-traversal marker (appended last: same discriminant rule).
+    /// `Filter.field` is the anchor collection; `Filter.value` is a
+    /// `Value::Map` (`id` anchor id, `dir` 0/1/2, `edge` optional field,
+    /// `depth` bound). Same contract as Near: only the Traverse scan
+    /// evaluates it, every other path answers false (fail-closed).
+    Traverse,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -242,6 +248,7 @@ fn eval_ordering(ord: Ordering, op: &Operator) -> bool {
         // Near is a scan, not a predicate: only the VectorKnn arm (which
         // verifies everything itself and marks the plan satisfied) may
         // produce rows for it. Any re-verification path answers false.
-        | Operator::Near => false,
+        // Traverse identical: only the Traverse scan evaluates it.
+        | Operator::Near | Operator::Traverse => false,
     }
 }

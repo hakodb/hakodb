@@ -1811,6 +1811,15 @@ impl ParallelQueryExecutor {
                 Ok(out)
             }
 
+            // Graph BFS crosses collections — the single-shard scan
+            // paths (projected/raw/walk) cannot run it. Loud error, never
+            // silent empty: traverse over `query()` (issue #53).
+            ScanType::Traverse { .. } => {
+                Err(crate::error::HakoError::Corrupt(
+                    "traverse scans need the decoded query path (use query(), not raw/projected/walk)".into(),
+                ))
+            }
+
         }
     }
 }

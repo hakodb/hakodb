@@ -95,7 +95,8 @@ Because it is a library, HakoDB has no "database server" to manage. Your app *is
 - **Encryption at rest** — optional key-based encryption (ChaCha20-Poly1305) for WAL and segment payloads; selectable encrypted collections.
 - **Transactions** — `begin_transaction` + staged mutations + `commit`; `begin_serializable_transaction` with conflict-aware commit validation (read/write version checks).
 - **Queries** — filters (`eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `notIn`, `arrayContains`, `arrayContainsAny`, `match`, `contains`, `startsWith`); ordering, limit, offset, cursor bounds (`startAt/startAfter/endAt/endBefore`); cost-aware parallel planner; predicate + projection pushdown; `count/sum/avg` aggregates.
-- **Indexing** — single-field secondary B-Tree indexes, composite indexes, inverted (full-text) indexes; vector (HNSW) indexes for KNN similarity search; async background index building.
+- **Indexing** — single-field secondary B-Tree indexes, composite indexes, inverted (full-text) indexes;
+vector (HNSW) indexes for KNN similarity search; graph backlink indexes for BFS traversal over document references; async background index building.
 - **Zero-copy projection** — queries cherry-pick fields directly from memory-mapped binary slices without inflating full documents.
 - **Real-time watch streams** — `watch_collection` with change events; FFI bridge for cross-language reactive UIs.
 - **Subcollections** — `put/get/delete/query` on hierarchical nested collections.
@@ -242,7 +243,8 @@ Platform outputs:
 - **Queries:** `hk_query_new/free`, all `hk_query_where_*` filters, `hk_query_order_by`, `hk_query_limit/offset`, `hk_query_select_field`, `hk_query_defer_blobs`, cursor functions (`start_at/start_after/end_at/end_before`), `hk_query_execute`, `hk_query_execute_to_handles`, `hk_query_delete`, `hk_query_patch`, aggregates (`hk_query_aggregate_count/sum/avg`, `hk_query_execute_aggregation`).
 - **Result sets:** `hk_result_set_count/get_doc/free`, `hk_result_set_to_json` (bulk single-call export).
 - **Diagnostics:** `hk_debug_write_stats` (write-phase timing breakdown; see `--wstats`).
-- **Indexing:** `hk_engine_create_index` (composite JSON), `hk_engine_create_simple_index`, `hk_engine_create_fts_index`.
+- **Indexing:** `hk_engine_create_index` (composite JSON), `hk_engine_create_simple_index`,
+`hk_engine_create_fts_index`, `hk_engine_create_vector_index`, `hk_engine_create_traverse_index`.
 - **Net Sync:** `hk_net_syncer_new/start/status/free`.
 - **Cloud Sync:** `hk_cloud_sync_new/start/status/stop/free`, plus the room-agnostic `hk_cloud_sync_server_new` and the room-bound `hk_cloud_sync_client_new`.
 

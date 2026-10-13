@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -16,6 +17,7 @@ use crate::index::composite::definition::{CompositeIndexDefinition, SortDirectio
 use crate::index::manager::IndexManager;
 use crate::index::service::IndexingService;
 use crate::index::storage::index_storage::IndexStorage;
+use crate::index::traverse::{TraverseDir, TraverseSpec, MAX_TRAVERSE_DEPTH};
 use crate::query::executor::executor::ParallelQueryExecutor;
 use crate::query::plan_cache::PlanCache;
 use crate::query::query::Query;
@@ -249,6 +251,11 @@ pub struct IndexList {
     pub fts: HashMap<String, Vec<String>>,
     pub composite: Vec<CompositeIndexInfo>,
     pub vector: HashMap<String, Vec<VectorIndexInfo>>,
+    /// Tracked traverse-target collections (issue #53). Additive key with
+    /// `#[serde(default)]` like vector (older JSON consumers ignore it);
+    /// bincode planes treat def-sync as same-minor lockstep (see #51).
+    #[serde(default)]
+    pub traverse: Vec<String>,
 }
 
 /// One vector definition for list_indexes (additive key: older JSON
@@ -260,6 +267,16 @@ pub struct VectorIndexInfo {
     pub metric: String,
 }
 
+/// One graph hit: collection + id (paths cross collections), BFS depth,
+/// and the doc itself. Returned by `Hako::find_paths`.
+#[derive(Debug, Clone)]
+pub struct TraverseHit {
+    pub collection: String,
+    pub id: String,
+    pub depth: usize,
+    pub doc: HakoDoc,
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct PersistedIndexState {
     secondary: HashMap<String, Vec<String>>,
@@ -269,6 +286,10 @@ struct PersistedIndexState {
     /// would otherwise wipe ALL defs on old files).
     #[serde(default)]
     vector: HashMap<String, Vec<PersistedVectorIndex>>,
+    /// Tracked traverse targets (issue #53). Same default rule: pre-graph
+    /// files load with tracking off.
+    #[serde(default)]
+    traverse: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1010,11 +1031,19 @@ impl Hako {
                             }
                             // ponytail: selective decode — only indexed
                             // fields materialize (same index state, no
-                            // value allocs for the rest).
+                            // value allocs for the rest). Traverse forces
+                            // full decode: refs live in any field, and any
+                            // collection may point at tracked targets.
                             let wanted = Hako::indexed_fields_for(&mgr, &col_name);
-                            if !wanted.is_empty() {
+                            let full = !mgr.traverse.is_empty();
+                            if !wanted.is_empty() || full {
                                 for (doc_id, bytes) in data {
-                                    if let Some(doc) = HakoDoc::decode_projected(&bytes, &wanted) {
+                                    let doc = if full {
+                                        HakoDoc::decode(&bytes)
+                                    } else {
+                                        HakoDoc::decode_projected(&bytes, &wanted)
+                                    };
+                                    if let Some(doc) = doc {
                                         // doc_id is already the naked ID
                                         mgr.index_document(&col_name, &doc_id, &doc);
                                     }
@@ -2286,6 +2315,20 @@ impl Hako {
 
         let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
 
+        // Graph traversal (issue #53): cross-collection BFS can't ride
+        // the single-shard executor — dedicated path below. Normal scans
+        // are untouched (perf: zero hot-path change).
+        if matches!(plan.scan, crate::query::plan::ScanType::Traverse { .. }) {
+            let results = self.execute_traverse_query(&plan)?;
+            self.record_audit(AuditEntry {
+                op: AccessOp::Query,
+                collection: query.collection.clone(),
+                doc_id: None,
+                ok: true,
+            });
+            return Ok(results);
+        }
+
         // SIMPLE CALL: No blob_file or encryption passed here!
         let results = self.executor.execute(shard_arc, &indexes, (*plan).clone())?;
 
@@ -2314,6 +2357,85 @@ impl Hako {
         let is_ready = self.index_query_ready();
         let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
         Ok((*plan).clone())
+    }
+
+    /// Traverse-query path (issue #53): BFS via `find_paths`, hits
+    /// filtered to the queried collection (cross-collection hits ride
+    /// `find_paths` — pipeline rows are single-collection), `extra`
+    /// verified per hit (missing-field rejects, VectorKnn rule), then
+    /// order/offset/limit mirroring the legacy manual sort.
+    fn execute_traverse_query(
+        &self,
+        plan: &crate::query::plan::QueryPlan,
+    ) -> Result<Vec<(String, HakoDoc)>> {
+        use crate::query::filter::compare_values;
+        use crate::query::plan::ScanType;
+        let (start_col, start_id, spec, extra) = match &plan.scan {
+            ScanType::Traverse { start_col, start_id, spec, extra } => {
+                (start_col.clone(), start_id.clone(), spec.clone(), extra.clone())
+            }
+            _ => {
+                return Err(HakoError::Corrupt("traverse executor reached without a Traverse plan".into()))
+            }
+        };
+        let mut spec = spec;
+        // scan_limit (limit+offset, planner-set) bounds the BFS fetch;
+        // fall back to the spec default when the planner left it open.
+        if let Some(fetch) = plan.scan_limit {
+            spec.limit = fetch;
+        }
+        let mut results: Vec<(String, HakoDoc)> = Vec::new();
+        for hit in self.find_paths(&start_col, &start_id, &spec)? {
+            if hit.collection != plan.collection {
+                continue;
+            }
+            let mut pass = true;
+            for f in extra.iter() {
+                match hit.doc.get(&f.field) {
+                    Some(v) => {
+                        if !compare_values(v, &f.op, &f.value) {
+                            pass = false;
+                            break;
+                        }
+                    }
+                    None => {
+                        pass = false;
+                        break;
+                    }
+                }
+            }
+            if !pass {
+                continue;
+            }
+            results.push((hit.id, hit.doc));
+        }
+        if !plan.order_by.is_empty() {
+            results.sort_by(|(id_a, doc_a), (id_b, doc_b)| {
+                for order in &plan.order_by {
+                    let cmp = match order.field.as_str() {
+                        "id" => id_a.cmp(id_b),
+                        "_time" => doc_a._time.cmp(&doc_b._time),
+                        _ => {
+                            let av = doc_a.get(&order.field);
+                            let bv = doc_b.get(&order.field);
+                            av.cmp(&bv)
+                        }
+                    };
+                    if cmp != std::cmp::Ordering::Equal {
+                        return if order.ascending { cmp } else { cmp.reverse() };
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+        let offset = plan.offset.unwrap_or(0);
+        if offset > 0 {
+            results = results.into_iter().skip(offset).collect();
+        }
+        if let Some(limit) = plan.limit {
+            results.truncate(limit);
+        }
+        Ok(results)
     }
 
     /// Raw scan: storage-encoded bytes instead of decoded docs. Same
@@ -2944,7 +3066,10 @@ impl Hako {
             vector.insert(col.clone(), list);
         }
 
-        let state = PersistedIndexState { secondary, fts, composite, vector };
+        let mut traverse: Vec<String> = mgr.traverse.tracked_cols();
+        traverse.sort();
+
+        let state = PersistedIndexState { secondary, fts, composite, vector, traverse };
         let path = self.index_defs_path();
         if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
         let json = serde_json::to_vec_pretty(&state).map_err(|e| HakoError::Corrupt(e.to_string()))?;
@@ -2990,6 +3115,13 @@ impl Hako {
                 let _ = mgr.create_vector_index(&collection, &def.field, def.dim, metric);
                 mgr.ensure_vector_graph(&collection, &def.field);
             }
+        }
+
+        // 2c. Populate traverse targets (issue #53). Backlink edges are
+        // derived and rebuild in STEP C through the hook — only the
+        // tracked set persists.
+        for collection in state.traverse {
+            mgr.traverse.track(&collection);
         }
 
         // 3. Populate Composite (Directly in manager)
@@ -3077,12 +3209,21 @@ impl Hako {
             vector.insert(col.clone(), infos);
         }
 
+        let mut traverse: Vec<String> = mgr
+            .traverse
+            .tracked_cols()
+            .into_iter()
+            .filter(|c| collection.is_none_or(|t| t == c))
+            .collect();
+        traverse.sort();
+
         IndexList {
             simple: secondary.clone(),
             secondary,
             fts,
             composite,
             vector,
+            traverse,
         }
     }
 
@@ -3403,6 +3544,160 @@ impl Hako {
                 .and_then(|m| m.get(field))
                 .map(|def| def.metric)
         })
+    }
+
+    /// Opt a collection in as a traversal target (issue #53, Phase A):
+    /// inbound edges to its docs are tracked from here on (live writes
+    /// via the hook, existing docs via the backfill below). Idempotent
+    /// (secondary norm — re-create is a no-op, never a backfill storm).
+    /// Forward traversal needs no state and works regardless; incoming
+    /// into an untracked collection is a loud error at query time.
+    pub fn create_traverse_index(&self, collection: &str) -> Result<()> {
+        {
+            let mgr = self.indexes.read().unwrap();
+            if mgr.traverse.is_tracked(collection) {
+                return Ok(());
+            }
+        }
+        {
+            self.indexes.write().unwrap().traverse.track(collection);
+        }
+
+        // Backfill existing docs (mirror create_fts): snapshot pointers,
+        // full-decode (refs live in any field), hook-feed in chunks.
+        let shard_arc = self.get_shard(collection)?;
+        let idx_mgr = Arc::clone(&self.indexes);
+        let col_name = collection.to_string();
+        let enc_key = self.config.encryption_key.clone();
+        let backfill_count = Arc::clone(&self.backfill_inflight);
+        backfill_count.fetch_add(1, Ordering::Relaxed);
+        thread::spawn(move || {
+            let _guard = BackfillGuard { counter: backfill_count };
+            let pointers = {
+                let storage = shard_arc.read().unwrap();
+                storage.get_physical_index_snapshot()
+            };
+            for chunk in pointers.chunks(100) {
+                let mut resolved_docs = Vec::new();
+                {
+                    let storage = shard_arc.read().unwrap();
+                    for (key, ptr) in chunk {
+                        if let Ok(Some(bytes)) = storage.read_pointer_internal(ptr, false) {
+                            resolved_docs.push((key.clone(), bytes));
+                        }
+                    }
+                }
+                let mut mgr = idx_mgr.write().unwrap();
+                for (full_key, bytes) in resolved_docs {
+                    if let Some(mut doc) = HakoDoc::decode(&bytes) {
+                        let _ = resolve_doc_static(&mut doc, &shard_arc, enc_key.as_deref());
+                        mgr.traverse.index_doc(&col_name, &full_key, &doc);
+                    }
+                }
+            }
+        });
+
+        let _ = self.persist_index_defs();
+        self.plan_cache.invalidate();
+        Ok(())
+    }
+
+    /// BFS traversal from one anchor (issue #53, Phase A). Outgoing
+    /// follows live ref fields; incoming consults the backlink map
+    /// (tracked targets only) with stale edges re-verified against
+    /// storage. Missing anchor = empty (fail-closed); incoming into an
+    /// untracked collection = hard error (loud, not silent); depth/limit
+    /// validated, never clamped. Level order, sorted within a level
+    /// (deterministic across runs); stops at the first `limit` hits.
+    pub fn find_paths(
+        &self,
+        collection: &str,
+        id: &str,
+        spec: &TraverseSpec,
+    ) -> Result<Vec<TraverseHit>> {
+        spec.validate()?;
+        if spec.direction.uses_incoming() {
+            let tracked = self.indexes.read().unwrap().traverse.is_tracked(collection);
+            if !tracked {
+                return Err(HakoError::Corrupt(format!(
+                    "traverse incoming needs a tracked collection: create_traverse_index({collection}) first"
+                )));
+            }
+        }
+        if self.get(collection, id)?.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut visited: HashSet<(String, String)> = HashSet::new();
+        visited.insert((collection.to_string(), id.to_string()));
+        let mut queue: VecDeque<((String, String), usize)> = VecDeque::new();
+        queue.push_back(((collection.to_string(), id.to_string()), 0));
+        let mut out = Vec::new();
+        'bfs: while let Some(((col, doc_id), depth)) = queue.pop_front() {
+            if depth >= spec.max_depth {
+                continue;
+            }
+            let mut next: Vec<(String, String)> = Vec::new();
+            if spec.direction.uses_outgoing() {
+                if let Ok(Some(doc)) = self.get(&col, &doc_id) {
+                    for (field, value) in doc.fields.iter() {
+                        if let Some(f) = spec.edge_field.as_deref() {
+                            if &**field != f {
+                                continue;
+                            }
+                        }
+                        if let Value::Reference { collection: tgt, doc_id: tid } = value {
+                            next.push((tgt.clone(), tid.clone()));
+                        }
+                    }
+                }
+            }
+            if spec.direction.uses_incoming() {
+                let edges: Vec<(String, String, String)> = self
+                    .indexes
+                    .read()
+                    .unwrap()
+                    .traverse
+                    .inbound(&col, &doc_id)
+                    .map(|v| {
+                        v.iter()
+                            .filter(|e| spec.edge_field.as_deref().is_none_or(|f| e.field == f))
+                            .map(|e| (e.src_col.clone(), e.src_id.clone(), e.field.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for (scol, sid, sfield) in edges {
+                    // Stale-edge guard: overwrites don't remove (dedupe +
+                    // verify, same tolerance as secondary). Confirm the
+                    // source still points here before following.
+                    let live = self.get(&scol, &sid).ok().flatten().is_some_and(|d| {
+                        d.get(&sfield).is_some_and(|v| {
+                            matches!(v, Value::Reference { collection: c, doc_id: t } if c == &col && t == &doc_id)
+                        })
+                    });
+                    if live {
+                        next.push((scol, sid));
+                    }
+                }
+            }
+            next.sort();
+            next.dedup();
+            for (ncol, nid) in next {
+                if !visited.insert((ncol.clone(), nid.clone())) {
+                    continue;
+                }
+                let nd = depth + 1;
+                if nd < spec.max_depth {
+                    queue.push_back(((ncol.clone(), nid.clone()), nd));
+                }
+                if out.len() >= spec.limit {
+                    break 'bfs;
+                }
+                if let Ok(Some(doc)) = self.get(&ncol, &nid) {
+                    out.push(TraverseHit { collection: ncol, id: nid, depth: nd, doc });
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Shared composite backfill spawner: used at explicit creation AND

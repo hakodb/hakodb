@@ -68,6 +68,19 @@ pub enum ScanType {
         metric: Metric,
         extra: Vec<Filter>,
     },
+    /// Graph BFS from one anchor (issue #53). `start_col`/`start_id`
+    /// ride the marker filter's field/value; `spec` carries direction,
+    /// edge field, depth, limit. `extra` like VectorKnn (verified by the
+    /// executor itself). Hits are filtered to the queried collection —
+    /// traversal crosses collections internally, results don't (the
+    /// pipeline's rows are single-collection; cross-collection hits ride
+    /// the `find_paths` engine API instead).
+    Traverse {
+        start_col: String,
+        start_id: String,
+        spec: crate::index::traverse::TraverseSpec,
+        extra: Vec<Filter>,
+    },
     // UPDATED: CursorIndex now defines a strict range
     CursorIndex {
         start: Bound<SmallVec<[u8; 32]>>,

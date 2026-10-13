@@ -117,6 +117,13 @@ impl IndexingService {
         if manager.vector.contains_key(collection) {
             return false;
         }
+        // Traverse defs need the owned path too: backlinks decode through
+        // index_document's hook over full docs (refs live in any field,
+        // and any collection's docs may point at tracked targets — so any
+        // tracking anywhere forces the owned rescan everywhere).
+        if !manager.traverse.is_empty() {
+            return false;
+        }
         if manager
             .composite
             .all_indexes()
