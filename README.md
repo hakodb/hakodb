@@ -1,10 +1,10 @@
 # HakoDB
 
-**HakoDB is an embedded, Firestore-style document database written in Rust.**
+**HakoDB is an embedded document database with native vector search and multi-plane sync, written in Rust.**
 
 It stores typed JSON-like documents in binary form, runs **fully in-process** like SQLite (no server process, no daemon, no network config), and exposes a **flat C ABI** (`hakodb.h`, generated per-target by the build) so any language can embed it. Ready-made SDKs live in their own repos — Go, JavaScript/TypeScript, Pascal/Lazarus, Tauri, and more (see [Repositories](#repositories)).
 
-HakoDB speaks "documents", not tables: collections of flexible, schemaless objects with a query API that feels like Google Firestore (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
+HakoDB speaks "documents", not tables: collections of flexible, schemaless objects with a fluent query API (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
 
 > **Current status: v0.12.3 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, **archive collections** (`relocate_docs`, `lazy_collections` with load/unload), a **selectivity-aware planner** (smallest-posting Eq, early sweep termination), and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
 
@@ -59,7 +59,7 @@ HakoDB speaks "documents", not tables: collections of flexible, schemaless objec
 
 HakoDB is a **document-oriented embedded database** for applications that want:
 
-- **Firestore-like ergonomics** — collections, documents, `set/get/delete`, fluent queries, real-time change streams.
+- **Document ergonomics** — collections, documents, `set/get/delete`, fluent queries, real-time change streams.
 - **SQLite-style embedding** — link a library into your process and open a database file; there is nothing to install or operate.
 - **Durability without sacrifice** — a WAL + tiered-segment storage engine with configurable durability (from full `fsync` per write to group-commit `on-commit` batches) and crash recovery.
 - **Encryption at rest** — ChaCha20-Poly1305 encryption of WAL and segment payloads via a master key.
@@ -523,11 +523,11 @@ API (HakoDB + FFI + SDKs)
 | **Indexing** | Async | B-Tree updates offloaded to a background worker thread to keep main-thread latency low. |
 | **Memory management** | Adaptive | Inlined RAM data spills to tiered segments when thresholds are met. |
 | **Concurrency** | Atomic | Atomic versioning and async auditing remove global mutex bottlenecks. |
-| **Durability** | ACID | `OnCommit` mode mirrors Firestore `batch.commit()` semantics. |
+| **Durability** | ACID | `OnCommit` mode commits write batches atomically. |
 | **Encryption** | Optimized | ChaCha20-Poly1305 with thread-local RNG for high-frequency encrypted I/O. |
 | **Real-time** | Threaded | FFI-compatible background listener bridge with `user_data` context passing. |
 
-### Feature status vs Firestore-style target
+### Feature status
 
 | Area | HakoDB status | Notes |
 |---|---|---|
