@@ -918,32 +918,11 @@ async fn handle_peer(
             match packet {
                 NetPacket::Ping { versions, indexes } => {
                     if let Ok(mut lp) = last_ping.lock() { *lp = Instant::now(); }
-                    
-                    for (col, fields) in indexes.secondary {
-                        for field in fields {
-                            // db.create_index is internal-idempotent (it won't recreate if exists)
-                            let _ = db.create_index(&col, &field);
-                        }
-                    }
 
-                    // 2. Sync FTS Indexes
-                    for (col, fields) in indexes.fts {
-                        for field in fields {
-                            let _ = db.create_fts_index(&col, &field);
-                        }
-                    }
-
-                    // 3. Sync Composite Indexes
-                    use crate::index::composite::definition::SortDirection;
-                    for comp in indexes.composite {
-                        let fields: Vec<(String, SortDirection)> = comp.fields.into_iter().map(|f| {
-                            let dir = if f.direction == "desc" { SortDirection::Desc } else { SortDirection::Asc };
-                            (f.field, dir)
-                        }).collect();
-                        
-                        // This registers the index and starts background backfilling
-                        let _ = db.create_composite_index(&comp.collection, fields);
-                    }
+                    // Index defs advertised by the peer converge locally
+                    // (issue #51). Shared helper in sync_core so it
+                    // unit-tests without networking.
+                    crate::sync_core::apply_peer_index_defs(&db, &indexes);
                     
                     for (col, remote_time) in versions {
                         if excluded.contains(&col) || db.is_sync_withheld(&col) { continue; }
@@ -1446,6 +1425,58 @@ mod tests {
         db.set_collection_local("c", true);
 
         assert!(collect_delta_ops(&db, "c", 0).is_empty());
+    }
+
+    /// Issue #51: a peer's advertised defs converge locally — secondary
+    /// arm unchanged, vector def lands, repeated Pings are no-ops, and
+    /// vectors written after convergence search correctly. Covers the
+    /// shared sync_core helper for all planes.
+    #[test]
+    fn peer_index_defs_converge_vector() {
+        use crate::index::vector::{encode_f32s, Metric};
+        use crate::sync_core::apply_peer_index_defs;
+
+        let (a, _da) = temp_db("ping-a");
+        let (b, _db) = temp_db("ping-b");
+        a.create_vector_index("pts", "emb", 2, Metric::Cosine).unwrap();
+        a.create_index("pts", "grp").unwrap();
+
+        let advertised = a.list_indexes(None);
+        apply_peer_index_defs(&b, &advertised);
+
+        let listed = b.list_indexes(Some("pts"));
+        assert!(
+            listed.vector.get("pts").is_some_and(|v| v
+                .iter()
+                .any(|d| d.field == "emb" && d.dim == 2 && d.metric == "cosine")),
+            "vector def must converge"
+        );
+        assert!(
+            listed.secondary.get("pts").is_some_and(|v| v.contains(&"grp".to_string())),
+            "secondary arm must keep working"
+        );
+
+        // Second Ping: guard skips the known def (no error, no dup).
+        apply_peer_index_defs(&b, &advertised);
+        let relisted = b.list_indexes(Some("pts"));
+        assert_eq!(
+            relisted.vector.get("pts").map(|v| v.len()),
+            Some(1),
+            "repeated Ping must not duplicate defs"
+        );
+
+        // Vectors written post-convergence index + search (quiescence
+        // first — same rule as engine tests: Near fail-closes early).
+        for (id, p) in [("a", [1.0f32, 0.0]), ("b", [0.0, 1.0]), ("c", [1.0, 1.0])] {
+            let mut doc = HakoDoc::default();
+            doc.insert("emb", Value::Binary(encode_f32s(&p)));
+            b.put("pts", id, &doc).unwrap();
+        }
+        assert!(b.await_quiescent(Duration::from_secs(60)));
+        let hits = b.find_near("pts", "emb", &[1.0, 0.5], 2).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0, "c");
+        assert_eq!(hits[1].0, "a");
     }
 
     fn beacon_pkt(id: &str, room: &[u8; 32], port: u16) -> BeaconPacket {

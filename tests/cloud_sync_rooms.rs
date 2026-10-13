@@ -158,6 +158,74 @@ async fn rooms_are_isolated_and_prefixed_on_server() {
     }
 }
 
+/// Issue #51: index defs converge over the cloud plane with room-prefix
+/// translation. A creates a vector index, the server lands it on
+/// `alpha_pts`, and late-joining B (same room) converges bare `pts` from
+/// the server reply — then vectors written on B search correctly.
+#[tokio::test]
+async fn cloud_index_defs_converge_vector() {
+    use hakodb::index::vector::{encode_f32s, Metric};
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{}", port);
+
+    let (srv_db, srv_dir) = temp_db("defs-server");
+    let server = CloudSync::new(
+        srv_db.clone(),
+        CloudSyncMode::Server,
+        "srv",
+        "",
+        "srv-key",
+        "tok",
+    );
+    server.start(&addr).await.unwrap();
+
+    let (db_a, dir_a) = temp_db("defs-a");
+    db_a.create_vector_index("pts", "emb", 2, Metric::Cosine).unwrap();
+    let ca = CloudSync::new(db_a.clone(), CloudSyncMode::Client, "a", "alpha", "k1", "tok");
+    ca.start(&format!("ws://{}", addr)).await.unwrap();
+
+    // Server converges the def on its room namespace...
+    wait_until("server alpha_pts def", || {
+        srv_db
+            .list_indexes(Some("alpha_pts"))
+            .vector
+            .get("alpha_pts")
+            .is_some_and(|v| v.iter().any(|d| d.field == "emb" && d.dim == 2))
+    }, 8000)
+    .await;
+
+    // ...and late-joining B converges the bare def from the reply.
+    let (db_b, dir_b) = temp_db("defs-b");
+    let cb = CloudSync::new(db_b.clone(), CloudSyncMode::Client, "b", "alpha", "k1", "tok");
+    cb.start(&format!("ws://{}", addr)).await.unwrap();
+    wait_until("client B pts def", || {
+        db_b
+            .list_indexes(Some("pts"))
+            .vector
+            .get("pts")
+            .is_some_and(|v| v.iter().any(|d| d.field == "emb" && d.dim == 2))
+    }, 8000)
+    .await;
+
+    for (id, p) in [("a", [1.0f32, 0.0]), ("b", [0.0, 1.0]), ("c", [1.0, 1.0])] {
+        let mut doc = HakoDoc::default();
+        doc.insert("emb", Value::Binary(encode_f32s(&p)));
+        db_b.put("pts", id, &doc).unwrap();
+    }
+    assert!(db_b.await_quiescent(Duration::from_secs(60)));
+    let hits = db_b.find_near("pts", "emb", &[1.0, 0.5], 2).unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].0, "c");
+
+    server.stop();
+    ca.stop();
+    cb.stop();
+    for d in [srv_dir, dir_a, dir_b] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
 #[tokio::test]
 async fn same_client_id_different_rooms_stay_isolated() {
     let port = free_port();

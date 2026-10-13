@@ -16,7 +16,7 @@ use std::sync::atomic::Ordering;
 
 use crate::document::hako_doc::HakoDoc;
 use crate::document::value::Value;
-use crate::engine::engine::IndexOp;
+use crate::engine::engine::{IndexList, IndexOp};
 use crate::engine::{ChangeEvent, ChangeKind, Hako};
 use crate::storage::blob::BlobWork;
 use crate::storage::engine::{Pointer, StorageEngine};
@@ -251,6 +251,63 @@ pub async fn apply_replicated_batch(
         };
 
         db.notify_watchers(&collection, event);
+    }
+}
+
+/// Apply a peer's advertised index defs locally (issue #51). Shared by
+/// every plane that carries defs (mesh Ping, socket IndexDefs, cloud
+/// VersionPing): secondary/FTS/composite create arms plus vector.
+/// Vector defs travel; graphs rebuild locally via the create backfill
+/// (never on the wire, by design). The vector arm is guarded —
+/// re-creating on every packet would restart backfills + invalidate the
+/// plan cache network-wide for zero benefit. Pure (no sockets): the mesh
+/// unit test covers the logic for all planes.
+pub(crate) fn apply_peer_index_defs(db: &Arc<Hako>, indexes: &IndexList) {
+    for (col, fields) in &indexes.secondary {
+        for field in fields {
+            // db.create_index is internal-idempotent (it won't recreate if exists)
+            let _ = db.create_index(col, field);
+        }
+    }
+
+    for (col, fields) in &indexes.fts {
+        for field in fields {
+            let _ = db.create_fts_index(col, field);
+        }
+    }
+
+    use crate::index::composite::definition::SortDirection;
+    for comp in &indexes.composite {
+        let fields: Vec<(String, SortDirection)> = comp.fields.iter().map(|f| {
+            let dir = if f.direction == "desc" { SortDirection::Desc } else { SortDirection::Asc };
+            (f.field.clone(), dir)
+        }).collect();
+
+        // This registers the index and starts background backfilling
+        let _ = db.create_composite_index(&comp.collection, fields);
+    }
+
+    {
+        let known: std::collections::HashSet<(String, String, u32, String)> = db
+            .list_indexes(None)
+            .vector
+            .into_iter()
+            .flat_map(|(col, defs)| {
+                defs.into_iter().map(move |d| (col.clone(), d.field, d.dim, d.metric))
+            })
+            .collect();
+        for (col, defs) in &indexes.vector {
+            for def in defs {
+                if known.contains(&(col.clone(), def.field.clone(), def.dim, def.metric.clone())) {
+                    continue;
+                }
+                let metric = match def.metric.as_str() {
+                    "l2" => crate::index::vector::Metric::L2,
+                    _ => crate::index::vector::Metric::Cosine,
+                };
+                let _ = db.create_vector_index(col, &def.field, def.dim, metric);
+            }
+        }
     }
 }
 

@@ -8,6 +8,7 @@
 //! Protocol (bincode, like mesh framing, unlike cloud msgpack):
 //! ```text
 //!   dialer/accepted -> Hello { versions }   (both directions)
+//!   either side     -> IndexDefs { indexes } (both directions, once per connect)
 //!   either side     -> Snapshot { collection, ops }  (full live + tombs)
 //!   either side     -> Data { collection, ops }      (live tail, 500ms)
 //! ```
@@ -15,6 +16,13 @@
 //! to reason about. Delta optimization later if snapshots get heavy.
 //! Unix-only (AF_UNIX in tokio is cfg(unix)); the feature is a silent
 //! no-op on Windows so default builds stay green there.
+//!
+//! Wire-compat rule (issue #51): the packet enum is positional bincode,
+//! so old peers cannot decode IndexDefs — they drop the connection and
+//! redial into the same drop. Socket peers are co-located instances of
+//! one deployment: upgrade them in lockstep. (Mesh Ping has the same
+//! property since IndexList gained `vector` in 0.13.0.) Doc bytes flow
+//! through the unchanged Snapshot/Data variants regardless.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{
@@ -27,9 +35,10 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::document::hako_doc::HakoDoc;
 use crate::engine::Hako;
+use crate::engine::engine::IndexList;
 use crate::storage::engine::Pointer;
 use crate::storage::wal::WalOp;
-use crate::sync_core::{apply_replicated_batch, echo_take, op_logical_time, resolve_send_bytes};
+use crate::sync_core::{apply_peer_index_defs, apply_replicated_batch, echo_take, op_logical_time, resolve_send_bytes};
 
 /// Fail-closed frame cap: a corrupt length prefix must not allocate the
 /// box. Snapshots bigger than this fail the connection, not the process.
@@ -38,6 +47,9 @@ const MAX_FRAME: usize = 256 * 1024 * 1024;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum SockPacket {
     Hello { versions: HashMap<String, i64> },
+    /// Index defs, once per connect (issue #51). Appended LAST: old peers
+    /// fail the whole-packet decode and drop (see module docs — lockstep).
+    IndexDefs { indexes: IndexList },
     Snapshot { collection: String, ops: Vec<WalOp> },
     Data { collection: String, ops: Vec<WalOp> },
 }
@@ -239,6 +251,13 @@ async fn handle_conn(st: Shared, stream: UnixStream, label: String) {
     };
     st.peers.lock().unwrap().insert(label.clone());
 
+    // 1b. Index defs, once per connect (issue #51). Peer rebuilds derived
+    // state locally; guarded + idempotent on receipt.
+    {
+        let indexes = st.db.list_indexes(None);
+        let _ = send(&SockPacket::IndexDefs { indexes });
+    }
+
     // 2. Full snapshot, both directions handled by symmetric send here
     // (the peer sends theirs; LWW dedups on ingest).
     for col in st.db.sync_collections().unwrap_or_default() {
@@ -328,6 +347,9 @@ async fn handle_conn(st: Shared, stream: UnixStream, label: String) {
             Ok(SockPacket::Snapshot { collection, ops })
             | Ok(SockPacket::Data { collection, ops }) => {
                 apply_replicated_batch(st.db.clone(), collection, ops, st.echo_cache.clone()).await;
+            }
+            Ok(SockPacket::IndexDefs { indexes }) => {
+                apply_peer_index_defs(&st.db, &indexes);
             }
             _ => break,
         }

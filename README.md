@@ -186,6 +186,10 @@ L2, HNSW graph with exact rescore (recall 0.995 @ 384d in the duel harness).
 >   (Gemini/OpenAI tiers) when data may leave the box.
 > - Changing models means re-embedding everything (vectors from model A are
 >   meaningless to model B).
+> - **Sync carries defs, not graphs.** Index definitions replicate over
+>   mesh/cloud/socket (peers converge, same-minor lockstep); HNSW graphs
+>   rebuild locally from the replicated documents — never snapshotted,
+>   never on the wire.
 >
 > Without an embedding pipeline the vector index sits empty: it is storage +
 > search, not understanding. See `tests/vector_knn.rs` for the API shape and
