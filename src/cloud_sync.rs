@@ -1131,6 +1131,11 @@ kind,
                 .into_iter()
                 .filter_map(|(col, v)| plain(&col).map(|p| (p, v)))
                 .collect(),
+            traverse: full
+                .traverse
+                .into_iter()
+                .filter_map(|col| plain(&col))
+                .collect(),
         }
     }
 
@@ -1310,6 +1315,7 @@ kind,
                                         comp.collection = format!("{marker}{}", comp.collection);
                                     }
                                     namespaced.vector = namespaced.vector.into_iter().map(|(c, v)| (format!("{marker}{c}"), v)).collect();
+                                    namespaced.traverse = namespaced.traverse.into_iter().map(|c| format!("{marker}{c}")).collect();
                                     crate::sync_core::apply_peer_index_defs(&db, &namespaced);
                                 }
 

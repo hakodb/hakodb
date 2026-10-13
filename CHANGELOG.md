@@ -2,6 +2,35 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.14.0 — graph traversal Phase A (issue #53)
+- **Backlink index**: opt-in per target collection
+  (`create_traverse_index`); outbound refs indexed from live writes,
+  backfills, and recovery rescans; deletes clean both directions;
+  overwrites dedupe + verify-at-query (secondary tolerance rule).
+- **`find_paths`**: BFS out/in/both with edge-field filter, depth cap
+  (max 32, hard errors never clamps), visited-set cycle guard,
+  stale-edge re-verification, deterministic level order, limit prefix.
+  Missing anchor = empty; incoming into untracked = loud error.
+- **Query path**: `Operator::Traverse` + `ScanType::Traverse` + planner
+  arm (shape-gated, fail-closed) executed at engine level (cross-shard
+  BFS can't ride the single-shard executor — hot path untouched);
+  hybrid extra filters, order/offset/limit; projected/raw/walk paths
+  fail loud, never silent-empty.
+- **FFI**: `hk_engine_create_traverse_index`,
+  `hk_query_where_traverse`, `hk_engine_find_paths`
+  (`[{"collection","id","depth","doc"}]`).
+- **Sync**: traverse defs travel over mesh/cloud/socket (room-prefix
+  translated); edges rebuild locally. `IndexList.traverse` is additive
+  (serde default; bincode planes = same-minor lockstep per #51 rule).
+- **Duel (acceptance)**: outgoing parity 0.8x vs N+1 point-gets (index
+  can't beat optimal gets — documented); both-direction 335x vs
+  scan-reverse (235ms -> 0.7ms); write +14% debug (~5% release est.),
+  ref-bearing docs only.
+- **Fix on the way**: build.rs link-search derives from OUT_DIR (shared
+  CARGO_TARGET_DIR broke the FFI test link with LNK1181).
+- Tests: `traverse.rs` (6), `traverse_query.rs` (4), `ffi_traverse.rs`
+  (3), sync def extensions (mesh/cloud/socket).
+
 ### v0.13.3 — FFI one-shot KNN (satellite wiring enabler)
 - **`hk_engine_find_near`**: nearest-first `[{"id","score","doc"}]`
   over the C ABI (owned string, `hk_string_free`); scores are the

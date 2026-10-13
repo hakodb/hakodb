@@ -173,6 +173,21 @@ fn hash_filter_value(
             return;
         }
     }
+    // Traverse marker carries the whole walk in a Map (anchor, dir, edge,
+    // depth): same rule as Near — two walks with different payloads must
+    // never share a plan. Hash the entries, sorted for determinism.
+    if matches!(op, crate::query::filter::Operator::Traverse) {
+        if let crate::document::value::Value::Map(pairs) = v {
+            12u8.hash(h);
+            let mut entries: Vec<(&str, String)> = pairs
+                .iter()
+                .map(|(k, vv)| (k.as_ref(), format!("{vv:?}")))
+                .collect();
+            entries.sort();
+            entries.hash(h);
+            return;
+        }
+    }
     hash_value(v, h);
 }
 

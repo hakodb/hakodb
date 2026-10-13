@@ -7,6 +7,7 @@ use std::sync::Arc;
 use super::composite::definition::CompositeIndexDefinition;
 use super::composite::manager::CompositeIndexManager;
 use super::inverted_index::InvertedIndex;
+use super::traverse::BacklinkIndex;
 use super::vector::{decode_f32s, validate_dim, HnswIndex, Metric, VectorDef};
 use crate::index::composite::composite_index::CompositeIndex;
 use crate::index::secondary_index::SecondaryIndex;
@@ -26,6 +27,11 @@ pub struct IndexManager {
     /// never snapshotted (rebuilt from docs on open/create); `complete`
     /// tells the executor whether ANN may run or exact must.
     pub hnsw: HashMap<String, HashMap<String, HnswIndex>>,
+    /// Graph backlinks (issue #53, Phase A): reverse edges into tracked
+    /// target collections. Derived like HNSW (hooks rebuild, never
+    /// snapshotted); deletes clean both directions, overwrites dedupe +
+    /// verify-at-query.
+    pub traverse: BacklinkIndex,
 }
 
 /// WAL tails at snapshot time, per collection: (wal data_len, wal
@@ -191,6 +197,10 @@ impl IndexManager {
         // an indexed binary field. Deletes intentionally need no hook
         // (liveness is external — see HnswIndex docs).
         self.index_vector(collection, doc_id, doc);
+
+        // 5. Graph backlinks (issue #53): index outbound refs into
+        // tracked targets. Self-gated (no-op when nothing tracked).
+        self.traverse.index_doc(collection, doc_id, doc);
     }
 
     pub fn index_batch<'a, I>(&mut self, collection: &str, docs: I)
@@ -220,6 +230,10 @@ impl IndexManager {
                 }
             }
         }
+
+        // Graph backlinks: drop edges touching the deleted doc (both
+        // directions; the old doc rides along on this path).
+        self.traverse.remove_doc(collection, doc_id, doc);
     }
 
     pub fn remove_batch<'a, I>(&mut self, collection: &str, docs: I)
@@ -278,6 +292,7 @@ impl IndexManager {
             || self.fts.contains_key(collection)
             || self.composite.has_collection(collection)
             || self.vector.contains_key(collection)
+            || self.traverse.is_tracked(collection)
     }
 
     /// Drop every RAM entry for `collection` while keeping all index
@@ -301,6 +316,9 @@ impl IndexManager {
                 graph.clear();
             }
         }
+        // Traverse defs stay registered; backlinks reset (rescan refills
+        // via the hook — same order).
+        self.traverse.clear_collection(collection);
         self.composite.clear_collection(collection);
     }
 

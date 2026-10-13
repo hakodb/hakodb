@@ -3148,6 +3148,156 @@ pub extern "C" fn hk_engine_find_near(
     })
 }
 
+/// Opt a collection in as a traversal target (issue #53): inbound edges
+/// tracked from here on (live writes + backfill). Idempotent.
+#[no_mangle]
+pub extern "C" fn hk_engine_create_traverse_index(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+) -> i32 {
+    if engine.is_null() {
+        return -1;
+    }
+    let engine = unsafe { &*engine };
+    let col = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
+    match engine.db.create_traverse_index(&col) {
+        Ok(_) => {
+            clear_last_error();
+            0
+        }
+        Err(e) => set_last_error(e.to_string()),
+    }
+}
+
+/// Graph-traversal marker on a query (issue #53): BFS from
+/// (`start_col`, `start_id`); `direction` 0/1/2, `edge_field` null = any
+/// ref field, `max_depth` bound. Result cap rides query limit.
+#[no_mangle]
+pub extern "C" fn hk_query_where_traverse(
+    query: *mut HK_Query,
+    start_col: *const c_char,
+    start_id: *const c_char,
+    direction: u32,
+    edge_field: *const c_char,
+    max_depth: usize,
+) -> i32 {
+    if query.is_null() { return set_last_error("null query handle"); }
+    let scol = match cstr_to_string(start_col) { Ok(v) => v, Err(e) => return set_last_error(e), };
+    let sid = match cstr_to_string(start_id) { Ok(v) => v, Err(e) => return set_last_error(e), };
+    let dir = match crate::index::traverse::TraverseDir::from_u32(direction) {
+        Ok(d) => d,
+        Err(e) => return set_last_error(e.to_string()),
+    };
+    let edge: Option<String> = if edge_field.is_null() {
+        None
+    } else {
+        match cstr_to_string(edge_field) { Ok(v) => Some(v), Err(e) => return set_last_error(e), }
+    };
+    let f = crate::query::builder::traverse_filter(&scol, &sid, dir, edge.as_deref(), max_depth);
+    let query = unsafe { &mut *query };
+    query.query.filters.push(crate::query::filter::Filter {
+        field: f.field,
+        op: Operator::Traverse,
+        value: f.value,
+    });
+    clear_last_error();
+    0
+}
+
+/// One-shot graph BFS for FFI consumers: nearest-first is meaningless
+/// here — hits ride BFS order as `[{"collection","id","depth","doc"}]`
+/// (owned string, `hk_string_free`). Missing anchor = `"[]"`
+/// (fail-closed); incoming into untracked = null + `hk_last_error`.
+#[no_mangle]
+pub extern "C" fn hk_engine_find_paths(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    doc_id: *const c_char,
+    direction: u32,
+    edge_field: *const c_char,
+    max_depth: usize,
+    k: usize,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error("null engine handle");
+            return ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let col = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(e);
+                return ptr::null_mut();
+            }
+        };
+        let id = match cstr_to_string(doc_id) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(e);
+                return ptr::null_mut();
+            }
+        };
+        let dir = match crate::index::traverse::TraverseDir::from_u32(direction) {
+            Ok(d) => d,
+            Err(e) => {
+                set_last_error(e.to_string());
+                return ptr::null_mut();
+            }
+        };
+        let edge: Option<String> = if edge_field.is_null() {
+            None
+        } else {
+            match cstr_to_string(edge_field) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    set_last_error(e);
+                    return ptr::null_mut();
+                }
+            }
+        };
+        let spec = crate::index::traverse::TraverseSpec {
+            direction: dir,
+            edge_field: edge,
+            max_depth,
+            limit: if k == 0 { 10 } else { k },
+        };
+        let rows = match engine.db.find_paths(&col, &id, &spec) {
+            Ok(r) => r,
+            Err(e) => {
+                set_last_error(e.to_string());
+                return ptr::null_mut();
+            }
+        };
+        let mut arr = Vec::with_capacity(rows.len());
+        for hit in &rows {
+            let doc_json: serde_json::Value = match doc_to_json(&hit.doc) {
+                Ok(s) => serde_json::from_str(&s).unwrap_or(serde_json::Value::Null),
+                Err(_) => serde_json::Value::Null,
+            };
+            arr.push(serde_json::json!({
+                "collection": hit.collection,
+                "id": hit.id,
+                "depth": hit.depth,
+                "doc": doc_json,
+            }));
+        }
+        match CString::new(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())) {
+            Ok(s) => {
+                clear_last_error();
+                s.into_raw()
+            }
+            Err(e) => {
+                set_last_error(e.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn hk_engine_list_indexes(
     engine: *mut HK_Engine,

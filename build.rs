@@ -14,7 +14,15 @@ fn main() {
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR should exist");
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "release".to_string());
-    let target_dir = std::path::Path::new("target").join(&profile);
+    // ponytail: derive from OUT_DIR (<target>/<profile>/build/<pkg>/out),
+    // not a hardcoded "target/" — a shared CARGO_TARGET_DIR (or any
+    // --target-dir) would otherwise point dependents at an empty dir and
+    // break the FFI test link with LNK1181.
+    let target_dir = std::path::Path::new(&out_dir)
+        .ancestors()
+        .nth(3)
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::Path::new("target").join(&profile));
 
 // ponytail: a stale unprefixed import lib SHADOWS the fresh .dll in
 // MinGW ld search order (it ran BEFORE rustc linked, so it always lagged

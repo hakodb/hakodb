@@ -309,6 +309,15 @@ pub(crate) fn apply_peer_index_defs(db: &Arc<Hako>, indexes: &IndexList) {
             }
         }
     }
+
+    // 5. Sync traverse targets (issue #53): tracked sets converge;
+    // backlink edges rebuild locally through hooks (never on the wire).
+    // Idempotent by construction (track is a set insert — repeated Pings
+    // cost one lookup, never a backfill storm; creation backfill runs
+    // only on first track).
+    for col in &indexes.traverse {
+        let _ = db.create_traverse_index(col);
+    }
 }
 
 /// Send-side blob inflation, shared: turn any WAL op into full wire bytes.
