@@ -138,8 +138,17 @@ impl Segment {
         let mut out = buffer[4..].to_vec();
         if let Some(enc) = &self.encryption { out = enc.decrypt(&out)?; }
         if is_compressed {
-            out = zstd::decode_all(&out[..])
-                .map_err(|e| HakoError::StorageError(format!("Zstd fail: {}", e)))?;
+            // Fail closed: a build without `compression` must never misread
+            // a zstd payload written by a compression-enabled build.
+            #[cfg(not(feature = "compression"))]
+            return Err(HakoError::StorageError(
+                "segment payload is zstd-compressed but this build lacks the `compression` feature".into(),
+            ));
+            #[cfg(feature = "compression")]
+            {
+                out = zstd::decode_all(&out[..])
+                    .map_err(|e| HakoError::StorageError(format!("Zstd fail: {}", e)))?;
+            }
         }
 
         // 3. Only populate cache if this isn't a one-time analytical scan
