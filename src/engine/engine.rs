@@ -3831,7 +3831,7 @@ impl Hako {
         dist.insert((collection.to_string(), id.to_string()), 0.0);
         heap.push((Reverse((0, collection.to_string(), id.to_string())), 0));
         let mut out = Vec::new();
-        while let Some(((Reverse((cbits, col, doc_id))), depth)) = heap.pop() {
+        while let Some((Reverse((cbits, col, doc_id)), depth)) = heap.pop() {
             let key = (col.clone(), doc_id.clone());
             if cbits > dist.get(&key).copied().unwrap_or(f64::INFINITY).to_bits() {
                 continue;
