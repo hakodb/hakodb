@@ -16,10 +16,14 @@ pub fn compact_segment(
     for (key, raw_value) in entries {
         let mut final_payload = raw_value.clone();
         let mut compression_bit = 0u32;
+        #[cfg(not(feature = "compression"))]
+        let _ = use_compression;
 
         // --- PHASE 1: COMPRESSION ---
         // Only compress if enabled and document is large enough (> 2KB)
         // Compression on tiny documents is a waste of CPU.
+        // Without the `compression` feature the bit is never set (raw stored).
+        #[cfg(feature = "compression")]
         if use_compression && raw_value.len() > 2048 {
             // Level 3 is a good balance between speed and ratio
             if let Ok(compressed) = zstd::encode_all(&raw_value[..], 3) {

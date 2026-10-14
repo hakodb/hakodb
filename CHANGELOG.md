@@ -2,6 +2,19 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### Unreleased — binary size (no version bump)
+- **TLS via OS store**: `tokio-tungstenite` backend switched from
+  `rustls-tls-native-roots` to `native-tls` (SChannel/OpenSSL). The old stack
+  linked two crypto providers (tungstenite 0.26 forces `rustls/aws_lc_rs`;
+  our `ring` feature added a second) — both are gone from the binary.
+  Full DLL measured 8.66 → 5.22 MB. Linux builds now link system OpenSSL.
+- **Optional compression**: new `compression` feature (default-on) gates
+  zstd (2 call-sites). Builds without it store raw and fail closed on
+  zstd payloads. Minimal DLL (`--no-default-features`) measured 2.21 MB.
+- **Release profile**: `lto = "thin"` + `codegen-units = 1` (kept `opt-level = 3`).
+- **Rejected by duel**: `opt-level = "z"` (+20–50% on hot reads) and
+  `panic = "abort"` (FFI relies on `catch_unwind`).
+
 ### v0.15.0 — graph Phase B: edge collections + Dijkstra
 - **`create_edge_index(col)`**: tracks the collection + secondary `_from`
   / `_to` — all existing machinery, so sync + persistence need no new

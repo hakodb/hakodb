@@ -558,6 +558,20 @@ API (HakoDB + FFI + SDKs)
 | Document model | `src/document/*` | Implemented |
 | C-FFI | `src/ffi.rs`, per-target `hakodb.h` | Implemented |
 
+### Binary size
+
+Measured Windows `hakodb.dll`, release, `strip + thin-LTO`:
+
+| Build | Size | Notes |
+|---|---|---|
+| Full (default features) | ~5.2 MB | sync + compression included; TLS via OS store (SChannel/OpenSSL), no bundled crypto provider |
+| Embedded core (`--no-default-features`) | ~2.2 MB | no sync, no compression; reads fail closed on zstd payloads |
+
+`opt-level = "z"` was duelled and rejected: +20–50% slower on hot read paths
+(`get` +43%, composite +52%, offset +20%). `panic = "abort"` is off the table:
+the FFI boundary relies on `catch_unwind`. The `compression` feature (default-on)
+gates zstd; builds without it never set the compression bit.
+
 ---
 
 ## Contribution notes
