@@ -564,7 +564,7 @@ Measured Windows `hakodb.dll`, release, `strip + thin-LTO`:
 
 | Build | Size | Notes |
 |---|---|---|
-| Full (default features) | ~5.2 MB | sync + compression included; TLS via OS store (SChannel/OpenSSL), no bundled crypto provider |
+| Full (default features) | ~7.4 MB | sync + compression included; TLS fully vendored (rustls/aws-lc, hermetic — no system OpenSSL needed) |
 | Embedded core (`--no-default-features`) | ~2.2 MB | no sync, no compression; reads fail closed on zstd payloads |
 
 `opt-level = "z"` was duelled and rejected: +20–50% slower on hot read paths
