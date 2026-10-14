@@ -40,7 +40,13 @@ use tokio_tungstenite::tungstenite::Message;
 // DATA STRUCTURES & PROTOCOL PACKETS
 // ============================================================================
 
-// TLS uses the OS store via native-tls: no provider init needed.
+// TLS uses vendored rustls with the single aws-lc provider (forced by
+// tungstenite 0.26; a second provider would be dead weight). Install it as
+// process default to prevent the 0.23 no-provider panic.
+#[cfg(feature = "cloud-sync")]
+fn init_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
 
 /// Server-internal collection that stores the room registry. It is
 /// `_`-prefixed so it stays hidden from `list_collections()`, and
@@ -596,7 +602,8 @@ impl CloudSync {
             return Ok(());
         }
 
-        // (native-tls needs no process-level provider init)
+        // Initialize Rustls CryptoProvider (Prevents Rustls 0.23 process-level panic)
+        init_crypto_provider();
 
         // 1. Start the High-Performance Ingest Flusher
         self.spawn_batch_flusher();

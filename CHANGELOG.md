@@ -2,6 +2,15 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.15.2 — revert native-tls (release-red fix)
+- **Back to vendored rustls, single aws-lc provider**: the `native-tls`
+  switch in 0.15.1 broke stock Linux containers + Android NDK (`openssl-sys`
+  needs system OpenSSL dev libs). Hermetic builds beat 0.5MB. The old extra
+  `ring` feature is dropped too (tungstenite 0.26 forces `aws_lc_rs`, so
+  ring was dead weight). 0.15.1 yanked from crates.io. Full DLL 8.66 →
+  ~7.4MB, core 2.21MB unchanged. Kept: optional `compression`, thin-LTO +
+  cgu1, opt-3.
+
 ### v0.15.1 — binary size (patch, behavior-neutral)
 - **TLS via OS store**: `tokio-tungstenite` backend switched from
   `rustls-tls-native-roots` to `native-tls` (SChannel/OpenSSL). The old stack
