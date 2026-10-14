@@ -96,11 +96,11 @@ jobs:
   linux-musl:
     # Static fallback: runs on ANY Linux incl. musl distros (Alpine) and
     # ancient glibc. Embedded core only (--no-default-features): the sync
-    # features pull rustls/ring/aws-lc-sys, whose C++ build has no musl
-    # toolchain in stock CI images (musl-tools ships C only). The suffix
+    # features pull native-tls, which needs OpenSSL dev libs absent from
+    # stock CI images (and zstd-sys C stays out too). The suffix
     # says so explicitly — no surprise for consumers. If a full-featured
-    # static build is ever needed, the road is cargo-zigbuild (zig ships
-    # musl libc++), not stock musl-gcc.
+    # static build is ever needed, the road is cargo-zigbuild, not stock
+    # musl-gcc.
     #
     # rlib ONLY: rustc drops `cdylib` for musl targets ("unsupported crate
     # type") — there is no .so here by construction, not by accident. Rust
@@ -147,7 +147,7 @@ jobs:
           export CC_aarch64_linux_android="$CLANG"
           export CXX_aarch64_linux_android="${CLANG}++"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CLANG"
-          # cc-rs (ring, aws-lc-sys) looks for the archiver under the
+          # cc-rs (zstd-sys C) looks for the archiver under the
           # target-prefixed name; the NDK only ships it as llvm-ar.
           export AR_aarch64_linux_android="$BIN/llvm-ar"
           cargo build --release --target aarch64-linux-android
