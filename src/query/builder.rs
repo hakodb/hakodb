@@ -35,7 +35,7 @@ impl<'a> Collection<'a> {
 /// Marker filter constructor (shared by the builder method and direct
 /// `Query::where_filter` users): anchor collection rides the filter
 /// field, the walk rides a Map value (`id`, `dir` 0/1/2, `edge`?,
-/// `depth`).
+/// `depth`, Phase B `via`?/`weight`?).
 pub fn traverse_filter(
     start_col: &str,
     start_id: &str,
@@ -43,7 +43,29 @@ pub fn traverse_filter(
     edge_field: Option<&str>,
     max_depth: usize,
 ) -> crate::query::filter::Filter {
-    traverse_marker(start_col, start_id, direction, edge_field, max_depth)
+    traverse_marker(start_col, start_id, direction, edge_field, max_depth, None, None)
+}
+
+/// Weighted variant: `via_edge` names the edge collection, `weight`
+/// names its numeric prop (Dijkstra ordering).
+pub fn traverse_filter_weighted(
+    start_col: &str,
+    start_id: &str,
+    direction: crate::index::traverse::TraverseDir,
+    edge_field: Option<&str>,
+    max_depth: usize,
+    via_edge: &str,
+    weight_field: Option<&str>,
+) -> crate::query::filter::Filter {
+    traverse_marker(
+        start_col,
+        start_id,
+        direction,
+        edge_field,
+        max_depth,
+        Some(via_edge),
+        weight_field,
+    )
 }
 
 fn traverse_marker(
@@ -52,6 +74,8 @@ fn traverse_marker(
     direction: crate::index::traverse::TraverseDir,
     edge_field: Option<&str>,
     max_depth: usize,
+    via_edge: Option<&str>,
+    weight_field: Option<&str>,
 ) -> crate::query::filter::Filter {
     let dir_n = match direction {
         crate::index::traverse::TraverseDir::Outgoing => 0,
@@ -68,6 +92,12 @@ fn traverse_marker(
     ];
     if let Some(f) = edge_field {
         pairs.push((std::sync::Arc::from("edge"), Value::String(f.into())));
+    }
+    if let Some(v) = via_edge {
+        pairs.push((std::sync::Arc::from("via"), Value::String(v.into())));
+    }
+    if let Some(w) = weight_field {
+        pairs.push((std::sync::Arc::from("weight"), Value::String(w.into())));
     }
     crate::query::filter::Filter {
         field: start_col.to_string(),
@@ -130,7 +160,31 @@ impl<'a> QueryBuilder<'a> {
         edge_field: Option<&str>,
         max_depth: usize,
     ) -> Self {
-        let f = traverse_marker(start_col, start_id, direction, edge_field, max_depth);
+        let f = traverse_marker(start_col, start_id, direction, edge_field, max_depth, None, None);
+        self.where_filter(&f.field.clone(), f.op, f.value)
+    }
+
+    /// Weighted variant (Phase B): `via_edge` names the edge collection,
+    /// `weight` its numeric prop — Dijkstra ordering instead of BFS.
+    pub fn where_traverse_weighted(
+        self,
+        start_col: &str,
+        start_id: &str,
+        direction: crate::index::traverse::TraverseDir,
+        edge_field: Option<&str>,
+        max_depth: usize,
+        via_edge: &str,
+        weight_field: Option<&str>,
+    ) -> Self {
+        let f = traverse_marker(
+            start_col,
+            start_id,
+            direction,
+            edge_field,
+            max_depth,
+            Some(via_edge),
+            weight_field,
+        );
         self.where_filter(&f.field.clone(), f.op, f.value)
     }
 

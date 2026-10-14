@@ -2,6 +2,29 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.15.0 — graph Phase B: edge collections + Dijkstra
+- **`create_edge_index(col)`**: tracks the collection + secondary `_from`
+  / `_to` — all existing machinery, so sync + persistence need no new
+  shapes. Edge docs are plain docs with `_from`/`_to` references (+ any
+  props, incl. numeric weights).
+- **Weighted walks**: `TraverseSpec.via_edge/weight_field`; Dijkstra
+  (cost-ordered, binary heap, deterministic ties) when set, BFS
+  otherwise. Missing/non-numeric weights count 1.0, negatives clamp 0
+  (documented, never silent-skip). BFS loop refactored onto the shared
+  expander (behavior pinned by existing tests).
+- **New API, additive only**: `hk_engine_create_edge_index`,
+  `hk_engine_shortest_paths` (`find_paths` frozen); `where_traverse_weighted`
+  + marker `via`/`weight` keys (old payloads parse unchanged);
+  `TraverseHit.cost` (BFS = hops).
+- **Incoming gate refined**: untracked anchor + incoming is loud ONLY
+  when no registered edge collection can serve it (via_edge reverse
+  hops need no backlinks).
+- **Duel**: Dijkstra 816us p50 on 4k edges; hook ~11us/edge dev-profile
+  (~3us release est., owned-state floor — profiled, not guessed);
+  end-to-end write delta dominated by generic B-tree growth, hook delta
+  isolated in-suite.
+- Tests: traverse 9, traverse_query 5, ffi_traverse 4 (all green).
+
 ### v0.14.0 — graph traversal Phase A (issue #53)
 - **Backlink index**: opt-in per target collection
   (`create_traverse_index`); outbound refs indexed from live writes,

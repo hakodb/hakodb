@@ -153,3 +153,37 @@ fn order_limit_offset_and_plan_isolation() {
     assert_eq!(ids2, vec!["c", "a"]);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn weighted_query_routes_and_orders_by_cost() {
+    use hakodb::query::builder::traverse_filter_weighted;
+    let dir = tmp("wquery");
+    let db = open_db(&dir);
+    db.create_edge_index("rel").unwrap();
+    let edge = |f: &str, t: &str, w: f64| {
+        let mut doc = HakoDoc::default();
+        doc.insert("_from", Value::Reference { collection: "n".into(), doc_id: f.into() });
+        doc.insert("_to", Value::Reference { collection: "n".into(), doc_id: t.into() });
+        doc.insert("w", Value::Float(w));
+        doc
+    };
+    db.put("rel", "e1", &edge("a", "b", 1.0)).unwrap();
+    db.put("rel", "e2", &edge("b", "c", 1.0)).unwrap();
+    db.put("rel", "e3", &edge("a", "c", 10.0)).unwrap();
+    for id in ["a", "b", "c"] {
+        db.put("n", id, &HakoDoc::default()).unwrap();
+    }
+    wait(&db);
+    // Weighted marker routes to Traverse and orders cheapest-first.
+    let mk = || traverse_filter_weighted("n", "a", TraverseDir::Outgoing, None, 5, "rel", Some("w"));
+    let f = mk();
+    let plan = db.explain(Query::new("n").where_filter(&f.field.clone(), f.op, f.value).limit(10)).expect("e");
+    assert!(matches!(plan.scan, ScanType::Traverse { .. }));
+    let f = mk();
+    let rows = db
+        .query(Query::new("n").where_filter(&f.field.clone(), f.op, f.value).limit(10))
+        .expect("q");
+    let ids: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, vec!["b", "c"], "Dijkstra: b@1.0 then c@2.0, not direct@10");
+    let _ = std::fs::remove_dir_all(&dir);
+}

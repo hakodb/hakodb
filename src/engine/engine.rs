@@ -274,6 +274,8 @@ pub struct TraverseHit {
     pub collection: String,
     pub id: String,
     pub depth: usize,
+    /// Accumulated path cost (BFS: hops as f64; Dijkstra: weight sum).
+    pub cost: f64,
     pub doc: HakoDoc,
 }
 
@@ -3546,6 +3548,18 @@ impl Hako {
         })
     }
 
+    /// Register an edge collection (issue #53, Phase B): tracks the
+    /// collection for inbound lookup AND indexes `_from`/`_to` for edge
+    /// lookup — all three ride existing machinery (traverse defs, plain
+    /// secondary indexes), so sync + persistence need no new shapes.
+    /// Idempotent like every other create.
+    pub fn create_edge_index(&self, edge_collection: &str) -> Result<()> {
+        self.create_traverse_index(edge_collection)?;
+        self.create_index(edge_collection, "_from")?;
+        self.create_index(edge_collection, "_to")?;
+        Ok(())
+    }
+
     /// Opt a collection in as a traversal target (issue #53, Phase A):
     /// inbound edges to its docs are tracked from here on (live writes
     /// via the hook, existing docs via the backfill below). Idempotent
@@ -3602,6 +3616,123 @@ impl Hako {
         Ok(())
     }
 
+    /// One expansion step shared by BFS and Dijkstra (issue #53): live
+    /// outgoing refs (weight 1.0), edge-collection hops in `via_edge`
+    /// (weight from the edge doc), verified backlinks (weight 1.0), and
+    /// edge-collection reverse hops. Sorted for determinism; NOT deduped
+    /// (visited/dist maps own that — Dijkstra must see every route).
+    /// Stale entries (overwrites, secondary over-approximation) are
+    /// re-verified against storage before following.
+    fn expand_neighbors(
+        &self,
+        col: &str,
+        doc_id: &str,
+        spec: &TraverseSpec,
+    ) -> Vec<(String, String, f64)> {
+        let mut next: Vec<(String, String, f64)> = Vec::new();
+        if spec.direction.uses_outgoing() {
+            if let Ok(Some(doc)) = self.get(col, doc_id) {
+                for (field, value) in doc.fields.iter() {
+                    if let Some(f) = spec.edge_field.as_deref() {
+                        if &**field != f {
+                            continue;
+                        }
+                    }
+                    if let Value::Reference { collection: tgt, doc_id: tid } = value {
+                        next.push((tgt.clone(), tid.clone(), 1.0));
+                    }
+                }
+            }
+            if let Some(edge_col) = spec.via_edge.as_deref() {
+                next.extend(self.edge_step(edge_col, col, doc_id, true, spec.weight_field.as_deref()));
+            }
+        }
+        if spec.direction.uses_incoming() {
+            let edges: Vec<(String, String, String)> = self
+                .indexes
+                .read()
+                .unwrap()
+                .traverse
+                .inbound(col, doc_id)
+                .map(|v| {
+                    v.iter()
+                        .filter(|e| spec.edge_field.as_deref().is_none_or(|f| e.field == f))
+                        .map(|e| (e.src_col.clone(), e.src_id.clone(), e.field.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (scol, sid, sfield) in edges {
+                let live = self.get(&scol, &sid).ok().flatten().is_some_and(|d| {
+                    d.get(&sfield).is_some_and(|v| {
+                        matches!(v, Value::Reference { collection: c, doc_id: t } if c == col && t == doc_id)
+                    })
+                });
+                if live {
+                    next.push((scol, sid, 1.0));
+                }
+            }
+            if let Some(edge_col) = spec.via_edge.as_deref() {
+                next.extend(self.edge_step(edge_col, col, doc_id, false, spec.weight_field.as_deref()));
+            }
+        }
+        next.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        next
+    }
+
+    /// One edge-collection hop (Phase B): edge docs in `edge_col` whose
+    /// `match_field` (`_from` outgoing / `_to` incoming) references the
+    /// anchor; the neighbor is the other end, weighted by `weight_field`
+    /// (missing/non-numeric/non-finite → 1.0, negative → clamped 0 —
+    /// documented, never silent-skip). Secondary lookup + verify, same
+    /// tolerance as backlinks.
+    fn edge_step(
+        &self,
+        edge_col: &str,
+        anchor_col: &str,
+        anchor_id: &str,
+        forward: bool,
+        weight_field: Option<&str>,
+    ) -> Vec<(String, String, f64)> {
+        let (match_field, other_field) = if forward { ("_from", "_to") } else { ("_to", "_from") };
+        let key = crate::index::index_key::encode_scalar(&Value::Reference {
+            collection: anchor_col.to_string(),
+            doc_id: anchor_id.to_string(),
+        });
+        let ids: Vec<String> = self
+            .indexes
+            .read()
+            .ok()
+            .and_then(|mgr| mgr.lookup_secondary(edge_col, match_field, &key))
+            .map(|v| v.into_iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        for eid in ids {
+            let Ok(Some(edoc)) = self.get(edge_col, &eid) else {
+                continue;
+            };
+            let linked = edoc.get(match_field).is_some_and(|v| {
+                matches!(v, Value::Reference { collection: c, doc_id: t } if c == anchor_col && t == anchor_id)
+            });
+            if !linked {
+                continue;
+            }
+            if let Some(Value::Reference { collection: oc, doc_id: oid }) = edoc.get(other_field) {
+                let w = weight_field
+                    .and_then(|wf| edoc.get(wf))
+                    .and_then(|v| match v {
+                        Value::Int(i) => Some(*i as f64),
+                        Value::Float(f) => Some(*f),
+                        _ => None,
+                    })
+                    .filter(|w| w.is_finite())
+                    .map(|w| w.max(0.0))
+                    .unwrap_or(1.0);
+                out.push((oc.clone(), oid.clone(), w));
+            }
+        }
+        out
+    }
+
     /// BFS traversal from one anchor (issue #53, Phase A). Outgoing
     /// follows live ref fields; incoming consults the backlink map
     /// (tracked targets only) with stale edges re-verified against
@@ -3616,16 +3747,36 @@ impl Hako {
         spec: &TraverseSpec,
     ) -> Result<Vec<TraverseHit>> {
         spec.validate()?;
+        // Incoming needs reverse state: tracked anchor (backlinks) OR a
+        // registered edge collection (secondary _from/_to). Neither =
+        // loud error (a silent empty walk hides a forgotten create).
         if spec.direction.uses_incoming() {
-            let tracked = self.indexes.read().unwrap().traverse.is_tracked(collection);
-            if !tracked {
+            let (tracked, via_ok) = self
+                .indexes
+                .read()
+                .map(|mgr| {
+                    let tracked = mgr.traverse.is_tracked(collection);
+                    let via_ok = spec.via_edge.as_deref().is_some_and(|e| {
+                        mgr.secondary.get(e).is_some_and(|m| {
+                            m.contains_key("_from") && m.contains_key("_to")
+                        })
+                    });
+                    (tracked, via_ok)
+                })
+                .unwrap_or((false, false));
+            if !tracked && !via_ok {
                 return Err(HakoError::Corrupt(format!(
-                    "traverse incoming needs a tracked collection: create_traverse_index({collection}) first"
+                    "traverse incoming needs reverse state: create_traverse_index({collection}) or create_edge_index(<edges>) first"
                 )));
             }
         }
         if self.get(collection, id)?.is_none() {
             return Ok(Vec::new());
+        }
+        // Weighted walks ride Dijkstra (Phase B); unweighted stay on the
+        // proven BFS below (untouched — its tests pin the behavior).
+        if spec.weight_field.is_some() {
+            return self.find_paths_weighted(collection, id, spec);
         }
         let mut visited: HashSet<(String, String)> = HashSet::new();
         visited.insert((collection.to_string(), id.to_string()));
@@ -3636,51 +3787,13 @@ impl Hako {
             if depth >= spec.max_depth {
                 continue;
             }
-            let mut next: Vec<(String, String)> = Vec::new();
-            if spec.direction.uses_outgoing() {
-                if let Ok(Some(doc)) = self.get(&col, &doc_id) {
-                    for (field, value) in doc.fields.iter() {
-                        if let Some(f) = spec.edge_field.as_deref() {
-                            if &**field != f {
-                                continue;
-                            }
-                        }
-                        if let Value::Reference { collection: tgt, doc_id: tid } = value {
-                            next.push((tgt.clone(), tid.clone()));
-                        }
-                    }
-                }
-            }
-            if spec.direction.uses_incoming() {
-                let edges: Vec<(String, String, String)> = self
-                    .indexes
-                    .read()
-                    .unwrap()
-                    .traverse
-                    .inbound(&col, &doc_id)
-                    .map(|v| {
-                        v.iter()
-                            .filter(|e| spec.edge_field.as_deref().is_none_or(|f| e.field == f))
-                            .map(|e| (e.src_col.clone(), e.src_id.clone(), e.field.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                for (scol, sid, sfield) in edges {
-                    // Stale-edge guard: overwrites don't remove (dedupe +
-                    // verify, same tolerance as secondary). Confirm the
-                    // source still points here before following.
-                    let live = self.get(&scol, &sid).ok().flatten().is_some_and(|d| {
-                        d.get(&sfield).is_some_and(|v| {
-                            matches!(v, Value::Reference { collection: c, doc_id: t } if c == &col && t == &doc_id)
-                        })
-                    });
-                    if live {
-                        next.push((scol, sid));
-                    }
-                }
-            }
-            next.sort();
-            next.dedup();
+            // Shared expansion (helper also serves Dijkstra; visited-set
+            // below absorbs the missing per-node dedup identically).
+            let next: Vec<(String, String)> = self
+                .expand_neighbors(&col, &doc_id, spec)
+                .into_iter()
+                .map(|(a, b, _)| (a, b))
+                .collect();
             for (ncol, nid) in next {
                 if !visited.insert((ncol.clone(), nid.clone())) {
                     continue;
@@ -3693,7 +3806,59 @@ impl Hako {
                     break 'bfs;
                 }
                 if let Ok(Some(doc)) = self.get(&ncol, &nid) {
-                    out.push(TraverseHit { collection: ncol, id: nid, depth: nd, doc });
+                    out.push(TraverseHit { collection: ncol, id: nid, depth: nd, cost: nd as f64, doc });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Dijkstra over the same expansion as BFS (issue #53, Phase B):
+    /// cost-ordered cheapest paths, same depth cap / limit / liveness /
+    /// determinism rules. Twin of the BFS loop above (kept separate so
+    /// the proven path stays byte-identical — see expand_neighbors note
+    /// if they ever diverge).
+    fn find_paths_weighted(
+        &self,
+        collection: &str,
+        id: &str,
+        spec: &TraverseSpec,
+    ) -> Result<Vec<TraverseHit>> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let mut dist: HashMap<(String, String), f64> = HashMap::new();
+        let mut heap: BinaryHeap<(Reverse<(u64, String, String)>, usize)> = BinaryHeap::new();
+        dist.insert((collection.to_string(), id.to_string()), 0.0);
+        heap.push((Reverse((0, collection.to_string(), id.to_string())), 0));
+        let mut out = Vec::new();
+        while let Some(((Reverse((cbits, col, doc_id))), depth)) = heap.pop() {
+            let key = (col.clone(), doc_id.clone());
+            if cbits > dist.get(&key).copied().unwrap_or(f64::INFINITY).to_bits() {
+                continue;
+            }
+            if depth >= 1 {
+                if out.len() >= spec.limit {
+                    break;
+                }
+                if let Ok(Some(doc)) = self.get(&col, &doc_id) {
+                    out.push(TraverseHit {
+                        collection: col.clone(),
+                        id: doc_id.clone(),
+                        depth,
+                        cost: f64::from_bits(cbits),
+                        doc,
+                    });
+                }
+            }
+            if depth >= spec.max_depth {
+                continue;
+            }
+            for (ncol, nid, w) in self.expand_neighbors(&col, &doc_id, spec) {
+                let nc = f64::from_bits(cbits) + w;
+                let nkey = (ncol.clone(), nid.clone());
+                if nc < dist.get(&nkey).copied().unwrap_or(f64::INFINITY) {
+                    dist.insert(nkey, nc);
+                    heap.push((Reverse((nc.to_bits(), ncol, nid)), depth + 1));
                 }
             }
         }

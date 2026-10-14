@@ -36,7 +36,7 @@ fn blank() -> HakoDoc {
 }
 
 fn spec(dir: TraverseDir, depth: usize, limit: usize) -> TraverseSpec {
-    TraverseSpec { direction: dir, edge_field: None, max_depth: depth, limit }
+    TraverseSpec { direction: dir, edge_field: None, max_depth: depth, limit, via_edge: None, weight_field: None }
 }
 
 /// Chain a->b->c plus c->a cycle; users collection untracked.
@@ -144,7 +144,7 @@ fn edge_field_filter_and_validation() {
         .find_paths(
             "docs",
             "m",
-            &TraverseSpec { direction: TraverseDir::Outgoing, edge_field: Some("other".into()), max_depth: 5, limit: 10 },
+            &TraverseSpec { direction: TraverseDir::Outgoing, edge_field: Some("other".into()), max_depth: 5, limit: 10, via_edge: None, weight_field: None },
         )
         .unwrap();
     assert_eq!(one.len(), 1);
@@ -210,5 +210,122 @@ fn defs_survive_restart_and_results_are_deterministic() {
         let listed = db.list_indexes(Some("docs"));
         assert!(listed.traverse.contains(&"docs".to_string()), "def must persist");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn wspec(dir: TraverseDir, depth: usize, limit: usize) -> TraverseSpec {
+    TraverseSpec {
+        direction: dir,
+        edge_field: None,
+        max_depth: depth,
+        limit,
+        via_edge: Some("rel".into()),
+        weight_field: Some("w".into()),
+    }
+}
+
+fn edge_doc(from_col: &str, from: &str, to_col: &str, to: &str, w: serde_json::Value) -> HakoDoc {
+    let mut doc = HakoDoc::default();
+    doc.insert("_from", Value::Reference { collection: from_col.into(), doc_id: from.into() });
+    doc.insert("_to", Value::Reference { collection: to_col.into(), doc_id: to.into() });
+    let wv = match &w {
+        serde_json::Value::Number(n) => n.as_f64().map(Value::Float).unwrap_or(Value::Null),
+        _ => Value::Null,
+    };
+    doc.insert("w", wv);
+    doc
+}
+
+/// Phase B: a-b-c chain exists ONLY as edge docs (no inline refs).
+/// Dijkstra follows cheapest cost; BFS ignores weights.
+fn seed_edges(db: &Hako) {
+    db.create_edge_index("rel").unwrap();
+    // a -1-> b -1-> c, plus a -10-> c direct (BFS prefers 1 hop, Dijkstra prefers 1+1).
+    db.put("rel", "e1", &edge_doc("n", "a", "n", "b", serde_json::json!(1.0))).unwrap();
+    db.put("rel", "e2", &edge_doc("n", "b", "n", "c", serde_json::json!(1.0))).unwrap();
+    db.put("rel", "e3", &edge_doc("n", "a", "n", "c", serde_json::json!(10.0))).unwrap();
+    for id in ["a", "b", "c"] {
+        db.put("n", id, &blank()).unwrap();
+    }
+}
+
+#[test]
+fn dijkstra_prefers_cheap_over_short() {
+    let dir = tmp("dijkstra");
+    let db = open_db(&dir);
+    seed_edges(&db);
+    wait(&db);
+    // BFS: a -> {b, c} (both depth 1, direct edges win by hop count).
+    let bfs = db
+        .find_paths("n", "a", &TraverseSpec {
+            direction: TraverseDir::Outgoing,
+            edge_field: None,
+            max_depth: 5,
+            limit: 10,
+            via_edge: Some("rel".into()),
+            weight_field: None,
+        })
+        .unwrap();
+    let mut ids: Vec<&str> = bfs.iter().map(|h| h.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["b", "c"]);
+    assert!(bfs.iter().all(|h| (h.cost - h.depth as f64).abs() < 1e-9), "BFS cost == hops");
+    // Dijkstra: c via b costs 2 < direct 10 — c comes with cost 2.
+    let dj = db.find_paths("n", "a", &wspec(TraverseDir::Outgoing, 5, 10)).unwrap();
+    let costs: Vec<(&str, f64)> = dj.iter().map(|h| (h.id.as_str(), h.cost)).collect();
+    assert_eq!(costs.len(), 2);
+    assert_eq!(costs[0].0, "b");
+    assert!((costs[0].1 - 1.0).abs() < 1e-9);
+    assert_eq!(costs[1].0, "c");
+    assert!((costs[1].1 - 2.0).abs() < 1e-9, "cheapest path a-b-c, not direct: {costs:?}");
+    // Cost order holds across bigger gaps: limit 1 takes cheapest only.
+    let one = db
+        .find_paths(
+            "n",
+            "a",
+            &TraverseSpec { limit: 1, ..wspec(TraverseDir::Outgoing, 5, 10) },
+        )
+        .unwrap();
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].id, "b");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn edge_weights_default_and_clamp() {
+    let dir = tmp("weights");
+    let db = open_db(&dir);
+    db.create_edge_index("rel").unwrap();
+    // Missing weight -> 1.0; negative -> clamped 0.
+    db.put("rel", "e1", &edge_doc("n", "a", "n", "b", serde_json::json!(serde_json::Value::Null)))
+        .unwrap();
+    let mut negdoc = HakoDoc::default();
+    negdoc.insert("_from", Value::Reference { collection: "n".into(), doc_id: "b".into() });
+    negdoc.insert("_to", Value::Reference { collection: "n".into(), doc_id: "c".into() });
+    negdoc.insert("w", Value::Float(-5.0));
+    db.put("rel", "e2", &negdoc).unwrap();
+    for id in ["a", "b", "c"] {
+        db.put("n", id, &blank()).unwrap();
+    }
+    wait(&db);
+    let dj = db.find_paths("n", "a", &wspec(TraverseDir::Outgoing, 5, 10)).unwrap();
+    let costs: Vec<(&str, f64)> = dj.iter().map(|h| (h.id.as_str(), h.cost)).collect();
+    assert_eq!(costs.len(), 2);
+    assert!((costs[0].1 - 1.0).abs() < 1e-9, "missing weight counts 1.0: {costs:?}");
+    assert!((costs[1].1 - 1.0).abs() < 1e-9, "negative clamps to 0, total 1.0: {costs:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn edge_incoming_walks_reverse() {
+    let dir = tmp("edgein");
+    let db = open_db(&dir);
+    seed_edges(&db);
+    wait(&db);
+    // Incoming to c via edges: b (e2) and a (e3).
+    let hits = db.find_paths("n", "c", &wspec(TraverseDir::Incoming, 5, 10)).unwrap();
+    let mut ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["a", "b"]);
     let _ = std::fs::remove_dir_all(&dir);
 }
