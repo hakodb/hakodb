@@ -127,3 +127,71 @@ fn find_paths_untracked_incoming_is_hard_error() {
     let rc = unsafe { hk_engine_create_traverse_index(eng, col2.as_ptr()) };
     assert_eq!(rc, 0);
 }
+
+#[test]
+fn shortest_paths_weighted_over_ffi() {
+    use hakodb::ffi::{hk_engine_create_edge_index, hk_engine_shortest_paths};
+    let dir = tmp("shortest");
+    seed_edge_db(&dir);
+    let eng = open(&dir);
+    // a -1-> b -1-> c plus a -10-> c: Dijkstra orders b@1.0, c@2.0.
+    let col = CString::new("n").unwrap();
+    let id = CString::new("a").unwrap();
+    let via = CString::new("rel").unwrap();
+    let w = CString::new("w").unwrap();
+    let out = unsafe {
+        hk_engine_shortest_paths(
+            eng,
+            col.as_ptr(),
+            id.as_ptr(),
+            0,
+            std::ptr::null(),
+            via.as_ptr(),
+            w.as_ptr(),
+            10,
+            10,
+        )
+    };
+    let v = to_json(out);
+    let arr = v.as_array().expect("array");
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["id"], "b");
+    assert!((arr[0]["cost"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+    assert_eq!(arr[1]["id"], "c");
+    assert!((arr[1]["cost"].as_f64().unwrap() - 2.0).abs() < 1e-9);
+    // create_edge_index via FFI works (idempotent here).
+    let rel = CString::new("rel").unwrap();
+    let rc = unsafe { hk_engine_create_edge_index(eng, rel.as_ptr()) };
+    assert_eq!(rc, 0);
+}
+
+fn seed_edge_db(dir: &std::path::Path) {
+    let mut cfg = HakoConfig::default();
+    cfg.durability_mode = DurabilityMode::Manual;
+    let db = Hako::open(dir, cfg).expect("open");
+    db.create_edge_index("rel").expect("edge");
+    let edge = |f: &str, t: &str, w: f64| {
+        let mut doc = HakoDoc::default();
+        doc.insert("_from", Value::Reference { collection: "n".into(), doc_id: f.into() });
+        doc.insert("_to", Value::Reference { collection: "n".into(), doc_id: t.into() });
+        doc.insert("w", Value::Float(w));
+        doc
+    };
+    for (id, f, t, w) in [("e1", "a", "b", 1.0), ("e2", "b", "c", 1.0), ("e3", "a", "c", 10.0)] {
+        db.write_batch(vec![BatchMutation::Put {
+            collection: "rel".into(),
+            doc_id: id.to_string(),
+            doc: edge(f, t, w),
+        }])
+        .expect("seed");
+    }
+    for id in ["a", "b", "c"] {
+        db.write_batch(vec![BatchMutation::Put {
+            collection: "n".into(),
+            doc_id: id.to_string(),
+            doc: HakoDoc::default(),
+        }])
+        .expect("seed");
+    }
+    db.flush().expect("flush");
+}

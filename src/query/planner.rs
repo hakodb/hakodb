@@ -119,8 +119,16 @@ impl QueryPlanner {
                             let edge = str_of("edge");
                             if depth >= 1 && depth <= crate::index::traverse::MAX_TRAVERSE_DEPTH as i64 {
                                 if let Ok(direction) = crate::index::traverse::TraverseDir::from_u32(dir as u32) {
+                                    // Phase B keys (optional, backward compatible).
+                                    let via = str_of("via");
+                                    let weight = str_of("weight");
                                     let incoming_ok = !direction.uses_incoming()
-                                        || indexes.traverse.is_tracked(&tf.field);
+                                        || indexes.traverse.is_tracked(&tf.field)
+                                        || via.as_deref().is_some_and(|e| {
+                                            indexes.secondary.get(e).is_some_and(|m| {
+                                                m.contains_key("_from") && m.contains_key("_to")
+                                            })
+                                        });
                                     if incoming_ok {
                                         let extra: Vec<Filter> = query
                                             .filters
@@ -134,6 +142,8 @@ impl QueryPlanner {
                                             edge_field: edge,
                                             max_depth: depth as usize,
                                             limit,
+                                            via_edge: via,
+                                            weight_field: weight,
                                         };
                                         let mut plan = Self::make_plan(
                                             query,

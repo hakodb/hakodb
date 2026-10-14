@@ -189,12 +189,20 @@ impl TraverseDir {
 /// field), depth bound, hit cap. Depth 0 is a hard error (nothing to
 /// walk); above MAX_TRAVERSE_DEPTH is a hard error (never silently
 /// clamp — the caller asked for something unbounded-adjacent).
+///
+/// Phase B: `via_edge` names an edge collection (docs with `_from`/`_to`
+/// references) whose edges join the walk alongside inline refs;
+/// `weight_field` (requires `via_edge`) switches ordering from BFS to
+/// Dijkstra over the named numeric prop (missing/non-numeric/negative
+/// weights count 1.0/1.0/clamped-0 — documented, never silent-skip).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraverseSpec {
     pub direction: TraverseDir,
     pub edge_field: Option<String>,
     pub max_depth: usize,
     pub limit: usize,
+    pub via_edge: Option<String>,
+    pub weight_field: Option<String>,
 }
 
 impl TraverseSpec {

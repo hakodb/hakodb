@@ -3264,6 +3264,8 @@ pub extern "C" fn hk_engine_find_paths(
             edge_field: edge,
             max_depth,
             limit: if k == 0 { 10 } else { k },
+            via_edge: None,
+            weight_field: None,
         };
         let rows = match engine.db.find_paths(&col, &id, &spec) {
             Ok(r) => r,
@@ -3282,6 +3284,128 @@ pub extern "C" fn hk_engine_find_paths(
                 "collection": hit.collection,
                 "id": hit.id,
                 "depth": hit.depth,
+                "cost": hit.cost,
+                "doc": doc_json,
+            }));
+        }
+        match CString::new(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())) {
+            Ok(s) => {
+                clear_last_error();
+                s.into_raw()
+            }
+            Err(e) => {
+                set_last_error(e.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Register an edge collection (issue #53, Phase B): tracks it for
+/// inbound lookup AND indexes `_from`/`_to` for edge lookup — all three
+/// ride existing machinery, so sync + persistence need no new shapes.
+/// Idempotent.
+#[no_mangle]
+pub extern "C" fn hk_engine_create_edge_index(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+) -> i32 {
+    if engine.is_null() {
+        return -1;
+    }
+    let engine = unsafe { &*engine };
+    let col = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
+    match engine.db.create_edge_index(&col) {
+        Ok(_) => {
+            clear_last_error();
+            0
+        }
+        Err(e) => set_last_error(e.to_string()),
+    }
+}
+
+/// Weighted shortest paths (Phase B): Dijkstra over inline refs +
+/// `via_edge` edge docs, ordered by accumulated cost. Same JSON shape
+/// as `find_paths` (with exact `cost` per hit). `weight_field` null =
+/// uniform 1.0 per hop (BFS-equivalent order). Missing anchor = `"[]"`
+/// (fail-closed); bad depth/direction/untracked incoming = null +
+/// `hk_last_error`. `find_paths` is frozen — this additive fn carries
+/// the new arity so existing bindings never break.
+#[no_mangle]
+pub extern "C" fn hk_engine_shortest_paths(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    doc_id: *const c_char,
+    direction: u32,
+    edge_field: *const c_char,
+    via_edge: *const c_char,
+    weight_field: *const c_char,
+    max_depth: usize,
+    k: usize,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error("null engine handle");
+            return ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let col = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(e);
+                return ptr::null_mut();
+            }
+        };
+        let id = match cstr_to_string(doc_id) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(e);
+                return ptr::null_mut();
+            }
+        };
+        let dir = match crate::index::traverse::TraverseDir::from_u32(direction) {
+            Ok(d) => d,
+            Err(e) => {
+                set_last_error(e.to_string());
+                return ptr::null_mut();
+            }
+        };
+        let opt_str = |p: *const c_char| {
+            if p.is_null() {
+                None
+            } else {
+                cstr_to_string(p).ok()
+            }
+        };
+        let spec = crate::index::traverse::TraverseSpec {
+            direction: dir,
+            edge_field: opt_str(edge_field),
+            max_depth,
+            limit: if k == 0 { 100 } else { k },
+            via_edge: opt_str(via_edge),
+            weight_field: opt_str(weight_field),
+        };
+        let rows = match engine.db.find_paths(&col, &id, &spec) {
+            Ok(r) => r,
+            Err(e) => {
+                set_last_error(e.to_string());
+                return ptr::null_mut();
+            }
+        };
+        let mut arr = Vec::with_capacity(rows.len());
+        for hit in &rows {
+            let doc_json: serde_json::Value = match doc_to_json(&hit.doc) {
+                Ok(s) => serde_json::from_str(&s).unwrap_or(serde_json::Value::Null),
+                Err(_) => serde_json::Value::Null,
+            };
+            arr.push(serde_json::json!({
+                "collection": hit.collection,
+                "id": hit.id,
+                "depth": hit.depth,
+                "cost": hit.cost,
                 "doc": doc_json,
             }));
         }

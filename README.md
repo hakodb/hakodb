@@ -96,7 +96,7 @@ Because it is a library, HakoDB has no "database server" to manage. Your app *is
 - **Transactions** — `begin_transaction` + staged mutations + `commit`; `begin_serializable_transaction` with conflict-aware commit validation (read/write version checks).
 - **Queries** — filters (`eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `notIn`, `arrayContains`, `arrayContainsAny`, `match`, `contains`, `startsWith`); ordering, limit, offset, cursor bounds (`startAt/startAfter/endAt/endBefore`); cost-aware parallel planner; predicate + projection pushdown; `count/sum/avg` aggregates.
 - **Indexing** — single-field secondary B-Tree indexes, composite indexes, inverted (full-text) indexes;
-vector (HNSW) indexes for KNN similarity search; graph backlink indexes for BFS traversal over document references; async background index building.
+vector (HNSW) indexes for KNN similarity search; graph backlink indexes for BFS traversal over document references, edge collections (`_from`/`_to`) for weighted Dijkstra shortest paths; async background index building.
 - **Zero-copy projection** — queries cherry-pick fields directly from memory-mapped binary slices without inflating full documents.
 - **Real-time watch streams** — `watch_collection` with change events; FFI bridge for cross-language reactive UIs.
 - **Subcollections** — `put/get/delete/query` on hierarchical nested collections.
