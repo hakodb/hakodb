@@ -2,7 +2,7 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
-### Unreleased — binary size (no version bump)
+### v0.15.1 — binary size (patch, behavior-neutral)
 - **TLS via OS store**: `tokio-tungstenite` backend switched from
   `rustls-tls-native-roots` to `native-tls` (SChannel/OpenSSL). The old stack
   linked two crypto providers (tungstenite 0.26 forces `rustls/aws_lc_rs`;
