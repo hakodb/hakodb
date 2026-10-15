@@ -48,14 +48,6 @@ fn init_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// Server-internal collection that stores the room registry. It is
-/// `_`-prefixed so it stays hidden from `list_collections()`, and
-/// sync-excluded by exact name (`SYNC_EXCLUDED_COLLECTIONS`) so it never
-/// leaves the device regardless of naming. (`__hako_security`, by
-/// contrast, replicates by design.)
-#[cfg(feature = "cloud-sync")]
-pub const INTERNAL_ROOMS_COLLECTION: &str = "__hako_rooms";
-
 #[cfg(feature = "cloud-sync")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,9 +89,8 @@ pub enum CloudPacket {
     },
     /// Version handshake exchanged symmetrically to catch up on missed deltas.
     /// `indexes` is additive (issue #51, serde default): old peers omit it
-    /// and converge doc bytes only. Names are room-plain on the wire (see
-    /// server_room_version_map); each side translates to its own storage
-    /// namespace before applying.
+    /// and converge doc bytes only. Names are plain on the wire and in
+    /// storage — one database, one room, no translation anywhere.
     VersionPing {
         versions: HashMap<String, i64>,
         #[serde(default)]
@@ -128,48 +119,20 @@ pub struct CloudStatus {
     pub room_key: String,
     pub active_clients: usize,
     pub queued_writes: usize,
-    /// Server mode only: number of distinct rooms currently hosted.
-    pub hosted_rooms: usize,
 }
 
 // ============================================================================
-// ROOM REGISTRY
+// ROOM IDENTITY (single-database)
 // ============================================================================
 //
-// A "room" is uniquely identified by the pair (room_name, room_key). Clients
-// that share a room name but use a different security key are considered to be
-// in different groups/rooms. On the server, every room owns a storage prefix:
-//   - first distinct (name, key) for a name  -> "roomname"
-//   - each additional distinct key           -> "roomname_1", "roomname_2", ...
-// Client collections are stored server-side as "<prefix>_<collection>" and are
-// presented back to clients as just "<collection>", so data never mixes across
-// rooms even when clients use the same collection names.
-//
-// The registry is persisted in the internal collection and mirrored into an
-// in-memory cache. The disk is only consulted on cache misses (first connect
-// after start / cache cold), and a periodic re-read keeps the cache realtime.
-
-#[cfg(feature = "cloud-sync")]
-#[derive(Debug, Clone)]
-struct RoomEntry {
-    room_id: String,
-    prefix: String,
-}
-
-#[cfg(feature = "cloud-sync")]
-#[derive(Default)]
-struct RoomRegistryState {
-    cache: HashMap<String, RoomEntry>,
-    prefixes: HashSet<String>,
-}
-
-#[cfg(feature = "cloud-sync")]
-pub struct RoomRegistry {
-    db: Arc<Hako>,
-    state: StdRwLock<RoomRegistryState>,
-    alloc_lock: StdMutex<()>,
-    loaded: std::sync::atomic::AtomicBool,
-}
+// A "room" is the pair (room_name, room_key): a connection-scoped channel
+// credential, exactly like the mesh `Identify{room_hash}` (see net_sync).
+// The server is bound to ONE room at construction; clients presenting a
+// different pair are rejected at handshake — fail-closed, before any data
+// moves. There is deliberately no storage namespace: the server stores
+// collections under their plain names, so one server process serves one
+// room. Multi-room hosting is N server processes (or hakocluster
+// multidb), never name-mangled collections in one database.
 
 #[cfg(feature = "cloud-sync")]
 fn hash_room_id(room_name: &str, room_key: &str) -> String {
@@ -257,24 +220,6 @@ pub(crate) fn check_group_access(
 }
 
 #[cfg(feature = "cloud-sync")]
-fn sanitize_room_name(name: &str) -> String {    let mut out = String::new();
-    for c in name.chars() {
-        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-            out.push(c);
-        } else if !out.is_empty() && !out.ends_with('_') {
-            out.push('_');
-        }
-    }
-    while out.ends_with('_') {
-        out.pop();
-    }
-    if out.is_empty() {
-        "room".to_string()
-    } else {
-        out.chars().take(40).collect()
-    }
-}
-#[cfg(feature = "cloud-sync")]
 fn value_to_string(v: &Value) -> Option<String> {
     match v {
         Value::String(s) => Some(s.clone()),
@@ -283,170 +228,14 @@ fn value_to_string(v: &Value) -> Option<String> {
 }
 
 /// Client-facing collections are stored server-side as "<prefix>_<collection>".
-/// When the prefix is empty (client-local ingest), the collection keeps its
-/// plain name instead of gaining a leading "_".
-#[cfg(feature = "cloud-sync")]
-fn storage_col_name(prefix: &str, plain_col: &str) -> String {
-    if prefix.is_empty() {
-        plain_col.to_string()
-    } else {
-        format!("{}_{}", prefix, plain_col)
-    }
-}
 
 /// Uniform key used by the outbound tailers and the ingest flusher to suppress
 /// echoes (writes that originated locally and were only re-applied on arrival).
+/// Connection-scoped like the room itself: collection + key are enough,
+/// because one server process serves exactly one room.
 #[cfg(feature = "cloud-sync")]
-fn echo_key(prefix: &str, plain_col: &str, key: &str) -> String {
-    format!("{}:{}:{}", prefix, plain_col, key)
-}
-
-#[cfg(feature = "cloud-sync")]
-impl RoomRegistry {
-    pub fn new(db: Arc<Hako>) -> Self {
-        Self {
-            db,
-            state: StdRwLock::new(RoomRegistryState::default()),
-            alloc_lock: StdMutex::new(()),
-            loaded: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-
-    fn load_all(&self) {
-        let mut state = self.state.write().unwrap();
-        state.cache.clear();
-        state.prefixes.clear();
-        if let Ok(hits) = self.db.query(Query::new(INTERNAL_ROOMS_COLLECTION)) {
-            for (id, doc) in hits {
-                let prefix = doc
-                    .get("prefix")
-                    .and_then(value_to_string)
-                    .unwrap_or_default();
-                if prefix.is_empty() {
-                    continue;
-                }
-                state.cache.insert(
-                    id.clone(),
-                    RoomEntry {
-                        room_id: id.clone(),
-                        prefix: prefix.clone(),
-                    },
-                );
-                state.prefixes.insert(prefix);
-            }
-        }
-        self.loaded.store(true, Ordering::SeqCst);
-    }
-
-    /// Resolves a room to its storage prefix, allocating + persisting a new
-    /// prefix when the room is seen for the first time. This is the ONLY path
-    /// that touches the internal collection on the hot path, and only on a
-    /// cache miss.
-    pub fn resolve(&self, room_name: &str, room_key: &str) -> FLResult<(String, String)> {
-        let room_id = hash_room_id(room_name, room_key);
-        let _guard = self.alloc_lock.lock().unwrap();
-
-        if !self.loaded.load(Ordering::SeqCst) {
-            self.load_all();
-        }
-
-        // 1. In-memory cache hit.
-        if let Some(entry) = self.state.read().unwrap().cache.get(&room_id) {
-            return Ok((entry.room_id.clone(), entry.prefix.clone()));
-        }
-
-        // 2. Durable registry hit (single-doc read).
-        if let Ok(Some(doc)) = self.db.get(INTERNAL_ROOMS_COLLECTION, &room_id) {
-            if let Some(prefix) = doc.get("prefix").and_then(value_to_string) {
-                let mut state = self.state.write().unwrap();
-                state.cache.insert(
-                    room_id.clone(),
-                    RoomEntry {
-                        room_id: room_id.clone(),
-                        prefix: prefix.clone(),
-                    },
-                );
-                state.prefixes.insert(prefix.clone());
-                return Ok((room_id, prefix));
-            }
-        }
-
-        // 3. Allocate a globally unique prefix.
-        let base = sanitize_room_name(room_name);
-        let prefix = {
-            let prefixes = self.state.read().unwrap();
-            if !prefixes.prefixes.contains(&base) {
-                base.clone()
-            } else {
-                let mut n = 1;
-                loop {
-                    let candidate = format!("{}_{}", base, n);
-                    if !prefixes.prefixes.contains(&candidate) {
-                        break candidate;
-                    }
-                    n += 1;
-                }
-            }
-        };
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let mut doc = HakoDoc::default();
-        doc.insert("room_name", Value::String(room_name.to_string()));
-        doc.insert("key_hash", Value::String(hash_room_id(room_name, room_key)));
-        doc.insert("prefix", Value::String(prefix.clone()));
-        doc.insert("created_at", Value::Int(now));
-        doc.insert("last_seen", Value::Int(now));
-        self.db.write_batch(vec![BatchMutation::Put {
-            collection: INTERNAL_ROOMS_COLLECTION.to_string(),
-            doc_id: room_id.clone(),
-            doc,
-        }])?;
-
-        let mut state = self.state.write().unwrap();
-        state.cache.insert(
-            room_id.clone(),
-            RoomEntry {
-                room_id: room_id.clone(),
-                prefix: prefix.clone(),
-            },
-        );
-        state.prefixes.insert(prefix.clone());
-
-        Ok((room_id, prefix))
-    }
-
-    /// All currently-known storage prefixes.
-    pub fn prefixes(&self) -> Vec<String> {
-        self.state.read().unwrap().prefixes.iter().cloned().collect()
-    }
-
-    /// Longest-prefix match: maps a server-side storage collection name back to
-    /// `(room_prefix, client_collection_name)`. Returns `None` when the
-    /// collection does not belong to any registered room.
-    pub fn prefix_of(&self, storage_col: &str) -> Option<(String, String)> {
-        let prefixes = self.state.read().unwrap();
-        let mut best: Option<(&String, &str)> = None;
-        for p in prefixes.prefixes.iter() {
-            let marker = format!("{}_", p);
-            if let Some(rest) = storage_col.strip_prefix(&marker) {
-                if rest.is_empty() {
-                    continue;
-                }
-                if best.map_or(true, |(bp, _)| p.len() > bp.len()) {
-                    best = Some((p, rest));
-                }
-            }
-        }
-        best.map(|(p, c)| (p.clone(), c.to_string()))
-    }
-
-    /// Re-reads the durable registry so the cache stays realtime.
-    pub fn refresh(&self) {
-        self.load_all();
-    }
+fn echo_key(collection: &str, key: &str) -> String {
+    format!("{collection}:{key}")
 }
 
 // ============================================================================
@@ -474,8 +263,6 @@ pub struct CloudSync {
     active_peers: Arc<AsyncRwLock<HashMap<String, PeerInfo>>>,
     // Outbound client queue (Client mode -> Server)
     outbound_tx: Arc<AsyncMutex<Option<mpsc::Sender<CloudPacket>>>>,
-    // Server mode: room registry so `status()` can report hosted rooms.
-    room_registry: Option<Arc<RoomRegistry>>,
     /// Peer capability announcements for the encryption fail-closed rules.
     /// Server: keyed by peer_key, set at auth, cleared on disconnect.
     /// Client: the server's caps live under the fixed key `"server"`.
@@ -485,7 +272,6 @@ pub struct CloudSync {
 #[cfg(feature = "cloud-sync")]
 struct IngestItem {
     collection: String,
-    prefix: String,
     op: WalOp,
     sender_client_id: Option<String>,
 }
@@ -493,23 +279,34 @@ struct IngestItem {
 #[cfg(feature = "cloud-sync")]
 struct PeerInfo {
     tx: mpsc::Sender<Message>,
-    prefix: String,
 }
 
-/// Admin view of one connected peer. `peer_key` is `{room_id}:{client_id}`;
-/// split on the first ':' to recover both parts.
+/// Admin view of one connected peer. `peer_key` is the client id.
 #[cfg(feature = "cloud-sync")]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PeerView {
     pub peer_key: String,
-    pub prefix: String,
+}
+
+/// Whole-database version map: the room catch-up clock. Collections are
+/// stored and compared under plain names — one database, one room.
+#[cfg(feature = "cloud-sync")]
+fn db_version_map(db: &Arc<Hako>) -> HashMap<String, i64> {
+    let mut map = HashMap::new();
+    if let Ok(cols) = db.sync_collections() {
+        for col in cols {
+            if let Ok(version) = db.get_collection_version(&col) {
+                map.insert(col, version);
+            }
+        }
+    }
+    map
 }
 
 #[cfg(feature = "cloud-sync")]
 impl CloudSync {
-    /// Creates a Cloud Sync controller. In **server** mode the room parameters
-    /// are ignored: the server is room-agnostic and hosts any room its clients
-    /// ask for. Prefer the dedicated [`CloudSync::server`] / [`CloudSync::client`]
+    /// Creates a Cloud Sync controller bound to one room (both modes).
+    /// Prefer the dedicated [`CloudSync::server`] / [`CloudSync::client`]
     /// constructors for clarity.
     pub fn new(
         db: Arc<Hako>,
@@ -520,25 +317,29 @@ impl CloudSync {
         auth_token: &str,
     ) -> Self {
         match mode {
-            CloudSyncMode::Server => Self::server(db, client_id, auth_token),
+            CloudSyncMode::Server => Self::server(db, client_id, auth_token, room_name, room_key),
             CloudSyncMode::Client => Self::client(db, client_id, room_name, room_key, auth_token),
         }
     }
 
-    /// Creates a room-agnostic cloud server ("big cloud server storage"). It is
-    /// not bound to any room: clients choose the room (and the server) and the
-    /// server accepts and persists any (room_name, room_key) pair, storing each
-    /// room's collections under its own storage prefix and relaying sync only to
-    /// the members of that room.
-    pub fn server(db: Arc<Hako>, server_id: &str, auth_token: &str) -> Self {
+    /// Creates a room-bound cloud server: serves exactly the configured
+    /// room on this database (single-database, like the mesh). Clients
+    /// presenting a different (name, key) pair are rejected at handshake.
+    /// Prefer this (or [`CloudSync::client`]) over [`CloudSync::new`].
+    pub fn server(
+        db: Arc<Hako>,
+        server_id: &str,
+        auth_token: &str,
+        room_name: &str,
+        room_key: &str,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(100_000);
-        let registry = Arc::new(RoomRegistry::new(db.clone()));
 
         Self {
             db,
             mode: CloudSyncMode::Server,
-            room_name: String::new(),
-            room_key: String::new(),
+            room_name: room_name.to_string(),
+            room_key: room_key.to_string(),
             client_id: server_id.to_string(),
             auth_token: auth_token.to_string(),
             api_key: Arc::new(StdMutex::new(None)),
@@ -549,7 +350,6 @@ impl CloudSync {
             ingest_rx: Arc::new(AsyncMutex::new(Some(rx))),
             active_peers: Arc::new(AsyncRwLock::new(HashMap::new())),
             outbound_tx: Arc::new(AsyncMutex::new(None)),
-            room_registry: Some(registry),
             caps: Arc::new(crate::sync_guard::CapsMap::default()),
         }
     }
@@ -582,7 +382,6 @@ impl CloudSync {
             ingest_rx: Arc::new(AsyncMutex::new(Some(rx))),
             active_peers: Arc::new(AsyncRwLock::new(HashMap::new())),
             outbound_tx: Arc::new(AsyncMutex::new(None)),
-            room_registry: None,
             caps: Arc::new(crate::sync_guard::CapsMap::default()),
         }
     }
@@ -628,48 +427,34 @@ impl CloudSync {
             0
         };
 
-        let (room_name, room_key, hosted_rooms) = match &self.room_registry {
-            Some(reg) => {
-                let hosted = reg.prefixes().len();
-                ("(multi-room)".to_string(), String::new(), hosted)
-            }
-            None => (
-                self.room_name.clone(),
-                self.room_key.clone(),
-                0,
-            ),
-        };
-
         CloudStatus {
             mode: self.mode,
             connected: self.running.load(Ordering::Relaxed),
-            room_name,
-            room_key,
+            room_name: self.room_name.clone(),
+            room_key: self.room_key.clone(),
             active_clients,
             queued_writes: 0,
-            hosted_rooms,
         }
     }
 
-    /// Snapshot of currently connected peers (server: all room members;
+    /// Snapshot of currently connected peers (server: room members;
     /// client: normally just the uplink, if tracked). Best-effort read.
     pub fn peer_list(&self) -> Vec<PeerView> {
         match self.active_peers.try_read() {
             Ok(guard) => guard
                 .iter()
-                .map(|(k, info)| PeerView {
+                .map(|(k, _)| PeerView {
                     peer_key: k.clone(),
-                    prefix: info.prefix.clone(),
                 })
                 .collect(),
             Err(_) => Vec::new(),
         }
     }
 
-    /// Per-collection versions for one storage prefix (room catch-up clock).
+    /// Per-collection versions of this database (the room catch-up clock).
     /// Backs the admin dashboard's room view; pure function of the DB.
-    pub fn room_versions(&self, prefix: &str) -> HashMap<String, i64> {
-        Self::server_room_version_map(&self.db, prefix)
+    pub fn room_versions(&self) -> HashMap<String, i64> {
+        db_version_map(&self.db)
     }
 
     // ========================================================================
@@ -701,8 +486,7 @@ impl CloudSync {
                     item = rx.recv() => {
                         match item {
                             Some(item) => {
-                                let storage_col = storage_col_name(&item.prefix, &item.collection);
-                                batch_buffer.entry(storage_col)
+                                batch_buffer.entry(item.collection.clone())
                                     .or_default()
                                     .push(item);
 
@@ -739,45 +523,35 @@ impl CloudSync {
             }
         }
 
-        for (storage_col, items) in buffer.drain() {
+        for (collection, items) in buffer.drain() {
             if items.is_empty() {
                 continue;
             }
 
-            // Every item in the same batch key shares (prefix, plain collection).
-            let prefix = items[0].prefix.clone();
-            let plain_col = items[0].collection.clone();
-
             // Local-only signal (inbound): a locally-scoped collection
             // refuses everything the room offers. Per-key marks do NOT
             // filter inbound — a genuinely newer remote put resurrects.
-            if db.is_collection_local(&plain_col) {
+            if db.is_collection_local(&collection) {
                 continue;
             }
 
-            // Sync-excluded plane (inbound): credential stores, sync state,
-            // and the room registry never arrive over the wire — in EITHER
-            // namespace (client-plain or server-prefixed), builtin or
-            // per-deployment extra. Without this, a hostile
+            // Sync-excluded plane (inbound): credential stores and sync
+            // state never arrive over the wire. Without this, a hostile
             // Replication{collection:"__groups"} would plant a same-named
-            // shard AND get relayed back out under the plain name,
-            // poisoning every room member's real store. The outbound
-            // tailers already skip these; this is the receipt-side choke
-            // point both directions route through.
-            if db.is_sync_withheld(&plain_col)
-                || db.is_sync_withheld(&storage_col)
+            // shard AND get relayed back out, poisoning every room
+            // member's real store. The outbound tailers already skip
+            // these; this is the receipt-side choke point both
+            // directions route through.
+            if db.is_sync_withheld(&collection)
             {
                 continue;
             }
 
             // Encryption fail-closed (inbound): when THIS node encrypts the
             // collection at rest, ops are accepted only from senders that
-            // proved the same key. Namespaces: server shards are storage
-            // names (`prefix_col`), clients use plain names — a match on
-            // either counts (documented; fail-closed direction).
-            // A keyless node never matches: its own encrypted set is empty.
-            let enc_local =
-                db.is_collection_encrypted(&storage_col) || db.is_collection_encrypted(&plain_col);
+            // proved the same key. A keyless node never matches: its own
+            // encrypted set is empty.
+            let enc_local = db.is_collection_encrypted(&collection);
             let local_fp =
                 crate::sync_guard::local_fingerprint(db.config.encryption_key.as_deref());
 
@@ -798,9 +572,9 @@ impl CloudSync {
                         if !crate::sync_guard::caps_allow(true, local_fp, sender.as_ref()) {
                             caps.warn(
                                 sender_key,
-                                &plain_col,
+                                &collection,
                                 &format!(
-                                    "dropping inbound ops for locally-encrypted '{plain_col}' from unverified sender '{sender_key}' (local key {}, peer needs the same encryption key; upgrade old peers)",
+                                    "dropping inbound ops for locally-encrypted '{collection}' from unverified sender '{sender_key}' (local key {}, peer needs the same encryption key; upgrade old peers)",
                                     crate::sync_guard::fp_short(&local_fp),
                                 ),
                             );
@@ -818,7 +592,7 @@ impl CloudSync {
                         }
 
                         // LWW Check
-                        if let Ok(Some(existing_doc)) = db.get(&storage_col, key) {
+                        if let Ok(Some(existing_doc)) = db.get(&collection, key) {
                             if existing_doc.get_logical_time() >= ts {
                                 continue;
                             }
@@ -826,7 +600,7 @@ impl CloudSync {
 
                         {
                             let mut cache = echo_cache.lock().unwrap();
-                            cache.insert(echo_key(&prefix, &plain_col, key), ts);
+                            cache.insert(echo_key(&collection, key), ts);
                         }
                         apply_ops.push(WalOp::PutInlined {
                             key: key.clone(),
@@ -844,12 +618,12 @@ impl CloudSync {
                         // LWW check (mirrors the put arm): a stale tombstone —
                         // e.g. replayed by handshake catch-up — must not beat
                         // a newer local put.
-                        if Self::is_stale_remote_delete(&db, &storage_col, key, *timestamp) {
+                        if Self::is_stale_remote_delete(&db, &collection, key, *timestamp) {
                             continue;
                         }
                         {
                             let mut cache = echo_cache.lock().unwrap();
-                            cache.insert(echo_key(&prefix, &plain_col, key), *timestamp);
+                            cache.insert(echo_key(&collection, key), *timestamp);
                         }
                         apply_ops.push(WalOp::Delete {
                             key: key.clone(),
@@ -866,7 +640,7 @@ impl CloudSync {
 
             if !apply_ops.is_empty() {
                 let db_clone = db.clone();
-                let col = storage_col.clone();
+                let col = collection.clone();
                 let keys: Vec<Arc<str>> = apply_ops
                     .iter()
                     .map(|op| Arc::from(op.get_key().to_string()))
@@ -877,8 +651,9 @@ impl CloudSync {
                 .await;
             }
 
-            // Relay packet to connected members of the SAME room (except origin).
-            // The collection name is translated back to the client-facing name.
+            // Relay packet to connected members (except origin). One room
+            // per server, so every connected peer is a member by
+            // construction — no room filter needed.
             // Encryption fail-closed: a batch is withheld from a recipient
             // when EITHER the origin marked this collection encrypted and the
             // recipient's fingerprint mismatches, OR this server encrypts it
@@ -895,7 +670,7 @@ impl CloudSync {
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_micros(),
-                    collection: plain_col.clone(),
+                    collection: collection.clone(),
                     ops,
                 };
 
@@ -904,7 +679,7 @@ impl CloudSync {
                     let peers_guard = peers.read().await;
 
                     for (peer_id, info) in peers_guard.iter() {
-                        if info.prefix != prefix || Some(peer_id) == origin_sender.as_ref() {
+                        if Some(peer_id) == origin_sender.as_ref() {
                             continue;
                         }
                         let recipient = caps.get(peer_id);
@@ -913,7 +688,7 @@ impl CloudSync {
                             .and_then(|o| caps.get(o));
                         let origin_encrypted = origin
                             .as_ref()
-                            .map(|o| o.encrypted_cols.iter().any(|c| c == &plain_col))
+                            .map(|o| o.encrypted_cols.iter().any(|c| c == &collection))
                             .unwrap_or(false);
                         let origin_fp = origin.map(|o| o.key_fp).unwrap_or([0u8; 32]);
                         let origin_ok = !origin_encrypted
@@ -927,9 +702,9 @@ impl CloudSync {
                         if !(origin_ok && local_ok) {
                             caps.warn(
                                 peer_id,
-                                &plain_col,
+                                &collection,
                                 &format!(
-                                    "withholding relay of '{plain_col}' from peer '{peer_id}' (unverified key for an encrypted room)"
+                                    "withholding relay of '{collection}' from peer '{peer_id}' (unverified key for an encrypted room)"
                                 ),
                             );
                             continue;
@@ -1020,33 +795,14 @@ kind,
         let seen_messages = self.seen_messages.clone();
         let echo_cache = self.echo_cache.clone();
         let caps_all = self.caps.clone();
-        // The room registry is created once (server constructor) and reused so
-        // `status()` can report the number of hosted rooms.
-        let rooms = self
-            .room_registry
-            .clone()
-            .expect("server mode always has a room registry");
+        // Single room, configured at construction (no registry, no
+        // allocation, no multi-room fallback — see module docs).
+        let room_name = self.room_name.clone();
+        let room_key = self.room_key.clone();
 
-        // 0. Keep the in-memory room registry realtime by re-reading the
-        //    durable internal collection periodically.
-        {
-            let rooms_refresh = rooms.clone();
-            let running_refresh = running.clone();
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(Duration::from_secs(20));
-                while running_refresh.load(Ordering::Relaxed) {
-                    ticker.tick().await;
-                    let rooms = rooms_refresh.clone();
-                    tokio::task::spawn_blocking(move || rooms.refresh())
-                        .await
-                        .ok();
-                }
-            });
-        }
-
-        // 1. Spawn Server Local WAL Tailer (Broadcasts server-side writes to all
-        //    connected clients of the owning room)
-        self.spawn_server_outbound_tailer(echo_cache, rooms.clone());
+        // 1. Spawn Server Local WAL Tailer (broadcasts server-side writes
+        //    to the connected clients of the room).
+        self.spawn_server_outbound_tailer(echo_cache);
 
         // 2. Accept Incoming WebSocket Clients
         tokio::spawn(async move {
@@ -1056,7 +812,8 @@ kind,
                     let db = db.clone();
                     let active_peers = active_peers.clone();
                     let seen_messages = seen_messages.clone();
-                    let rooms = rooms.clone();
+                    let room_name = room_name.clone();
+                    let room_key = room_key.clone();
                     let caps_one = caps_all.clone();
 
                     tokio::spawn(async move {
@@ -1065,7 +822,8 @@ kind,
                                 ws_stream,
                                 ingest_tx,
                                 db,
-                                rooms,
+                                room_name,
+                                room_key,
                                 active_peers,
                                 seen_messages,
                                 caps_one,
@@ -1080,73 +838,13 @@ kind,
         Ok(())
     }
 
-    /// Server-side version map restricted to one room, keyed by the
-    /// client-facing (unprefixed) collection names.
-    fn server_room_version_map(db: &Arc<Hako>, prefix: &str) -> HashMap<String, i64> {
-        let mut map = HashMap::new();
-        // Sync enumeration: hidden room collections (e.g. "_secret") take
-        // part; the excluded plane never appears (dropped by enumeration,
-        // double-checked at serve time).
-        if let Ok(cols) = db.sync_collections() {
-            let marker = format!("{}_", prefix);
-            for col in cols {
-                if let Some(plain) = col.strip_prefix(&marker) {
-                    if !plain.is_empty() {
-                        if let Ok(version) = db.get_collection_version(&col) {
-                            map.insert(plain.to_string(), version);
-                        }
-                    }
-                }
-            }
-        }
-        map
-    }
-
-    /// Server-side index defs for one room, keyed by client-facing
-    /// (unprefixed) names (issue #51). Mirrors server_room_version_map:
-    /// each family map is re-keyed, composite entries rewritten.
-    fn server_room_index_list(db: &Arc<Hako>, prefix: &str) -> IndexList {
-        let full = db.list_indexes(None);
-        let marker = format!("{}_", prefix);
-        let plain = |col: &str| col.strip_prefix(&marker).map(str::to_string);
-        // IndexList maps are hashbrown (engine.rs); std maps won't assign.
-        let mut remap_map = |m: hashbrown::HashMap<String, Vec<String>>| {
-            m.into_iter()
-                .filter_map(|(col, v)| plain(&col).map(|p| (p, v)))
-                .collect::<hashbrown::HashMap<String, Vec<String>>>()
-        };
-        IndexList {
-            simple: remap_map(full.simple),
-            secondary: remap_map(full.secondary),
-            fts: remap_map(full.fts),
-            composite: full
-                .composite
-                .into_iter()
-                .filter_map(|mut c| {
-                    plain(&c.collection).map(|p| {
-                        c.collection = p;
-                        c
-                    })
-                })
-                .collect(),
-            vector: full
-                .vector
-                .into_iter()
-                .filter_map(|(col, v)| plain(&col).map(|p| (p, v)))
-                .collect(),
-            traverse: full
-                .traverse
-                .into_iter()
-                .filter_map(|col| plain(&col))
-                .collect(),
-        }
-    }
 
     async fn handle_server_client<S>(
         ws_stream: tokio_tungstenite::WebSocketStream<S>,
         ingest_tx: mpsc::Sender<IngestItem>,
         db: Arc<Hako>,
-        rooms: Arc<RoomRegistry>,
+        room_name: String,
+        room_key: String,
         peers: Arc<AsyncRwLock<HashMap<String, PeerInfo>>>,
         seen_messages: Arc<AsyncMutex<Vec<u128>>>,
         caps: Arc<crate::sync_guard::CapsMap>,
@@ -1157,23 +855,36 @@ kind,
         let (client_tx, mut client_rx) = mpsc::channel::<Message>(2000);
 
         let mut peer_key = String::new();
-        let mut room_prefix = String::new();
         let mut authenticated = false;
 
         if let Some(Ok(Message::Binary(bytes))) = ws_rx.next().await {
             if let Ok(CloudPacket::Authenticate {
                 token: _,
                 client_id: cid,
-                room_name,
-                room_key,
+                room_name: presented_name,
+                room_key: presented_key,
                 api_key,
                 enc_fp,
                 enc_cols,
                 ..
             }) = rmp_serde::from_slice(&bytes)
             {
-                // Group policy first: rejected peers must not create rooms.
-                if let Err(e) = check_group_access(&db, &room_name, api_key.as_deref(), &cid) {
+                // Single-room enforcement, BEFORE group policy and before
+                // any data moves: the presented pair must equal the
+                // configured room. No registry, no allocation, no
+                // multi-room fallback — a wrong room is a wrong server.
+                if presented_name != room_name || presented_key != room_key {
+                    let nack = CloudPacket::AuthResult {
+                        success: false,
+                        error: Some("room mismatch".into()),
+                    };
+                    if let Ok(bytes) = rmp_serde::to_vec_named(&nack) {
+                        let _ = ws_tx.send(Message::Binary(bytes.into())).await;
+                    }
+                    return;
+                }
+                // Group policy: rejected peers are dropped here.
+                if let Err(e) = check_group_access(&db, &presented_name, api_key.as_deref(), &cid) {
                     let nack = CloudPacket::AuthResult {
                         success: false,
                         error: Some(e),
@@ -1183,69 +894,32 @@ kind,
                     }
                     return;
                 }
-                // Resolve the room -> storage prefix (register it if needed).
-                let resolve = {
-                    let rooms = rooms.clone();
-                    let rn = room_name.clone();
-                    let rk = room_key.clone();
-                    tokio::task::spawn_blocking(move || rooms.resolve(&rn, &rk)).await
+                authenticated = true;
+                // One room per server: the client id alone keys the peer
+                // (a reconnect replaces the stale entry).
+                peer_key = cid;
+
+                peers.write().await.insert(
+                    peer_key.clone(),
+                    PeerInfo { tx: client_tx },
+                );
+                // Record encryption capabilities for the fail-closed
+                // rules (relay + apply consult this, not the wire).
+                // Absent fields (old peers) store as unverified.
+                caps.set(
+                    &peer_key,
+                    crate::sync_guard::PeerCaps {
+                        key_fp: enc_fp.unwrap_or([0u8; 32]),
+                        encrypted_cols: enc_cols.clone(),
+                    },
+                );
+
+                let ack = CloudPacket::AuthResult {
+                    success: true,
+                    error: None,
                 };
-
-                match resolve {
-                    Ok(Ok((room_id, prefix))) => {
-                        authenticated = true;
-                        room_prefix = prefix.clone();
-                        // Peers are keyed by room+client so the same client_id
-                        // used in different rooms can never clobber each other
-                        // on a multi-room server.
-                        peer_key = format!("{}:{}", room_id, cid);
-
-                        peers.write().await.insert(
-                            peer_key.clone(),
-                            PeerInfo {
-                                tx: client_tx,
-                                prefix,
-                            },
-                        );
-                        // Record encryption capabilities for the fail-closed
-                        // rules (relay + apply consult this, not the wire).
-                        // Absent fields (old peers) store as unverified.
-                        caps.set(
-                            &peer_key,
-                            crate::sync_guard::PeerCaps {
-                                key_fp: enc_fp.unwrap_or([0u8; 32]),
-                                encrypted_cols: enc_cols.clone(),
-                            },
-                        );
-
-                        let ack = CloudPacket::AuthResult {
-                            success: true,
-                            error: None,
-                        };
-                        let ack_bytes = rmp_serde::to_vec_named(&ack).unwrap();
-                        let _ = ws_tx.send(Message::Binary(ack_bytes.into())).await;
-                    }
-                    Ok(Err(e)) => {
-                        let nack = CloudPacket::AuthResult {
-                            success: false,
-                            error: Some(format!("Room registration failed: {}", e)),
-                        };
-                        if let Ok(bytes) = rmp_serde::to_vec_named(&nack) {
-                            let _ = ws_tx.send(Message::Binary(bytes.into())).await;
-                        }
-                        return;
-                    }
-                    Err(e) => {
-                        let nack = CloudPacket::AuthResult {
-                            success: false,
-                            error: Some(format!("Room registration failed: {}", e)),
-                        };
-                        if let Ok(bytes) = rmp_serde::to_vec_named(&nack) {
-                            let _ = ws_tx.send(Message::Binary(bytes.into())).await;
-                        }
-                        return;
-                    }
-                }
+                let ack_bytes = rmp_serde::to_vec_named(&ack).unwrap();
+                let _ = ws_tx.send(Message::Binary(ack_bytes.into())).await;
             }
         }
 
@@ -1289,13 +963,12 @@ kind,
                                     }
                                 }
 
-                                // Translate client collection -> room-scoped storage.
-                                let prefix = room_prefix.clone();
+                                // Ingest directly: one database, one room —
+                                // client collections land under plain names.
                                 for op in ops {
                                     let _ = ingest_tx
                                         .send(IngestItem {
                                             collection: collection.clone(),
-                                            prefix: prefix.clone(),
                                             op,
                                             sender_client_id: Some(peer_key.clone()),
                                         })
@@ -1303,31 +976,19 @@ kind,
                                 }
                             }
                             CloudPacket::VersionPing { versions: client_versions, indexes } => {
-                                let prefix = room_prefix.clone();
-
-                                // 0. Index defs converge (issue #51): client
-                                // names are room-plain; re-prefix to storage
-                                // namespace before applying.
+                                // 0. Index defs converge (issue #51): names
+                                // are plain on the wire both directions —
+                                // apply directly, no namespace translation.
                                 if let Some(idx) = indexes {
-                                    let marker = format!("{}_", prefix);
-                                    let mut namespaced = idx;
-                                    namespaced.simple = namespaced.simple.into_iter().map(|(c, v)| (format!("{marker}{c}"), v)).collect();
-                                    namespaced.secondary = namespaced.secondary.into_iter().map(|(c, v)| (format!("{marker}{c}"), v)).collect();
-                                    namespaced.fts = namespaced.fts.into_iter().map(|(c, v)| (format!("{marker}{c}"), v)).collect();
-                                    for comp in &mut namespaced.composite {
-                                        comp.collection = format!("{marker}{}", comp.collection);
-                                    }
-                                    namespaced.vector = namespaced.vector.into_iter().map(|(c, v)| (format!("{marker}{c}"), v)).collect();
-                                    namespaced.traverse = namespaced.traverse.into_iter().map(|c| format!("{marker}{c}")).collect();
-                                    crate::sync_core::apply_peer_index_defs(&db, &namespaced);
+                                    crate::sync_core::apply_peer_index_defs(&db, &idx);
                                 }
 
-                                // 1. SYMMETRICAL REPLY: Send the Server's room-scoped
-                                //    VersionMap (plain collection names) back to Client
-                                let server_versions = Self::server_room_version_map(&db, &prefix);
+                                // 1. SYMMETRICAL REPLY: send this database's
+                                //    version map back to the client.
+                                let server_versions = db_version_map(&db);
                                 let reply = CloudPacket::VersionPing {
                                     versions: server_versions.clone(),
-                                    indexes: Some(Self::server_room_index_list(&db, &prefix)),
+                                    indexes: Some(db.list_indexes(None)),
                                 };
                                 if let Ok(reply_bytes) = rmp_serde::to_vec_named(&reply) {
                                     let peers_guard = peers.read().await;
@@ -1336,20 +997,18 @@ kind,
                                     }
                                 }
 
-                                // 2. Pull catch-up: send deltas for every room collection
-                                //    where the Server is ahead of the Client (including
-                                //    collections the client has never seen).
-                                for (plain_col, server_ts) in server_versions {
+                                // 2. Pull catch-up: send deltas for every
+                                //    collection where the server is ahead
+                                //    (including ones the client never saw).
+                                for (collection, server_ts) in server_versions {
                                     let client_ts = client_versions
-                                        .get(&plain_col)
+                                        .get(&collection)
                                         .copied()
                                         .unwrap_or(0);
                                     if server_ts > client_ts {
-                                        let storage_col = format!("{}_{}", prefix, plain_col);
                                         Self::send_catchup_deltas(
                                             &db,
-                                            &storage_col,
-                                            &plain_col,
+                                            &collection,
                                             client_ts,
                                             &peer_key,
                                             &peers,
@@ -1380,11 +1039,11 @@ kind,
     #[cfg(feature = "cloud-sync")]
     fn is_stale_remote_delete(
         db: &Arc<Hako>,
-        storage_col: &str,
+        collection: &str,
         key: &str,
         timestamp: i64,
     ) -> bool {
-        match db.get(storage_col, key) {
+        match db.get(collection, key) {
             Ok(Some(existing)) => existing.get_logical_time() >= timestamp,
             _ => false,
         }
@@ -1396,16 +1055,15 @@ kind,
     /// carry timestamps and both ingest paths enforce LWW (a stale
     /// tombstone loses to a newer local put). Previously catch-up was
     /// put-only, so a peer offline during a delete never learned of it.
-    /// `filter_col` is the app-level collection name for the local-only
-    /// check — the handshake must not leak what the tailers withhold.
+    /// `collection` is both the shard read and the local-only check —
+    /// the handshake must not leak what the tailers withhold.
     #[cfg(feature = "cloud-sync")]
     fn collect_catchup_ops(
         db: &Arc<Hako>,
-        storage_col: &str,
-        filter_col: &str,
+        collection: &str,
         since_ts: i64,
     ) -> Vec<WalOp> {
-        let Ok(shard_arc) = db.get_shard(storage_col) else {
+        let Ok(shard_arc) = db.get_shard(collection) else {
             return Vec::new();
         };
         let changed: Vec<(String, crate::storage::engine::Pointer)> = {
@@ -1439,7 +1097,7 @@ kind,
         {
             let guard = shard_arc.read().unwrap();
             for (key, ptr) in changed {
-                if db.is_local_only(filter_col, &key) {
+                if db.is_local_only(collection, &key) {
                     continue;
                 }
                 if let crate::storage::engine::Pointer::Deleted { timestamp } = ptr {
@@ -1460,45 +1118,42 @@ kind,
 
     async fn send_catchup_deltas(
         db: &Arc<Hako>,
-        storage_col: &str,
-        plain_col: &str,
+        collection: &str,
         since_ts: i64,
         peer_key: &str,
         peers: &Arc<AsyncRwLock<HashMap<String, PeerInfo>>>,
         caps: &Arc<crate::sync_guard::CapsMap>,
     ) {
-        // Sender rule: a locally-encrypted room (storage namespace on the
-        // server) only replays to a fingerprint-verified peer. Old/silent
-        // peers pause here loudly instead of leaking on catch-up.
-        // Sync-excluded plane is never served, in either namespace: a room
-        // collection unfortunately named like an excluded store must not
-        // reach members that would apply it unprefixed.
-        if db.is_sync_withheld(plain_col)
-            || db.is_sync_withheld(storage_col)
+        // Sender rule: a locally-encrypted collection only replays to a
+        // fingerprint-verified peer. Old/silent peers pause here loudly
+        // instead of leaking on catch-up. Sync-excluded plane is never
+        // served: a collection unfortunately named like an excluded
+        // store must not reach members.
+        if db.is_sync_withheld(collection)
         {
             return;
         }
-        if db.is_collection_encrypted(storage_col) {
+        if db.is_collection_encrypted(collection) {
             let local_fp =
                 crate::sync_guard::local_fingerprint(db.config.encryption_key.as_deref());
             let peer = caps.get(peer_key);
             if !crate::sync_guard::caps_allow(true, local_fp, peer.as_ref()) {
                 caps.warn(
                     peer_key,
-                    plain_col,
+                    collection,
                     &format!(
-                        "withholding catch-up replay of encrypted '{plain_col}' from peer '{peer_key}' (unverified key)"
+                        "withholding catch-up replay of encrypted '{collection}' from peer '{peer_key}' (unverified key)"
                     ),
                 );
                 return;
             }
         }
-        let ops = Self::collect_catchup_ops(db, storage_col, plain_col, since_ts);
+        let ops = Self::collect_catchup_ops(db, collection, since_ts);
 
         if !ops.is_empty() {
             let packet = CloudPacket::Replication {
                 msg_id: 0,
-                collection: plain_col.to_string(),
+                collection: collection.to_string(),
                 ops,
             };
             if let Ok(bytes) = rmp_serde::to_vec_named(&packet) {
@@ -1510,12 +1165,12 @@ kind,
         }
     }
 
-    /// Tails local WAL changes on the SERVER and broadcasts server-side writes to
-    /// the connected clients of the room that owns each collection.
+    /// Tails local WAL changes on the SERVER and broadcasts server-side
+    /// writes to the connected clients. One database, one room — every
+    /// synced collection belongs to the room by construction.
     fn spawn_server_outbound_tailer(
         &self,
         echo_cache: Arc<StdMutex<HashMap<String, i64>>>,
-        rooms: Arc<RoomRegistry>,
     ) {
         let db = self.db.clone();
         let active_peers = self.active_peers.clone();
@@ -1530,22 +1185,14 @@ kind,
                 // excluded plane is dropped by the enumerator itself.
                 let cols = db.sync_collections().unwrap_or_default();
 
-                for col in cols {
-                    // Skip collections that don't belong to any registered room.
-                    let Some((prefix, plain_col)) = rooms.prefix_of(&col) else {
-                        continue;
-                    };
-                    // Never broadcast a room collection whose plain name is
-                    // sync-excluded (e.g. a room collection unfortunately
-                    // named "__groups"): recipients apply it unprefixed and
-                    // would poison their real store. Receipt-side drops it
-                    // too — this stops it at the source for unpatched peers.
-                    if db.is_sync_withheld(&plain_col) {
+                for collection in cols {
+                    // Never broadcast a sync-excluded collection.
+                    if db.is_sync_withheld(&collection) {
                         continue;
                     }
 
-                    if let Ok(shard_arc) = db.get_shard(&col) {
-                        let last_pos = *offsets.get(&col).unwrap_or(&0);
+                    if let Ok(shard_arc) = db.get_shard(&collection) {
+                        let last_pos = *offsets.get(&collection).unwrap_or(&0);
                         let tail_res = {
                             let guard = shard_arc.read().unwrap();
                             guard.wal.tail(last_pos)
@@ -1564,12 +1211,12 @@ kind,
                                     let wal_ts = crate::sync_core::op_logical_time(&op);
 
                                     // Skip writes originating from client WebSockets (already handled)
-                                    let ek = echo_key(&prefix, &plain_col, &key);
+                                    let ek = echo_key(&collection, &key);
                                     let is_echo = crate::sync_core::echo_take(&echo_cache, &ek, wal_ts);
 
                                     if !is_echo {
                                         // Local-only signal: server never fans marked ops out.
-                                        if db.is_local_only(&plain_col, key) {
+                                        if db.is_local_only(&collection, key) {
                                             continue;
                                         }
                                         let final_op = match op {
@@ -1603,8 +1250,7 @@ kind,
                                     // fingerprint-matched peers of the room.
                                     // (Storage or plain name match counts;
                                     // see the ingest rule.)
-                                    let enc_local = db.is_collection_encrypted(&col)
-                                        || db.is_collection_encrypted(&plain_col);
+                                    let enc_local = db.is_collection_encrypted(&collection);
                                     let local_fp = crate::sync_guard::local_fingerprint(
                                         db.config.encryption_key.as_deref(),
                                     );
@@ -1613,7 +1259,7 @@ kind,
                                             .duration_since(UNIX_EPOCH)
                                             .unwrap()
                                             .as_micros(),
-                                        collection: plain_col.clone(),
+                                        collection: collection.clone(),
                                         ops: to_send,
                                     };
 
@@ -1622,14 +1268,10 @@ kind,
                                         let rt = tokio::runtime::Handle::current();
                                         let peers_ptr = active_peers.clone();
                                         let caps_ptr = caps_srv.clone();
-                                        let target_prefix = prefix.clone();
-                                        let plain_c = plain_col.clone();
+                                        let plain_c = collection.clone();
                                         rt.block_on(async move {
                                             let peers_guard = peers_ptr.read().await;
                                             for (peer_id, info) in peers_guard.iter() {
-                                                if info.prefix != target_prefix {
-                                                    continue;
-                                                }
                                                 if enc_local {
                                                     let peer = caps_ptr.get(peer_id);
                                                     if !crate::sync_guard::caps_allow(
@@ -1653,7 +1295,7 @@ kind,
                                     }
                                 }
 
-                                offsets.insert(col, new_pos);
+                                offsets.insert(collection, new_pos);
                             }
                         }
                     }
@@ -1779,7 +1421,6 @@ kind,
                                                             let _ = ingest_tx
                                                                 .send(IngestItem {
                                                                     collection: collection.clone(),
-                                                                    prefix: String::new(),
                                                                     op,
                                                                     sender_client_id: None,
                                                                 })
@@ -1819,7 +1460,7 @@ kind,
         if db.is_sync_withheld(collection) {
             return;
         }
-        let ops = Self::collect_catchup_ops(db, collection, collection, server_ts);
+        let ops = Self::collect_catchup_ops(db, collection, server_ts);
 
         if !ops.is_empty() {
             let packet = CloudPacket::Replication {
@@ -1885,8 +1526,7 @@ kind,
                                     // (sync_core: shared decode + echo take, all tailers).
                                     let wal_ts = crate::sync_core::op_logical_time(&op);
 
-                                    let echo_key = echo_key("", &col, &key);
-                                    let is_echo = crate::sync_core::echo_take(&echo_cache, &echo_key, wal_ts);
+                                    let is_echo = crate::sync_core::echo_take(&echo_cache, &echo_key(&col, &key), wal_ts);
 
                                     if !is_echo {
                                         // Local-only signal: client never pushes marked ops upstream.
@@ -1962,83 +1602,34 @@ mod tests {
     }
 
     #[test]
-    fn same_room_key_pair_reuses_prefix() {
-        let (db, _dir) = temp_db("samepair");
-        let reg = RoomRegistry::new(db.clone());
-        let (id1, p1) = reg.resolve("alpha", "k1").unwrap();
-        let (id2, p2) = reg.resolve("alpha", "k1").unwrap();
-        assert_eq!(id1, id2);
-        assert_eq!(p1, p2);
-        assert_eq!(p1, "alpha");
+    fn room_identity_is_name_plus_key() {
+        // Room identity binds BOTH halves: same name + different key are
+        // different rooms (handshake rejects cross-talk), same pair is
+        // stable across calls. No registry, no allocation, no suffixes.
+        let a = hash_room_id("alpha", "k1");
+        assert_eq!(a, hash_room_id("alpha", "k1"));
+        assert_ne!(a, hash_room_id("alpha", "k2"));
+        assert_ne!(a, hash_room_id("beta", "k1"));
     }
 
     #[test]
-    fn same_name_different_key_gets_suffix() {
-        let (db, _dir) = temp_db("suffix");
-        let reg = RoomRegistry::new(db.clone());
-        let (_, p1) = reg.resolve("alpha", "k1").unwrap();
-        let (_, p2) = reg.resolve("alpha", "k2").unwrap();
-        let (_, p3) = reg.resolve("alpha", "k3").unwrap();
-        assert_eq!(p1, "alpha");
-        assert_eq!(p2, "alpha_1");
-        assert_eq!(p3, "alpha_2");
+    fn server_constructor_binds_the_room() {
+        let (db, _dir) = temp_db("serverbind");
+        let s = CloudSync::server(db, "hub-1", "tok", "game", "s3cret");
+        assert_eq!(s.room_name, "game");
+        assert_eq!(s.room_key, "s3cret");
+        assert_eq!(s.mode, CloudSyncMode::Server);
+        let st = s.status();
+        assert_eq!(st.room_name, "game");
     }
 
     #[test]
-    fn different_names_are_independent() {
-        let (db, _dir) = temp_db("names");
-        let reg = RoomRegistry::new(db.clone());
-        let (_, p1) = reg.resolve("alpha", "k1").unwrap();
-        let (_, p2) = reg.resolve("beta", "k1").unwrap();
-        assert_eq!(p1, "alpha");
-        assert_eq!(p2, "beta");
-    }
-
-    #[test]
-    fn prefix_persists_across_registry_restart() {
-        let (db, dir) = temp_db("persist");
-        {
-            let reg = RoomRegistry::new(db.clone());
-            let (_, p1) = reg.resolve("alpha", "k1").unwrap();
-            let (_, p2) = reg.resolve("alpha", "k2").unwrap();
-            assert_eq!(p1, "alpha");
-            assert_eq!(p2, "alpha_1");
-        }
-        // A fresh registry on the same db reloads prefixes from the internal collection.
-        let reg = RoomRegistry::new(db.clone());
-        let (_, p1) = reg.resolve("alpha", "k1").unwrap();
-        let (_, p2) = reg.resolve("alpha", "k2").unwrap();
-        assert_eq!(p1, "alpha");
-        assert_eq!(p2, "alpha_1");
-        // A new distinct key after restart gets the next free suffix.
-        let (_, p3) = reg.resolve("alpha", "k3").unwrap();
-        assert_eq!(p3, "alpha_2");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn prefix_of_maps_storage_back_to_plain() {
-        let (db, _dir) = temp_db("prefixof");
-        let reg = RoomRegistry::new(db.clone());
-        reg.resolve("alpha", "k1").unwrap();
-        reg.resolve("alpha", "k2").unwrap();
-        assert_eq!(
-            reg.prefix_of("alpha_users").unwrap(),
-            ("alpha".to_string(), "users".to_string())
-        );
-        assert_eq!(
-            reg.prefix_of("alpha_1_users").unwrap(),
-            ("alpha_1".to_string(), "users".to_string())
-        );
-        assert!(reg.prefix_of("orphan_users").is_none());
-    }
-
-    #[test]
-    fn sanitize_handles_weird_names() {
-        assert_eq!(sanitize_room_name("my room!"), "my_room");
-        assert_eq!(sanitize_room_name("a/b\\c"), "a_b_c");
-        assert_eq!(sanitize_room_name(""), "room");
-        assert_eq!(sanitize_room_name("___"), "room");
+    fn client_constructor_binds_the_room() {
+        let (db, _dir) = temp_db("clientbind");
+        let c = CloudSync::client(db, "node-7", "game", "s3cret", "tok");
+        assert_eq!(c.room_name, "game");
+        assert_eq!(c.room_key, "s3cret");
+        assert_eq!(c.mode, CloudSyncMode::Client);
     }
 
     fn put_simple(db: &Arc<Hako>, col: &str, id: &str) {
@@ -2054,7 +1645,7 @@ mod tests {
         put_simple(&db, "c", "gone");
         db.delete("c", "gone").unwrap();
 
-        let ops = CloudSync::collect_catchup_ops(&db, "c", "c", 0);
+        let ops = CloudSync::collect_catchup_ops(&db, "c", 0);
         let mut puts = 0;
         let mut dels = Vec::new();
         for op in &ops {
@@ -2076,7 +1667,7 @@ mod tests {
         db.delete_local("c", "gone").unwrap();
 
         // Key-level mark: the tombstone never enters catch-up...
-        let ops = CloudSync::collect_catchup_ops(&db, "c", "c", 0);
+        let ops = CloudSync::collect_catchup_ops(&db, "c", 0);
         assert_eq!(ops.len(), 1, "local-only tombstone leaked: {ops:?}");
 
         // ...and the clock still advanced past it (deleter looks ahead).
@@ -2085,7 +1676,7 @@ mod tests {
 
         // Collection-level mark: nothing leaves at all.
         db.set_collection_local("c", true);
-        let ops = CloudSync::collect_catchup_ops(&db, "c", "c", 0);
+        let ops = CloudSync::collect_catchup_ops(&db, "c", 0);
         assert!(ops.is_empty(), "local-only collection leaked: {ops:?}");
     }
 
@@ -2103,8 +1694,8 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_drops_sync_excluded_plane() {        // A hostile Replication{collection:"__groups"} must neither plant a
-        // same-named shard nor poison the real credential store — in either
-        // namespace — while legit room traffic still applies.
+        // same-named shard nor poison the real credential store — while
+        // legit room traffic still applies.
         let (db, _dir) = temp_db("excluded-ingest");
         put_simple(&db, "seed", "k");
         let hostile_value = db
@@ -2112,9 +1703,8 @@ mod tests {
             .unwrap()
             .unwrap()
             .encode_buffered();
-        let hostile = |collection: &str, prefix: &str| IngestItem {
+        let hostile = |collection: &str| IngestItem {
             collection: collection.to_string(),
-            prefix: prefix.to_string(),
             op: WalOp::PutInlined {
                 key: "evil".to_string(),
                 value: hostile_value.clone(),
@@ -2123,7 +1713,6 @@ mod tests {
         };
         let legit = IngestItem {
             collection: "users".to_string(),
-            prefix: "alpha".to_string(),
             op: WalOp::PutInlined {
                 key: "ok".to_string(),
                 value: hostile_value.clone(),
@@ -2132,12 +1721,8 @@ mod tests {
         };
         let mut buffer: std::collections::HashMap<String, Vec<IngestItem>> =
             std::collections::HashMap::new();
-        buffer.insert(
-            "alpha___groups".to_string(),
-            vec![hostile("__groups", "alpha")],
-        );
-        buffer.insert("__groups".to_string(), vec![hostile("__groups", "")]);
-        buffer.insert("__users".to_string(), vec![hostile("__users", "")]);
+        buffer.insert("__groups".to_string(), vec![hostile("__groups")]);
+        buffer.insert("__users".to_string(), vec![hostile("__users")]);
         buffer.insert("users".to_string(), vec![legit]);
         let echo_cache = Arc::new(StdMutex::new(
             std::collections::HashMap::<String, i64>::new(),
@@ -2149,10 +1734,6 @@ mod tests {
         CloudSync::flush_ingest_buffer(&db, &mut buffer, &echo_cache, &peers, &caps)
             .await;
 
-        assert!(
-            db.get("alpha___groups", "evil").unwrap().is_none(),
-            "hostile server-namespace batch planted a shard"
-        );
         assert!(
             db.get("__groups", "evil").unwrap().is_none(),
             "hostile packet poisoned the real credential store"
