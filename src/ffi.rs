@@ -1,14 +1,11 @@
 use std::cell::RefCell;
-// use crate::engine::Engine;
 use std::ffi::{c_char, c_int, CStr, CString};
-// use std::os::raw::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{channel, Sender};
 use std::time::Duration;
 use std::{ptr, thread};
 use std::collections::HashSet;
 
-// use std::sync::Arc;
 use hashbrown::HashMap;
 
 use crate::config::{DurabilityMode, HakoConfig};
@@ -18,7 +15,6 @@ use crate::engine::{BatchMutation, Hako};
 use crate::index::composite::definition::SortDirection;
 use crate::query::filter::Operator;
 use crate::query::query::{AggregateOp, Query};
-// use crate::query::planner::QueryPlanner;
 
 macro_rules! safety_shield {
     ($fallback:expr, $block:block) => {

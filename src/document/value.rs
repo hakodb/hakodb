@@ -160,7 +160,6 @@ impl Eq for Value {}
 mod serde_arc_str_map {
     use super::*;
     use serde::{Serializer, Deserializer, Deserialize}; // <--- ADD THIS
-    // use serde::ser::SerializeSeq;
 
     pub fn serialize<S>(vec: &[(Arc<str>, Value)], s: S) -> Result<S::Ok, S::Error> where S: Serializer {
         use serde::ser::SerializeSeq;
