@@ -2,6 +2,21 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.16.0 — cloud single-room (breaking)
+- **Room as channel (net_sync parity).** `CloudSync::server` takes
+  `room_name` + `room_key` and serves exactly that room; wrong-room
+  handshakes are rejected before any data moves. `RoomRegistry`,
+  `__hako_rooms`, storage prefixes, and all strip/remap machinery are
+  gone (−449 net lines). Collections store under plain names.
+- **FFI break:** `hk_cloud_sync_server_new` gains `room_name` +
+  `room_key`. Old 3-arg callers against the new DLL read garbage —
+  bump Go/Pascal/JS/Tauri/CLI in lockstep (done same week).
+- Wire protocol unchanged (plain names were already on the wire).
+  Storage break: legacy prefixed collections are ignored, not
+  deleted — fresh rooms only, no migrator.
+- `hakocloudserver` stays pinned to 0.8.x; its multidb migration is
+  tracked separately.
+
 ### v0.15.3 — ring-only TLS + shared sync framing (patch)
 - **tungstenite 0.26 → 0.30**: the new major selects no TLS provider
   itself, so rustls ships **ring-only** — `aws-lc-sys` C++ is gone from
