@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 #[cfg(feature = "net-sync")]
 use std::time::{Duration, Instant, UNIX_EPOCH, SystemTime};
 #[cfg(feature = "net-sync")]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use crate::sync_frame::{recv_frame, send_frame};
 #[cfg(feature = "net-sync")]
 use tokio::sync::{Mutex as AsyncMutex, watch};
 #[cfg(feature = "net-sync")]
@@ -746,7 +746,7 @@ impl NetSyncer {
                     if let Ok(payload) = bincode::serialize(&packet) {
                         let mut guard = peers_audit.lock().await;
                         for writer in guard.values_mut() {
-                            let _ = send_raw(writer, &payload).await;
+                            let _ = send_frame(writer, &payload).await;
                         }
                         // Reset local timer
                         let mut lp = last_ping_ptr.lock().unwrap();
@@ -855,10 +855,10 @@ async fn handle_peer(
     // 1. Identify Handshake
     let handshake = NetPacket::Identify { id: self_id.clone(), room_hash: my_hash };
     if let Ok(bytes) = bincode::serialize(&handshake) {
-        if send_raw(&mut writer, &bytes).await.is_err() { return; }
+        if send_frame(&mut writer, &bytes).await.is_err() { return; }
     }
 
-    let p_bytes = match tokio::time::timeout(Duration::from_secs(5), recv_raw(&mut reader)).await {
+    let p_bytes = match tokio::time::timeout(Duration::from_secs(5), recv_frame(&mut reader)).await {
         Ok(Ok(b)) => b,
         _ => return,
     };
@@ -882,7 +882,7 @@ async fn handle_peer(
             encrypted_cols: ours.encrypted_cols,
         };
         if let Ok(bytes) = bincode::serialize(&packet) {
-            if send_raw(&mut writer, &bytes).await.is_err() {
+            if send_frame(&mut writer, &bytes).await.is_err() {
                 return;
             }
         }
@@ -912,7 +912,7 @@ async fn handle_peer(
     // 4. Loop
     let echo_cache_clone = echo_cache.clone();
     loop {
-        let raw = match recv_raw(&mut reader).await { Ok(b) => b, _ => break };
+        let raw = match recv_frame(&mut reader).await { Ok(b) => b, _ => break };
 
         if let Ok(packet) = bincode::deserialize::<NetPacket>(&raw) {
             match packet {
@@ -1092,7 +1092,7 @@ async fn handle_bootstrap(db: &Arc<Hako>, peers: &Arc<AsyncMutex<HashMap<String,
                     // 3. Now we can safely await the async Mutex for peers
                     let mut guard = peers.lock().await;
                     if let Some(w) = guard.get_mut(peer_id) {
-                        let _ = send_raw(w, &payload).await;
+                        let _ = send_frame(w, &payload).await;
                     }
                 }
             }
@@ -1233,8 +1233,8 @@ async fn send_replication_packet(
             
             // Look up the specific peer's TCP write half
             if let Some(writer) = guard.get_mut(peer_id) {
-                // Send using your existing send_raw utility (length-prefix + data)
-                if let Err(e) = send_raw(writer, &payload).await {
+                // Send using the shared sync_frame utility (length-prefix + data)
+                if let Err(e) = send_frame(writer, &payload).await {
                     eprintln!("[net_sync] Failed to send packet to {}: {}", peer_id, e);
                 }
             }
@@ -1279,7 +1279,7 @@ async fn relay_mesh(
                 continue;
             }
         }
-        let _ = send_raw(writer, data).await;
+        let _ = send_frame(writer, data).await;
     }
 }
 
@@ -1291,7 +1291,7 @@ fn broadcast_mesh(peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, col:
             let mut guard = p_ptr.lock().await;
             for writer in guard.values_mut() { 
                 // let peer = writer.peer_addr().unwrap().ip().to_string();
-                let _ = send_raw(writer, &payload).await; 
+                let _ = send_frame(writer, &payload).await; 
 
             }
         });
@@ -1335,7 +1335,7 @@ fn send_filtered_mesh(
                     );
                     continue;
                 }
-                let _ = send_raw(writer, &payload).await;
+                let _ = send_frame(writer, &payload).await;
             }
         });
     }
@@ -1351,23 +1351,10 @@ async fn update_status(tx: &watch::Sender<NetworkStatus>, peers: &Arc<AsyncMutex
     });
 }
 
-async fn send_raw<W: AsyncWriteExt + Unpin>(w: &mut W, data: &[u8]) -> tokio::io::Result<()> {
-    w.write_all(&(data.len() as u32).to_le_bytes()).await?;
-    w.write_all(data).await
-}
-
-async fn recv_raw<R: AsyncReadExt + Unpin>(r: &mut R) -> tokio::io::Result<Vec<u8>> {
-    let mut len_b = [0u8; 4];
-    r.read_exact(&mut len_b).await?;
-    let mut data = vec![0u8; u32::from_le_bytes(len_b) as usize];
-    r.read_exact(&mut data).await?;
-    Ok(data)
-}
-
 /// Helper to send typed packets safely
 async fn send_packet(writer: &mut OwnedWriteHalf, packet: NetPacket) -> tokio::io::Result<()> {
     if let Ok(payload) = bincode::serialize(&packet) {
-        send_raw(writer, &payload).await?;
+        send_frame(writer, &payload).await?;
     }
     Ok(())
 }

@@ -108,7 +108,7 @@ Measured Windows `hakodb.dll`, release (`strip + thin-LTO`):
 
 | Build | Size | Notes |
 |---|---|---|
-| Full (default features) | ~7.4 MB | sync + compression; vendored TLS (no system OpenSSL needed) |
+| Full (default features) | ~6.5 MB | sync + compression; vendored TLS, ring-only (no system OpenSSL needed) |
 | Embedded core (`--no-default-features`) | ~2.2 MB | no sync, no compression; reads fail closed on zstd payloads |
 
 `opt-level = "z"` was duelled and rejected (+20–50% on hot reads); `panic = "abort"` is off the table (FFI relies on `catch_unwind`).

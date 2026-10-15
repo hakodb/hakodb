@@ -40,12 +40,12 @@ use tokio_tungstenite::tungstenite::Message;
 // DATA STRUCTURES & PROTOCOL PACKETS
 // ============================================================================
 
-// TLS uses vendored rustls with the single aws-lc provider (forced by
-// tungstenite 0.26; a second provider would be dead weight). Install it as
-// process default to prevent the 0.23 no-provider panic.
+// TLS uses vendored rustls with the single ring provider (tungstenite 0.30
+// selects no provider itself; install ring as process default to prevent
+// the 0.23 no-provider panic).
 #[cfg(feature = "cloud-sync")]
 fn init_crypto_provider() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 /// Server-internal collection that stores the room registry. It is

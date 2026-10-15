@@ -30,7 +30,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::document::hako_doc::HakoDoc;
@@ -39,10 +39,10 @@ use crate::engine::engine::IndexList;
 use crate::storage::engine::Pointer;
 use crate::storage::wal::WalOp;
 use crate::sync_core::{apply_peer_index_defs, apply_replicated_batch, echo_take, op_logical_time, resolve_send_bytes};
+use crate::sync_frame::recv_frame;
 
-/// Fail-closed frame cap: a corrupt length prefix must not allocate the
-/// box. Snapshots bigger than this fail the connection, not the process.
-const MAX_FRAME: usize = 256 * 1024 * 1024;
+/// Frame a packet for the channel: serialize (bincode, like mesh framing)
+/// then shared length-prefix via `sync_core::frame_bytes`.
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum SockPacket {
@@ -54,17 +54,12 @@ enum SockPacket {
     Data { collection: String, ops: Vec<WalOp> },
 }
 
-/// Frame a packet (length-prefix + bincode), pure bytes for the channel.
+/// Frame a packet for the channel: serialize (bincode, like mesh framing)
+/// then shared length-prefix via `sync_core::frame_bytes`.
 fn frame_packet(pkt: &SockPacket) -> std::io::Result<Vec<u8>> {
     let bytes = bincode::serialize(pkt)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    if bytes.len() > MAX_FRAME {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too large"));
-    }
-    let mut frame = Vec::with_capacity(4 + bytes.len());
-    frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&bytes);
-    Ok(frame)
+    crate::sync_core::frame_bytes(&bytes)
 }
 
 /// One side of a socket peering: shared tailer + ingest state. Both the
@@ -244,9 +239,13 @@ async fn handle_conn(st: Shared, stream: UnixStream, label: String) {
     if !send(&SockPacket::Hello { versions }) {
         return;
     }
-    let mut rd_buf = ReadHalf { inner: rd };
-    let _peer_versions = match rd_buf.recv().await {
-        Ok(SockPacket::Hello { versions }) => versions,
+    let mut rd_buf = rd;
+    let _peer_versions = match recv_frame(&mut rd_buf)
+        .await
+        .ok()
+        .and_then(|b| bincode::deserialize::<SockPacket>(&b).ok())
+    {
+        Some(SockPacket::Hello { versions }) => versions,
         _ => return,
     };
     st.peers.lock().unwrap().insert(label.clone());
@@ -343,12 +342,18 @@ async fn handle_conn(st: Shared, stream: UnixStream, label: String) {
         if !st.running.load(Ordering::Acquire) {
             break;
         }
-        match rd_buf.recv().await {
-            Ok(SockPacket::Snapshot { collection, ops })
-            | Ok(SockPacket::Data { collection, ops }) => {
+        // Shared capped framing + positional-bincode decode (fail-closed:
+        // undecodable bytes end the connection, same as before).
+        let pkt = recv_frame(&mut rd_buf)
+            .await
+            .ok()
+            .and_then(|b| bincode::deserialize::<SockPacket>(&b).ok());
+        match pkt {
+            Some(SockPacket::Snapshot { collection, ops })
+            | Some(SockPacket::Data { collection, ops }) => {
                 apply_replicated_batch(st.db.clone(), collection, ops, st.echo_cache.clone()).await;
             }
-            Ok(SockPacket::IndexDefs { indexes }) => {
+            Some(SockPacket::IndexDefs { indexes }) => {
                 apply_peer_index_defs(&st.db, &indexes);
             }
             _ => break,
@@ -357,25 +362,4 @@ async fn handle_conn(st: Shared, stream: UnixStream, label: String) {
     tailer.abort();
     writer.abort();
     st.peers.lock().unwrap().remove(&label);
-}
-
-/// Owned read half with framing (UnixStream split halves borrow the
-/// socket; this re-owns the read side for the read loop).
-struct ReadHalf {
-    inner: tokio::net::unix::OwnedReadHalf,
-}
-
-impl ReadHalf {
-    async fn recv(&mut self) -> std::io::Result<SockPacket> {
-        let mut len_buf = [0u8; 4];
-        self.inner.read_exact(&mut len_buf).await?;
-        let len = u32::from_le_bytes(len_buf) as usize;
-        if len == 0 || len > MAX_FRAME {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad frame length"));
-        }
-        let mut buf = vec![0u8; len];
-        self.inner.read_exact(&mut buf).await?;
-        bincode::deserialize(&buf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-    }
 }

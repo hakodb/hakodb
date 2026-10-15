@@ -8,7 +8,11 @@
 //!
 //! Deliberately NOT extracted (yet): the tail loops themselves (offset
 //! bookkeeping differs: DB-persisted vs in-memory), blob inflation
-//! (resolve paths differ), framing (bincode vs msgpack vs length-prefix).
+//! (resolve paths differ), and cloud framing (msgpack over WS — a different
+//! wire). Length-prefix framing IS shared below (`frame_bytes`, `MAX_FRAME`)
+//! by the TCP mesh and unix-socket planes; the async send/recv halves live
+//! in `sync_frame` (tokio-gated) so this module stays tokio-free and
+//! compilable in minimal builds.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -40,6 +44,28 @@ pub fn op_logical_time(op: &WalOp) -> i64 {
         WalOp::Delete { timestamp, .. } => *timestamp,
         _ => 0,
     }
+}
+
+/// Fail-closed frame cap for the length-prefix planes (mesh TCP, unix
+/// socket): a corrupt length prefix fails the connection, never allocates
+/// the box. Snapshots bigger than this fail the peer, not the process.
+pub const MAX_FRAME: usize = 256 * 1024 * 1024;
+
+/// Frame already-serialized bytes (u32-LE length + payload), pure and
+/// transport-free; the caller serializes (bincode on both planes today).
+/// Rejects empty and over-cap payloads — the mesh previously sent/received
+/// uncapped, so a corrupt prefix could allocate gigabytes.
+pub fn frame_bytes(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    if data.is_empty() || data.len() > MAX_FRAME {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad frame length",
+        ));
+    }
+    let mut frame = Vec::with_capacity(4 + data.len());
+    frame.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    frame.extend_from_slice(data);
+    Ok(frame)
 }
 
 /// Echo discipline, shared: an op we just ingested from a peer must not
@@ -383,6 +409,19 @@ mod tests {
         // Markers carry nothing.
         let op = WalOp::BeginTx { tx_id: 7 };
         assert_eq!(op_logical_time(&op), 0);
+    }
+
+    #[test]
+    fn frame_bytes_roundtrip_and_caps() {
+        // Layout: u32-LE length + payload.
+        let f = frame_bytes(&[7u8, 8, 9]).unwrap();
+        assert_eq!(&f[..4], &3u32.to_le_bytes());
+        assert_eq!(&f[4..], &[7u8, 8, 9]);
+        // Fail closed: empty and over-cap never frame (mesh previously
+        // received uncapped — a corrupt prefix could allocate gigabytes).
+        assert!(frame_bytes(&[]).is_err());
+        assert!(frame_bytes(&vec![0u8; MAX_FRAME + 1]).is_err());
+        assert!(frame_bytes(&vec![0u8; MAX_FRAME]).is_ok());
     }
 
     #[test]

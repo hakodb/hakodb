@@ -10,6 +10,9 @@ pub mod storage;
 pub mod sync_core;
 pub mod sync_guard;
 
+#[cfg(any(feature = "net-sync", feature = "socket-sync"))]
+pub mod sync_frame;
+
 pub mod util;
 
 #[cfg(feature = "net-sync")]
