@@ -2,6 +2,18 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.15.3 — ring-only TLS + shared sync framing (patch)
+- **tungstenite 0.26 → 0.30**: the new major selects no TLS provider
+  itself, so rustls ships **ring-only** — `aws-lc-sys` C++ is gone from
+  the tree and the DLL (zero `aws_lc` refs). Full DLL 7.37 → 6.49MB.
+  Zero compile errors on the jump (Message/accept/connect surface
+  source-compatible); cloud rooms 4/4 green.
+- **Shared length-prefix framing** (`sync_core::frame_bytes`,
+  `sync_frame::send/recv_frame`): mesh `send_raw`/`recv_raw` and socket
+  `frame_packet`/`ReadHalf` unified. Side fix: mesh receive was uncapped
+  (corrupt prefix could allocate gigabytes) — now fail-closed at 256MB
+  like the socket plane. New `frame_bytes_roundtrip_and_caps` unit test.
+
 ### v0.15.2 — revert native-tls (release-red fix)
 - **Back to vendored rustls, single aws-lc provider**: the `native-tls`
   switch in 0.15.1 broke stock Linux containers + Android NDK (`openssl-sys`
