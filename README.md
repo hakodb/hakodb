@@ -1,111 +1,41 @@
 # HakoDB
 
-**HakoDB is an embedded document database with native vector search and multi-plane sync, written in Rust.**
+**Embedded document database with native vector search and multi-plane sync, written in Rust.**
 
-It stores typed JSON-like documents in binary form, runs **fully in-process** like SQLite (no server process, no daemon, no network config), and exposes a **flat C ABI** (`hakodb.h`, generated per-target by the build) so any language can embed it. Ready-made SDKs live in their own repos — Go, JavaScript/TypeScript, Pascal/Lazarus, Tauri, and more (see [Repositories](#repositories)).
-
-HakoDB speaks "documents", not tables: collections of flexible, schemaless objects with a fluent query API (`collection().doc().set()`, `.where().orderBy().limit()`), while keeping the zero-deploy footprint of an embedded engine.
-
-> **Current status: v0.12.3 (production-candidate).** The core engine supports physical data sharding, zero-copy field projection, near-instant recovery, composite + full-text + secondary indexing, encryption at rest, deferred blob fetching, bulk JSON result export, TopN heap for unindexed order+limit, **archive collections** (`relocate_docs`, `lazy_collections` with load/unload), a **selectivity-aware planner** (smallest-posting Eq, early sweep termination), and high-throughput local or cloud synchronization capable of **50,000+ OPS** under heavy concurrent workloads.
-
----
-
-## What's new (latest three — full history in [CHANGELOG](CHANGELOG.md))
-
-### v0.12.3 — archive C ABI
-- `hk_engine_relocate_docs(src, dst, ids_json)` → JSON
-  `{moved:[...],missing:[...]}`; `hk_engine_load/unload_collection`
-  (0/−1); `hk_engine_unloaded_collections` (JSON array). Wired the same
-  week into Go, JS, Pascal and the CLI. No behavior change.
-
-### v0.12.2 — recovery racefix + early termination + selectivity probe
-- A late recovery import clobbered fresh lazy fills with stale snapshot
-  state — fixed via the `index_touched` set (both orders converge).
-- Unordered bounded sweeps stop at the page (−70% measured); P6 rides
-  the smallest Eq posting (30× filter-order lottery fixed).
-- Box A/B over FFI: multi-Eq hot-first 142 → 2400 qps (~17×);
-  standard gate PASS 14/14, no regression.
-
-### v0.12.0 — recovery/query perf series + snapshot freshness
-- Bulk replay path (−22% touch), background lazy load with progress,
-  selective decode (−42% wide-doc), hang hardening (10/10 gaming loops
-  clean), v4 snapshot tails with stale-only rescan. (v0.12.1 added
-  borrowed secondary inserts on top.)
-
-## Table of Contents
-
-- [What is HakoDB?](#what-is-hakodb)
-- [What's new (0.7.2 → 0.8.23)](#whats-new-072--0823)
-- [Changelog (older releases)](CHANGELOG.md)
-- [When to use HakoDB (sync vs non-sync)](#when-to-use-hakodb-sync-vs-non-sync)
-- [Key features](#key-features)
-- [Quick Start (Rust)](#quick-start-rust)
-- [Rust usage](#rust-usage)
-- [Vector search (KNN)](#vector-search-knn)
-- [Multi-language platform support (C ABI)](#multi-language-platform-support-c-abi)
-- [Net Sync (LAN replication)](#net-sync-lan-replication)
-- [Cloud Sync (centralized replication)](#cloud-sync-centralized-replication)
-- [Sync encryption posture (read this before encrypting)](#sync-encryption-posture-read-this-before-encrypting)
-- [Guide: choosing a read path](docs/reads.md)
-- [Repositories](#repositories)
-- [Architecture](#architecture)
-- [Implementation status](#implementation-status)
-- [Contribution notes](#contribution-notes)
-- [License](#license)
-
----
+Stores typed JSON-like documents in binary form, runs **fully in-process** like SQLite (no server, no daemon), and exposes a **flat C ABI** (`hakodb.h`, generated per-target by the build) so any language can embed it. SDKs (Go, JS/TS, Pascal, Tauri, HTTP backend) live in their own repos under the [`hakodb`](https://github.com/hakodb) organization.
 
 ## What is HakoDB?
 
-HakoDB is a **document-oriented embedded database** for applications that want:
+A document-oriented embedded database for applications that want:
 
-- **Document ergonomics** — collections, documents, `set/get/delete`, fluent queries, real-time change streams.
-- **SQLite-style embedding** — link a library into your process and open a database file; there is nothing to install or operate.
-- **Durability without sacrifice** — a WAL + tiered-segment storage engine with configurable durability (from full `fsync` per write to group-commit `on-commit` batches) and crash recovery.
-- **Encryption at rest** — ChaCha20-Poly1305 encryption of WAL and segment payloads via a master key.
-- **Real-time locally** — `watch_collection` streams document changes (`put` / `delete`) to subscribers in-process.
-- **Synchronization when you need it** — two optional replication layers:
-  - **Net Sync** (`net-sync` feature): peer-to-peer mesh replication over LAN with mDNS discovery.
-  - **Cloud Sync** (`cloud-sync` feature): centralized client-server replication over WebSockets + MessagePack.
+- **Document ergonomics** — collections, `put/get/delete`, fluent queries (`where/orderBy/limit`), real-time change streams.
+- **SQLite-style embedding** — link the library, open a file; nothing to install or operate.
+- **Durability without sacrifice** — WAL + tiered-segment storage, configurable durability (`Always` / `Interval` / `Manual` / `OnCommit`), crash recovery.
+- **Encryption at rest** — ChaCha20-Poly1305 for WAL and segment payloads via a master key.
+- **Sync when you need it** (optional features) — peer-to-peer mesh over LAN (`net-sync`), or centralized client-server replication over WebSockets + MessagePack (`cloud-sync`).
 
-Because it is a library, HakoDB has no "database server" to manage. Your app *is* the database host. This makes it ideal for local-first and offline-first products, desktop and CLI tooling, edge devices, games, and apps that occasionally need to sync with the cloud or with each other.
+Your app *is* the database host: ideal for local-first/offline-first products, desktop and CLI tooling, edge devices, and games.
 
----
+## When to use it
 
-## When to use HakoDB (sync vs non-sync)
-
-| Scenario | Recommended mode | Why |
+| Scenario | Mode | Why |
 |---|---|---|
-| Desktop / CLI / local tool needs a real DB with zero setup | **Embedded (no sync)** | In-process, single file, no services. |
-| Offline-first mobile/edge/desktop app that syncs to a central backend | **Cloud Sync** (client) | Local reads/writes keep working offline; deltas sync over `ws://`/`wss://`. |
-| Central hub collecting writes from many devices | **Cloud Sync** (server) | Thousands of concurrent WebSocket clients, 5ms micro-batched writes, WAL tailer broadcast. |
-| Real-time multiplayer / collaborative session on one LAN | **Net Sync** (mesh) | mDNS discovery, room-key isolation, delta replication across peers. |
-| Local app that must *also* be reachable by other processes/languages | **Embedded + FFI** | C ABI plus per-language SDK repos; watch streams for reactive UIs. |
-| Analytics / ad-hoc queries over large datasets | **Embedded** | Composite indexes, FTS, aggregates, zero-copy projection, parallel scans. |
-
-**In short:** use HakoDB **without sync** when your data is local to one process. Turn on **Net Sync** when you need peer-to-peer replication across devices on a network you control. Turn on **Cloud Sync** when you need offline-first clients to converge through a central server (or to build a real-time multi-client hub).
-
----
+| Desktop / CLI / tool with zero setup | Embedded (no sync) | In-process, single file. |
+| Offline-first app syncing to a backend | Cloud Sync (client) | Works offline; deltas sync over `ws://`/`wss://`. |
+| Hub collecting writes from many devices | Cloud Sync (server) | Thousands of concurrent clients, micro-batched writes. |
+| Real-time collaboration on one LAN | Net Sync (mesh) | mDNS discovery, room-key isolation. |
+| Reachable from other processes/languages | Embedded + FFI | C ABI plus per-language SDKs. |
+| Analytics over large datasets | Embedded | Composite/FTS indexes, aggregates, parallel scans. |
 
 ## Key features
 
-- **Core engine API** — `open`, `put`, `get`, `delete`, `query`, `compact`, `flush`, `write_batch`.
-- **Durable storage stack** — shard-oriented segment storage (`segment-l{level}-{id}.dat`) with tiered compaction; WAL with transactional markers and group-commit batching; committed-op recovery replay; index snapshot + WAL rewrite after compaction/recovery.
-- **Durability tuning** — `DurabilityMode`: `Always`, `Interval`, `Manual`, `OnCommit`; group-commit control via `group_commit_max_ops`.
-- **Encryption at rest** — optional key-based encryption (ChaCha20-Poly1305) for WAL and segment payloads; selectable encrypted collections.
-- **Transactions** — `begin_transaction` + staged mutations + `commit`; `begin_serializable_transaction` with conflict-aware commit validation (read/write version checks).
-- **Queries** — filters (`eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `notIn`, `arrayContains`, `arrayContainsAny`, `match`, `contains`, `startsWith`); ordering, limit, offset, cursor bounds (`startAt/startAfter/endAt/endBefore`); cost-aware parallel planner; predicate + projection pushdown; `count/sum/avg` aggregates.
-- **Indexing** — single-field secondary B-Tree indexes, composite indexes, inverted (full-text) indexes;
-vector (HNSW) indexes for KNN similarity search; graph backlink indexes for BFS traversal over document references, edge collections (`_from`/`_to`) for weighted Dijkstra shortest paths; async background index building.
-- **Zero-copy projection** — queries cherry-pick fields directly from memory-mapped binary slices without inflating full documents.
-- **Real-time watch streams** — `watch_collection` with change events; FFI bridge for cross-language reactive UIs.
-- **Subcollections** — `put/get/delete/query` on hierarchical nested collections.
-- **Security & operations** — collection-prefix allow/deny policy rules; in-memory and file-backed audit logging (`audit.log`).
-- **Multi-language FFI** — opaque handle C ABI with document builder, CRUD, query, batch, transaction, watch, result-set and cloud-sync functions; per-language SDKs live in their own repos (see [Repositories](#repositories)).
+- **Engine** — `open/put/get/delete/query`, atomic `write_batch`, serializable transactions, `watch_collection` streams, subcollections.
+- **Queries** — `eq/ne/gt/gte/lt/lte/in/notIn/arrayContains/match/contains/startsWith`, ordering, limit/offset, cursor bounds, `count/sum/avg`, cost-aware parallel planner with projection pushdown.
+- **Indexes** — secondary B-Tree, composite, full-text, HNSW vector (KNN), graph backlinks (BFS) + `_from`/`_to` edge collections (weighted Dijkstra); built asynchronously in the background.
+- **Storage** — tiered compaction, group-commit WAL, blob offloading, optional zstd compression (`compression` feature, default-on).
+- **Operations** — collection-prefix allow/deny rules, audit logging, `flush/compact/backup`.
 
----
-
-## Quick Start (Rust)
+## Quick start (Rust)
 
 ```rust
 use hakodb::config::HakoConfig;
@@ -113,476 +43,76 @@ use hakodb::document::hako_doc::HakoDoc;
 use hakodb::document::value::Value;
 use hakodb::engine::{BatchMutation, Hako};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cfg = HakoConfig::default();
-    cfg.encryption_key = Some("change-me-secret".to_string());
-
-    let db = Hako::open(".hakodb-example", cfg)?;
-
-    let mut doc = HakoDoc::default();
-    doc.insert("name", Value::String("alice".to_string()));
-    doc.insert("age", Value::Int(30));
-
-    db.put("users", "1", &doc)?;
-    db.flush()?;
-    Ok(())
-}
-```
-
----
-
-## Rust usage
-
-```rust
-use hakodb::config::HakoConfig;
-use hakodb::engine::{BatchMutation, Hako};
-
 let db = Hako::open("./data", HakoConfig::default())?;
+let mut doc = HakoDoc::default();
+doc.insert("name", Value::String("alice".to_string()));
+doc.insert("age", Value::Int(30));
+db.put("users", "1", &doc)?;
 
-// atomic batch write
-db.write_batch(vec![
-    BatchMutation::Put {
-        collection: "users".into(),
-        doc_id: "1".into(),
-        doc: /* HakoDoc */ doc1,
-    },
-    BatchMutation::Delete { collection: "users".into(), doc_id: "2".into() },
-])?;
-
-// serializable transaction
+// atomic batch + serializable transaction + reactive watch
+db.write_batch(vec![BatchMutation::Put { collection: "users".into(), doc_id: "2".into(), doc }])?;
 let mut tx = db.begin_serializable_transaction();
-tx.get(&db, "accounts", "alice")?;
 tx.put("accounts", "alice", updated_balance_doc);
-let ids = tx.commit(&db)?;
-
-// reactive watch
+tx.commit(&db)?;
 let rx = db.watch_collection("users");
 while let Ok(event) = rx.recv() {
     println!("{:?} {}", event.kind, event.path);
 }
 ```
 
-See [`example/rust/basic`](example/rust/basic) for a complete, working example of the engine API.
-
-> More Rust examples: [`example/rust/basic`](example/rust/basic) — a runnable
-> Cargo project (`cargo run`) covering open, CRUD, query, aggregation, batch,
-> transaction and the real-time watch channel.
-
----
+See [`example/rust/basic`](example/rust/basic) for a complete runnable project.
 
 ## Vector search (KNN)
 
-`create_vector_index(collection, field, dim, metric)` + `find_near(collection,
-field, query, k)`: nearest-first hits over a binary LE-`f32` field, cosine or
-L2, HNSW graph with exact rescore (recall 0.995 @ 384d in the duel harness).
+`create_vector_index(collection, field, dim, metric)` + `find_near(collection, field, query, k)`: nearest-first hits over a binary LE-`f32` field, cosine or L2, HNSW with exact rescore.
 
-> **The index does not embed.** HakoDB stores vectors and finds neighbors —
-> turning your text/images into vectors needs an **embedding model**, a
-> separate component you operate alongside the database:
->
-> - Query and corpus **must share one model** (dimensions and geometry differ
->   per model; a dim mismatch is a hard error, never silent truncation).
-> - Lightweight paths: a multilingual ONNX model (`paraphrase-multilingual-
->   MiniLM`, 384d) as a tiny sidecar service, or a vendor embedding API
->   (Gemini/OpenAI tiers) when data may leave the box.
-> - Changing models means re-embedding everything (vectors from model A are
->   meaningless to model B).
-> - **Sync carries defs, not graphs.** Index definitions replicate over
->   mesh/cloud/socket (peers converge, same-minor lockstep); HNSW graphs
->   rebuild locally from the replicated documents — never snapshotted,
->   never on the wire.
->
-> Without an embedding pipeline the vector index sits empty: it is storage +
-> search, not understanding. See `tests/vector_knn.rs` for the API shape and
-> `hakodb/hakobackend` HTTP_CONTRACT §3 for the HTTP contract (float arrays
-> over the wire, index-before-write order).
+> **The index does not embed.** Turning text/images into vectors needs an embedding model you operate separately; query and corpus must share one model (a dim mismatch is a hard error). **Sync carries index definitions, not graphs** — HNSW graphs rebuild locally from replicated documents.
 
----
+## C ABI (multi-language)
 
-## Multi-language platform support (C ABI)
-
-HakoDB exposes a flat C ABI for embedding in other languages and integration layers. Opaque handle types are defined in `hakodb.h` — generated per target by `build.rs` + `cbindgen.toml` next to the binaries (`target/<...>/hakodb.h`); release bundles carry the header from the build that produced them, and the flat release `hakodb.h` is the Linux-generated superset. There is no checked-in header since 0.9.1. Language SDKs wrapping this ABI live in their own repos — see [Repositories](#repositories).
-
-### Build artifacts
-
-- Cargo crate types: `cdylib` (dynamic library consumers) and `rlib` (Rust consumers).
-- Auto-generated C header via `build.rs` + `cbindgen.toml`: `target/<...>/hakodb.h` (per-target, next to binaries).
+Flat C API over opaque handles (`HK_Engine`, `HK_Doc`, `HK_Query`, `HK_Batch`, `HK_Transaction`, `HK_Watch`, `HK_ResultSet`, sync handles): CRUD, batches, transactions, queries, watch, result sets, sync. Build outputs: `target/release/libhakodb.so` (Linux), `.dylib` (macOS), `hakodb.dll` (Windows) + per-target `hakodb.h`.
 
 ```bash
-cargo build --release
+cargo build --release                                   # full (sync + compression)
+cargo build --release --no-default-features             # embedded core (~2.2 MB)
 ```
 
-Platform outputs:
+## Sync
 
-- Linux: `target/release/libhakodb.so`
-- macOS: `target/release/libhakodb.dylib`
-- Windows: `target\release\hakodb.dll`
-
-### Opaque handle types
-
-- `HK_Engine` — main database instance
-- `HK_Doc` — document builder / result handle
-- `HK_Batch` — atomic write-batch container
-- `HK_Query` — query definition builder
-- `HK_Config` — advanced configuration builder
-- `HK_Watch` — real-time subscription handle
-- `HK_Transaction` — serializable transaction handle
-- `HK_ResultSet` — query result handle set
-- `HK_NetSyncer` — LAN net-sync handle
-- `HK_CloudSync` — cloud-sync handle
-
-### C API highlights
-
-- **Engine / memory:** `hk_engine_open`, `hk_engine_open_with_config`, `hk_engine_is_indexes_ready`, `hk_engine_free`, `hk_engine_backup`, `hk_engine_compact`, `hk_engine_list_collections`, `hk_engine_list_indexes`, `hk_engine_get_stats`, `hk_engine_get_audit_log`, `hk_engine_snapshot_indices`, `hk_last_error`, `hk_string_free`.
-- **Configuration:** `hk_config_new/free`, `hk_config_set_durability`, `hk_config_set_encryption_key`, `hk_config_set_encrypted_collections`, `hk_config_set_audit_log`, `hk_config_set_query_workers`, `hk_config_set_memory_limits`, `hk_config_set_storage_tuning`, `hk_config_set_blob_threshold`, `hk_config_set_compression`, `hk_config_set_wal_reserve_bytes`.
-- **Real-time:** `hk_engine_watch`, `hk_watch_free`.
-- **Documents:** `hk_doc_new/free`, `hk_doc_insert_str/int/float/bool/null/bin/timestamp/server_timestamp/doc/array/reference`, `hk_doc_to_json`, `hk_doc_resolve_blobs` (materialize deferred `__blob__` placeholders).
-- **CRUD:** `hk_engine_insert`, `hk_engine_insert_take` (owned doc, no clone), `hk_engine_get`, `hk_engine_delete`, `hk_engine_patch`, `hk_engine_get_by_ref`, `hk_engine_insert_subdoc`.
-- **Batches:** `hk_batch_new/free`, `hk_batch_set`, `hk_batch_delete`, `hk_batch_commit`.
-- **Transactions:** `hk_transaction_begin/get/set/commit/free`.
-- **Queries:** `hk_query_new/free`, all `hk_query_where_*` filters, `hk_query_order_by`, `hk_query_limit/offset`, `hk_query_select_field`, `hk_query_defer_blobs`, cursor functions (`start_at/start_after/end_at/end_before`), `hk_query_execute`, `hk_query_execute_to_handles`, `hk_query_delete`, `hk_query_patch`, aggregates (`hk_query_aggregate_count/sum/avg`, `hk_query_execute_aggregation`).
-- **Result sets:** `hk_result_set_count/get_doc/free`, `hk_result_set_to_json` (bulk single-call export).
-- **Diagnostics:** `hk_debug_write_stats` (write-phase timing breakdown; see `--wstats`).
-- **Indexing:** `hk_engine_create_index` (composite JSON), `hk_engine_create_simple_index`,
-`hk_engine_create_fts_index`, `hk_engine_create_vector_index`, `hk_engine_create_traverse_index`.
-- **Net Sync:** `hk_net_syncer_new/start/status/free`.
-- **Cloud Sync:** `hk_cloud_sync_new/start/status/stop/free`, plus the room-agnostic `hk_cloud_sync_server_new` and the room-bound `hk_cloud_sync_client_new`.
-
-The per-language SDKs (see [Repositories](#repositories)) wrap these APIs.
-
----
-
-## Net Sync (LAN replication)
-
-The `net-sync` feature provides peer-to-peer replication over the local network:
-
-- mDNS-based peer discovery for local mesh clusters.
-- Room-key isolation using SHA-256 room hashing (`Identify` handshake validation).
-- Delta replication via WAL operation payloads (`Replication` packets).
-- Live node status telemetry (`idle` / `connected` / `syncing`, peer count, known peers).
-- Relay/mesh fan-out controls for multi-hop LAN topologies.
-
-Core FFI functions: `hk_net_syncer_new`, `hk_net_syncer_start`, `hk_net_syncer_status`, `hk_net_syncer_free`. All FFI-based gateways include wrappers for these APIs.
-
-### Enable the feature
+Two optional, independent replication layers:
 
 ```toml
 [dependencies]
-hakodb = { version = "0.8", features = ["net-sync"] }
-tokio = { version = "1", features = ["full"] }
+hakodb = { version = "0.15", features = ["net-sync"] }    # LAN mesh: mDNS discovery, room-key isolation, delta replication
+hakodb = { version = "0.15", features = ["cloud-sync"] }  # central hub: offline-first clients over ws(s), room isolation, auth tokens
 ```
 
-### Android notes
+Rooms isolate data (`room_name` + `room_key`); the cloud server is room-agnostic and hosts any room. Index definitions replicate; derived state (HNSW graphs) rebuilds locally.
 
-On Android, discovery defaults to UDP subnet broadcast (no `MulticastLock`
-needed — broadcast bypasses the WiFi multicast filter). Override with
-`with_discovery()` if the app holds a lock and prefers mDNS as well.
-Requirements live on the app side: `INTERNET` permission, same WiFi as the
-group, and realistic expectations about Doze (the mesh stalls with the screen
-off; use a foreground service for always-on sync). Mixed groups: the desktop
-side must opt into `Both` — a default-configured desktop never hears
-broadcast-only mobile peers. The core library needs no Java glue.
+### Encryption posture (read before encrypting)
 
----
-
-## Cloud Sync (centralized replication)
-
-The `cloud-sync` feature provides cloud-level, **bi-directional synchronization** over WebSockets and MessagePack. HakoDB instances can act as a **central cloud server** or as an **offline-first cloud client**.
-
-### Enable the feature
-
-```toml
-[dependencies]
-hakodb = { version = "0.8", features = ["cloud-sync"] }
-tokio = { version = "1", features = ["full"] }
-```
-
-### Architecture overview
-
-- **Server mode (`CloudSyncMode::Server`)** — central hub handling thousands of concurrent WebSocket connections. An ingress batch flusher coalesces incoming stream mutations into 5ms micro-batches (preventing write-lock bottlenecks); a server outbound WAL tailer captures local server-side writes (CLI, FFI, or `db.put()`) and broadcasts them to all room subscribers.
-- **Client mode (`CloudSyncMode::Client`)** — connects to the cloud server over `ws://` or `wss://` (with automatic `https://` → `wss://` conversion). An outbound WAL tailer streams local embedded changes upstream; incoming remote changes are applied locally using LWW (last-write-wins) timestamp filtering.
-- **Symmetrical 2-way handshake (`VersionPing`)** — exchanged automatically on connection so that either side (server or client) catches up any deltas missed while offline or restarting.
-- **TLS-friendly URLs** — `https://`/`wss://` connect seamlessly through cloud proxies (GitHub Codespaces, Cloudflare Tunnels, AWS ALB, Heroku).
-- **High-throughput flusher** — drains and coalesces incoming client mutations every 5ms or 512 ops, reducing HakoDB write-lock acquisitions by ~500x.
-- **Anti-echo & deduplication** — self-pruning echo cache plus `msg_id` deduplication prevents infinite loopbacks and stale re-transmissions.
-
-### Rooms and storage layout
-
-A **room** is uniquely identified by the pair `(room_name, room_key)`. Clients
-that share a room name but use a different security key are treated as being in
-different rooms, so their data is fully isolated on the server.
-
-- `CloudSync::new(db, mode, client_id, room_name, room_key, auth_token)` — the
-  `room_name` argument was added in **v0.7.0** (inserted before `room_key`).
-  Prefer the dedicated constructors:
-  - `CloudSync::server(db, server_id, auth_token)` — a **room-agnostic cloud
-    server** ("big cloud server storage"). It is *not* bound to any room: it
-    accepts and persists any `(room_name, room_key)` pair its clients ask for.
-  - `CloudSync::client(db, client_id, room_name, room_key, auth_token)` — an
-    offline-first client that decides which room (and, via `start(server_url)`,
-    which server) to sync with. Every client using the same `(room_name,
-    room_key)` on the same server forms one sync group.
-- The server is **multi-room and room-agnostic**: it accepts any `(room_name,
-  room_key)` pair and hosts all of them in one database.
-- On the server, every room owns a **storage prefix**:
-  - first distinct `(name, key)` for a name → `roomname`
-  - each additional distinct key → `roomname_1`, `roomname_2`, …
-- Client collections are stored server-side as `<prefix>_<collection>` (e.g. a
-  client's `users` collection lands in `game_users`) and are presented back to
-  clients as plain `<collection>`, so data never mixes across rooms even when
-  clients use identical collection names.
-- The room→prefix mapping is kept in the internal, hidden
-  `__hako_rooms` collection and is re-read periodically by the server, so
-  new rooms are picked up without a restart.
-- Peer routing on the server is keyed by `(room, client_id)`, so two clients in
-  different rooms may safely reuse the same `client_id` without clobbering each
-  other's connections.
-
-### Cloud Sync server example (Rust)
-
-```rust
-use std::sync::Arc;
-use hakodb::config::HakoConfig;
-use hakodb::engine::Hako;
-use hakodb::cloud_sync::CloudSync;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = Arc::new(Hako::open("./data/cloud_server_db", HakoConfig::default())?);
-
-    // Room-agnostic server: not bound to any room, hosts any (room, key).
-    let cloud_server = CloudSync::server(db.clone(), "server_node_01", "master_jwt_secret");
-
-    cloud_server.start("0.0.0.0:8080").await?;
-    println!("HakoDB Cloud Sync Server listening on ws://0.0.0.0:8080");
-
-    tokio::signal::ctrl_c().await?;
-    cloud_server.stop();
-    Ok(())
-}
-```
-
-### Cloud Sync client example (Rust)
-
-```rust
-use std::sync::Arc;
-use hakodb::config::HakoConfig;
-use hakodb::document::hako_doc::HakoDoc;
-use hakodb::document::value::Value;
-use hakodb::engine::Hako;
-use hakodb::cloud_sync::CloudSync;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = Arc::new(Hako::open("./data/client_db", HakoConfig::default())?);
-
-    // The client picks its room (room_name + room_key) and the server URL.
-    let cloud_client = CloudSync::client(
-        db.clone(),
-        "user_client_42",          // Client ID
-        "game",                    // Room name (must match other clients of the room)
-        "secret_game_room_key",    // Must match the room key
-        "user_jwt_token_123",      // Authentication Token
-    );
-
-    cloud_client.start("wss://my-cloud-server.app.dev").await?;
-    println!("Connected to Cloud Sync Server");
-
-    // Local writes are synced to the server in the background.
-    let mut doc = HakoDoc::default();
-    doc.insert("username", Value::String("player_one".to_string()));
-    doc.insert("score", Value::Int(9500));
-    db.put("players", "user_42", &doc)?;
-
-    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-    cloud_client.stop();
-    Ok(())
-}
-```
-
----
-
-## Sync encryption posture (read this before encrypting)
-
-Encryption at rest (WAL/segments, via `encryption_key` + `encrypted_cols`)
-and sync-time plaintext are **independent properties**. The sync tailers
-read through the storage decryption layer and emit decoded documents, so
-an encrypted collection replicates as **plaintext on the wire** unless the
-rules below refuse the transfer. There is deliberately no silent path.
-
-### What is (and isn't) protected
+At-rest encryption and sync-time plaintext are **independent**: an encrypted collection replicates as **plaintext on the wire** unless refused below. No silent path.
 
 | Threat | Status |
 |---|---|
-| Disk / backup theft on any node | Protected when the node holds the key (at-rest encryption). |
-| Keyless or wrong-key peer receiving your encrypted docs | **Refused, loudly.** Both directions enforce: senders skip the room per peer, receivers drop the batch. |
-| Old (pre-capability) peer in the room | Treated as unverified: encrypted rooms pause for it (it keeps syncing plaintext rooms). Upgrade the peer to resume. |
-| Cloud server operator / DB thief | **Not protected.** The hub sees whatever clients send (and needs `room_key` in the clear to route). If the operator must not read a room, that room needs end-to-end encryption (future work), not at-rest keys. |
-| Passive LAN observer (mesh) | **Not protected.** Packets between verified key-holders are still plaintext. Use mTLS/`wss://` segments or E2E rooms for observer resistance. |
-| Active impersonator replaying a fingerprint | **Not protected.** Fingerprints are assertions, not proofs (no challenge-response yet). Mitigated by group admission + room keys, not eliminated. |
+| Disk/backup theft | Protected when the node holds the key. |
+| Keyless or wrong-key peer | **Refused, loudly**, both directions. |
+| Old (pre-capability) peer | Encrypted rooms pause for it; plaintext rooms keep syncing. Upgrade to resume. |
+| Server operator / passive LAN observer | **Not protected** — use E2E rooms or `wss://`/mTLS segments. |
 
-Admission control (groups, API keys, room keys) is **not** confidentiality:
-it decides *who may join*, these rules decide *what may leave*.
+Rule: one room needs the **same** `encryption_key` on every sharing node (`encrypted_cols`, server uses `<prefix>_<collection>` storage names). There is intentionally **no override flag**.
 
-### How it works
+## Binary size
 
-Every sync handshake now carries encryption capabilities alongside auth:
-
-- **Mesh**: a `SyncCaps` packet (`key_fp` = SHA-256 of the at-rest secret,
-  plus the node's encrypted collection list) right after `Identify`.
-  Appended as the last enum variant, so old peers fail the decode and
-  skip it silently — mixed-version meshes stay connected.
-- **Cloud**: `enc_fp` / `enc_cols` fields on `Authenticate` (serde
-  defaults; old clients omit them and parse fine both directions).
-
-The decision (`caps_allow`, in `src/sync_guard.rs`) is one rule everywhere:
-a locally-encrypted collection flows to/from a peer **iff** that peer
-presented the same non-zero fingerprint. Everything else — old peers,
-keyless peers, wrong-key peers — is refused per collection with a
-throttled loud warning naming peer, collection, and key prefix
-(`[sync-guard] ...`), plus an info line when caps arrive. Plaintext
-collections behave byte-identically to before (zero behavior delta when
-nothing is encrypted).
-
-Enforcement points: mesh tailer (per-peer fan-out), bootstrap, delta
-sender, inbound apply, and mesh relay (origin-aware: an encrypted room's
-bytes are forwarded only to fingerprint-matched peers, original bytes
-untouched); cloud relay fan-out, server apply, server tailer, and both
-catch-up senders. The cloud **client trusts its configured hub** (it
-sends everything upstream; the server enforces on receipt and relay) —
-otherwise encrypted rooms could never use the standard keyless hub.
-Catch-up and version-driven deltas self-heal anything skipped while a
-peer was unknown: skipped ops stay behind the receiver's version vector
-and are re-sent on the next exchange (including the re-`Ping` triggered
-by every caps announcement).
-
-### Operating it
-
-1. Put the **same** `encryption_key` on every node that must share the
-   room; list the room in `encrypted_cols` (or leave the list empty for
-   global encryption).
-2. On the cloud server, configure `encrypted_cols` with **storage** names
-   (`<prefix>_<collection>`); clients use plain names. Either side
-   matching counts.
-3. Expect `[sync-guard]` warnings while any peer is keyless, wrong-keyed,
-   or old — fix by distributing the key / upgrading, not by relaxing.
-4. There is intentionally **no override flag**: a downgrade switch would
-   reintroduce the exact silent leak this removes. Mixed-version rooms
-   keep working for plaintext collections throughout the upgrade.
-
----
-
-## Repositories
-
-HakoDB lives under the [`hakodb`](https://github.com/hakodb) organization
-— one repo per deliverable, each versioned independently:
-
-| Repo | Delivers | Version |
-|---|---|---|
-| [`hakodb/hakodb`](https://github.com/hakodb/hakodb) | Core library: engine, storage, query, FFI (`hakodb.h`), net/cloud sync | 0.12.3 |
-| [`hakodb/hakocli`](https://github.com/hakodb/hakocli) | Command-line manager + serve REPL | 0.2.4 |
-| [`hakodb/hakocluster`](https://github.com/hakodb/hakocluster) | In-process dispatcher over N instances + socket sync | 0.3.5 |
-| [`hakodb/hakocloudserver`](https://github.com/hakodb/hakocloudserver) | Managed sync hub + admin console | 0.1.1 |
-| [`hakodb/hakotauri`](https://github.com/hakodb/hakotauri) | Tauri gateway crate (Rust) | 0.4.2 |
-| [`hakodb/hakotaurits`](https://github.com/hakodb/hakotaurits) | Tauri client (`@hakodb/tauri`) | 0.3.1 |
-| [`hakodb/hakobench`](https://github.com/hakodb/hakobench) | C++ benchmark harnesses + SQLite duel | 0.1.1 |
-| [`hakodb/hakogo`](https://github.com/hakodb/hakogo) | Go SDK (cgo) | 0.1.3 |
-| [`hakodb/hakojs`](https://github.com/hakodb/hakojs) | JS/TS SDK (`@hakodb/client`, Node + Bun) | 0.5.15 |
-| [`hakodb/hakopascal`](https://github.com/hakodb/hakopascal) | Lazarus/FPC wrapper + components (+ cluster unit) | 0.1.3 |
-| [`hakodb/hakobackend`](https://github.com/hakodb/hakobackend) | Universal HTTP backend gateway + plug-and-play DBs | 0.6.1 |
-| [`hakodb/hakobackend-ts`](https://github.com/hakodb/hakobackend-ts) | Backend TS client (`@hakodb/backend`) | 0.3.1 |
-
-Branches: **`main`** (stable — merged releases only) and **`cloud_sync`**
-(active development). Before v0.8.20 the project was developed privately
-as FireLite, so there is no public repo or history to browse — the
-[CHANGELOG](CHANGELOG.md) in this repo is the authoritative record of
-what changed and when. Migrating a private FireLite (≤0.8.19) database?
-Open it once with v0.8.21+: internal collections migrate automatically
-(`__firelite_*` → `__hako_*`).
-
----
-
-## Architecture
-
-```text
-API (HakoDB + FFI + SDKs)
-  -> Query (Parallel sharded executor + projection pushdown)
-    -> Index (Async background manager + lock-free metadata)
-      -> Storage (WAL Inlining + RAM-to-Disk Checkpointing + Tiered Segments)
-        -> Hardware (Positional I/O + Atomic Sync Coordination)
-```
-
----
-
-## Implementation status
-
-### Performance & durability
-
-| Area | Status | Technical detail |
-|---|---|---|
-| **Write performance** | Elite | WAL inlining (small docs bypass segments); single hardware flush per write. |
-| **Read performance** | Elite | Zero-lock positional reads allow many parallel readers without contention. |
-| **Indexing** | Async | B-Tree updates offloaded to a background worker thread to keep main-thread latency low. |
-| **Memory management** | Adaptive | Inlined RAM data spills to tiered segments when thresholds are met. |
-| **Concurrency** | Atomic | Atomic versioning and async auditing remove global mutex bottlenecks. |
-| **Durability** | ACID | `OnCommit` mode commits write batches atomically. |
-| **Encryption** | Optimized | ChaCha20-Poly1305 with thread-local RNG for high-frequency encrypted I/O. |
-| **Real-time** | Threaded | FFI-compatible background listener bridge with `user_data` context passing. |
-
-### Feature status
-
-| Area | HakoDB status | Notes |
-|---|---|---|
-| Embedded engine | Implemented | High-concurrency Rust runtime with FFI bridge |
-| Durable WAL + recovery | Implemented | Fully encrypted WAL with committed-op filter and crash recovery |
-| Encryption at rest | Implemented | ChaCha20-Poly1305 on both WAL and segment layers |
-| Atomic batches | Implemented | Single-I/O memory buffer writes for maximum throughput |
-| Transactions | Implemented | Serializable snapshot isolation with conflict detection |
-| Composite indexes | Implemented | Background-updated B-Trees with equality scan support |
-| Query engine | Implemented | Cost-aware planner + predicate pushdown doc-view filter |
-| Zero-copy pipeline | Implemented | Direct field projection from binary views across all FFI layers |
-| Real-time listeners | Implemented | Non-blocking cross-language callback architecture |
-| Subcollections | Implemented | Prefix-based hierarchical document nesting |
-| Multi-platform FFI | Implemented | Windows (`.dll`), Linux (`.so`), macOS (`.dylib`) |
-| Compaction | Implemented | Tiered LSM-style background merging + memory checkpointing |
-| Parity (Cloud) | Implemented | Central hub + offline-first clients, room isolation, auth tokens + group API keys |
-
-### Module map
-
-| Module | Path | Status |
-|---|---|---|
-| Engine API | `src/engine/*` | Implemented |
-| Storage + crypto | `src/storage/*` | Implemented |
-| Indexing | `src/index/*` | Implemented |
-| Query planner/executor | `src/query/*` | Implemented |
-| Document model | `src/document/*` | Implemented |
-| C-FFI | `src/ffi.rs`, per-target `hakodb.h` | Implemented |
-
-### Binary size
-
-Measured Windows `hakodb.dll`, release, `strip + thin-LTO`:
+Measured Windows `hakodb.dll`, release (`strip + thin-LTO`):
 
 | Build | Size | Notes |
 |---|---|---|
-| Full (default features) | ~7.4 MB | sync + compression included; TLS fully vendored (rustls/aws-lc, hermetic — no system OpenSSL needed) |
+| Full (default features) | ~7.4 MB | sync + compression; vendored TLS (no system OpenSSL needed) |
 | Embedded core (`--no-default-features`) | ~2.2 MB | no sync, no compression; reads fail closed on zstd payloads |
 
-`opt-level = "z"` was duelled and rejected: +20–50% slower on hot read paths
-(`get` +43%, composite +52%, offset +20%). `panic = "abort"` is off the table:
-the FFI boundary relies on `catch_unwind`. The `compression` feature (default-on)
-gates zstd; builds without it never set the compression bit.
-
----
-
-## Contribution notes
-
-- Keep module boundaries aligned with the Module map below.
-- Add recovery tests when touching storage/WAL/indexing.
-- Document binary format or compatibility-impacting changes.
-- Keep C ABI additions reflected in cbindgen config + the generated header.
-
----
+`opt-level = "z"` was duelled and rejected (+20–50% on hot reads); `panic = "abort"` is off the table (FFI relies on `catch_unwind`).
 
 ## License
 
-MIT — see [LICENSE-MIT](LICENSE-MIT).
+MIT — see [LICENSE-MIT](LICENSE-MIT). Full history in [CHANGELOG](CHANGELOG.md).

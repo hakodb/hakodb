@@ -26,12 +26,10 @@ use crate::storage::wal::WalOp;
 use crate::storage::crypto::EncryptionContext;
 use crate::storage::blob::{BlobManager, BlobWork};
 use crate::storage::engine::{StorageEngine, Pointer};
-// use crate::config::DurabilityMode;
 
 use crate::util::lock::SafeLock;
 
 use std::cell::RefCell;
-// use rayon::prelude::*;
 
 static RAYON_INIT: Once = Once::new();
 
@@ -1992,17 +1990,7 @@ impl Hako {
 
     pub fn get(&self, collection: &str, doc_id: &str) -> Result<Option<HakoDoc>> {
         if !self.allowed(collection, AccessOp::Get) {
-            // ponytail: gate entry construction (two String allocs) on the
-            // toggle — record_audit already no-ops when disabled.
-            if self.config.enable_audit_log {
-                self.record_audit(AuditEntry {
-                    op: AccessOp::Get,
-                    collection: collection.into(),
-                    doc_id: Some(doc_id.into()),
-                    ok: false,
-                });
-            }
-            return Err(HakoError::Corrupt("Denied".into()));
+            return Err(self.deny(AccessOp::Get, collection, Some(doc_id)));
         }
 
         // ponytail: hot-cache probe. Hit skips storage lookup, full decode
@@ -2078,15 +2066,7 @@ impl Hako {
     /// [`Self::get`]; framing-invalid rows also read None (strict views).
     pub fn get_view(&self, collection: &str, doc_id: &str) -> Result<Option<crate::document::hako_doc::DocView>> {
         if !self.allowed(collection, AccessOp::Get) {
-            if self.config.enable_audit_log {
-                self.record_audit(AuditEntry {
-                    op: AccessOp::Get,
-                    collection: collection.into(),
-                    doc_id: Some(doc_id.into()),
-                    ok: false,
-                });
-            }
-            return Err(HakoError::Corrupt("Denied".into()));
+            return Err(self.deny(AccessOp::Get, collection, Some(doc_id)));
         }
 
         let shard = self.get_shard(collection)?;
@@ -2300,13 +2280,7 @@ impl Hako {
 
     pub fn query(&self, query: Query) -> Result<Vec<(String, HakoDoc)>> {
         if !self.allowed(&query.collection, AccessOp::Query) {
-            self.record_audit(AuditEntry {
-                op: AccessOp::Query,
-                collection: query.collection.clone(),
-                doc_id: None,
-                ok: false,
-            });
-            return Err(HakoError::Corrupt("Denied".into()));
+            return Err(self.deny(AccessOp::Query, &query.collection, None));
         }
 
         let shard_arc = self.get_shard(&query.collection)?;
@@ -2449,13 +2423,7 @@ impl Hako {
     pub fn query_raw(&self, mut query: Query) -> Result<Vec<(String, std::sync::Arc<Vec<u8>>)>> {
         query.raw = true;
         if !self.allowed(&query.collection, AccessOp::Query) {
-            self.record_audit(AuditEntry {
-                op: AccessOp::Query,
-                collection: query.collection.clone(),
-                doc_id: None,
-                ok: false,
-            });
-            return Err(HakoError::Corrupt("Denied".into()));
+            return Err(self.deny(AccessOp::Query, &query.collection, None));
         }
 
         let shard_arc = self.get_shard(&query.collection)?;
@@ -2489,13 +2457,7 @@ impl Hako {
     {
         query.raw = true;
         if !self.allowed(&query.collection, AccessOp::Query) {
-            self.record_audit(AuditEntry {
-                op: AccessOp::Query,
-                collection: query.collection.clone(),
-                doc_id: None,
-                ok: false,
-            });
-            return Err(HakoError::Corrupt("Denied".into()));
+            return Err(self.deny(AccessOp::Query, &query.collection, None));
         }
 
         let shard_arc = self.get_shard(&query.collection)?;
@@ -2527,13 +2489,7 @@ impl Hako {
     {
         query.raw = true;
         if !self.allowed(&query.collection, AccessOp::Query) {
-            self.record_audit(AuditEntry {
-                op: AccessOp::Query,
-                collection: query.collection.clone(),
-                doc_id: None,
-                ok: false,
-            });
-            return Err(HakoError::Corrupt("Denied".into()));
+            return Err(self.deny(AccessOp::Query, &query.collection, None));
         }
 
         let shard_arc = self.get_shard(&query.collection)?;
@@ -2563,13 +2519,7 @@ impl Hako {
     ) -> Result<Vec<(String, Vec<(String, Value)>)>> {
         // 1. Security Check
         if !self.allowed(&query.collection, AccessOp::Query) {
-            self.record_audit(AuditEntry {
-                op: AccessOp::Query,
-                collection: query.collection.clone(),
-                doc_id: None,
-                ok: false,
-            });
-            return Err(HakoError::Corrupt("Denied".into()));
+            return Err(self.deny(AccessOp::Query, &query.collection, None));
         }
 
         let mut q = query.clone();
@@ -2598,13 +2548,7 @@ impl Hako {
 
     pub fn patch(&self, col: &str, id: &str, updates: Vec<(String, Value)>) -> Result<String> {
         if !self.allowed(col, AccessOp::Put) {
-            self.record_audit(AuditEntry {
-                op: AccessOp::Put,
-                collection: col.into(),
-                doc_id: Some(id.into()),
-                ok: false,
-            });
-            return Err(HakoError::Corrupt("Denied".into()));
+            return Err(self.deny(AccessOp::Put, col, Some(id)));
         }
 
         let data = self.write_batch(vec![BatchMutation::Patch {
@@ -2718,6 +2662,22 @@ impl Hako {
             .last()
             .map(|r| r.allow)
             .unwrap_or(true)
+    }
+
+    /// Denial constructor for the admission gates: audits the rejection
+    /// (entry allocs gated on the toggle, same as the inlined sites did)
+    /// and returns the uniform `"Denied"` error. One copy instead of ~12.
+    #[inline]
+    fn deny(&self, op: AccessOp, collection: &str, doc_id: Option<&str>) -> HakoError {
+        if self.config.enable_audit_log {
+            self.record_audit(AuditEntry {
+                op,
+                collection: collection.into(),
+                doc_id: doc_id.map(Into::into),
+                ok: false,
+            });
+        }
+        HakoError::Corrupt("Denied".into())
     }
 
     fn get_col<'a>(&self, m: &'a BatchMutation) -> &'a str {
@@ -2965,13 +2925,7 @@ impl Hako {
 
     pub fn execute_aggregation(&self, query: Query) -> Result<HashMap<String, f64>> {
         if !self.allowed(&query.collection, AccessOp::Query) {
-            self.record_audit(AuditEntry {
-                op: AccessOp::Query,
-                collection: query.collection.clone(),
-                doc_id: None,
-                ok: false,
-            });
-            return Err(HakoError::Corrupt("Denied".into()));
+            return Err(self.deny(AccessOp::Query, &query.collection, None));
         }
 
         let shard_arc = self.get_shard(&query.collection)?;

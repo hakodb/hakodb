@@ -1,6 +1,5 @@
 use crate::document::hako_doc::HakoDoc;
 use crate::document::value::Value;
-// use std::collections::HashMap;
 use hashbrown::HashMap;
 use std::sync::Arc;
 

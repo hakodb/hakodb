@@ -1,11 +1,9 @@
 use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
-// use std::fs::File;
 
 use crate::config::{HakoConfig, DurabilityMode};
 use crate::error::{HakoError, Result};
 use std::sync::{Arc, Mutex, RwLock};
-// use std::sync::atomic::Ordering;
 use std::time::UNIX_EPOCH;
 use crate::memory::page_cache::PageCache;
 
@@ -16,7 +14,6 @@ use super::segment::Segment;
 use super::wal::{Wal, WalOp};
 use crossbeam_channel::Sender as CrossbeamSender;
 use crate::document::hako_doc::HakoDoc;
-// use crate::document::value::Value;
 
 /// Successful narrow-lock tier merges since process start: test
 /// tripwire (a compaction race test that never merges is vacuous) and

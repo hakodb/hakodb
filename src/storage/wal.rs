@@ -3,8 +3,6 @@ use std::io::{Read, Seek, SeekFrom, Write, BufReader};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-// use rayon::string;
-
 use crate::config::DurabilityMode;
 use crate::error::{HakoError, Result};
 

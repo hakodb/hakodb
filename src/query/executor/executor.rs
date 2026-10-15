@@ -172,6 +172,28 @@ impl ParallelQueryExecutor {
         })
     }
 
+    /// Shared fast-lane gate for the raw/walk entry points: they never decode
+    /// to match or sort, so unsatisfied filters/ordering are a loud error,
+    /// not a silent sweep. One message (keeps the `"index-satisfied"`
+    /// contract asserted by `cursor_parity`, one literal in rodata).
+    #[inline]
+    fn check_index_satisfied(plan: &QueryPlan) -> Result<()> {
+        use crate::error::HakoError;
+        if (!plan.filters.is_empty() || !plan.or_groups.is_empty())
+            && !plan.filters_satisfied_by_index
+        {
+            return Err(HakoError::QueryError(
+                "query requires index-satisfied filters (decode to match)".into(),
+            ));
+        }
+        if !plan.order_by_satisfied && !plan.order_by.is_empty() {
+            return Err(HakoError::QueryError(
+                "query requires index-satisfied ordering (decode to sort)".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn new(workers: usize) -> Self {
         Self {
             workers: workers.max(1),
@@ -657,19 +679,7 @@ impl ParallelQueryExecutor {
         plan: QueryPlan,
     ) -> Result<Vec<(String, Arc<Vec<u8>>)>> {
         let _inflight = InflightGuard::take();
-        use crate::error::HakoError;
-        if (!plan.filters.is_empty() || !plan.or_groups.is_empty())
-            && !plan.filters_satisfied_by_index
-        {
-            return Err(HakoError::QueryError(
-                "raw queries require index-satisfied filters (decode to match)".into(),
-            ));
-        }
-        if !plan.order_by_satisfied && !plan.order_by.is_empty() {
-            return Err(HakoError::QueryError(
-                "raw queries require index-satisfied ordering (decode to sort)".into(),
-            ));
-        }
+        Self::check_index_satisfied(&plan)?;
 
         let storage = storage_arc.read().unwrap();
         let found = self.execute_single_scan(
@@ -731,28 +741,16 @@ impl ParallelQueryExecutor {
         F: FnMut(&str, &[u8]) -> bool,
     {
         let _inflight = InflightGuard::take();
-        use crate::error::HakoError;
+        Self::check_index_satisfied(&plan)?;
         // ponytail: reserved for the non-SortedKeys arms when the walk
         // grows beyond order-by-id (underscore until then, not dead).
         let _ = indexes;
-        if (!plan.filters.is_empty() || !plan.or_groups.is_empty())
-            && !plan.filters_satisfied_by_index
-        {
-            return Err(HakoError::QueryError(
-                "walk requires index-satisfied filters (decode to match)".into(),
-            ));
-        }
-        if !plan.order_by_satisfied && !plan.order_by.is_empty() {
-            return Err(HakoError::QueryError(
-                "walk requires index-satisfied ordering (decode to sort)".into(),
-            ));
-        }
         let (reverse, start_key, start_exclusive) = match &plan.scan {
             ScanType::SortedKeys { start_key, start_exclusive, reverse } => {
                 (*reverse, start_key.clone(), *start_exclusive)
             }
             _ => {
-                return Err(HakoError::QueryError(
+                return Err(crate::error::HakoError::QueryError(
                     "walk supports SortedKeys scans only (order by id)".into(),
                 ))
             }
@@ -807,26 +805,14 @@ impl ParallelQueryExecutor {
         F: FnMut(&str, &DocView) -> bool,
     {
         let _inflight = InflightGuard::take();
-        use crate::error::HakoError;
+        Self::check_index_satisfied(&plan)?;
         let _ = indexes;
-        if (!plan.filters.is_empty() || !plan.or_groups.is_empty())
-            && !plan.filters_satisfied_by_index
-        {
-            return Err(HakoError::QueryError(
-                "view walk requires index-satisfied filters (decode to match)".into(),
-            ));
-        }
-        if !plan.order_by_satisfied && !plan.order_by.is_empty() {
-            return Err(HakoError::QueryError(
-                "view walk requires index-satisfied ordering (decode to sort)".into(),
-            ));
-        }
         let (reverse, start_key, start_exclusive) = match &plan.scan {
             ScanType::SortedKeys { start_key, start_exclusive, reverse } => {
                 (*reverse, start_key.clone(), *start_exclusive)
             }
             _ => {
-                return Err(HakoError::QueryError(
+                return Err(crate::error::HakoError::QueryError(
                     "view walk supports SortedKeys scans only (order by id)".into(),
                 ))
             }
