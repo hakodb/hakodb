@@ -4181,15 +4181,17 @@ pub extern "C" fn hk_cloud_sync_new(
     })
 }
 
-/// Creates a room-agnostic cloud SERVER. Not bound to any room: the server
-/// accepts and persists any (room_name, room_key) pair its clients ask for and
-/// routes sync to the matching room group.
+/// Creates a room-bound cloud SERVER: serves exactly the configured room
+/// on this database (single-database, like the mesh). Clients presenting
+/// a different (room_name, room_key) pair are rejected at handshake.
 #[cfg(feature = "cloud-sync")]
 #[no_mangle]
 pub extern "C" fn hk_cloud_sync_server_new(
     engine: *mut HK_Engine,
     server_id: *const c_char,
     auth_token: *const c_char,
+    room_name: *const c_char,
+    room_key: *const c_char,
 ) -> *mut HK_CloudSync {
     safety_shield!(ptr::null_mut(), {
         if engine.is_null() {
@@ -4200,9 +4202,16 @@ pub extern "C" fn hk_cloud_sync_server_new(
         let engine_ref = unsafe { &*engine };
         let sid_str = cstr_to_string(server_id).unwrap_or_else(|_| "server".into());
         let token_str = cstr_to_string(auth_token).unwrap_or_default();
+        let room_name_str = cstr_to_string(room_name).unwrap_or_else(|_| "default".into());
+        let room_key_str = cstr_to_string(room_key).unwrap_or_else(|_| "default".into());
 
-        let cloud_sync =
-            crate::cloud_sync::CloudSync::server(engine_ref.db.clone(), &sid_str, &token_str);
+        let cloud_sync = crate::cloud_sync::CloudSync::server(
+            engine_ref.db.clone(),
+            &sid_str,
+            &token_str,
+            &room_name_str,
+            &room_key_str,
+        );
 
         clear_last_error();
         Box::into_raw(Box::new(HK_CloudSync {
