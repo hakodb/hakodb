@@ -240,8 +240,12 @@ async fn handle_conn(st: Shared, stream: UnixStream, label: String) {
         return;
     }
     let mut rd_buf = rd;
-    let _peer_versions = match rd_buf.recv().await {
-        Ok(SockPacket::Hello { versions }) => versions,
+    let _peer_versions = match recv_frame(&mut rd_buf)
+        .await
+        .ok()
+        .and_then(|b| bincode::deserialize::<SockPacket>(&b).ok())
+    {
+        Some(SockPacket::Hello { versions }) => versions,
         _ => return,
     };
     st.peers.lock().unwrap().insert(label.clone());
