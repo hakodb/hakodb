@@ -1,6 +1,6 @@
 # HakoDB
 
-**Embedded document database with native vector search and multi-plane sync, written in Rust.**
+**Embedded document database with native vector + graph search and multi-plane sync, written in Rust.**
 
 Stores typed JSON-like documents in binary form, runs **fully in-process** like SQLite (no server, no daemon), and exposes a **flat C ABI** (`hakodb.h`, generated per-target by the build) so any language can embed it. SDKs (Go, JS/TS, Pascal, Tauri, HTTP backend) live in their own repos under the [`hakodb`](https://github.com/hakodb) organization.
 
@@ -68,13 +68,19 @@ See [`example/rust/basic`](example/rust/basic) for a complete runnable project.
 
 > **The index does not embed.** Turning text/images into vectors needs an embedding model you operate separately; query and corpus must share one model (a dim mismatch is a hard error). **Sync carries index definitions, not graphs** — HNSW graphs rebuild locally from replicated documents.
 
+## Graph traversal
+
+`create_traverse_index(collection)` tracks `Reference` edges into a backlink index; `find_paths(collection, id, spec)` walks out/in/both with BFS (depth-capped, visited-set, deterministic order). For weighted shortest paths, `create_edge_index(edge_collection)` registers `_from`/`_to` edge docs and `TraverseSpec::via_edge` runs Dijkstra (missing weight = 1.0, negatives clamp 0; hits carry `cost`). Untracked incoming anchors fail loudly instead of returning empty.
+
+> **Sync carries defs, not state** — backlink/edge indexes rebuild locally from replicated documents, same as HNSW graphs.
+
 ## C ABI (multi-language)
 
 Flat C API over opaque handles (`HK_Engine`, `HK_Doc`, `HK_Query`, `HK_Batch`, `HK_Transaction`, `HK_Watch`, `HK_ResultSet`, sync handles): CRUD, batches, transactions, queries, watch, result sets, sync. Build outputs: `target/release/libhakodb.so` (Linux), `.dylib` (macOS), `hakodb.dll` (Windows) + per-target `hakodb.h`.
 
 ```bash
 cargo build --release                                   # full (sync + compression)
-cargo build --release --no-default-features             # embedded core (~2.2 MB)
+cargo build --release --no-default-features             # embedded core
 ```
 
 ## Sync
@@ -101,17 +107,6 @@ At-rest encryption and sync-time plaintext are **independent**: an encrypted col
 | Server operator / passive LAN observer | **Not protected** — use E2E rooms or `wss://`/mTLS segments. |
 
 Rule: one room needs the **same** `encryption_key` on every sharing node (`encrypted_cols`, server uses `<prefix>_<collection>` storage names). There is intentionally **no override flag**.
-
-## Binary size
-
-Measured Windows `hakodb.dll`, release (`strip + thin-LTO`):
-
-| Build | Size | Notes |
-|---|---|---|
-| Full (default features) | ~6.5 MB | sync + compression; vendored TLS, ring-only (no system OpenSSL needed) |
-| Embedded core (`--no-default-features`) | ~2.2 MB | no sync, no compression; reads fail closed on zstd payloads |
-
-`opt-level = "z"` was duelled and rejected (+20–50% on hot reads); `panic = "abort"` is off the table (FFI relies on `catch_unwind`).
 
 ## License
 
