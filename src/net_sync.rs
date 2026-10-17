@@ -63,6 +63,31 @@ pub enum NetPacket {
         key_fp: [u8; 32],
         encrypted_cols: Vec<String>,
     },
+    /// LAN relay coordination (#72 phase 1). Both appended LAST so old
+    /// peers keep decoding every earlier variant; unknown trailing
+    /// variants fail decode and are silently skipped (the SyncCaps rule).
+    ///
+    /// NOTE ON THE DESIGN TEXT: the issue sketched the lease as an
+    /// additive field inside `Ping`. Under bincode that would BREAK old
+    /// peers decoding the Ping variant itself (all version exchange would
+    /// die in a mixed mesh). New variants keep the compat property the
+    /// design actually needs; senders announce at the same cadence as
+    /// their ping.
+    /// A peer announces it holds (or recently held) the cloud relay role:
+    /// `last_exchange_ts` is its last successful cloud round-trip (ms
+    /// epoch). Observers track freshness per client_id for the lag meter
+    /// and the phase-2 GRACE eligibility rule.
+    CloudLease {
+        client_id: String,
+        last_exchange_ts: i64,
+    },
+    /// Sent by a peer the moment it takes over the relay role. Observers
+    /// use it for fast convergence (no need to wait for the next
+    /// CloudLease) and logging; it carries no lease state.
+    RelayTake {
+        ts: i64,
+        client_id: String,
+    },
 }
 
 // --- UDP broadcast discovery (mobile path; desktop opt-in) ---
@@ -230,6 +255,10 @@ pub struct NetSyncer {
     pub enable_relay: bool,
     last_mesh_ping: Arc<Mutex<Instant>>,
     echo_cache: Arc<Mutex<HashMap<String, i64>>>,
+    /// Observed cloud-relay leases per peer client_id (#72): client_id ->
+    /// (last_exchange_ms_epoch, seen_at). Fed by CloudLease/RelayTake
+    /// packets; read by the lag meter and the phase-2 GRACE rule.
+    cloud_leases: Arc<Mutex<HashMap<String, (i64, Instant)>>>,
     mdns: Arc<Mutex<Option<ServiceDaemon>>>,
     // ponytail: atomic so the FFI setter can change the mode on a shared
     // (Arc'd) handle; start() reads it once at boot.
@@ -340,6 +369,7 @@ impl NetSyncer {
             enable_relay: false,
             last_mesh_ping: Arc::new(Mutex::new(Instant::now())),
             echo_cache: Arc::new(Mutex::new(HashMap::new())),
+            cloud_leases: Arc::new(Mutex::new(HashMap::new())),
             mdns: Arc::new(Mutex::new(None)),
             discovery: AtomicU8::new(default_discovery_mode() as u8),
         }
@@ -386,6 +416,7 @@ impl NetSyncer {
         let excl_srv = self.excluded_collections.clone();
         let last_ping_ptr = self.last_mesh_ping.clone();
         let echo_cache_clone = self.echo_cache.clone();
+        let lease_srv = self.cloud_leases.clone();
         let caps_srv = caps_map.clone();
 
         let relay_enabled = self.enable_relay; 
@@ -402,13 +433,14 @@ impl NetSyncer {
                 let lp_c = last_ping_ptr.clone();
                 let echo_c = echo_cache_clone.clone();
                 let caps_c = caps_srv.clone();
+                let lease_c = lease_srv.clone();
                 
                 // SPAWN the handler so the loop can continue accepting other peers
                 tokio::spawn(async move {
                     handle_peer(
                         stream, db_c, peers_c, seen_c, stx_c, 
                         sid_c, hash_c, excl_c, relay_enabled, 
-                        lp_c, echo_c, caps_c
+                        lp_c, echo_c, caps_c, lease_c
                     ).await;
                 });
             }
@@ -446,6 +478,7 @@ impl NetSyncer {
         let hash_disc = self.room_hash;
         let relay_disc = self.enable_relay;
         let echo_cache_clone = self.echo_cache.clone();
+        let lease_disc = self.cloud_leases.clone();
 
         // Shared membership view: Name -> (Last Known Address, last-seen).
         // Written by whichever transports the mode enables (mDNS and/or
@@ -564,6 +597,7 @@ impl NetSyncer {
                                 let addr_c = p_addr.clone();
                                 let echo_cache = echo_cache_clone.clone();
                                 let caps_c = caps_disc.clone();
+                                let lease_c = lease_disc.clone();
 
                                 tokio::spawn(async move {
                                     // Short timeout so a single dead peer doesn't hang the loop
@@ -571,7 +605,7 @@ impl NetSyncer {
                                         handle_peer(
                                             stream, db_c, peers_c, seen_c, stx_c, 
                                             sid_c, hash_disc, excl_c, relay_disc, lp_c,
-                                            echo_cache, caps_c
+                                            echo_cache, caps_c, lease_c
                                         ).await;
                                     }
                                 });
@@ -854,6 +888,7 @@ async fn handle_peer(
     last_ping: Arc<Mutex<Instant>>,
     echo_cache: Arc<Mutex<HashMap<String, i64>>>,
     caps: Arc<CapsMap>,
+    cloud_leases: Arc<Mutex<HashMap<String, (i64, Instant)>>>,
 ) {
     let (mut reader, mut writer) = stream.into_split();
 
@@ -1013,6 +1048,23 @@ async fn handle_peer(
                         .await;
                         let _ = send_packet(w, NetPacket::SyncRequest).await;
                     }
+                }
+                NetPacket::CloudLease { client_id, last_exchange_ts } => {
+                    // #72 phase 1: record the relay's cloud freshness for
+                    // the lag meter / phase-2 GRACE rule. Best-effort book
+                    // keeping — a bad clock just shows a big lag.
+                    let mut leases = cloud_leases.lock().unwrap();
+                    leases.insert(client_id, (last_exchange_ts, Instant::now()));
+                }
+                NetPacket::RelayTake { ts, client_id } => {
+                    // Same book-keeping; the take-over moment is itself
+                    // proof of a live relay (assume fresh until the next
+                    // CloudLease refines it).
+                    let mut leases = cloud_leases.lock().unwrap();
+                    leases.insert(client_id.clone(), (ts, Instant::now()));
+                    crate::util::log::info(&format!(
+                        "[sync] peer '{peer_id}' took the cloud relay role (client '{client_id}')"
+                    ));
                 }
                 _ => {}
             }
@@ -1925,5 +1977,44 @@ mod tests {
         // is the encoded HakoDoc, a few header bytes over the raw chunk).
         assert_eq!(seen["k000"], chunk.len() + 19);
         assert_eq!(seen["k095"], chunk.len() + 19);
+    }
+
+    /// #72 phase 1: the relay carriers survive the wire and keep the
+    /// mixed-version mesh property — earlier variant indices unchanged,
+    /// unknown trailing variants skipped by old peers (decode failure,
+    /// never a disconnect).
+    #[test]
+    fn relay_carriers_roundtrip_and_old_peers_skip_them() {
+        let lease = NetPacket::CloudLease {
+            client_id: "relay-1".to_string(),
+            last_exchange_ts: 1_760_000_000_000,
+        };
+        let take = NetPacket::RelayTake {
+            ts: 1_760_000_000_000,
+            client_id: "relay-1".to_string(),
+        };
+        for pkt in [lease, take] {
+            let bytes = bincode::serialize(&pkt).unwrap();
+            match bincode::deserialize::<NetPacket>(&bytes).expect("decode own relay packet") {
+                NetPacket::CloudLease { client_id, last_exchange_ts } => {
+                    assert_eq!(client_id, "relay-1");
+                    assert_eq!(last_exchange_ts, 1_760_000_000_000);
+                }
+                NetPacket::RelayTake { ts, client_id } => {
+                    assert_eq!(ts, 1_760_000_000_000);
+                    assert_eq!(client_id, "relay-1");
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+        // Older variants keep their wire positions (Identify = 0).
+        let id = NetPacket::Identify { id: "n".to_string(), room_hash: [1u8; 32] };
+        assert_eq!(&bincode::serialize(&id).unwrap()[..4], &[0u8, 0, 0, 0]);
+        // Old peers (which only know the pre-relay variants) fail decode
+        // on ANY trailing-variant packet and skip it — simulate with an
+        // out-of-range variant index, the exact mixed-version rule.
+        let mut unknown = vec![99u8, 0, 0, 0];
+        unknown.extend_from_slice(&[0u8; 8]);
+        assert!(bincode::deserialize::<NetPacket>(&unknown).is_err());
     }
 }

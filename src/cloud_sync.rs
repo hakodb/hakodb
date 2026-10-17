@@ -1,7 +1,7 @@
 #[cfg(feature = "cloud-sync")]
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "cloud-sync")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 #[cfg(feature = "cloud-sync")]
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 #[cfg(feature = "cloud-sync")]
@@ -188,6 +188,33 @@ fn hash_room_id(room_name: &str, room_key: &str) -> String {
 #[cfg(feature = "cloud-sync")]
 pub const GROUPS_COLLECTION: &str = "__groups";
 
+/// #72 lag meter: ms-epoch of the last successful cloud exchange on ANY
+/// client face in this process (auth round-trip completed, or any server
+/// packet decoded). 0 = never reached the cloud. Announced over the mesh
+/// via `NetPacket::CloudLease`; read via `cloud_last_exchange_millis`.
+#[cfg(feature = "cloud-sync")]
+static LAST_CLOUD_EXCHANGE_MS: AtomicI64 = AtomicI64::new(0);
+
+#[cfg(feature = "cloud-sync")]
+fn note_cloud_exchange() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    LAST_CLOUD_EXCHANGE_MS.store(now, Ordering::Relaxed);
+}
+
+/// ms-epoch of the last successful cloud round-trip on any client face,
+/// or None when this process never reached the cloud. The LAN relay lag
+/// meter and the phase-2 GRACE eligibility rule both read this.
+#[cfg(feature = "cloud-sync")]
+pub fn cloud_last_exchange_millis() -> Option<i64> {
+    match LAST_CLOUD_EXCHANGE_MS.load(Ordering::Relaxed) {
+        0 => None,
+        ts => Some(ts),
+    }
+}
+
 /// SHA-256 hex of an API key. Keys are 256-bit random (unbounded entropy),
 /// so a fast hash + timing-safe compare is the right tool — no KDF needed.
 #[cfg(feature = "cloud-sync")]
@@ -300,6 +327,10 @@ pub struct CloudSync {
     /// Server: keyed by peer_key, set at auth, cleared on disconnect.
     /// Client: the server's caps live under the fixed key `"server"`.
     caps: Arc<crate::sync_guard::CapsMap>,
+    /// #72 admission control: hard cap on distinct connected clients
+    /// (0 = unlimited, the historic default). Atomic so FFI/SDK handles
+    /// can tune it at runtime.
+    max_clients: Arc<AtomicUsize>,
 }
 
 #[cfg(feature = "cloud-sync")]
@@ -384,6 +415,7 @@ impl CloudSync {
             active_peers: Arc::new(AsyncRwLock::new(HashMap::new())),
             outbound_tx: Arc::new(AsyncMutex::new(None)),
             caps: Arc::new(crate::sync_guard::CapsMap::default()),
+            max_clients: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -416,6 +448,7 @@ impl CloudSync {
             active_peers: Arc::new(AsyncRwLock::new(HashMap::new())),
             outbound_tx: Arc::new(AsyncMutex::new(None)),
             caps: Arc::new(crate::sync_guard::CapsMap::default()),
+            max_clients: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -451,6 +484,21 @@ impl CloudSync {
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+    }
+
+    /// #72 admission control (server face): hard cap on distinct connected
+    /// clients per room. 0 = unlimited (historic default). A client
+    /// reconnecting with its own id always re-admits (replaces its stale
+    /// entry); a new client beyond the cap gets a typed loud
+    /// `AuthResult { success: false, error: "room at capacity" }` and the
+    /// caller retries with backoff. Works on Arc'd handles (FFI/SDK).
+    pub fn set_max_clients_per_room(&self, max: usize) {
+        self.max_clients.store(max, Ordering::Relaxed);
+    }
+
+    /// Current per-room client cap (0 = unlimited).
+    pub fn max_clients_per_room(&self) -> usize {
+        self.max_clients.load(Ordering::Relaxed)
     }
 
     pub fn status(&self) -> CloudStatus {
@@ -840,6 +888,7 @@ kind,
         let seen_messages = self.seen_messages.clone();
         let echo_cache = self.echo_cache.clone();
         let caps_all = self.caps.clone();
+        let max_clients = self.max_clients.clone();
         // Single room, configured at construction (no registry, no
         // allocation, no multi-room fallback — see module docs).
         let room_name = self.room_name.clone();
@@ -860,6 +909,7 @@ kind,
                     let room_name = room_name.clone();
                     let room_key = room_key.clone();
                     let caps_one = caps_all.clone();
+                    let max_clients_clone = max_clients.clone();
 
                 // TCP_NODELAY on the raw accept socket: the hub's small
                 // control frames (AuthResult/VersionPing) and fan-out
@@ -880,6 +930,7 @@ kind,
                                 active_peers,
                                 seen_messages,
                                 caps_one,
+                                max_clients_clone,
                             )
                             .await;
                         }
@@ -901,6 +952,7 @@ kind,
         peers: Arc<AsyncRwLock<HashMap<String, PeerInfo>>>,
         seen_messages: Arc<AsyncMutex<Vec<u128>>>,
         caps: Arc<crate::sync_guard::CapsMap>,
+        max_clients: Arc<AtomicUsize>,
     ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
@@ -946,6 +998,26 @@ kind,
                         let _ = ws_tx.send(Message::Binary(bytes.into())).await;
                     }
                     return;
+                }
+                // #72 admission control: per-room client cap. A peer
+                // RECONNECTING with its own id always replaces its stale
+                // entry (cap counts distinct clients, not retries); a NEW
+                // client beyond the cap gets a typed loud reject and the
+                // LAN peers behind it stay mesh-only (they never dial).
+                let max = max_clients.load(Ordering::Relaxed);
+                if max > 0 {
+                    let p = peers.read().await;
+                    if !p.contains_key(&cid) && p.len() >= max {
+                        drop(p);
+                        let nack = CloudPacket::AuthResult {
+                            success: false,
+                            error: Some("room at capacity".into()),
+                        };
+                        if let Ok(bytes) = rmp_serde::to_vec_named(&nack) {
+                            let _ = ws_tx.send(Message::Binary(bytes.into())).await;
+                        }
+                        return;
+                    }
                 }
                 authenticated = true;
                 // One room per server: the client id alone keys the peer
@@ -1520,6 +1592,9 @@ kind,
                     if let Ok(CloudPacket::AuthResult { success: true, .. }) =
                         rmp_serde::from_slice(&bytes)
                     {
+                        // Auth round-trip completed: the relay lag meter
+                        // and the lease freshness both live off this.
+                        note_cloud_exchange();
                         let ping = CloudPacket::VersionPing {
                             versions: db.get_version_map(),
                             indexes: Some(db.list_indexes(None)),
@@ -1541,6 +1616,10 @@ kind,
                                     Some(Ok(msg)) => {
                                         if let Message::Binary(b) = msg {
                                             if let Ok(packet) = rmp_serde::from_slice::<CloudPacket>(&b) {
+                                                // Any decoded server packet
+                                                // proves the cloud path is
+                                                // alive right now.
+                                                note_cloud_exchange();
                                                 match packet {
                                                     CloudPacket::VersionPing { versions: server_versions, indexes } => {
                                                         // Server names are room-plain = client
@@ -2188,5 +2267,95 @@ mod tests {
                 p.len()
             );
         }
+    }
+
+    /// #72 lag meter: a successful exchange stamps the process-wide clock;
+    /// the getter exposes it (None = never reached the cloud).
+    #[test]
+    fn cloud_last_exchange_tracks_round_trips() {
+        // Any pre-existing value (earlier tests in this binary may have
+        // exchanged) only ever moves FORWARD from a fresh stamp.
+        let before = cloud_last_exchange_millis();
+        note_cloud_exchange();
+        let after = cloud_last_exchange_millis().expect("stamp must be visible");
+        if let Some(b) = before {
+            assert!(after >= b, "clock must be monotonic: {b} -> {after}");
+        }
+    }
+
+    /// #72 admission control: cap 1 admits the first client, rejects a
+    /// NEW client with the typed loud error, and still admits a
+    /// reconnect of the SAME client id (stale-entry replacement).
+    #[tokio::test]
+    async fn room_at_capacity_rejects_new_clients() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (db, _dir) = temp_db("cap-room");
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        let server = CloudSync::server(db, "hub", "tok-cap", "caproom", "k-cap");
+        server.set_max_clients_per_room(1);
+        server.start(&format!("127.0.0.1:{port}")).await.unwrap();
+
+        let url = format!("ws://127.0.0.1:{port}");
+        let auth = |cid: &str| {
+            rmp_serde::to_vec_named(&CloudPacket::Authenticate {
+                token: "tok-cap".into(),
+                client_id: cid.into(),
+                room_name: "caproom".into(),
+                room_key: "k-cap".into(),
+                api_key: None,
+                client_version: Some("t".into()),
+                enc_fp: None,
+                enc_cols: Vec::new(),
+            })
+            .unwrap()
+        };
+
+        // Client 1: admitted.
+        let (mut ws1, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws1.send(Message::Binary(auth("c1").into())).await.unwrap();
+        let Some(Ok(Message::Binary(b))) = ws1.next().await else {
+            panic!("no auth reply for c1");
+        };
+        match rmp_serde::from_slice::<CloudPacket>(&b).unwrap() {
+            CloudPacket::AuthResult { success: true, .. } => {}
+            other => panic!("c1 must be admitted, got {other:?}"),
+        }
+
+        // Client 2 (new id): beyond the cap — typed loud reject.
+        let (mut ws2, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws2.send(Message::Binary(auth("c2").into())).await.unwrap();
+        let Some(Ok(Message::Binary(b))) = ws2.next().await else {
+            panic!("no auth reply for c2");
+        };
+        match rmp_serde::from_slice::<CloudPacket>(&b).unwrap() {
+            CloudPacket::AuthResult { success: false, error } => {
+                assert_eq!(
+                    error.as_deref(),
+                    Some("room at capacity"),
+                    "the reject must be typed and loud"
+                );
+            }
+            other => panic!("c2 must be rejected, got {other:?}"),
+        }
+
+        // Client 1 reconnects (same id): stale-entry replacement admits.
+        drop(ws1);
+        let (mut ws1b, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws1b.send(Message::Binary(auth("c1").into())).await.unwrap();
+        let Some(Ok(Message::Binary(b))) = ws1b.next().await else {
+            panic!("no auth reply for c1 reconnect");
+        };
+        match rmp_serde::from_slice::<CloudPacket>(&b).unwrap() {
+            CloudPacket::AuthResult { success: true, .. } => {}
+            other => panic!("c1 reconnect must be admitted, got {other:?}"),
+        }
+        server.stop();
     }
 }
