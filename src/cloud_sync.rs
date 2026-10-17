@@ -993,7 +993,12 @@ kind,
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let (mut ws_tx, mut ws_rx) = ws_stream.split();
-        let (client_tx, mut client_rx) = mpsc::channel::<Message>(2000);
+        // Depth 16 (~14 MB of 0.9 MB catch-up pages): deep enough that the
+        // blocking tailer's try_send never trips for a healthy client, but
+        // shallow enough that N thundering joiners cannot buffer their whole
+        // catch-up in hub RAM before the slowest reader drains it. The old
+        // 2000 cap queued ~31 MB/client x N — the thundering-join swap-storm.
+        let (client_tx, mut client_rx) = mpsc::channel::<Message>(16);
 
         let mut peer_key = String::new();
         let mut authenticated = false;
