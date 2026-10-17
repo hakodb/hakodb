@@ -675,6 +675,9 @@ impl CloudSync {
                 };
 
                 if let Ok(bytes) = rmp_serde::to_vec_named(&packet) {
+                    // Sized before the loop — the error log below wants the
+                    // wire footprint without another clone-chase.
+                    let bytes_len = bytes.len();
                     let msg = Message::Binary(bytes.into());
                     let peers_guard = peers.read().await;
 
@@ -709,7 +712,16 @@ impl CloudSync {
                             );
                             continue;
                         }
-                        let _ = info.tx.try_send(msg.clone());
+                        let sent_result = info.tx.try_send(msg.clone());
+                        // Issue #69 #4: every silent drop here becomes a
+                        // logged, peer-keyed event.
+                        if let Err(ref se) = sent_result {
+                            eprintln!(
+                                "[sync] relay '{collection}' to '{peer_id}': queue send failed ({} B): {}",
+                                bytes_len,
+                                se
+                            );
+                        }
                     }
                 }
             }
@@ -993,7 +1005,13 @@ kind,
                                 if let Ok(reply_bytes) = rmp_serde::to_vec_named(&reply) {
                                     let peers_guard = peers.read().await;
                                     if let Some(tx) = peers_guard.get(&peer_key) {
-                                        let _ = tx.tx.try_send(Message::Binary(reply_bytes.into()));
+                                        // Small control frame, but a failed
+                                        // handshake reply used to vanish too.
+                                        if let Err(se) = tx.tx.send(Message::Binary(reply_bytes.into())).await {
+                                            eprintln!(
+                                                "[sync] VersionPing reply to '{peer_key}' failed: {se}"
+                                            );
+                                        }
                                     }
                                 }
 
@@ -1116,7 +1134,48 @@ kind,
         ops
     }
 
-    async fn send_catchup_deltas(
+    /// Catch-up/chunk wire budget: a page must never approach the default
+    /// tungstenite frame limit (16 MiB) — issue #69's single-frame history
+    /// bug. 1000 ops of ~500 B docs ≈ 0.6 MB; the byte cap splits big-doc
+    /// pages long before any transport limit can be hit.
+    const CATCHUP_PAGE_MAX_OPS: usize = 1000;
+    const CATCHUP_PAGE_MAX_BYTES: usize = 6 * 1024 * 1024;
+
+    /// Conservative serialized-size estimate for wire budgeting
+    /// (rmp_named + docs routing overhead per op; never an under-count).
+    fn op_wire_len(op: &WalOp) -> usize {
+        match op {
+            WalOp::PutInlined { key, value } => key.len() + value.len() + 128,
+            WalOp::PutBlob { key, .. } | WalOp::Put { key, .. } => key.len() + 96,
+            WalOp::Delete { key, .. } => key.len() + 64,
+            WalOp::BeginTx { .. } | WalOp::CommitTx { .. } => 48,
+        }
+    }
+
+    /// Split a delta batch into wire-safe pages. Empty input → no pages.
+    fn page_out_ops(ops: Vec<WalOp>) -> Vec<Vec<WalOp>> {
+        let mut pages: Vec<Vec<WalOp>> = Vec::new();
+        let mut cur: Vec<WalOp> = Vec::new();
+        let mut cur_bytes = 0usize;
+        for op in ops {
+            let len = Self::op_wire_len(&op);
+            let full = !cur.is_empty()
+                && (cur.len() >= Self::CATCHUP_PAGE_MAX_OPS
+                    || cur_bytes + len > Self::CATCHUP_PAGE_MAX_BYTES);
+            if full {
+                pages.push(std::mem::take(&mut cur));
+                cur_bytes = 0;
+            }
+            cur_bytes += len;
+            cur.push(op);
+        }
+        if !cur.is_empty() {
+            pages.push(cur);
+        }
+        pages
+    }
+
+  async fn send_catchup_deltas(
         db: &Arc<Hako>,
         collection: &str,
         since_ts: i64,
@@ -1149,20 +1208,51 @@ kind,
             }
         }
         let ops = Self::collect_catchup_ops(db, collection, since_ts);
+        if ops.is_empty() {
+            return;
+        }
+        let total_ops = ops.len();
+        let pages = Self::page_out_ops(ops);
 
-        if !ops.is_empty() {
+        let peers_guard = peers.read().await;
+        let peer_tx = peers_guard.get(peer_key).map(|p| p.tx.clone());
+        drop(peers_guard);
+        let Some(client_tx) = peer_tx else { return };
+
+        for (i, page_ops) in pages.into_iter().enumerate() {
             let packet = CloudPacket::Replication {
                 msg_id: 0,
                 collection: collection.to_string(),
-                ops,
+                ops: page_ops,
             };
-            if let Ok(bytes) = rmp_serde::to_vec_named(&packet) {
-                let peers_guard = peers.read().await;
-                if let Some(tx) = peers_guard.get(peer_key) {
-                    let _ = tx.tx.try_send(Message::Binary(bytes.into()));
+            let bytes = match rmp_serde::to_vec_named(&packet) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[sync] catchup '{collection}' to '{peer_key}': encode failed: {e}"
+                    );
+                    return;
                 }
+            };
+            // Awaited send: backpressure against the peer queue instead of
+            // a silent try_send overflow (issue #69: the old single-frame
+            // path dropped everything over the frame cap with no error at
+            // either end). On send failure the peer's handshake ts has not
+            // advanced — next reconnect resumes naturally.
+            if let Err(e) = client_tx.send(Message::Binary(bytes.into())).await {
+                eprintln!(
+                    "[sync] catchup '{collection}' to '{peer_key}': page {}/{} after {} sent ops failed: {e}; peer resends on next handshake",
+                    i + 1,
+                    total_ops / Self::CATCHUP_PAGE_MAX_OPS + 1,
+                    i * Self::CATCHUP_PAGE_MAX_OPS
+                );
+                return;
             }
         }
+        eprintln!(
+            "[sync] catchup '{collection}' to '{peer_key}': {} ops delivered",
+            total_ops
+        );
     }
 
     /// Tails local WAL changes on the SERVER and broadcasts server-side
@@ -1254,44 +1344,53 @@ kind,
                                     let local_fp = crate::sync_guard::local_fingerprint(
                                         db.config.encryption_key.as_deref(),
                                     );
-                                    let packet = CloudPacket::Replication {
-                                        msg_id: SystemTime::now()
-                                            .duration_since(UNIX_EPOCH)
-                                            .unwrap()
-                                            .as_micros(),
-                                        collection: collection.clone(),
-                                        ops: to_send,
-                                    };
+                                    for page_ops in Self::page_out_ops(to_send).into_iter() {
+                                        let packet = CloudPacket::Replication {
+                                            msg_id: SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_micros(),
+                                            collection: collection.clone(),
+                                            ops: page_ops,
+                                        };
 
-                                    if let Ok(bytes) = rmp_serde::to_vec_named(&packet) {
-                                        let msg = Message::Binary(bytes.into());
-                                        let rt = tokio::runtime::Handle::current();
-                                        let peers_ptr = active_peers.clone();
-                                        let caps_ptr = caps_srv.clone();
-                                        let plain_c = collection.clone();
-                                        rt.block_on(async move {
-                                            let peers_guard = peers_ptr.read().await;
-                                            for (peer_id, info) in peers_guard.iter() {
-                                                if enc_local {
-                                                    let peer = caps_ptr.get(peer_id);
-                                                    if !crate::sync_guard::caps_allow(
-                                                        true,
-                                                        local_fp,
-                                                        peer.as_ref(),
-                                                    ) {
-                                                        caps_ptr.warn(
-                                                            peer_id,
-                                                            &plain_c,
-                                                            &format!(
-                                                                "withholding server fan-out of '{plain_c}' from peer '{peer_id}' (unverified key for an encrypted room)"
-                                                            ),
+                                        if let Ok(bytes) = rmp_serde::to_vec_named(&packet) {
+                                            let bytes_len = bytes.len();
+                                            let msg = Message::Binary(bytes.into());
+                                            let rt = tokio::runtime::Handle::current();
+                                            let peers_ptr = active_peers.clone();
+                                            let caps_ptr = caps_srv.clone();
+                                            let plain_c = collection.clone();
+                                            rt.block_on(async move {
+                                                let peers_guard = peers_ptr.read().await;
+                                                for (peer_id, info) in peers_guard.iter() {
+                                                    if enc_local {
+                                                        let peer = caps_ptr.get(peer_id);
+                                                        if !crate::sync_guard::caps_allow(
+                                                            true,
+                                                            local_fp,
+                                                            peer.as_ref(),
+                                                        ) {
+                                                            caps_ptr.warn(
+                                                                peer_id,
+                                                                &plain_c,
+                                                                &format!(
+                                                                    "withholding server fan-out of '{plain_c}' from peer '{peer_id}' (unverified key for an encrypted room)"
+                                                                ),
+                                                            );
+                                                            continue;
+                                                        }
+                                                    }
+                                                    if let Err(se) = info.tx.try_send(msg.clone()) {
+                                                        eprintln!(
+                                                            "[sync] fan-out '{plain_c}' to '{peer_id}': queue send failed ({} B): {}",
+                                                            bytes_len,
+                                                            se
                                                         );
-                                                        continue;
                                                     }
                                                 }
-                                                let _ = info.tx.try_send(msg.clone());
-                                            }
-                                        });
+                                            });
+                                        }
                                     }
                                 }
 
@@ -1339,10 +1438,9 @@ kind,
 
         tokio::spawn(async move {
             while running.load(Ordering::Relaxed) {
-                if let Ok((ws_stream, _)) =
-                    tokio_tungstenite::connect_async(&ws_url).await
-                {
-                    let (mut ws_tx, mut ws_rx) = ws_stream.split();
+                let ws_result = tokio_tungstenite::connect_async(&ws_url).await;
+                if matches!(ws_result, Ok(_)) {
+                    let (mut ws_tx, mut ws_rx) = ws_result.map(|(s, _)| s.split()).unwrap();
 
                     let auth_packet = CloudPacket::Authenticate {
                         token: auth_token.clone(),
@@ -1387,7 +1485,9 @@ kind,
                                             }
                                         }
                                     }
-                                    Some(Ok(msg)) = ws_rx.next() => {
+                                    ws_next = ws_rx.next() => {
+                                        match ws_next {
+                                    Some(Ok(msg)) => {
                                         if let Message::Binary(b) = msg {
                                             if let Ok(packet) = rmp_serde::from_slice::<CloudPacket>(&b) {
                                                 match packet {
@@ -1427,9 +1527,23 @@ kind,
                                                                 .await;
                                                         }
                                                     }
-                                                    _ => {}
+                                                     _ => {}
                                                 }
                                             }
+                                        }
+                                    }
+                                    Some(Err(e)) => {
+                                        // Issue #69: read failures were
+                                        // invisible — including the old
+                                        // 16 MiB frame-cap rejections that
+                                        // silently starved catchups.
+                                        eprintln!("[cloud-sync] ws error on {ws_url}: {e}");
+                                        break;
+                                    }
+                                    None => {
+                                        eprintln!("[cloud-sync] ws closed by peer");
+                                        break;
+                                    }
                                         }
                                     }
                                     else => break,
@@ -1437,6 +1551,15 @@ kind,
                             }
                         }
                     }
+                } else {
+                    // Issue #69: reconnect cycles were fully silent — a client
+                    // that cannot reach the hub used to sit there forever
+                    // with no trace, its last_ts frozen.
+                    eprintln!(
+                        "[cloud-sync] connect {} failed: {}",
+                        ws_url,
+                        ws_result.err().map(|e| e.to_string()).unwrap_or_default()
+                    );
                 }
 
                 tokio::time::sleep(Duration::from_secs(3)).await;
@@ -1461,17 +1584,38 @@ kind,
             return;
         }
         let ops = Self::collect_catchup_ops(db, collection, server_ts);
-
-        if !ops.is_empty() {
+        if ops.is_empty() {
+            return;
+        }
+        let total_ops = ops.len();
+        let mut op_written = 0usize;
+        for (i, page_ops) in Self::page_out_ops(ops).into_iter().enumerate() {
+            op_written += page_ops.len();
+            // Distinct msg_id per page so the hub's dedupe window never
+            // swallows a sibling page.
+            let msg_id = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros()
+                + (i as u128);
             let packet = CloudPacket::Replication {
-                msg_id: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros(),
+                msg_id,
                 collection: collection.to_string(),
-                ops,
+                ops: page_ops,
             };
-            let _ = outbound_tx.send(packet).await;
+            // Pages stay under the transport frame cap (issue #69); a
+            // failed push (hub down / queue closed) is a real condition —
+            // announce instead of dropping half silently.
+            if outbound_tx.send(packet).await.is_err() {
+                eprintln!(
+                    "[sync] upstream '{collection}': push failed at page {}/{} ({} ops sent of {})",
+                    i + 1,
+                    (op_written / Self::CATCHUP_PAGE_MAX_OPS) + 1,
+                    op_written,
+                    total_ops
+                );
+                return;
+            }
         }
     }
 
@@ -1559,15 +1703,29 @@ kind,
                                 }
 
                                 if !to_send.is_empty() {
-                                    let packet = CloudPacket::Replication {
-                                        msg_id: SystemTime::now()
-                                            .duration_since(UNIX_EPOCH)
-                                            .unwrap()
-                                            .as_micros(),
-                                        collection: col.clone(),
-                                        ops: to_send,
-                                    };
-                                    let _ = tx.blocking_send(packet);
+                                    for (i, page_ops) in
+                                        Self::page_out_ops(to_send).into_iter().enumerate()
+                                    {
+                                        let packet = CloudPacket::Replication {
+                                            msg_id: SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_micros(),
+                                            collection: col.clone(),
+                                            ops: page_ops,
+                                        };
+                                        if tx.blocking_send(packet).is_err() {
+                                            // Hub-side outbound channel is closed
+                                            // (client shutting down / reconnect
+                                            // abandons the old one) — logged,
+                                            // not swallowed.
+                                            eprintln!(
+                                                "[cloud] tailer '{col}': outbound closed at page {}",
+                                                i + 1
+                                            );
+                                            break;
+                                        }
+                                    }
                                 }
 
                                 offsets.insert(col, new_pos);
@@ -1895,6 +2053,75 @@ mod tests {
                 assert!(enc_cols.is_empty());
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    // ---- issue #69: catch-up paging (Stage A) ----------------------------
+
+    fn small_ops(n: usize) -> Vec<WalOp> {
+        (0..n)
+            .map(|i| WalOp::PutInlined { key: format!("k{i:04}"), value: vec![7u8; 256] })
+            .collect()
+    }
+
+    #[test]
+    fn pages_split_at_doc_cap() {
+        let pages = CloudSync::page_out_ops(small_ops(2500));
+        assert_eq!(pages.len(), 3);
+        assert_eq!(pages[0].len(), CloudSync::CATCHUP_PAGE_MAX_OPS);
+        assert_eq!(pages[1].len(), CloudSync::CATCHUP_PAGE_MAX_OPS);
+        assert_eq!(pages[2].len(), 500);
+    }
+
+    #[test]
+    fn pages_split_at_byte_cap_before_doc_cap() {
+        // 8 KB docs: doc cap allows 1000 (≈8.6 MB over budget) — the byte
+        // budget must trip first.
+        let ops: Vec<WalOp> = (0..3000)
+            .map(|i| WalOp::PutInlined { key: format!("k{i:04}"), value: vec![1u8; 8192] })
+            .collect();
+        let pages = CloudSync::page_out_ops(ops);
+        // ~8.3 KB wire each: the byte budget trips before the 1000-doc cap.
+        assert_eq!(pages.len(), 4);
+        assert!(
+            pages.iter().all(|p| p.len() < CloudSync::CATCHUP_PAGE_MAX_OPS),
+            "byte budget must bound page size first"
+        );
+    }
+
+    #[test]
+    fn single_op_over_budget_is_one_page_not_a_split() {
+        // One op alone over the byte budget cannot be split further; it
+        // must still flow as a page (same exposure as the pre-pager single
+        // frame), and the transport frame cap is the honest ceiling.
+        let big = WalOp::PutInlined { key: "big".into(), value: vec![9u8; CloudSync::CATCHUP_PAGE_MAX_BYTES + 4096] };
+        let pages = CloudSync::page_out_ops(vec![big]);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].len(), 1);
+    }
+
+    #[test]
+    fn empty_batch_pages_to_nothing() {
+        assert!(CloudSync::page_out_ops(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn no_page_ever_approaches_the_transport_cap() {
+        // Every page with ≥2 ops must sit under the byte budget + one op;
+        // the classic stress shape (40k × ~543 B wire ≈ 21 MB single frame)
+        // must end up ~21 small pages.
+        let pages = CloudSync::page_out_ops(small_ops(40_000));
+        assert!(pages.len() >= 40);
+        for (i, p) in pages.iter().enumerate() {
+            let bytes: usize = p.iter().map(CloudSync::op_wire_len).sum();
+            assert!(
+                bytes <= CloudSync::CATCHUP_PAGE_MAX_BYTES
+                    || (i == pages.len() - 1 && p.len() == 1),
+                "page {} over budget: {} B in {} ops",
+                i,
+                bytes,
+                p.len()
+            );
         }
     }
 }
