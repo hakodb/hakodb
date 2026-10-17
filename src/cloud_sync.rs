@@ -36,6 +36,35 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex, RwLock as AsyncRwLock};
 #[cfg(feature = "cloud-sync")]
 use tokio_tungstenite::tungstenite::Message;
 
+
+/// Shared transport config for BOTH ws faces (cloudserver room accept and
+/// the client-side connect). Both faces can hit the transport caps:
+/// a legacy hub pushes one big catch-up frame at a joining client, and a
+/// legacy client pushes one big batch at the hub (issue #69 measured a
+/// 103 MB single frame hub-side).
+///
+/// Why the caps are NOT simply tiny: tungstenite's inbound caps are checks,
+/// not preallocations — a raised limit costs nothing until a big frame
+/// actually arrives, then it is paid once for the message that carries it.
+/// The outbound side is different: the write accumulator previously sat at
+/// usize::MAX, which is how thousands of slow-stalled peers balloon memory
+/// — that hard limit stays bounded here.
+pub(crate) fn ws_transport_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+    // WebSocketConfig is non-exhaustive upstream: mutate the default.
+    let mut cfg = WebSocketConfig::default();
+    // Inbound: accept legacy single frames up to 64 MiB (~120k small docs
+    // on one frame, per the measured ~543 B/op). Anything beyond fails
+    // loudly (logged at both faces) and reconnects — the same ceiling the
+    // pager keeps new peers far away from.
+    cfg.max_frame_size = Some(64 << 20);
+    cfg.max_message_size = Some(64 << 20);
+    // Outbound backpressure: the write accumulator only builds past
+    // write_buffer_size when TCP writes stall; bound it instead of letting
+    // it grow forever (16 MiB > any pager page we emit).
+    cfg.max_write_buffer_size = 16 << 20;
+    cfg
+}
 // ============================================================================
 // DATA STRUCTURES & PROTOCOL PACKETS
 // ============================================================================
@@ -828,8 +857,16 @@ kind,
                     let room_key = room_key.clone();
                     let caps_one = caps_all.clone();
 
-                    tokio::spawn(async move {
-                        if let Ok(ws_stream) = tokio_tungstenite::accept_async(stream).await {
+                // TCP_NODELAY on the raw accept socket: the hub's small
+                // control frames (AuthResult/VersionPing) and fan-out
+                // pages must not sit behind Nagle batching.
+                let _ = stream.set_nodelay(true);
+                tokio::spawn(async move {
+                        if let Ok(ws_stream) = tokio_tungstenite::accept_async_with_config(
+                            stream,
+                            Some(ws_transport_config()),
+                        )
+                        .await {
                             Self::handle_server_client(
                                 ws_stream,
                                 ingest_tx,
@@ -1431,14 +1468,24 @@ kind,
         let echo_cache = self.echo_cache.clone();
         let seen_messages = self.seen_messages.clone();
 
-        let (outbound_tx, mut outbound_rx) = mpsc::channel::<CloudPacket>(10_000);
+        // Outbound queue is DEEP memory (CloudPacket owns its ops), unlike
+        // the hub's Binary(Bytes) queues. A stalled WAN link must not let
+        // the staged queue grow unbounded: 256 pages × 6 MB cap bounds the
+        // worst case, and the tailer blocks (backpressure onto the WAL
+        // tail) instead of ballooning RAM.
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<CloudPacket>(256);
         *self.outbound_tx.lock().await = Some(outbound_tx.clone());
 
         self.spawn_client_outbound_tailer(echo_cache);
 
         tokio::spawn(async move {
             while running.load(Ordering::Relaxed) {
-                let ws_result = tokio_tungstenite::connect_async(&ws_url).await;
+                let ws_result = tokio_tungstenite::connect_async_with_config(
+                    &ws_url,
+                    Some(ws_transport_config()),
+                    true,
+                )
+                .await;
                 if matches!(ws_result, Ok(_)) {
                     let (mut ws_tx, mut ws_rx) = ws_result.map(|(s, _)| s.split()).unwrap();
 
@@ -2103,6 +2150,20 @@ mod tests {
     #[test]
     fn empty_batch_pages_to_nothing() {
         assert!(CloudSync::page_out_ops(Vec::new()).is_empty());
+    }
+
+    // ---- issue #69: transport bounds shared by both faces ----------------
+
+    #[test]
+    fn ws_transport_is_bounded_and_legacy_friendly() {
+        // Non-regression guard: the shared transport config must (a) be able
+        // to receive a big legacy single frame instead of silently failing
+        // the peer, and (b) never let the outbound write accumulator balloon
+        // memory under thousands of stalled peers (was usize::MAX).
+        let cfg = ws_transport_config();
+        assert_eq!(cfg.max_frame_size, Some(64 << 20));
+        assert_eq!(cfg.max_message_size, Some(64 << 20));
+        assert_eq!(cfg.max_write_buffer_size, 16 << 20);
     }
 
     #[test]
