@@ -1412,4 +1412,120 @@ mod tests {
         assert_eq!(eng.wal.data_len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    fn copy_dir_shallow(src: &std::path::Path, dst: &std::path::Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap().flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                std::fs::copy(&p, dst.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+
+    fn any_nonzero_segment(dir: &std::path::Path) -> bool {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("segment-l0-"))
+            .any(|e| e.metadata().unwrap().len() > 0)
+    }
+
+    /// Live-deployment diagnostic: small docs (< 4 KB) never touch segments —
+    /// they live in WAL + RAM until per-shard inlined bytes exceed
+    /// `max_inlined_memory_bytes`, at which point the maintenance checkpoint
+    /// spills them into a new segment file. 0-byte segment files beside a
+    /// fat WAL are therefore expected for small-doc rooms, not breakage.
+    #[test]
+    fn small_docs_spill_to_segment_at_inline_checkpoint() {
+        use crate::storage::wal::WalOp;
+
+        let dir = tmp("inline-spill");
+        let doc = vec![5u8; 256];
+        let mut cfg = cfg_for(DurabilityMode::Always);
+        cfg.max_inlined_memory_bytes = 2048; // trip the checkpoint early
+        cfg.value_blob_threshold_bytes = 8192; // keep this size on the inline path
+        {
+            let mut eng = StorageEngine::open(&dir, &cfg, "c".into(), None).unwrap();
+            for i in 0..20 {
+                eng.put(format!("k{i:03}"), &doc).unwrap();
+            }
+            assert!(
+                eng.inlined_bytes > cfg.max_inlined_memory_bytes,
+                "RAM inlined bytes must exceed the checkpoint trigger"
+            );
+            eng.run_background_maintenance(false).unwrap();
+            assert!(
+                any_nonzero_segment(&dir),
+                "checkpoint must spill inlined docs into a segment file"
+            );
+            assert!(
+                eng.get("k007").unwrap().is_some(),
+                "doc must be reachable after spill"
+            );
+            assert!(eng.wal.data_len() > 0, "WAL still carries the ops");
+            assert!(matches!(
+                eng.wal.append_batch_fast(9, &[WalOp::CommitTx { tx_id: 9 }], false),
+                Ok(_)
+            ), "WAL stays writable after spill");
+        }
+        let eng2 = StorageEngine::open(&dir, &cfg_for(DurabilityMode::Always), "c".into(), None).unwrap();
+        assert!(
+            eng2.get("k007").unwrap().is_some(),
+            "doc survives reopen after spill"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Medium docs (4 KB..blob_threshold) append to the active segment
+    /// synchronously on the put path — this is the only segment-growing
+    /// trigger besides the inline checkpoint.
+    #[test]
+    fn medium_docs_append_to_active_segment() {
+        let dir = tmp("medium-seg");
+        let doc = vec![1u8; 8192];
+        let mut eng = StorageEngine::open(&dir, &cfg_for(DurabilityMode::Always), "c".into(), None).unwrap();
+        eng.put("m-one".into(), &doc).unwrap();
+        assert_eq!(
+            eng.segments[&0].segment.current_size,
+            4 + 8192,
+            "segment tracks 4-byte length header + payload"
+        );
+        assert!(eng.get("m-one").unwrap().is_some(), "medium doc reads back through the segment pointer");
+        eng.flush_all().unwrap();
+        // Windows note: read_dir metadata can lag an unflushed append; assert
+        // dir contents only after the segment is synced.
+        assert!(any_nonzero_segment(&dir), "flush lands segment bytes on disk");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Handshake fix for issue #70: a file copy taken while the writer is
+    /// OPEN (the "manual backup of a running deployment" shape) must replay
+    /// fully offline. Copied-once storage: the immediate query and the
+    /// post-discovery query must both see the docs.
+    #[test]
+    fn copied_while_live_open_replays_offline() {
+        let dir = tmp("copy-writer-live");
+        let doc = vec![9u8; 512];
+        {
+            let mut eng = StorageEngine::open(&dir, &cfg_for(DurabilityMode::Always), "c".into(), None).unwrap();
+            for i in 0..50 {
+                eng.put(format!("src-{i:03}"), &doc).unwrap();
+            }
+            assert!(eng.wal.data_len() > 0, "Always flushes before the copy");
+            copy_dir_shallow(&dir, &dir.with_extension("copy"));
+        }
+        let copy_dir = dir.with_extension("copy");
+        let eng2 = StorageEngine::open(&copy_dir, &cfg_for(DurabilityMode::Always), "c".into(), None).unwrap();
+        assert!(
+            eng2.get("src-000").unwrap().is_some(),
+            "first replayed doc must be visible immediately"
+        );
+        assert!(
+            eng2.get("src-049").unwrap().is_some(),
+            "last replayed doc must be visible immediately"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&copy_dir);
+    }
 }
