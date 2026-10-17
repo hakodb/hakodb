@@ -49,7 +49,11 @@ use tokio_tungstenite::tungstenite::Message;
 /// The outbound side is different: the write accumulator previously sat at
 /// usize::MAX, which is how thousands of slow-stalled peers balloon memory
 /// — that hard limit stays bounded here.
-pub(crate) fn ws_transport_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+///
+/// Public so the load-probe peers (hakocloudserver `peer-bench`) exercise
+/// the exact same transport settings as the real client instead of a
+/// courteous lookalike.
+pub fn ws_transport_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
     use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
     // WebSocketConfig is non-exhaustive upstream: mutate the default.
     let mut cfg = WebSocketConfig::default();
