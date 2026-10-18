@@ -703,6 +703,9 @@ impl CloudSync {
                         if let Some(doc) = HakoDoc::decode(value) {
                             index_puts.push((key.clone(), Arc::new(doc)));
                         }
+                        // Hybrid-clock watermark (issue #80): accepted
+                        // remote ts raises the floor for local stamps.
+                        db.observe_remote_ts(ts);
                         sender_relays
                             .entry(item.sender_client_id.clone())
                             .or_default()
@@ -723,6 +726,8 @@ impl CloudSync {
                             key: key.clone(),
                             timestamp: *timestamp,
                         });
+                        // Hybrid-clock watermark (issue #80): see the put arm.
+                        db.observe_remote_ts(*timestamp);
                         sender_relays
                             .entry(item.sender_client_id.clone())
                             .or_default()

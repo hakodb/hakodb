@@ -164,6 +164,9 @@ pub async fn apply_replicated_batch(
                 // on version match, so an unbumped delete leaves the live
                 // doc cached FOREVER (stale reads after replicated deletes).
                 affected_keys.push(key.into());
+                // Hybrid-clock watermark (issue #80): accepted remote ts
+                // raises the floor so local stamps never go backwards.
+                db.observe_remote_ts(remote_ts);
             } else {
                 let ts = doc.get_logical_time();
                 {
@@ -183,6 +186,8 @@ pub async fn apply_replicated_batch(
                 accepted_ops.push(WalOp::PutInlined { key: key.clone(), value: skeleton_bytes });
                 index_puts.push((key.clone(), Some(doc)));
                 affected_keys.push(key.into());
+                // Hybrid-clock watermark (issue #80): see the delete arm.
+                db.observe_remote_ts(ts);
             }
         }
     } // Read lock dropped.
