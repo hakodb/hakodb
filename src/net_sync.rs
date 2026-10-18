@@ -240,6 +240,9 @@ async fn beacon_listener_task(
 }
 
 #[cfg(feature = "net-sync")]
+/// Clone shares all leg state (peers, tailers, status): used to bind the
+/// caller-facing handle while a start() task owns another clone.
+#[derive(Clone)]
 pub struct NetSyncer {
     db: Arc<Hako>,
     self_id: String,
@@ -267,9 +270,10 @@ pub struct NetSyncer {
     /// the connection drops → retry) — no tie-breaking, the configured
     /// side dials by determinism.
     static_peers: Vec<String>,
-    // ponytail: atomic so the FFI setter can change the mode on a shared
-    // (Arc'd) handle; start() reads it once at boot.
-    discovery: AtomicU8,
+    // ponytail: Arc'd atomic so the FFI setter can change the mode on a
+    // shared handle and clones share the leg (std atomics aren't Clone).
+    // start() reads it once at boot.
+    discovery: Arc<AtomicU8>,
 }
 
 /// Which discovery transports a mesh node runs. mDNS is the desktop sweet
@@ -384,7 +388,7 @@ impl NetSyncer {
             cloud_leases: Arc::new(Mutex::new(HashMap::new())),
             mdns: Arc::new(Mutex::new(None)),
             static_peers: Vec::new(),
-            discovery: AtomicU8::new(default_discovery_mode() as u8),
+            discovery: Arc::new(AtomicU8::new(default_discovery_mode() as u8)),
         }
     }
 
@@ -683,14 +687,27 @@ impl NetSyncer {
                         let conn = in_flight.clone();
                         let addr_c = addr.clone();
                         tokio::spawn(async move {
+                            // Scheme prefix is presentation only (config
+                            // readability): strip before resolving.
+                            let hp = addr_c.trim_start_matches("tcp://");
                             let dial =
-                                tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr_c)).await;
-                            if let Ok(Ok(stream)) = dial {
-                                handle_peer(
-                                    stream, db_c, peers_c, seen_c, stx_c, sid_c, hash_s, excl_c,
-                                    relay_s, lp_c, echo_c, caps_c, lease_c,
-                                )
-                                .await;
+                                tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(hp)).await;
+                            match dial {
+                                Ok(Ok(stream)) => {
+                                    eprintln!("[mesh] static dial {addr_c}: connected");
+                                    handle_peer(
+                                        stream, db_c, peers_c, seen_c, stx_c, sid_c, hash_s, excl_c,
+                                        relay_s, lp_c, echo_c, caps_c, lease_c,
+                                    )
+                                    .await;
+                                    eprintln!("[mesh] static dial {addr_c}: connection ended");
+                                }
+                                Ok(Err(e)) => eprintln!(
+                                    "[mesh] static dial {addr_c}: refused ({e}); retrying"
+                                ),
+                                Err(_) => eprintln!(
+                                    "[mesh] static dial {addr_c}: timeout; retrying"
+                                ),
                             }
                             conn.lock().unwrap().remove(&addr_c);
                         });
