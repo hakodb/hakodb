@@ -25,6 +25,40 @@ pub fn tier_compactions() -> usize {
     TIER_COMPACTIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The loud empty-open diagnosis (#70): open recovered ZERO live docs for
+/// a collection whose on-disk history is NOT empty. After the incident —
+/// a live copy replayed nothing though its WAL held megabytes of real op
+/// bytes — this state deserves a scream, not silence. Fires only when the
+/// parser extracted ZERO ops while real record bytes or nonzero segment
+/// files exist on disk (a tombstone-emptied collection replays ops, so it
+/// stays quiet; a fresh dir has neither bytes nor segments).
+fn empty_open_diagnosis_message(
+    logical_name: &str,
+    live_keys: usize,
+    ops_replayed: usize,
+    wal_data_bytes: u64,
+    nonzero_segments: usize,
+) -> Option<String> {
+    if live_keys > 0 || ops_replayed > 0 {
+        return None;
+    }
+    if wal_data_bytes < 1024 && nonzero_segments == 0 {
+        // Nothing on disk claims history: fresh collection or pure
+        // Interval tail loss (the copy simply lacks the in-memory part).
+        return None;
+    }
+    Some(format!(
+        "[hakodb][loud-open] collection '{}' recovered 0 live documents \
+and the WAL replay produced 0 operations, yet its on-disk history is \
+not empty: wal.log holds {} real record bytes and {} nonzero segment \
+file(s). Likely causes: (a) a live copy whose WAL/segment tail was \
+truncated mid-record, (b) the copy skipped segment files, (c) a \
+hand-edit or corruption that detached the WAL from its history. \
+Compare against the source directory before writing anything.",
+        logical_name, wal_data_bytes, nonzero_segments
+    ))
+}
+
 
 #[derive(Debug, Clone)] 
 pub enum Pointer {
@@ -96,8 +130,7 @@ impl StorageEngine {
         cfg: &HakoConfig,
         logical_name: String,
         encryption: Option<EncryptionContext>,
-    ) -> Result<Self> {
-        let base_path = base_dir.as_ref().to_path_buf(); 
+    ) -> Result<Self> {        let base_path = base_dir.as_ref().to_path_buf(); 
         std::fs::create_dir_all(&base_path)?;
         // std::fs::create_dir_all(base_dir.as_ref())?;
 
@@ -204,7 +237,19 @@ impl StorageEngine {
             total_pending_blob_bytes: std::sync::atomic::AtomicUsize::new(0),
         };
 
-        engine.recover()?;
+        let engine_wal_ops_replayed = engine.recover()?;
+        // Loud empty-open check (#70): a collection whose replay extracted
+        // zero ops while disk history claims bytes/segments is the incident
+        // shape — surface it on stderr before anything overwrites evidence.
+        if let Some(msg) = empty_open_diagnosis_message(
+            &engine.logical_name,
+            engine.sorted_keys.len(),
+            engine_wal_ops_replayed,
+            engine.wal.data_len(),
+            engine.segments.values().filter(|s| s.segment.current_size > 0).count(),
+        ) {
+            eprintln!("{}", msg);
+        }
         // WAL hygiene: hot-small collections pile history that nothing ever
         // compacts (segments never spill at this volume). One bounded rewrite
         // on open when stale history dominates; best-effort, never fails open.
@@ -222,13 +267,15 @@ impl StorageEngine {
         Ok(engine)
     }
 
-    fn recover(&mut self) -> Result<()> {
+    fn recover(&mut self) -> Result<usize> {
         // ponytail: size the map from the WAL footprint (avoids rehash
         // churn on big replays; ops average well above 64B, so this
         // under-reserves rather than over-).
         let est = (self.wal.data_len() / 64).clamp(1024, 1_000_000) as usize;
         self.index.reserve(est);
+        let mut ops_replayed = 0usize;
         for op in self.wal.replay()? {
+            ops_replayed += 1;
             match op {
                 WalOp::Put { key, segment_id, segment_offset, len } => {
                     let pointer = Pointer::Segment {
@@ -266,7 +313,7 @@ impl StorageEngine {
         // maintains it afterwards; absent entries fall back to a scan).
         let live = self.sorted_keys.len();
         self.collection_counts.insert(self.logical_name.clone(), live);
-        Ok(())
+        Ok(ops_replayed)
     }
 
     /// Vacuum: physically drop tombstones from the RAM index. The docs are
@@ -1411,5 +1458,187 @@ mod tests {
         assert!(eng.wal.has_pending(), "strict: 200 ops must NOT trip count flush");
         assert_eq!(eng.wal.data_len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn copy_dir_shallow(src: &std::path::Path, dst: &std::path::Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap().flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                std::fs::copy(&p, dst.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+
+    fn any_nonzero_segment(dir: &std::path::Path) -> bool {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("segment-l0-"))
+            .any(|e| e.metadata().unwrap().len() > 0)
+    }
+
+    /// Live-deployment diagnostic: small docs (< 4 KB) never touch segments —
+    /// they live in WAL + RAM until per-shard inlined bytes exceed
+    /// `max_inlined_memory_bytes`, at which point the maintenance checkpoint
+    /// spills them into a new segment file. 0-byte segment files beside a
+    /// fat WAL are therefore expected for small-doc rooms, not breakage.
+    #[test]
+    fn small_docs_spill_to_segment_at_inline_checkpoint() {
+        use crate::storage::wal::WalOp;
+
+        let dir = tmp("inline-spill");
+        let doc = vec![5u8; 256];
+        let mut cfg = cfg_for(DurabilityMode::Always);
+        cfg.max_inlined_memory_bytes = 2048; // trip the checkpoint early
+        cfg.value_blob_threshold_bytes = 8192; // keep this size on the inline path
+        {
+            let mut eng = StorageEngine::open(&dir, &cfg, "c".into(), None).unwrap();
+            for i in 0..20 {
+                eng.put(format!("k{i:03}"), &doc).unwrap();
+            }
+            assert!(
+                eng.inlined_bytes > cfg.max_inlined_memory_bytes,
+                "RAM inlined bytes must exceed the checkpoint trigger"
+            );
+            eng.run_background_maintenance(false).unwrap();
+            assert!(
+                any_nonzero_segment(&dir),
+                "checkpoint must spill inlined docs into a segment file"
+            );
+            assert!(
+                eng.get("k007").unwrap().is_some(),
+                "doc must be reachable after spill"
+            );
+            assert!(eng.wal.data_len() > 0, "WAL still carries the ops");
+            assert!(matches!(
+                eng.wal.append_batch_fast(9, &[WalOp::CommitTx { tx_id: 9 }], false),
+                Ok(_)
+            ), "WAL stays writable after spill");
+        }
+        let eng2 = StorageEngine::open(&dir, &cfg_for(DurabilityMode::Always), "c".into(), None).unwrap();
+        assert!(
+            eng2.get("k007").unwrap().is_some(),
+            "doc survives reopen after spill"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Medium docs (4 KB..blob_threshold) append to the active segment
+    /// synchronously on the put path — this is the only segment-growing
+    /// trigger besides the inline checkpoint.
+    #[test]
+    fn medium_docs_append_to_active_segment() {
+        let dir = tmp("medium-seg");
+        let doc = vec![1u8; 8192];
+        let mut eng = StorageEngine::open(&dir, &cfg_for(DurabilityMode::Always), "c".into(), None).unwrap();
+        eng.put("m-one".into(), &doc).unwrap();
+        assert_eq!(
+            eng.segments[&0].segment.current_size,
+            4 + 8192,
+            "segment tracks 4-byte length header + payload"
+        );
+        assert!(eng.get("m-one").unwrap().is_some(), "medium doc reads back through the segment pointer");
+        eng.flush_all().unwrap();
+        // Windows note: read_dir metadata can lag an unflushed append; assert
+        // dir contents only after the segment is synced.
+        assert!(any_nonzero_segment(&dir), "flush lands segment bytes on disk");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Handshake fix for issue #70: a file copy taken while the writer is
+    /// OPEN (the "manual backup of a running deployment" shape) must replay
+    /// fully offline. Copied-once storage: the immediate query and the
+    /// post-discovery query must both see the docs.
+    #[test]
+    fn copied_while_live_open_replays_offline() {
+        let dir = tmp("copy-writer-live");
+        let doc = vec![9u8; 512];
+        {
+            let mut eng = StorageEngine::open(&dir, &cfg_for(DurabilityMode::Always), "c".into(), None).unwrap();
+            for i in 0..50 {
+                eng.put(format!("src-{i:03}"), &doc).unwrap();
+            }
+            assert!(eng.wal.data_len() > 0, "Always flushes before the copy");
+            copy_dir_shallow(&dir, &dir.with_extension("copy"));
+        }
+        let copy_dir = dir.with_extension("copy");
+        let eng2 = StorageEngine::open(&copy_dir, &cfg_for(DurabilityMode::Always), "c".into(), None).unwrap();
+        assert!(
+            eng2.get("src-000").unwrap().is_some(),
+            "first replayed doc must be visible immediately"
+        );
+        assert!(
+            eng2.get("src-049").unwrap().is_some(),
+            "last replayed doc must be visible immediately"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&copy_dir);
+    }
+
+    /// Loud empty-open diagnosis: the message fires exactly for the #70
+    /// incident shape — zero live docs AND zero replayed ops while real
+    /// record bytes or nonzero segments exist. Tombstone-emptied and
+    /// fresh collections stay quiet.
+    #[test]
+    fn loud_open_diagnosis_fires_only_for_suspicious_states() {
+        let msg = |live, ops, bytes, segs| {
+            empty_open_diagnosis_message("c", live, ops, bytes, segs).is_some()
+        };
+        // Fresh dir: no bytes, no segments.
+        assert!(!msg(0, 0, 0, 0), "fresh collection stays quiet");
+        // Interval tail loss: copy lacks the in-memory part — nothing
+        // on disk claims history, so no scream (data simply never landed).
+        assert!(!msg(0, 0, 128, 0), "tiny pad-only WAL stays quiet");
+        // Tombstone-emptied: replay extracted ops, live is 0. Legit.
+        assert!(!msg(0, 12, 50_000, 3), "emptied-by-deletes stays quiet");
+        // Live docs: healthy open never warns.
+        assert!(!msg(7, 900, 900, 1));
+        // The incident shape: parser extracted nothing, disk says megabytes.
+        assert!(
+            msg(0, 0, 7_230_007, 0),
+            "real WAL bytes with zero replayed ops must scream"
+        );
+        // Segment-only copy (WAL lost / skipped): same scream.
+        assert!(msg(0, 0, 0, 2));
+        // And the message names the collection and the numbers.
+        let text = empty_open_diagnosis_message("mhs", 0, 0, 103_698_999, 1).unwrap();
+        assert!(text.contains("'mhs'") && text.contains("103698999"));
+    }
+
+    /// Arm 3 (deterministic): Interval durability + copy inside the quiet
+    /// window — puts sit in the writer's RAM buffer, so the copy's WAL
+    /// holds zero real bytes. The copy opens with ZERO docs and NO error:
+    /// documented silent-loss shape. The loud-open diagnostic correctly
+    /// does NOT fire here (disk never claimed the history), which is why
+    /// Interval users must quiesce before copying.
+    #[test]
+    fn interval_quiet_window_copy_lacks_buffered_tail() {
+        let dir = tmp("copy-interval-quiet");
+        let mut cfg = cfg_for(DurabilityMode::Interval);
+        // Pin both triggers off: no op-count flush, no time flush inside
+        // the test window. Writes stay in the writer's RAM buffer.
+        cfg.group_commit_max_ops = 1_000_000;
+        cfg.group_commit_interval_ms = 60_000;
+        let doc = vec![7u8; 512];
+        {
+            let mut eng = StorageEngine::open(&dir, &cfg, "c".into(), None).unwrap();
+            for i in 0..50 {
+                eng.put(format!("q-{i:03}"), &doc).unwrap();
+            }
+            assert!(eng.wal.has_pending(), "writes still buffered in RAM");
+            assert_eq!(eng.wal.data_len(), 0, "nothing flushed inside the window");
+            copy_dir_shallow(&dir, &dir.with_extension("copy"));
+        }
+        let copy_dir = dir.with_extension("copy");
+        let eng2 = StorageEngine::open(&copy_dir, &cfg, "c".into(), None).unwrap();
+        assert_eq!(eng2.wal.data_len(), 0, "copy WAL carries zero real bytes");
+        assert!(
+            eng2.get("q-000").unwrap().is_none(),
+            "the buffered tail was never on disk: copy reads empty, no error"
+        );
+        assert_eq!(eng2.count_prefix("q"), 0, "documented zero state");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&copy_dir);
     }
 }
