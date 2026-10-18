@@ -270,10 +270,35 @@ pub struct NetSyncer {
     /// the connection drops → retry) — no tie-breaking, the configured
     /// side dials by determinism.
     static_peers: Vec<String>,
+    /// Last dial outcome per static peer address, for /api/health probes:
+    /// addr -> (outcome, unix_millis at the last transition). Outcome codes:
+    /// 1 = connected, 2 = refused, 3 = timeout, 4 = connection ended. Only
+    /// written by the static dial task; readers get a snapshot (empty until
+    /// start() runs static dialing).
+    dial_state: Arc<std::sync::Mutex<HashMap<String, (u8, i64)>>>,
     // ponytail: Arc'd atomic so the FFI setter can change the mode on a
     // shared handle and clones share the leg (std atomics aren't Clone).
     // start() reads it once at boot.
     discovery: Arc<AtomicU8>,
+}
+
+/// Outcome codes for NetSyncer::mesh_dial_status (see dial_state docs).
+pub const MESH_DIAL_CONNECTED: u8 = 1;
+pub const MESH_DIAL_REFUSED: u8 = 2;
+pub const MESH_DIAL_TIMEOUT: u8 = 3;
+pub const MESH_DIAL_ENDED: u8 = 4;
+
+/// Record a dial outcome on the shared status map (helper keeps the dial
+/// task slim). Last-writer-wins per address; a fresh connect overwrites
+/// any prior refusal.
+pub(crate) fn note_dial_outcome(
+    map: &Arc<std::sync::Mutex<HashMap<String, (u8, i64)>>>,
+    addr: &str,
+    outcome: u8,
+) {
+    if let Ok(mut m) = map.lock() {
+        m.insert(addr.to_string(), (outcome, crate::util::clock::unix_millis() as i64));
+    }
 }
 
 /// Which discovery transports a mesh node runs. mDNS is the desktop sweet
@@ -388,6 +413,7 @@ impl NetSyncer {
             cloud_leases: Arc::new(Mutex::new(HashMap::new())),
             mdns: Arc::new(Mutex::new(None)),
             static_peers: Vec::new(),
+            dial_state: Arc::new(std::sync::Mutex::new(HashMap::new())),
             discovery: Arc::new(AtomicU8::new(default_discovery_mode() as u8)),
         }
     }
@@ -422,6 +448,19 @@ impl NetSyncer {
     pub fn discovery_mode(&self) -> DiscoveryMode {
         DiscoveryMode::from_u8(self.discovery.load(Ordering::Relaxed))
             .unwrap_or(DiscoveryMode::Mdns)
+    }
+
+    /// Snapshot of the last static-dial outcome per address, for health
+    /// probes (see dial_state docs). Empty until start() dials; the clone
+    /// family shares one map so FFI readers see live state.
+    pub fn mesh_dial_status(&self) -> Vec<(String, u8, i64)> {
+        let map = self.dial_state.lock().unwrap();
+        let mut v: Vec<(String, u8, i64)> = map
+            .iter()
+            .map(|(a, (o, t))| (a.clone(), *o, *t))
+            .collect();
+        v.sort();
+        v
     }
 
     pub async fn start(&self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
@@ -665,6 +704,7 @@ impl NetSyncer {
             let in_flight: Arc<std::sync::Mutex<HashSet<String>>> =
                 Arc::new(std::sync::Mutex::new(HashSet::new()));
             let caps_st = caps_static.clone();
+            let dial_state_s = self.dial_state.clone();
             let handle_static = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_secs(15));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -686,6 +726,7 @@ impl NetSyncer {
                         let lease_c = lease_s.clone();
                         let conn = in_flight.clone();
                         let addr_c = addr.clone();
+                        let ds_c = dial_state_s.clone();
                         tokio::spawn(async move {
                             // Scheme prefix is presentation only (config
                             // readability): strip before resolving.
@@ -694,20 +735,28 @@ impl NetSyncer {
                                 tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(hp)).await;
                             match dial {
                                 Ok(Ok(stream)) => {
+                                    crate::net_sync::note_dial_outcome(&ds_c, &addr_c, MESH_DIAL_CONNECTED);
                                     eprintln!("[mesh] static dial {addr_c}: connected");
                                     handle_peer(
                                         stream, db_c, peers_c, seen_c, stx_c, sid_c, hash_s, excl_c,
                                         relay_s, lp_c, echo_c, caps_c, lease_c,
                                     )
                                     .await;
+                                    crate::net_sync::note_dial_outcome(&ds_c, &addr_c, MESH_DIAL_ENDED);
                                     eprintln!("[mesh] static dial {addr_c}: connection ended");
                                 }
-                                Ok(Err(e)) => eprintln!(
-                                    "[mesh] static dial {addr_c}: refused ({e}); retrying"
-                                ),
-                                Err(_) => eprintln!(
-                                    "[mesh] static dial {addr_c}: timeout; retrying"
-                                ),
+                                Ok(Err(e)) => {
+                                    crate::net_sync::note_dial_outcome(&ds_c, &addr_c, MESH_DIAL_REFUSED);
+                                    eprintln!(
+                                        "[mesh] static dial {addr_c}: refused ({e}); retrying"
+                                    )
+                                }
+                                Err(_) => {
+                                    crate::net_sync::note_dial_outcome(&ds_c, &addr_c, MESH_DIAL_TIMEOUT);
+                                    eprintln!(
+                                        "[mesh] static dial {addr_c}: timeout; retrying"
+                                    )
+                                }
                             }
                             conn.lock().unwrap().remove(&addr_c);
                         });
