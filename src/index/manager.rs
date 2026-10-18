@@ -397,20 +397,6 @@ impl IndexManager {
             }
         }
     }
-
-    fn merge_maps<K, V>(into: &mut HashMap<String, HashMap<K, V>>, from: HashMap<String, HashMap<K, V>>)
-    where
-        K: std::hash::Hash + Eq,
-    {
-        for (col, fields) in from {
-            let col_map = into.entry(col).or_default();
-            for (field, index) in fields {
-                if let Some(existing_index) = col_map.get_mut(&field) {
-                    *existing_index = index;
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]

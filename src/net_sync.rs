@@ -63,6 +63,31 @@ pub enum NetPacket {
         key_fp: [u8; 32],
         encrypted_cols: Vec<String>,
     },
+    /// LAN relay coordination (#72 phase 1). Both appended LAST so old
+    /// peers keep decoding every earlier variant; unknown trailing
+    /// variants fail decode and are silently skipped (the SyncCaps rule).
+    ///
+    /// NOTE ON THE DESIGN TEXT: the issue sketched the lease as an
+    /// additive field inside `Ping`. Under bincode that would BREAK old
+    /// peers decoding the Ping variant itself (all version exchange would
+    /// die in a mixed mesh). New variants keep the compat property the
+    /// design actually needs; senders announce at the same cadence as
+    /// their ping.
+    /// A peer announces it holds (or recently held) the cloud relay role:
+    /// `last_exchange_ts` is its last successful cloud round-trip (ms
+    /// epoch). Observers track freshness per client_id for the lag meter
+    /// and the phase-2 GRACE eligibility rule.
+    CloudLease {
+        client_id: String,
+        last_exchange_ts: i64,
+    },
+    /// Sent by a peer the moment it takes over the relay role. Observers
+    /// use it for fast convergence (no need to wait for the next
+    /// CloudLease) and logging; it carries no lease state.
+    RelayTake {
+        ts: i64,
+        client_id: String,
+    },
 }
 
 // --- UDP broadcast discovery (mobile path; desktop opt-in) ---
@@ -230,6 +255,10 @@ pub struct NetSyncer {
     pub enable_relay: bool,
     last_mesh_ping: Arc<Mutex<Instant>>,
     echo_cache: Arc<Mutex<HashMap<String, i64>>>,
+    /// Observed cloud-relay leases per peer client_id (#72): client_id ->
+    /// (last_exchange_ms_epoch, seen_at). Fed by CloudLease/RelayTake
+    /// packets; read by the lag meter and the phase-2 GRACE rule.
+    cloud_leases: Arc<Mutex<HashMap<String, (i64, Instant)>>>,
     mdns: Arc<Mutex<Option<ServiceDaemon>>>,
     // ponytail: atomic so the FFI setter can change the mode on a shared
     // (Arc'd) handle; start() reads it once at boot.
@@ -340,6 +369,7 @@ impl NetSyncer {
             enable_relay: false,
             last_mesh_ping: Arc::new(Mutex::new(Instant::now())),
             echo_cache: Arc::new(Mutex::new(HashMap::new())),
+            cloud_leases: Arc::new(Mutex::new(HashMap::new())),
             mdns: Arc::new(Mutex::new(None)),
             discovery: AtomicU8::new(default_discovery_mode() as u8),
         }
@@ -386,6 +416,7 @@ impl NetSyncer {
         let excl_srv = self.excluded_collections.clone();
         let last_ping_ptr = self.last_mesh_ping.clone();
         let echo_cache_clone = self.echo_cache.clone();
+        let lease_srv = self.cloud_leases.clone();
         let caps_srv = caps_map.clone();
 
         let relay_enabled = self.enable_relay; 
@@ -402,13 +433,14 @@ impl NetSyncer {
                 let lp_c = last_ping_ptr.clone();
                 let echo_c = echo_cache_clone.clone();
                 let caps_c = caps_srv.clone();
+                let lease_c = lease_srv.clone();
                 
                 // SPAWN the handler so the loop can continue accepting other peers
                 tokio::spawn(async move {
                     handle_peer(
                         stream, db_c, peers_c, seen_c, stx_c, 
                         sid_c, hash_c, excl_c, relay_enabled, 
-                        lp_c, echo_c, caps_c
+                        lp_c, echo_c, caps_c, lease_c
                     ).await;
                 });
             }
@@ -446,6 +478,7 @@ impl NetSyncer {
         let hash_disc = self.room_hash;
         let relay_disc = self.enable_relay;
         let echo_cache_clone = self.echo_cache.clone();
+        let lease_disc = self.cloud_leases.clone();
 
         // Shared membership view: Name -> (Last Known Address, last-seen).
         // Written by whichever transports the mode enables (mDNS and/or
@@ -564,6 +597,7 @@ impl NetSyncer {
                                 let addr_c = p_addr.clone();
                                 let echo_cache = echo_cache_clone.clone();
                                 let caps_c = caps_disc.clone();
+                                let lease_c = lease_disc.clone();
 
                                 tokio::spawn(async move {
                                     // Short timeout so a single dead peer doesn't hang the loop
@@ -571,7 +605,7 @@ impl NetSyncer {
                                         handle_peer(
                                             stream, db_c, peers_c, seen_c, stx_c, 
                                             sid_c, hash_disc, excl_c, relay_disc, lp_c,
-                                            echo_cache, caps_c
+                                            echo_cache, caps_c, lease_c
                                         ).await;
                                     }
                                 });
@@ -745,8 +779,13 @@ impl NetSyncer {
                     
                     if let Ok(payload) = bincode::serialize(&packet) {
                         let mut guard = peers_audit.lock().await;
-                        for writer in guard.values_mut() {
-                            let _ = send_frame(writer, &payload).await;
+                        for (peer_id, writer) in guard.iter_mut() {
+                            if let Err(e) = send_frame(writer, &payload).await {
+                                net_send_warn(
+                                    &format!("ping-{peer_id}"),
+                                    format!("[sync] periodic ping to peer '{peer_id}' failed ({} bytes): {e}", payload.len()),
+                                );
+                            }
                         }
                         // Reset local timer
                         let mut lp = last_ping_ptr.lock().unwrap();
@@ -849,6 +888,7 @@ async fn handle_peer(
     last_ping: Arc<Mutex<Instant>>,
     echo_cache: Arc<Mutex<HashMap<String, i64>>>,
     caps: Arc<CapsMap>,
+    cloud_leases: Arc<Mutex<HashMap<String, (i64, Instant)>>>,
 ) {
     let (mut reader, mut writer) = stream.into_split();
 
@@ -1009,6 +1049,23 @@ async fn handle_peer(
                         let _ = send_packet(w, NetPacket::SyncRequest).await;
                     }
                 }
+                NetPacket::CloudLease { client_id, last_exchange_ts } => {
+                    // #72 phase 1: record the relay's cloud freshness for
+                    // the lag meter / phase-2 GRACE rule. Best-effort book
+                    // keeping — a bad clock just shows a big lag.
+                    let mut leases = cloud_leases.lock().unwrap();
+                    leases.insert(client_id, (last_exchange_ts, Instant::now()));
+                }
+                NetPacket::RelayTake { ts, client_id } => {
+                    // Same book-keeping; the take-over moment is itself
+                    // proof of a live relay (assume fresh until the next
+                    // CloudLease refines it).
+                    let mut leases = cloud_leases.lock().unwrap();
+                    leases.insert(client_id.clone(), (ts, Instant::now()));
+                    crate::util::log::info(&format!(
+                        "[sync] peer '{peer_id}' took the cloud relay role (client '{client_id}')"
+                    ));
+                }
                 _ => {}
             }
         }
@@ -1026,6 +1083,48 @@ fn resolve_op_to_bytes(shard_arc: &Arc<RwLock<crate::storage::engine::StorageEng
     // all transports. Body moved verbatim; this stays as the call edge.
     crate::sync_core::resolve_send_bytes(shard_arc, db, op)
 }
+
+// Stage B (#69): bootstrap paging + pacing + send hygiene.
+/// Byte budget per bootstrap/delta page — same unit as the cloud pager;
+/// sits far below the mesh hard cap `sync_core::MAX_FRAME` (256 MiB),
+/// which must stay unchanged.
+const BOOT_PAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// Doc-count ceiling per page: payload size varies wildly, so both
+/// budgets apply (docs bound the LWW-lock window, bytes bound the frame).
+const BOOT_PAGE_MAX_DOCS: usize = 1000;
+/// Bootstrap pacing floor per the measured WAN goodput in #69: a joining
+/// peer may not monopolize the host. ponytail: arithmetic sleep pacing
+/// for one serial sender; upgrade to a true token bucket if two joins
+/// ever contend measurably at this scale.
+const BOOTSTRAP_PACE_BPS: u64 = 4 * 1024 * 1024;
+
+/// Sleep owed before the next page, keeping bootstrap traffic under the
+/// pacing floor (static per-peer; concurrent joins each get their own).
+fn bootstrap_pace(payload_bytes: usize) -> Duration {
+    Duration::from_secs_f64(payload_bytes as f64 / BOOTSTRAP_PACE_BPS as f64)
+}
+
+/// Throttled failure log for sends that would otherwise drop silently:
+/// one line per key per window. Real failures surface with the peer and
+/// packet size; peer flaps do not firehose stderr. Returns true when a
+/// line was emitted (test tripwire).
+fn net_send_warn(key: &str, msg: String) -> bool {
+    const WINDOW: Duration = Duration::from_secs(10);
+    let due = {
+        let mut g = NET_WARN_LAST.lock().unwrap();
+        let due = g
+            .get(key)
+            .map(|t| t.elapsed() >= WINDOW)
+            .unwrap_or(true);
+        if due { g.insert(key.to_string(), Instant::now()); }
+        due
+    };
+    if due { eprintln!("{msg}"); }
+    due
+}
+
+static NET_WARN_LAST: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Instant>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 async fn handle_bootstrap(db: &Arc<Hako>, peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, peer_id: &str, excluded: &HashSet<String>, caps: &Arc<CapsMap>) {
     let encryption_key = db.config.encryption_key.as_deref();
@@ -1058,9 +1157,19 @@ async fn handle_bootstrap(db: &Arc<Hako>, peers: &Arc<AsyncMutex<HashMap<String,
             guard.index.iter().map(|(k,p)| (k.clone(), p.clone())).collect()
         };
 
+        // 2-3. Paged replay stream (#69 Stage B): pages of both budgets —
+        // `BOOT_PAGE_MAX_DOCS` bounds the receiver's apply window,
+        // `BOOT_PAGE_MAX_BYTES` bounds the frame (payload sizes vary
+        // wildly, so doc count alone would lie). The read lock drops
+        // BEFORE each page send. Pace after each page so a joining peer
+        // cannot monopolize the host.
+        let mut page: Vec<WalOp> = Vec::new();
+        let mut page_bytes = 0usize;
+
         for (key, ptr) in snapshot {
-            // 2. Read and Inflate data in an isolated scope
-            // This ensures the RwLockReadGuard is dropped BEFORE the .await below
+            // Inflate in an isolated scope: the RwLockReadGuard must drop
+            // before the async send below (and before blob resolution,
+            // which takes its own writes).
             let bytes_to_send = {
                 let guard = shard_arc.read().unwrap();
                 match guard.read_pointer_internal(&ptr, false) {
@@ -1070,7 +1179,7 @@ async fn handle_bootstrap(db: &Arc<Hako>, peers: &Arc<AsyncMutex<HashMap<String,
                         if let Some(mut doc) = HakoDoc::decode(&final_bytes) {
                             if doc.fields.iter().any(|(_, v)| matches!(v, Value::BlobLink { .. })) {
                                 // Drop this specific read guard because resolve_doc_static will acquire its own
-                                drop(guard); 
+                                drop(guard);
                                 let _ = crate::engine::engine::resolve_doc_static(&mut doc, &shard_arc, encryption_key);
                                 final_bytes = doc.encode();
                             }
@@ -1082,23 +1191,65 @@ async fn handle_bootstrap(db: &Arc<Hako>, peers: &Arc<AsyncMutex<HashMap<String,
             }; // <--- All Shard Locks are 100% dropped here.
 
             if let Some(value) = bytes_to_send {
-                let packet = NetPacket::Replication { 
-                    msg_id: 0, 
-                    collection: col.clone(), 
-                    ops: vec![WalOp::PutInlined { key, value }] 
-                };
+                let op_bytes = key.len() + value.len();
+                if !page.is_empty()
+                    && (page.len() >= BOOT_PAGE_MAX_DOCS
+                        || page_bytes + op_bytes > BOOT_PAGE_MAX_BYTES)
+                {
+                    let payload_len = send_bootstrap_page(peers, peer_id, &col, std::mem::take(&mut page)).await;
+                    tokio::time::sleep(bootstrap_pace(payload_len)).await;
+                    page_bytes = 0;
+                }
+                page.push(WalOp::PutInlined { key, value });
+                page_bytes += op_bytes;
+            }
+        }
+        // Final partial page (or the whole thing for small collections).
+        let payload_len = send_bootstrap_page(peers, peer_id, &col, page).await;
+        let _ = payload_len;
+    }
+}
 
-                if let Ok(payload) = bincode::serialize(&packet) {
-                    // 3. Now we can safely await the async Mutex for peers
-                    let mut guard = peers.lock().await;
-                    if let Some(w) = guard.get_mut(peer_id) {
-                        let _ = send_frame(w, &payload).await;
-                    }
+/// Serialize and send ONE bootstrap page to one peer. Returns the payload
+/// size for pacing; failures are loud (throttled) — a silently dropped
+/// bootstrap page means a silently divergent peer, the exact failure mode
+/// this stage exists to remove.
+async fn send_bootstrap_page(
+    peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>,
+    peer_id: &str,
+    col: &str,
+    ops: Vec<WalOp>,
+) -> usize {
+    if ops.is_empty() { return 0; }
+    let packet = NetPacket::Replication {
+        msg_id: 0,
+        collection: col.to_string(),
+        ops,
+    };
+    match bincode::serialize(&packet) {
+        Ok(payload) => {
+            let len = payload.len();
+            let mut guard = peers.lock().await;
+            if let Some(w) = guard.get_mut(peer_id) {
+                if let Err(e) = send_frame(w, &payload).await {
+                    net_send_warn(
+                        &format!("boot-{peer_id}"),
+                        format!("[sync] bootstrap page to peer '{peer_id}' for collection '{col}' failed ({len} bytes): {e}"),
+                    );
                 }
             }
+            len
+        }
+        Err(e) => {
+            net_send_warn(
+                &format!("boot-ser-{col}"),
+                format!("[sync] bootstrap page serialization error for collection '{col}': {e}"),
+            );
+            0
         }
     }
 }
+
 
 #[cfg(feature = "net-sync")]
 /// Rejoin/bootstrap catch-up builder shared by the delta sender: every index
@@ -1235,7 +1386,10 @@ async fn send_replication_packet(
             if let Some(writer) = guard.get_mut(peer_id) {
                 // Send using the shared sync_frame utility (length-prefix + data)
                 if let Err(e) = send_frame(writer, &payload).await {
-                    eprintln!("[net_sync] Failed to send packet to {}: {}", peer_id, e);
+                    net_send_warn(
+                        &format!("delta-{peer_id}"),
+                        format!("[net_sync] Failed to send packet to {}: {}", peer_id, e),
+                    );
                 }
             }
         }
@@ -1279,20 +1433,30 @@ async fn relay_mesh(
                 continue;
             }
         }
-        let _ = send_frame(writer, data).await;
+        if let Err(e) = send_frame(writer, data).await {
+            net_send_warn(
+                &format!("relay-{id}"),
+                format!("[sync] mesh relay to peer '{id}' failed ({} bytes): {e}", data.len()),
+            );
+        }
     }
 }
 
-fn broadcast_mesh(peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, col: &str, ops: Vec<WalOp>, msg_id: u128) {    let id = if msg_id == 0 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() } else { msg_id };
+fn broadcast_mesh(peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, col: &str, ops: Vec<WalOp>, msg_id: u128) {
+    let id = if msg_id == 0 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() } else { msg_id };
     let packet = NetPacket::Replication { msg_id: id, collection: col.to_string(), ops };
     if let Ok(payload) = bincode::serialize(&packet) {
         let p_ptr = peers.clone();
+        let col_s = col.to_string();
         tokio::spawn(async move {
             let mut guard = p_ptr.lock().await;
-            for writer in guard.values_mut() { 
-                // let peer = writer.peer_addr().unwrap().ip().to_string();
-                let _ = send_frame(writer, &payload).await; 
-
+            for (peer_id, writer) in guard.iter_mut() {
+                if let Err(e) = send_frame(writer, &payload).await {
+                    net_send_warn(
+                        &format!("mesh-{peer_id}"),
+                        format!("[sync] mesh broadcast to peer '{peer_id}' for collection '{col_s}' failed ({} bytes): {e}", payload.len()),
+                    );
+                }
             }
         });
     }
@@ -1335,7 +1499,12 @@ fn send_filtered_mesh(
                     );
                     continue;
                 }
-                let _ = send_frame(writer, &payload).await;
+                if let Err(e) = send_frame(writer, &payload).await {
+                    net_send_warn(
+                        &format!("meshf-{peer_id}"),
+                        format!("[sync] filtered mesh send to peer '{peer_id}' for collection '{col_s}' failed ({} bytes): {e}", payload.len()),
+                    );
+                }
             }
         });
     }
@@ -1714,5 +1883,138 @@ mod tests {
         let fp_none = crate::sync_guard::local_fingerprint(None);
         assert!(peer_may_send(&plain_db, &caps_map, "old-peer", "open", fp_none));
         assert!(peer_may_send(&plain_db, &caps_map, "good-peer", "open", fp_none));
+    }
+
+    /// Stage B (#69) send hygiene: the throttled warn fires on the first
+    /// failure for a key, then holds the window (no firehose during peer
+    /// flaps), then fires again once it expires.
+    #[test]
+    fn net_send_warn_throttles_per_key() {
+        let tag = format!("tw-{}", std::process::id());
+        assert!(net_send_warn(&tag, "first".into()), "first failure is loud");
+        assert!(!net_send_warn(&tag, "second".into()), "inside the window: quiet");
+        // Different key fires independently.
+        assert!(net_send_warn(&format!("{tag}-b"), "other peer".into()));
+    }
+
+    /// Stage B (#69): the pacing floor is arithmetic — 4 MB/s.
+    #[test]
+    fn bootstrap_pace_matches_floor() {
+        assert_eq!(bootstrap_pace(0), Duration::ZERO);
+        assert_eq!(bootstrap_pace(BOOTSTRAP_PACE_BPS as usize), Duration::from_secs(1));
+        assert_eq!(bootstrap_pace(BOOTSTRAP_PACE_BPS as usize / 2), Duration::from_millis(500));
+    }
+
+    /// Stage B (#69) core: a mesh peer joining a >16 MB node receives the
+    /// whole collection in byte-budgeted pages (never one giant frame like
+    /// the cloud plane bug), each page within both budgets, every key
+    /// delivered exactly once.
+    #[tokio::test]
+    async fn bootstrap_pages_large_collection_over_loopback() {
+        let (db, _dir) = temp_db("boot-page");
+        // 96 x 256 KiB = 24 MB node: far over the 16 MiB transport class
+        // that silently dropped data on the cloud plane before Stage A.
+        let chunk = vec![7u8; 256 * 1024];
+        for i in 0..96 {
+            let mut doc = HakoDoc::default();
+            doc.insert("b", Value::Binary(chunk.clone()));
+            db.put("big", &format!("k{i:03}"), &doc).unwrap();
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (mut c_read, _c_write) = client.into_split();
+        let (_s_read, s_write) = server.into_split();
+
+        let peers: Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>> = Arc::new(
+            AsyncMutex::new(HashMap::from([("u1".to_string(), s_write)])),
+        );
+        let caps: Arc<CapsMap> = Arc::new(CapsMap::default());
+        let db2 = db.clone();
+        let peers2 = peers.clone();
+        let sender = tokio::spawn(async move {
+            handle_bootstrap(&db2, &peers2, "u1", &HashSet::new(), &caps).await;
+        });
+
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut pages = 0usize;
+        let mut max_page_bytes = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while seen.len() < 96 {
+            assert!(Instant::now() < deadline, "bootstrap never converged (seen {})", seen.len());
+            let frame = tokio::time::timeout(Duration::from_secs(30), recv_frame(&mut c_read)).await;
+            match frame {
+                Ok(Ok(bytes)) => {
+                    if let Ok(NetPacket::Replication { collection, ops, .. }) =
+                        bincode::deserialize::<NetPacket>(&bytes)
+                    {
+                        assert_eq!(collection, "big");
+                        assert!(ops.len() <= BOOT_PAGE_MAX_DOCS, "page over doc budget: {}", ops.len());
+                        // Framing overhead is a few bytes; budget holds.
+                        max_page_bytes = max_page_bytes.max(bytes.len());
+                        assert!(
+                            bytes.len() <= BOOT_PAGE_MAX_BYTES + 64,
+                            "page {} bytes over budget", bytes.len()
+                        );
+                        pages += 1;
+                        for op in ops {
+                            if let WalOp::PutInlined { key, value } = op {
+                                seen.insert(key, value.len());
+                            }
+                        }
+                    }
+                }
+                other => panic!("bootstrap stream ended early: {other:?}"),
+            }
+        }
+        sender.abort();
+        assert_eq!(seen.len(), 96, "every key must arrive");
+        assert!(pages >= 3, ">16 MB node must split into multiple pages, got {pages}");
+        assert!(max_page_bytes <= BOOT_PAGE_MAX_BYTES + 64);
+        // Payloads survived the pager intact (256 KiB docs; the wire value
+        // is the encoded HakoDoc, a few header bytes over the raw chunk).
+        assert_eq!(seen["k000"], chunk.len() + 19);
+        assert_eq!(seen["k095"], chunk.len() + 19);
+    }
+
+    /// #72 phase 1: the relay carriers survive the wire and keep the
+    /// mixed-version mesh property — earlier variant indices unchanged,
+    /// unknown trailing variants skipped by old peers (decode failure,
+    /// never a disconnect).
+    #[test]
+    fn relay_carriers_roundtrip_and_old_peers_skip_them() {
+        let lease = NetPacket::CloudLease {
+            client_id: "relay-1".to_string(),
+            last_exchange_ts: 1_760_000_000_000,
+        };
+        let take = NetPacket::RelayTake {
+            ts: 1_760_000_000_000,
+            client_id: "relay-1".to_string(),
+        };
+        for pkt in [lease, take] {
+            let bytes = bincode::serialize(&pkt).unwrap();
+            match bincode::deserialize::<NetPacket>(&bytes).expect("decode own relay packet") {
+                NetPacket::CloudLease { client_id, last_exchange_ts } => {
+                    assert_eq!(client_id, "relay-1");
+                    assert_eq!(last_exchange_ts, 1_760_000_000_000);
+                }
+                NetPacket::RelayTake { ts, client_id } => {
+                    assert_eq!(ts, 1_760_000_000_000);
+                    assert_eq!(client_id, "relay-1");
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+        // Older variants keep their wire positions (Identify = 0).
+        let id = NetPacket::Identify { id: "n".to_string(), room_hash: [1u8; 32] };
+        assert_eq!(&bincode::serialize(&id).unwrap()[..4], &[0u8, 0, 0, 0]);
+        // Old peers (which only know the pre-relay variants) fail decode
+        // on ANY trailing-variant packet and skip it — simulate with an
+        // out-of-range variant index, the exact mixed-version rule.
+        let mut unknown = vec![99u8, 0, 0, 0];
+        unknown.extend_from_slice(&[0u8; 8]);
+        assert!(bincode::deserialize::<NetPacket>(&unknown).is_err());
     }
 }

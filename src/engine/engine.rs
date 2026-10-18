@@ -17,7 +17,7 @@ use crate::index::composite::definition::{CompositeIndexDefinition, SortDirectio
 use crate::index::manager::IndexManager;
 use crate::index::service::IndexingService;
 use crate::index::storage::index_storage::IndexStorage;
-use crate::index::traverse::{TraverseDir, TraverseSpec, MAX_TRAVERSE_DEPTH};
+use crate::index::traverse::TraverseSpec;
 use crate::query::executor::executor::ParallelQueryExecutor;
 use crate::query::plan_cache::PlanCache;
 use crate::query::query::Query;
