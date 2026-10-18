@@ -287,6 +287,9 @@ pub enum DiscoveryMode {
     Broadcast = 1,
     /// Both transports at once (mixed groups, debugging).
     Both = 2,
+    /// No discovery: static peers only (server deployments — containers,
+    /// k8s, locked-down hosts where multicast is noise or blocked).
+    Off = 3,
 }
 
 #[cfg(feature = "net-sync")]
@@ -296,6 +299,7 @@ impl DiscoveryMode {
             0 => Some(DiscoveryMode::Mdns),
             1 => Some(DiscoveryMode::Broadcast),
             2 => Some(DiscoveryMode::Both),
+            3 => Some(DiscoveryMode::Off),
             _ => None,
         }
     }
@@ -328,6 +332,7 @@ fn transports_for(mode: DiscoveryMode) -> (bool, bool) {
         DiscoveryMode::Mdns => (true, false),
         DiscoveryMode::Broadcast => (false, true),
         DiscoveryMode::Both => (true, true),
+        DiscoveryMode::Off => (false, false),
     }
 }
 
@@ -1798,6 +1803,7 @@ mod tests {
         assert_eq!(transports_for(DiscoveryMode::Mdns), (true, false));
         assert_eq!(transports_for(DiscoveryMode::Broadcast), (false, true));
         assert_eq!(transports_for(DiscoveryMode::Both), (true, true));
+        assert_eq!(transports_for(DiscoveryMode::Off), (false, false));
     }
 
     #[test]
