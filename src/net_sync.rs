@@ -240,6 +240,9 @@ async fn beacon_listener_task(
 }
 
 #[cfg(feature = "net-sync")]
+/// Clone shares all leg state (peers, tailers, status): used to bind the
+/// caller-facing handle while a start() task owns another clone.
+#[derive(Clone)]
 pub struct NetSyncer {
     db: Arc<Hako>,
     self_id: String,
@@ -260,9 +263,17 @@ pub struct NetSyncer {
     /// packets; read by the lag meter and the phase-2 GRACE rule.
     cloud_leases: Arc<Mutex<HashMap<String, (i64, Instant)>>>,
     mdns: Arc<Mutex<Option<ServiceDaemon>>>,
-    // ponytail: atomic so the FFI setter can change the mode on a shared
-    // (Arc'd) handle; start() reads it once at boot.
-    discovery: AtomicU8,
+    /// Static peer addresses (tcp://host:port or host:port) for server
+    /// deployments where discovery cannot run: containers/k8s list exact
+    /// addresses; mDNS/broadcast does not cross those boundaries. Each
+    /// address gets one dedicated dial task (connect → handle_peer until
+    /// the connection drops → retry) — no tie-breaking, the configured
+    /// side dials by determinism.
+    static_peers: Vec<String>,
+    // ponytail: Arc'd atomic so the FFI setter can change the mode on a
+    // shared handle and clones share the leg (std atomics aren't Clone).
+    // start() reads it once at boot.
+    discovery: Arc<AtomicU8>,
 }
 
 /// Which discovery transports a mesh node runs. mDNS is the desktop sweet
@@ -280,6 +291,9 @@ pub enum DiscoveryMode {
     Broadcast = 1,
     /// Both transports at once (mixed groups, debugging).
     Both = 2,
+    /// No discovery: static peers only (server deployments — containers,
+    /// k8s, locked-down hosts where multicast is noise or blocked).
+    Off = 3,
 }
 
 #[cfg(feature = "net-sync")]
@@ -289,6 +303,7 @@ impl DiscoveryMode {
             0 => Some(DiscoveryMode::Mdns),
             1 => Some(DiscoveryMode::Broadcast),
             2 => Some(DiscoveryMode::Both),
+            3 => Some(DiscoveryMode::Off),
             _ => None,
         }
     }
@@ -321,6 +336,7 @@ fn transports_for(mode: DiscoveryMode) -> (bool, bool) {
         DiscoveryMode::Mdns => (true, false),
         DiscoveryMode::Broadcast => (false, true),
         DiscoveryMode::Both => (true, true),
+        DiscoveryMode::Off => (false, false),
     }
 }
 
@@ -371,8 +387,16 @@ impl NetSyncer {
             echo_cache: Arc::new(Mutex::new(HashMap::new())),
             cloud_leases: Arc::new(Mutex::new(HashMap::new())),
             mdns: Arc::new(Mutex::new(None)),
-            discovery: AtomicU8::new(default_discovery_mode() as u8),
+            static_peers: Vec::new(),
+            discovery: Arc::new(AtomicU8::new(default_discovery_mode() as u8)),
         }
+    }
+
+    /// Static mesh peers to dial directly (see field docs). Replaces the
+    /// list; takes effect at [`Self::start`].
+    pub fn with_static_peers(mut self, addrs: Vec<String>) -> Self {
+        self.static_peers = addrs;
+        self
     }
 
     pub fn with_relay(mut self, enable: bool) -> Self {
@@ -418,6 +442,7 @@ impl NetSyncer {
         let echo_cache_clone = self.echo_cache.clone();
         let lease_srv = self.cloud_leases.clone();
         let caps_srv = caps_map.clone();
+        let caps_static = caps_map.clone();
 
         let relay_enabled = self.enable_relay; 
 
@@ -619,13 +644,86 @@ impl NetSyncer {
         // 4. Push the single handle to the tasks list
         self.tasks.lock().unwrap().push(handle_discovery);
 
+        // Static peer dialers (server deployments; see field docs). One
+        // task per address, guarded by a per-address in-flight set so a
+        // healthy connection is never re-dialed — retry happens only after
+        // the previous connection fully drops. 15s cadence matches the
+        // discovery reconncetions above.
+        let static_addrs = self.static_peers.clone();
+        if !static_addrs.is_empty() {
+            let db_s = self.db.clone();
+            let peers_s = self.peers.clone();
+            let seen_s = self.seen_messages.clone();
+            let stx_s = self.status_tx.clone();
+            let sid_s = self.self_id.clone();
+            let excl_s = self.excluded_collections.clone();
+            let lp_s = self.last_mesh_ping.clone();
+            let echo_s = self.echo_cache.clone();
+            let lease_s = self.cloud_leases.clone();
+            let relay_s = relay_enabled;
+            let hash_s = hash;
+            let in_flight: Arc<std::sync::Mutex<HashSet<String>>> =
+                Arc::new(std::sync::Mutex::new(HashSet::new()));
+            let caps_st = caps_static.clone();
+            let handle_static = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(15));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    for addr in static_addrs.iter() {
+                        if !in_flight.lock().unwrap().insert(addr.clone()) {
+                            continue;
+                        }
+                        let db_c = db_s.clone();
+                        let peers_c = peers_s.clone();
+                        let seen_c = seen_s.clone();
+                        let stx_c = stx_s.clone();
+                        let sid_c = sid_s.clone();
+                        let excl_c = excl_s.clone();
+                        let lp_c = lp_s.clone();
+                        let echo_c = echo_s.clone();
+                        let caps_c = caps_st.clone();
+                        let lease_c = lease_s.clone();
+                        let conn = in_flight.clone();
+                        let addr_c = addr.clone();
+                        tokio::spawn(async move {
+                            // Scheme prefix is presentation only (config
+                            // readability): strip before resolving.
+                            let hp = addr_c.trim_start_matches("tcp://");
+                            let dial =
+                                tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(hp)).await;
+                            match dial {
+                                Ok(Ok(stream)) => {
+                                    eprintln!("[mesh] static dial {addr_c}: connected");
+                                    handle_peer(
+                                        stream, db_c, peers_c, seen_c, stx_c, sid_c, hash_s, excl_c,
+                                        relay_s, lp_c, echo_c, caps_c, lease_c,
+                                    )
+                                    .await;
+                                    eprintln!("[mesh] static dial {addr_c}: connection ended");
+                                }
+                                Ok(Err(e)) => eprintln!(
+                                    "[mesh] static dial {addr_c}: refused ({e}); retrying"
+                                ),
+                                Err(_) => eprintln!(
+                                    "[mesh] static dial {addr_c}: timeout; retrying"
+                                ),
+                            }
+                            conn.lock().unwrap().remove(&addr_c);
+                        });
+                    }
+                }
+            });
+            self.tasks.lock().unwrap().push(handle_static);
+        }
+
         // 3. Tailer
         let db_tail = self.db.clone();
         let peers_tail = self.peers.clone();
         let offsets_tail = self.shard_offsets.clone();
         let excl_tail = self.excluded_collections.clone();
         let echo_cache_clone = self.echo_cache.clone();
-        let caps_tail = caps_map.clone();
+        let caps_tail = caps_static.clone();
         
         let handle_tailer = tokio::task::spawn_blocking(move || {
             let mut last_checkpoint_save = Instant::now(); // Use Instant for timing
@@ -1722,6 +1820,7 @@ mod tests {
         assert_eq!(transports_for(DiscoveryMode::Mdns), (true, false));
         assert_eq!(transports_for(DiscoveryMode::Broadcast), (false, true));
         assert_eq!(transports_for(DiscoveryMode::Both), (true, true));
+        assert_eq!(transports_for(DiscoveryMode::Off), (false, false));
     }
 
     #[test]
