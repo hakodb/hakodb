@@ -1,7 +1,7 @@
 #[cfg(feature = "cloud-sync")]
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "cloud-sync")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 #[cfg(feature = "cloud-sync")]
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 #[cfg(feature = "cloud-sync")]
@@ -36,6 +36,39 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex, RwLock as AsyncRwLock};
 #[cfg(feature = "cloud-sync")]
 use tokio_tungstenite::tungstenite::Message;
 
+
+/// Shared transport config for BOTH ws faces (cloudserver room accept and
+/// the client-side connect). Both faces can hit the transport caps:
+/// a legacy hub pushes one big catch-up frame at a joining client, and a
+/// legacy client pushes one big batch at the hub (issue #69 measured a
+/// 103 MB single frame hub-side).
+///
+/// Why the caps are NOT simply tiny: tungstenite's inbound caps are checks,
+/// not preallocations — a raised limit costs nothing until a big frame
+/// actually arrives, then it is paid once for the message that carries it.
+/// The outbound side is different: the write accumulator previously sat at
+/// usize::MAX, which is how thousands of slow-stalled peers balloon memory
+/// — that hard limit stays bounded here.
+///
+/// Public so the load-probe peers (hakocloudserver `peer-bench`) exercise
+/// the exact same transport settings as the real client instead of a
+/// courteous lookalike.
+pub fn ws_transport_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+    // WebSocketConfig is non-exhaustive upstream: mutate the default.
+    let mut cfg = WebSocketConfig::default();
+    // Inbound: accept legacy single frames up to 64 MiB (~120k small docs
+    // on one frame, per the measured ~543 B/op). Anything beyond fails
+    // loudly (logged at both faces) and reconnects — the same ceiling the
+    // pager keeps new peers far away from.
+    cfg.max_frame_size = Some(64 << 20);
+    cfg.max_message_size = Some(64 << 20);
+    // Outbound backpressure: the write accumulator only builds past
+    // write_buffer_size when TCP writes stall; bound it instead of letting
+    // it grow forever (16 MiB > any pager page we emit).
+    cfg.max_write_buffer_size = 16 << 20;
+    cfg
+}
 // ============================================================================
 // DATA STRUCTURES & PROTOCOL PACKETS
 // ============================================================================
@@ -155,6 +188,33 @@ fn hash_room_id(room_name: &str, room_key: &str) -> String {
 #[cfg(feature = "cloud-sync")]
 pub const GROUPS_COLLECTION: &str = "__groups";
 
+/// #72 lag meter: ms-epoch of the last successful cloud exchange on ANY
+/// client face in this process (auth round-trip completed, or any server
+/// packet decoded). 0 = never reached the cloud. Announced over the mesh
+/// via `NetPacket::CloudLease`; read via `cloud_last_exchange_millis`.
+#[cfg(feature = "cloud-sync")]
+static LAST_CLOUD_EXCHANGE_MS: AtomicI64 = AtomicI64::new(0);
+
+#[cfg(feature = "cloud-sync")]
+fn note_cloud_exchange() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    LAST_CLOUD_EXCHANGE_MS.store(now, Ordering::Relaxed);
+}
+
+/// ms-epoch of the last successful cloud round-trip on any client face,
+/// or None when this process never reached the cloud. The LAN relay lag
+/// meter and the phase-2 GRACE eligibility rule both read this.
+#[cfg(feature = "cloud-sync")]
+pub fn cloud_last_exchange_millis() -> Option<i64> {
+    match LAST_CLOUD_EXCHANGE_MS.load(Ordering::Relaxed) {
+        0 => None,
+        ts => Some(ts),
+    }
+}
+
 /// SHA-256 hex of an API key. Keys are 256-bit random (unbounded entropy),
 /// so a fast hash + timing-safe compare is the right tool — no KDF needed.
 #[cfg(feature = "cloud-sync")]
@@ -267,6 +327,28 @@ pub struct CloudSync {
     /// Server: keyed by peer_key, set at auth, cleared on disconnect.
     /// Client: the server's caps live under the fixed key `"server"`.
     caps: Arc<crate::sync_guard::CapsMap>,
+    /// #72 admission control: hard cap on distinct connected clients
+    /// (0 = unlimited, the historic default). Atomic so FFI/SDK handles
+    /// can tune it at runtime.
+    max_clients: Arc<AtomicUsize>,
+    /// Shared catch-up page cache: one materialization + encode serves ALL
+    /// concurrent fresh joiners of a collection (identical byte streams —
+    /// same room, same server_ts). Keyed by collection, holding the newest
+    /// server_ts it was built for; a version bump simply misses and
+    /// re-collects. Bounded by the collection count (each entry ~= the
+    /// collection's wire size). Fixes the thundering-join HOL storm where
+    /// N joiners each re-materialized the whole collection.
+    catchup_cache: Arc<StdMutex<HashMap<String, CatchupCacheEntry>>>,
+    /// Test/ops tripwire: how many catch-up sends were served from the
+    /// shared cache instead of a fresh materialization.
+    catchup_cache_hits: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "cloud-sync")]
+struct CatchupCacheEntry {
+    server_ts: i64,
+    /// Fully encoded ws frames (msgpack page packets), ready to send.
+    packets: Arc<Vec<Message>>,
 }
 
 #[cfg(feature = "cloud-sync")]
@@ -351,6 +433,9 @@ impl CloudSync {
             active_peers: Arc::new(AsyncRwLock::new(HashMap::new())),
             outbound_tx: Arc::new(AsyncMutex::new(None)),
             caps: Arc::new(crate::sync_guard::CapsMap::default()),
+            max_clients: Arc::new(AtomicUsize::new(0)),
+            catchup_cache: Arc::new(StdMutex::new(HashMap::new())),
+            catchup_cache_hits: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -383,6 +468,9 @@ impl CloudSync {
             active_peers: Arc::new(AsyncRwLock::new(HashMap::new())),
             outbound_tx: Arc::new(AsyncMutex::new(None)),
             caps: Arc::new(crate::sync_guard::CapsMap::default()),
+            max_clients: Arc::new(AtomicUsize::new(0)),
+            catchup_cache: Arc::new(StdMutex::new(HashMap::new())),
+            catchup_cache_hits: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -418,6 +506,27 @@ impl CloudSync {
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+    }
+
+    /// #72 admission control (server face): hard cap on distinct connected
+    /// clients per room. 0 = unlimited (historic default). A client
+    /// reconnecting with its own id always re-admits (replaces its stale
+    /// entry); a new client beyond the cap gets a typed loud
+    /// `AuthResult { success: false, error: "room at capacity" }` and the
+    /// caller retries with backoff. Works on Arc'd handles (FFI/SDK).
+    pub fn set_max_clients_per_room(&self, max: usize) {
+        self.max_clients.store(max, Ordering::Relaxed);
+    }
+
+    /// Current per-room client cap (0 = unlimited).
+    pub fn max_clients_per_room(&self) -> usize {
+        self.max_clients.load(Ordering::Relaxed)
+    }
+
+    /// How many catch-up sends were served from the shared page cache
+    /// (ops visibility + test tripwire for the thundering-join fix).
+    pub fn catchup_cache_hits(&self) -> usize {
+        self.catchup_cache_hits.load(Ordering::Relaxed)
     }
 
     pub fn status(&self) -> CloudStatus {
@@ -675,6 +784,9 @@ impl CloudSync {
                 };
 
                 if let Ok(bytes) = rmp_serde::to_vec_named(&packet) {
+                    // Sized before the loop — the error log below wants the
+                    // wire footprint without another clone-chase.
+                    let bytes_len = bytes.len();
                     let msg = Message::Binary(bytes.into());
                     let peers_guard = peers.read().await;
 
@@ -709,7 +821,16 @@ impl CloudSync {
                             );
                             continue;
                         }
-                        let _ = info.tx.try_send(msg.clone());
+                        let sent_result = info.tx.try_send(msg.clone());
+                        // Issue #69 #4: every silent drop here becomes a
+                        // logged, peer-keyed event.
+                        if let Err(ref se) = sent_result {
+                            eprintln!(
+                                "[sync] relay '{collection}' to '{peer_id}': queue send failed ({} B): {}",
+                                bytes_len,
+                                se
+                            );
+                        }
                     }
                 }
             }
@@ -795,6 +916,9 @@ kind,
         let seen_messages = self.seen_messages.clone();
         let echo_cache = self.echo_cache.clone();
         let caps_all = self.caps.clone();
+        let max_clients = self.max_clients.clone();
+        let catchup_cache = self.catchup_cache.clone();
+        let catchup_cache_hits = self.catchup_cache_hits.clone();
         // Single room, configured at construction (no registry, no
         // allocation, no multi-room fallback — see module docs).
         let room_name = self.room_name.clone();
@@ -815,9 +939,20 @@ kind,
                     let room_name = room_name.clone();
                     let room_key = room_key.clone();
                     let caps_one = caps_all.clone();
+                    let max_clients_clone = max_clients.clone();
+                    let cache_clone = catchup_cache.clone();
+                    let cache_hits_clone = catchup_cache_hits.clone();
 
-                    tokio::spawn(async move {
-                        if let Ok(ws_stream) = tokio_tungstenite::accept_async(stream).await {
+                // TCP_NODELAY on the raw accept socket: the hub's small
+                // control frames (AuthResult/VersionPing) and fan-out
+                // pages must not sit behind Nagle batching.
+                let _ = stream.set_nodelay(true);
+                tokio::spawn(async move {
+                        if let Ok(ws_stream) = tokio_tungstenite::accept_async_with_config(
+                            stream,
+                            Some(ws_transport_config()),
+                        )
+                        .await {
                             Self::handle_server_client(
                                 ws_stream,
                                 ingest_tx,
@@ -827,6 +962,9 @@ kind,
                                 active_peers,
                                 seen_messages,
                                 caps_one,
+                                max_clients_clone,
+                                cache_clone,
+                                cache_hits_clone,
                             )
                             .await;
                         }
@@ -848,11 +986,19 @@ kind,
         peers: Arc<AsyncRwLock<HashMap<String, PeerInfo>>>,
         seen_messages: Arc<AsyncMutex<Vec<u128>>>,
         caps: Arc<crate::sync_guard::CapsMap>,
+        max_clients: Arc<AtomicUsize>,
+        cache: Arc<StdMutex<HashMap<String, CatchupCacheEntry>>>,
+        cache_hits: Arc<AtomicUsize>,
     ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let (mut ws_tx, mut ws_rx) = ws_stream.split();
-        let (client_tx, mut client_rx) = mpsc::channel::<Message>(2000);
+        // Depth 16 (~14 MB of 0.9 MB catch-up pages): deep enough that the
+        // blocking tailer's try_send never trips for a healthy client, but
+        // shallow enough that N thundering joiners cannot buffer their whole
+        // catch-up in hub RAM before the slowest reader drains it. The old
+        // 2000 cap queued ~31 MB/client x N — the thundering-join swap-storm.
+        let (client_tx, mut client_rx) = mpsc::channel::<Message>(16);
 
         let mut peer_key = String::new();
         let mut authenticated = false;
@@ -893,6 +1039,26 @@ kind,
                         let _ = ws_tx.send(Message::Binary(bytes.into())).await;
                     }
                     return;
+                }
+                // #72 admission control: per-room client cap. A peer
+                // RECONNECTING with its own id always replaces its stale
+                // entry (cap counts distinct clients, not retries); a NEW
+                // client beyond the cap gets a typed loud reject and the
+                // LAN peers behind it stay mesh-only (they never dial).
+                let max = max_clients.load(Ordering::Relaxed);
+                if max > 0 {
+                    let p = peers.read().await;
+                    if !p.contains_key(&cid) && p.len() >= max {
+                        drop(p);
+                        let nack = CloudPacket::AuthResult {
+                            success: false,
+                            error: Some("room at capacity".into()),
+                        };
+                        if let Ok(bytes) = rmp_serde::to_vec_named(&nack) {
+                            let _ = ws_tx.send(Message::Binary(bytes.into())).await;
+                        }
+                        return;
+                    }
                 }
                 authenticated = true;
                 // One room per server: the client id alone keys the peer
@@ -993,7 +1159,13 @@ kind,
                                 if let Ok(reply_bytes) = rmp_serde::to_vec_named(&reply) {
                                     let peers_guard = peers.read().await;
                                     if let Some(tx) = peers_guard.get(&peer_key) {
-                                        let _ = tx.tx.try_send(Message::Binary(reply_bytes.into()));
+                                        // Small control frame, but a failed
+                                        // handshake reply used to vanish too.
+                                        if let Err(se) = tx.tx.send(Message::Binary(reply_bytes.into())).await {
+                                            eprintln!(
+                                                "[sync] VersionPing reply to '{peer_key}' failed: {se}"
+                                            );
+                                        }
                                     }
                                 }
 
@@ -1010,9 +1182,12 @@ kind,
                                             &db,
                                             &collection,
                                             client_ts,
+                                            server_ts,
                                             &peer_key,
                                             &peers,
                                             &caps,
+                                            &cache,
+                                            &cache_hits,
                                         )
                                         .await;
                                     }
@@ -1116,13 +1291,57 @@ kind,
         ops
     }
 
+    /// Catch-up/chunk wire budget: a page must never approach the default
+    /// tungstenite frame limit (16 MiB) — issue #69's single-frame history
+    /// bug. 1000 ops of ~500 B docs ≈ 0.6 MB; the byte cap splits big-doc
+    /// pages long before any transport limit can be hit.
+    const CATCHUP_PAGE_MAX_OPS: usize = 1000;
+    const CATCHUP_PAGE_MAX_BYTES: usize = 6 * 1024 * 1024;
+
+    /// Conservative serialized-size estimate for wire budgeting
+    /// (rmp_named + docs routing overhead per op; never an under-count).
+    fn op_wire_len(op: &WalOp) -> usize {
+        match op {
+            WalOp::PutInlined { key, value } => key.len() + value.len() + 128,
+            WalOp::PutBlob { key, .. } | WalOp::Put { key, .. } => key.len() + 96,
+            WalOp::Delete { key, .. } => key.len() + 64,
+            WalOp::BeginTx { .. } | WalOp::CommitTx { .. } => 48,
+        }
+    }
+
+    /// Split a delta batch into wire-safe pages. Empty input → no pages.
+    fn page_out_ops(ops: Vec<WalOp>) -> Vec<Vec<WalOp>> {
+        let mut pages: Vec<Vec<WalOp>> = Vec::new();
+        let mut cur: Vec<WalOp> = Vec::new();
+        let mut cur_bytes = 0usize;
+        for op in ops {
+            let len = Self::op_wire_len(&op);
+            let full = !cur.is_empty()
+                && (cur.len() >= Self::CATCHUP_PAGE_MAX_OPS
+                    || cur_bytes + len > Self::CATCHUP_PAGE_MAX_BYTES);
+            if full {
+                pages.push(std::mem::take(&mut cur));
+                cur_bytes = 0;
+            }
+            cur_bytes += len;
+            cur.push(op);
+        }
+        if !cur.is_empty() {
+            pages.push(cur);
+        }
+        pages
+    }
+
     async fn send_catchup_deltas(
         db: &Arc<Hako>,
         collection: &str,
-        since_ts: i64,
+        client_ts: i64,
+        server_ts: i64,
         peer_key: &str,
         peers: &Arc<AsyncRwLock<HashMap<String, PeerInfo>>>,
         caps: &Arc<crate::sync_guard::CapsMap>,
+        cache: &Arc<StdMutex<HashMap<String, CatchupCacheEntry>>>,
+        cache_hits: &Arc<AtomicUsize>,
     ) {
         // Sender rule: a locally-encrypted collection only replays to a
         // fingerprint-verified peer. Old/silent peers pause here loudly
@@ -1148,21 +1367,80 @@ kind,
                 return;
             }
         }
-        let ops = Self::collect_catchup_ops(db, collection, since_ts);
-
-        if !ops.is_empty() {
-            let packet = CloudPacket::Replication {
-                msg_id: 0,
-                collection: collection.to_string(),
-                ops,
-            };
-            if let Ok(bytes) = rmp_serde::to_vec_named(&packet) {
-                let peers_guard = peers.read().await;
-                if let Some(tx) = peers_guard.get(peer_key) {
-                    let _ = tx.tx.try_send(Message::Binary(bytes.into()));
+        // Shared page cache: fresh joiners of the same collection at the
+        // same server_ts need IDENTICAL bytes — materialize + encode once,
+        // send N times (Bytes/Message clones are refcount bumps). A version
+        // bump replaces the entry on the next miss.
+        let cached: Option<Arc<Vec<Message>>> = {
+            let mut guard = cache.lock().unwrap();
+            match guard.get(collection) {
+                Some(entry) if entry.server_ts == server_ts && client_ts == 0 => {
+                    cache_hits.fetch_add(1, Ordering::Relaxed);
+                    Some(entry.packets.clone())
                 }
+                _ => None,
+            }
+        };
+
+        let packets = match cached {
+            Some(p) => p,
+            None => {
+                let ops = Self::collect_catchup_ops(db, collection, client_ts);
+                if ops.is_empty() {
+                    return;
+                }
+                let total_ops = ops.len();
+                let pages = Self::page_out_ops(ops);
+                let mut encoded: Vec<Message> = Vec::with_capacity(pages.len());
+                for page_ops in pages {
+                    let packet = CloudPacket::Replication {
+                        msg_id: 0,
+                        collection: collection.to_string(),
+                        ops: page_ops,
+                    };
+                    match rmp_serde::to_vec_named(&packet) {
+                        Ok(b) => encoded.push(Message::Binary(b.into())),
+                        Err(e) => {
+                            eprintln!(
+                                "[sync] catchup '{collection}': encode failed: {e}"
+                            );
+                            return;
+                        }
+                    }
+                }
+                let packets = Arc::new(encoded);
+                let mut guard = cache.lock().unwrap();
+                guard.insert(
+                    collection.to_string(),
+                    CatchupCacheEntry { server_ts, packets: packets.clone() },
+                );
+                let _ = total_ops;
+                packets
+            }
+        };
+
+        let peers_guard = peers.read().await;
+        let peer_tx = peers_guard.get(peer_key).map(|p| p.tx.clone());
+        drop(peers_guard);
+        let Some(client_tx) = peer_tx else { return };
+
+        let total = packets.len();
+        for (i, msg) in packets.iter().enumerate() {
+            // Awaited send: backpressure against the peer queue instead of
+            // a silent try_send overflow (issue #69: the old single-frame
+            // path dropped everything over the frame cap with no error at
+            // either end). On send failure the peer's handshake ts has not
+            // advanced — next reconnect resumes naturally.
+            if let Err(e) = client_tx.send(msg.clone()).await {
+                eprintln!(
+                    "[sync] catchup '{collection}' to '{peer_key}': page {i}/{total} failed: {e}; peer resends on next handshake"
+                );
+                return;
             }
         }
+        eprintln!(
+            "[sync] catchup '{collection}' to '{peer_key}': {total} page(s) delivered"
+        );
     }
 
     /// Tails local WAL changes on the SERVER and broadcasts server-side
@@ -1254,44 +1532,53 @@ kind,
                                     let local_fp = crate::sync_guard::local_fingerprint(
                                         db.config.encryption_key.as_deref(),
                                     );
-                                    let packet = CloudPacket::Replication {
-                                        msg_id: SystemTime::now()
-                                            .duration_since(UNIX_EPOCH)
-                                            .unwrap()
-                                            .as_micros(),
-                                        collection: collection.clone(),
-                                        ops: to_send,
-                                    };
+                                    for page_ops in Self::page_out_ops(to_send).into_iter() {
+                                        let packet = CloudPacket::Replication {
+                                            msg_id: SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_micros(),
+                                            collection: collection.clone(),
+                                            ops: page_ops,
+                                        };
 
-                                    if let Ok(bytes) = rmp_serde::to_vec_named(&packet) {
-                                        let msg = Message::Binary(bytes.into());
-                                        let rt = tokio::runtime::Handle::current();
-                                        let peers_ptr = active_peers.clone();
-                                        let caps_ptr = caps_srv.clone();
-                                        let plain_c = collection.clone();
-                                        rt.block_on(async move {
-                                            let peers_guard = peers_ptr.read().await;
-                                            for (peer_id, info) in peers_guard.iter() {
-                                                if enc_local {
-                                                    let peer = caps_ptr.get(peer_id);
-                                                    if !crate::sync_guard::caps_allow(
-                                                        true,
-                                                        local_fp,
-                                                        peer.as_ref(),
-                                                    ) {
-                                                        caps_ptr.warn(
-                                                            peer_id,
-                                                            &plain_c,
-                                                            &format!(
-                                                                "withholding server fan-out of '{plain_c}' from peer '{peer_id}' (unverified key for an encrypted room)"
-                                                            ),
+                                        if let Ok(bytes) = rmp_serde::to_vec_named(&packet) {
+                                            let bytes_len = bytes.len();
+                                            let msg = Message::Binary(bytes.into());
+                                            let rt = tokio::runtime::Handle::current();
+                                            let peers_ptr = active_peers.clone();
+                                            let caps_ptr = caps_srv.clone();
+                                            let plain_c = collection.clone();
+                                            rt.block_on(async move {
+                                                let peers_guard = peers_ptr.read().await;
+                                                for (peer_id, info) in peers_guard.iter() {
+                                                    if enc_local {
+                                                        let peer = caps_ptr.get(peer_id);
+                                                        if !crate::sync_guard::caps_allow(
+                                                            true,
+                                                            local_fp,
+                                                            peer.as_ref(),
+                                                        ) {
+                                                            caps_ptr.warn(
+                                                                peer_id,
+                                                                &plain_c,
+                                                                &format!(
+                                                                    "withholding server fan-out of '{plain_c}' from peer '{peer_id}' (unverified key for an encrypted room)"
+                                                                ),
+                                                            );
+                                                            continue;
+                                                        }
+                                                    }
+                                                    if let Err(se) = info.tx.try_send(msg.clone()) {
+                                                        eprintln!(
+                                                            "[sync] fan-out '{plain_c}' to '{peer_id}': queue send failed ({} B): {}",
+                                                            bytes_len,
+                                                            se
                                                         );
-                                                        continue;
                                                     }
                                                 }
-                                                let _ = info.tx.try_send(msg.clone());
-                                            }
-                                        });
+                                            });
+                                        }
                                     }
                                 }
 
@@ -1332,17 +1619,26 @@ kind,
         let echo_cache = self.echo_cache.clone();
         let seen_messages = self.seen_messages.clone();
 
-        let (outbound_tx, mut outbound_rx) = mpsc::channel::<CloudPacket>(10_000);
+        // Outbound queue is DEEP memory (CloudPacket owns its ops), unlike
+        // the hub's Binary(Bytes) queues. A stalled WAN link must not let
+        // the staged queue grow unbounded: 256 pages × 6 MB cap bounds the
+        // worst case, and the tailer blocks (backpressure onto the WAL
+        // tail) instead of ballooning RAM.
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<CloudPacket>(256);
         *self.outbound_tx.lock().await = Some(outbound_tx.clone());
 
         self.spawn_client_outbound_tailer(echo_cache);
 
         tokio::spawn(async move {
             while running.load(Ordering::Relaxed) {
-                if let Ok((ws_stream, _)) =
-                    tokio_tungstenite::connect_async(&ws_url).await
-                {
-                    let (mut ws_tx, mut ws_rx) = ws_stream.split();
+                let ws_result = tokio_tungstenite::connect_async_with_config(
+                    &ws_url,
+                    Some(ws_transport_config()),
+                    true,
+                )
+                .await;
+                if matches!(ws_result, Ok(_)) {
+                    let (mut ws_tx, mut ws_rx) = ws_result.map(|(s, _)| s.split()).unwrap();
 
                     let auth_packet = CloudPacket::Authenticate {
                         token: auth_token.clone(),
@@ -1371,6 +1667,9 @@ kind,
                     if let Ok(CloudPacket::AuthResult { success: true, .. }) =
                         rmp_serde::from_slice(&bytes)
                     {
+                        // Auth round-trip completed: the relay lag meter
+                        // and the lease freshness both live off this.
+                        note_cloud_exchange();
                         let ping = CloudPacket::VersionPing {
                             versions: db.get_version_map(),
                             indexes: Some(db.list_indexes(None)),
@@ -1387,9 +1686,15 @@ kind,
                                             }
                                         }
                                     }
-                                    Some(Ok(msg)) = ws_rx.next() => {
+                                    ws_next = ws_rx.next() => {
+                                        match ws_next {
+                                    Some(Ok(msg)) => {
                                         if let Message::Binary(b) = msg {
                                             if let Ok(packet) = rmp_serde::from_slice::<CloudPacket>(&b) {
+                                                // Any decoded server packet
+                                                // proves the cloud path is
+                                                // alive right now.
+                                                note_cloud_exchange();
                                                 match packet {
                                                     CloudPacket::VersionPing { versions: server_versions, indexes } => {
                                                         // Server names are room-plain = client
@@ -1427,9 +1732,23 @@ kind,
                                                                 .await;
                                                         }
                                                     }
-                                                    _ => {}
+                                                     _ => {}
                                                 }
                                             }
+                                        }
+                                    }
+                                    Some(Err(e)) => {
+                                        // Issue #69: read failures were
+                                        // invisible — including the old
+                                        // 16 MiB frame-cap rejections that
+                                        // silently starved catchups.
+                                        eprintln!("[cloud-sync] ws error on {ws_url}: {e}");
+                                        break;
+                                    }
+                                    None => {
+                                        eprintln!("[cloud-sync] ws closed by peer");
+                                        break;
+                                    }
                                         }
                                     }
                                     else => break,
@@ -1437,6 +1756,15 @@ kind,
                             }
                         }
                     }
+                } else {
+                    // Issue #69: reconnect cycles were fully silent — a client
+                    // that cannot reach the hub used to sit there forever
+                    // with no trace, its last_ts frozen.
+                    eprintln!(
+                        "[cloud-sync] connect {} failed: {}",
+                        ws_url,
+                        ws_result.err().map(|e| e.to_string()).unwrap_or_default()
+                    );
                 }
 
                 tokio::time::sleep(Duration::from_secs(3)).await;
@@ -1461,17 +1789,38 @@ kind,
             return;
         }
         let ops = Self::collect_catchup_ops(db, collection, server_ts);
-
-        if !ops.is_empty() {
+        if ops.is_empty() {
+            return;
+        }
+        let total_ops = ops.len();
+        let mut op_written = 0usize;
+        for (i, page_ops) in Self::page_out_ops(ops).into_iter().enumerate() {
+            op_written += page_ops.len();
+            // Distinct msg_id per page so the hub's dedupe window never
+            // swallows a sibling page.
+            let msg_id = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros()
+                + (i as u128);
             let packet = CloudPacket::Replication {
-                msg_id: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros(),
+                msg_id,
                 collection: collection.to_string(),
-                ops,
+                ops: page_ops,
             };
-            let _ = outbound_tx.send(packet).await;
+            // Pages stay under the transport frame cap (issue #69); a
+            // failed push (hub down / queue closed) is a real condition —
+            // announce instead of dropping half silently.
+            if outbound_tx.send(packet).await.is_err() {
+                eprintln!(
+                    "[sync] upstream '{collection}': push failed at page {}/{} ({} ops sent of {})",
+                    i + 1,
+                    (op_written / Self::CATCHUP_PAGE_MAX_OPS) + 1,
+                    op_written,
+                    total_ops
+                );
+                return;
+            }
         }
     }
 
@@ -1559,15 +1908,29 @@ kind,
                                 }
 
                                 if !to_send.is_empty() {
-                                    let packet = CloudPacket::Replication {
-                                        msg_id: SystemTime::now()
-                                            .duration_since(UNIX_EPOCH)
-                                            .unwrap()
-                                            .as_micros(),
-                                        collection: col.clone(),
-                                        ops: to_send,
-                                    };
-                                    let _ = tx.blocking_send(packet);
+                                    for (i, page_ops) in
+                                        Self::page_out_ops(to_send).into_iter().enumerate()
+                                    {
+                                        let packet = CloudPacket::Replication {
+                                            msg_id: SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_micros(),
+                                            collection: col.clone(),
+                                            ops: page_ops,
+                                        };
+                                        if tx.blocking_send(packet).is_err() {
+                                            // Hub-side outbound channel is closed
+                                            // (client shutting down / reconnect
+                                            // abandons the old one) — logged,
+                                            // not swallowed.
+                                            eprintln!(
+                                                "[cloud] tailer '{col}': outbound closed at page {}",
+                                                i + 1
+                                            );
+                                            break;
+                                        }
+                                    }
                                 }
 
                                 offsets.insert(col, new_pos);
@@ -1896,5 +2259,269 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    // ---- issue #69: catch-up paging (Stage A) ----------------------------
+
+    fn small_ops(n: usize) -> Vec<WalOp> {
+        (0..n)
+            .map(|i| WalOp::PutInlined { key: format!("k{i:04}"), value: vec![7u8; 256] })
+            .collect()
+    }
+
+    #[test]
+    fn pages_split_at_doc_cap() {
+        let pages = CloudSync::page_out_ops(small_ops(2500));
+        assert_eq!(pages.len(), 3);
+        assert_eq!(pages[0].len(), CloudSync::CATCHUP_PAGE_MAX_OPS);
+        assert_eq!(pages[1].len(), CloudSync::CATCHUP_PAGE_MAX_OPS);
+        assert_eq!(pages[2].len(), 500);
+    }
+
+    #[test]
+    fn pages_split_at_byte_cap_before_doc_cap() {
+        // 8 KB docs: doc cap allows 1000 (≈8.6 MB over budget) — the byte
+        // budget must trip first.
+        let ops: Vec<WalOp> = (0..3000)
+            .map(|i| WalOp::PutInlined { key: format!("k{i:04}"), value: vec![1u8; 8192] })
+            .collect();
+        let pages = CloudSync::page_out_ops(ops);
+        // ~8.3 KB wire each: the byte budget trips before the 1000-doc cap.
+        assert_eq!(pages.len(), 4);
+        assert!(
+            pages.iter().all(|p| p.len() < CloudSync::CATCHUP_PAGE_MAX_OPS),
+            "byte budget must bound page size first"
+        );
+    }
+
+    #[test]
+    fn single_op_over_budget_is_one_page_not_a_split() {
+        // One op alone over the byte budget cannot be split further; it
+        // must still flow as a page (same exposure as the pre-pager single
+        // frame), and the transport frame cap is the honest ceiling.
+        let big = WalOp::PutInlined { key: "big".into(), value: vec![9u8; CloudSync::CATCHUP_PAGE_MAX_BYTES + 4096] };
+        let pages = CloudSync::page_out_ops(vec![big]);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].len(), 1);
+    }
+
+    #[test]
+    fn empty_batch_pages_to_nothing() {
+        assert!(CloudSync::page_out_ops(Vec::new()).is_empty());
+    }
+
+    // ---- issue #69: transport bounds shared by both faces ----------------
+
+    #[test]
+    fn ws_transport_is_bounded_and_legacy_friendly() {
+        // Non-regression guard: the shared transport config must (a) be able
+        // to receive a big legacy single frame instead of silently failing
+        // the peer, and (b) never let the outbound write accumulator balloon
+        // memory under thousands of stalled peers (was usize::MAX).
+        let cfg = ws_transport_config();
+        assert_eq!(cfg.max_frame_size, Some(64 << 20));
+        assert_eq!(cfg.max_message_size, Some(64 << 20));
+        assert_eq!(cfg.max_write_buffer_size, 16 << 20);
+    }
+
+    #[test]
+    fn no_page_ever_approaches_the_transport_cap() {
+        // Every page with ≥2 ops must sit under the byte budget + one op;
+        // the classic stress shape (40k × ~543 B wire ≈ 21 MB single frame)
+        // must end up ~21 small pages.
+        let pages = CloudSync::page_out_ops(small_ops(40_000));
+        assert!(pages.len() >= 40);
+        for (i, p) in pages.iter().enumerate() {
+            let bytes: usize = p.iter().map(CloudSync::op_wire_len).sum();
+            assert!(
+                bytes <= CloudSync::CATCHUP_PAGE_MAX_BYTES
+                    || (i == pages.len() - 1 && p.len() == 1),
+                "page {} over budget: {} B in {} ops",
+                i,
+                bytes,
+                p.len()
+            );
+        }
+    }
+
+    /// #72 lag meter: a successful exchange stamps the process-wide clock;
+    /// the getter exposes it (None = never reached the cloud).
+    #[test]
+    fn cloud_last_exchange_tracks_round_trips() {
+        // Any pre-existing value (earlier tests in this binary may have
+        // exchanged) only ever moves FORWARD from a fresh stamp.
+        let before = cloud_last_exchange_millis();
+        note_cloud_exchange();
+        let after = cloud_last_exchange_millis().expect("stamp must be visible");
+        if let Some(b) = before {
+            assert!(after >= b, "clock must be monotonic: {b} -> {after}");
+        }
+    }
+
+    /// #72 admission control: cap 1 admits the first client, rejects a
+    /// NEW client with the typed loud error, and still admits a
+    /// reconnect of the SAME client id (stale-entry replacement).
+    #[tokio::test]
+    async fn room_at_capacity_rejects_new_clients() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (db, _dir) = temp_db("cap-room");
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        let server = CloudSync::server(db, "hub", "tok-cap", "caproom", "k-cap");
+        server.set_max_clients_per_room(1);
+        server.start(&format!("127.0.0.1:{port}")).await.unwrap();
+
+        let url = format!("ws://127.0.0.1:{port}");
+        let auth = |cid: &str| {
+            rmp_serde::to_vec_named(&CloudPacket::Authenticate {
+                token: "tok-cap".into(),
+                client_id: cid.into(),
+                room_name: "caproom".into(),
+                room_key: "k-cap".into(),
+                api_key: None,
+                client_version: Some("t".into()),
+                enc_fp: None,
+                enc_cols: Vec::new(),
+            })
+            .unwrap()
+        };
+
+        // Client 1: admitted.
+        let (mut ws1, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws1.send(Message::Binary(auth("c1").into())).await.unwrap();
+        let Some(Ok(Message::Binary(b))) = ws1.next().await else {
+            panic!("no auth reply for c1");
+        };
+        match rmp_serde::from_slice::<CloudPacket>(&b).unwrap() {
+            CloudPacket::AuthResult { success: true, .. } => {}
+            other => panic!("c1 must be admitted, got {other:?}"),
+        }
+
+        // Client 2 (new id): beyond the cap — typed loud reject.
+        let (mut ws2, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws2.send(Message::Binary(auth("c2").into())).await.unwrap();
+        let Some(Ok(Message::Binary(b))) = ws2.next().await else {
+            panic!("no auth reply for c2");
+        };
+        match rmp_serde::from_slice::<CloudPacket>(&b).unwrap() {
+            CloudPacket::AuthResult { success: false, error } => {
+                assert_eq!(
+                    error.as_deref(),
+                    Some("room at capacity"),
+                    "the reject must be typed and loud"
+                );
+            }
+            other => panic!("c2 must be rejected, got {other:?}"),
+        }
+
+        // Client 1 reconnects (same id): stale-entry replacement admits.
+        drop(ws1);
+        let (mut ws1b, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws1b.send(Message::Binary(auth("c1").into())).await.unwrap();
+        let Some(Ok(Message::Binary(b))) = ws1b.next().await else {
+            panic!("no auth reply for c1 reconnect");
+        };
+        match rmp_serde::from_slice::<CloudPacket>(&b).unwrap() {
+            CloudPacket::AuthResult { success: true, .. } => {}
+            other => panic!("c1 reconnect must be admitted, got {other:?}"),
+        }
+        server.stop();
+    }
+
+    /// Shared catch-up page cache: the second fresh joiner of the same
+    /// collection at the same server_ts is served from the cache (one
+    /// materialization + encode, N sends) — the thundering-join HOL fix.
+    #[tokio::test]
+    async fn catchup_pages_shared_across_fresh_joiners() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (db, _dir) = temp_db("cache-room");
+        // 2500 docs x ~200B: three 1000-op pages per fresh join.
+        let mut doc = HakoDoc::default();
+        doc.insert("v", Value::String("x".repeat(180)));
+        for i in 0..2500 {
+            db.put("docs", &format!("k{i:05}"), &doc).unwrap();
+        }
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        let server = CloudSync::server(db, "hub", "tok-cc", "ccroom", "k-cc");
+        server.start(&format!("127.0.0.1:{port}")).await.unwrap();
+        let url = format!("ws://127.0.0.1:{port}");
+
+        let join_and_count = |cid: &'static str| {
+            let url = url.clone();
+            async move {
+                let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+                let auth = rmp_serde::to_vec_named(&CloudPacket::Authenticate {
+                    token: "tok-cc".into(),
+                    client_id: cid.into(),
+                    room_name: "ccroom".into(),
+                    room_key: "k-cc".into(),
+                    api_key: None,
+                    client_version: Some("t".into()),
+                    enc_fp: None,
+                    enc_cols: Vec::new(),
+                })
+                .unwrap();
+                ws.send(Message::Binary(auth.into())).await.unwrap();
+                let Some(Ok(Message::Binary(b))) = ws.next().await else {
+                    panic!("{cid}: no auth reply");
+                };
+                assert!(matches!(
+                    rmp_serde::from_slice::<CloudPacket>(&b).unwrap(),
+                    CloudPacket::AuthResult { success: true, .. }
+                ));
+                let ping = rmp_serde::to_vec_named(&CloudPacket::VersionPing {
+                    versions: HashMap::new(),
+                    indexes: None,
+                })
+                .unwrap();
+                ws.send(Message::Binary(ping.into())).await.unwrap();
+
+                let mut ops = 0usize;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+                while ops < 2500 {
+                    assert!(tokio::time::Instant::now() < deadline, "{cid}: timeout at {ops}");
+                    let Some(Ok(Message::Binary(b))) = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        ws.next(),
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                    else {
+                        break;
+                    };
+                    if let Ok(CloudPacket::Replication { ops: page, .. }) =
+                        rmp_serde::from_slice::<CloudPacket>(&b)
+                    {
+                        ops += page.len();
+                    }
+                }
+                ws.close(None).await.ok();
+                ops
+            }
+        };
+
+        let got1 = join_and_count("cc1").await;
+        assert_eq!(got1, 2500, "first joiner materializes and receives all");
+        let got2 = join_and_count("cc2").await;
+        assert_eq!(got2, 2500, "second joiner must receive the identical stream");
+        assert!(
+            server.catchup_cache_hits() >= 1,
+            "second join must be served from the shared cache"
+        );
+        server.stop();
     }
 }
