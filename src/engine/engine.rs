@@ -443,6 +443,15 @@ pub struct Hako {
     // doc_versions: RwLock<HashMap<String, u64>>,
     pub(crate) doc_versions: Vec<RwLock<HashMap<Arc<str>, u64>>>,
     global_version: AtomicU64,
+    /// Hybrid-clock watermark (issue #80): the highest doc timestamp this
+    /// engine has ever emitted OR accepted from the wire. Local writes stamp
+    /// at `max(now, watermark + 1)` so a wall-clock jump backward (NTP step,
+    /// VM restore) can never emit a timestamp older than one already
+    /// circulating — which would let a jumped peer's stale-but-future-
+    /// stamped bootstrap re-offer silently resurrect over newer local
+    /// writes, forever. Remote ingest also raises the watermark (see
+    /// sync_core / cloud_sync apply paths).
+    last_ts_watermark: std::sync::atomic::AtomicI64,
     security_rules: RwLock<Vec<SecurityRule>>,
     /// ponytail: lock-free gate for allowed(). The common case (no rules)
     /// skips the RwLock acquisition on every op; set alongside the rules.
@@ -897,6 +906,7 @@ impl Hako {
             // stepped BACKWARD past the last run reopens the hole —
             // ETag users with strict needs should add a boot epoch.
             global_version: AtomicU64::new(crate::util::clock::now_micros().max(1) as u64),
+            last_ts_watermark: std::sync::atomic::AtomicI64::new(crate::util::clock::now_micros() as i64),
             security_rules: RwLock::new(Vec::new()),
             security_enabled: std::sync::atomic::AtomicBool::new(false),
             read_only: std::sync::atomic::AtomicBool::new(false),
@@ -1606,7 +1616,15 @@ impl Hako {
         WRITE_STATS.batches.fetch_add(1, Ordering::Relaxed);
         WRITE_STATS.mutations.fetch_add(mutations.len() as u64, Ordering::Relaxed);
         let now_nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64;
-        let now_micros = now_nanos / 1000; 
+        let mut now_micros = now_nanos / 1000;
+        // Hybrid-clock guard (issue #80): never stamp below a timestamp
+        // already emitted or accepted — a backward wall-clock step would
+        // otherwise make every future local write lose LWW forever.
+        let watermark = self.last_ts_watermark.load(std::sync::atomic::Ordering::Relaxed);
+        if now_micros <= watermark {
+            now_micros = watermark.saturating_add(1);
+        }
+        self.last_ts_watermark.store(now_micros, std::sync::atomic::Ordering::Relaxed);
 
         let threshold = self.config.value_blob_threshold_bytes;
         let mut shard_map: HashMap<String, ShardWork> = HashMap::new();
@@ -2890,6 +2908,31 @@ impl Hako {
     }
 
     /// Read-only enforcement switch (hakocluster: replicas + failover).
+    /// Raise the hybrid-clock watermark to a timestamp observed on the
+    /// wire (issue #80). Called by the ingest paths for LWW-ACCEPTED ops
+    /// only, so dropped stale ops can't drag the stamp forward. The chase
+    /// clamps at a generous skew ceiling: a doc stamped beyond it still
+    /// applies (content wins), but an absurd/attacker timestamp can't pin
+    /// the watermark at i64::MAX — that would tie every later stamp and
+    /// tombstone comparison into permanent drops.
+    pub(crate) fn observe_remote_ts(&self, ts: i64) {
+        const SKEW_CEILING_MICROS: i64 = 100 * 365 * 24 * 60 * 60 * 1_000_000; // 100y
+        let ceiling = crate::util::clock::now_micros() as i64 + SKEW_CEILING_MICROS;
+        let effective = ts.min(ceiling);
+        let mut cur = self.last_ts_watermark.load(std::sync::atomic::Ordering::Relaxed);
+        while effective > cur {
+            match self.last_ts_watermark.compare_exchange_weak(
+                cur,
+                effective,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
     /// Refuses local writes at the write_batch gate; replicated ingest
     /// and all reads are unaffected. Reversible.
     pub fn set_read_only(&self, ro: bool) {
