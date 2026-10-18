@@ -39,22 +39,6 @@ impl CompositeIndexManager {
         (self.by_id.clone(), self.next_id)
     }
 
-    /// Merge persisted trees back in. Only ids that exist in the current
-    /// definitions (restored from definitions.json first) and whose
-    /// definition still matches are overwritten — anything else is a
-    /// stale/foreign entry and stays out. Allocator takes the max so a
-    /// future create never reuses a live id.
-    pub(crate) fn import_snapshot(&mut self, trees: HashMap<u32, CompositeIndex>, next_id: u32) {
-        for (id, index) in trees {
-            if let Some(existing) = self.by_id.get(&id) {
-                if existing.definition == index.definition {
-                    self.by_id.insert(id, index);
-                }
-            }
-        }
-        self.next_id = self.next_id.max(next_id);
-    }
-
     /// Filtered import: trees for skipped collections (rebuilt newer by
     /// a touch/load) are left alone. Same definition-match rule as above.
     pub(crate) fn import_snapshot_filtered(

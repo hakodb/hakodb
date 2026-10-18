@@ -1,25 +1,24 @@
 #[cfg(feature = "cloud-sync")]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 #[cfg(feature = "cloud-sync")]
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 #[cfg(feature = "cloud-sync")]
-use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex};
 #[cfg(feature = "cloud-sync")]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "cloud-sync")]
+use crate::engine::engine::IndexList;
 #[cfg(feature = "cloud-sync")]
 use crate::document::hako_doc::HakoDoc;
 #[cfg(feature = "cloud-sync")]
 use crate::document::value::Value;
 #[cfg(feature = "cloud-sync")]
 use crate::engine::engine::IndexOp;
-use crate::engine::engine::IndexList;
 #[cfg(feature = "cloud-sync")]
-use crate::engine::{BatchMutation, ChangeEvent, ChangeKind, Hako};
+use crate::engine::{ChangeEvent, ChangeKind, Hako};
 #[cfg(feature = "cloud-sync")]
 use crate::error::{HakoError, Result as FLResult};
-#[cfg(feature = "cloud-sync")]
-use crate::query::query::Query;
 #[cfg(feature = "cloud-sync")]
 use crate::storage::engine::Pointer;
 #[cfg(feature = "cloud-sync")]
@@ -166,20 +165,6 @@ pub struct CloudStatus {
 // collections under their plain names, so one server process serves one
 // room. Multi-room hosting is N server processes (or hakocluster
 // multidb), never name-mangled collections in one database.
-
-#[cfg(feature = "cloud-sync")]
-fn hash_room_id(room_name: &str, room_key: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(room_name.as_bytes());
-    hasher.update(b"\x00");
-    hasher.update(room_key.as_bytes());
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(64);
-    for b in digest {
-        hex.push_str(&format!("{:02x}", b));
-    }
-    hex
-}
 
 /// Group policy store: a `__groups` doc per room name (admin-managed).
 /// Absent row or `mode: "open"` admits everyone (historic behavior);
@@ -1372,7 +1357,7 @@ kind,
         // send N times (Bytes/Message clones are refcount bumps). A version
         // bump replaces the entry on the next miss.
         let cached: Option<Arc<Vec<Message>>> = {
-            let mut guard = cache.lock().unwrap();
+            let guard = cache.lock().unwrap();
             match guard.get(collection) {
                 Some(entry) if entry.server_ts == server_ts && client_ts == 0 => {
                     cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -1409,7 +1394,7 @@ kind,
                     }
                 }
                 let packets = Arc::new(encoded);
-                let mut guard = cache.lock().unwrap();
+            let mut guard = cache.lock().unwrap();
                 guard.insert(
                     collection.to_string(),
                     CatchupCacheEntry { server_ts, packets: packets.clone() },
@@ -1962,17 +1947,6 @@ mod tests {
         cfg.durability_mode = DurabilityMode::Manual;
         let db = Arc::new(Hako::open(&dir, cfg).unwrap());
         (db, dir)
-    }
-
-    #[test]
-    fn room_identity_is_name_plus_key() {
-        // Room identity binds BOTH halves: same name + different key are
-        // different rooms (handshake rejects cross-talk), same pair is
-        // stable across calls. No registry, no allocation, no suffixes.
-        let a = hash_room_id("alpha", "k1");
-        assert_eq!(a, hash_room_id("alpha", "k1"));
-        assert_ne!(a, hash_room_id("alpha", "k2"));
-        assert_ne!(a, hash_room_id("beta", "k1"));
     }
 
     #[test]
