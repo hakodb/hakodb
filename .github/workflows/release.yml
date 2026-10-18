@@ -165,6 +165,11 @@ jobs:
     needs: [windows-msvc, linux, linux-musl, android]
     runs-on: ubuntu-latest
     steps:
+      # Full history: the notes below diff this tag against the previous
+      # one, and a shallow clone has no tags to diff against.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           name: hakodb-${{ github.ref_name }}-x86_64-pc-windows-msvc
@@ -217,6 +222,20 @@ jobs:
             (cd pkg && tar -czf "../release/hakodb-${{ github.ref_name }}-$tag.tar.gz" "$tag")
           done
           (cd release && sha256sum * > SHA256SUMS)
+      - name: Derive release notes
+        run: |
+          PREV=$(git tag --sort=-creatordate --merged HEAD | sed -n 2p)
+          {
+            if [ -n "$PREV" ]; then
+              echo "## Changes since $PREV"
+              git log --no-merges --pretty=format:"- %s (%h)" "$PREV..HEAD"
+            else
+              echo "## Initial tagged release"
+              git log --no-merges --pretty=format:"- %s (%h)" | head -30
+            fi
+          } > body.md
       - uses: softprops/action-gh-release@v2
         with:
           files: release/*
+          body_path: body.md
+          generate_release_notes: true
