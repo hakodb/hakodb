@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+﻿use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -42,7 +42,7 @@ thread_local! {
 
 // --- Write-path phase accounting (ponytail) ---
 // Always-on accumulators: a handful of Instant reads + Relaxed adds per
-// batch (~0.1µs against 20µs+ batches). Read via `write_stats_report()`
+// batch (~0.1Âµs against 20Âµs+ batches). Read via `write_stats_report()`
 // (resets), e.g. from the `hk_debug_write_stats` FFI hook or a test.
 pub(crate) struct WritePhaseStats {
     pub batches: AtomicU64,
@@ -116,7 +116,7 @@ pub fn write_stats_report() -> String {
 // the honest metric. Same always-on discipline as WRITE_STATS (a pair of
 // Instant reads + Relaxed adds per acquisition). Read via
 // `lock_stats_report()` (resets), e.g. from a test or a mixed-load probe.
-// Sampling points (not exhaustive — the three that gate mixed r/w):
+// Sampling points (not exhaustive â€” the three that gate mixed r/w):
 // write_batch apply (shard write), Hako::get (shard read), query scan
 // (storage read in execute Phase 1).
 pub(crate) struct LockPhaseStats {
@@ -132,7 +132,7 @@ pub(crate) static LOCK_STATS: LockPhaseStats = LockPhaseStats {
     read_acqs: AtomicU64::new(0),
 };
 
-/// Human-readable lock-wait table + reset. `avg` per acquisition —
+/// Human-readable lock-wait table + reset. `avg` per acquisition â€”
 /// ~0 when free, >> 0 under contention.
 pub fn lock_stats_report() -> String {
     let wacq = LOCK_STATS.write_acqs.load(Ordering::Relaxed);
@@ -179,7 +179,7 @@ pub enum ChangeKind {
 
 #[derive(Debug, Clone)]
 pub struct ChangeEvent {
-    // ponytail: shared id — every write fans out one event per mutation and
+    // ponytail: shared id â€” every write fans out one event per mutation and
     // the old String clone per event was pure tax; subscribers bump or copy
     // out only what they forward.
     pub path: Arc<str>,
@@ -204,7 +204,7 @@ pub struct SecurityRule {
 
 /// Collections that must never leave the device over sync (net or cloud),
 /// in either direction. Sync-state, room registry, and the admin plane's
-/// credential stores. (`__hako_security` is deliberately NOT here —
+/// credential stores. (`__hako_security` is deliberately NOT here â€”
 /// policy documents replicate by design.)
 pub const SYNC_EXCLUDED_COLLECTIONS: &[&str] = &[
     "__hako_system",
@@ -255,6 +255,14 @@ pub struct CompositeIndexInfo {
     pub id: u32,
     pub collection: String,
     pub fields: Vec<CompositeIndexFieldInfo>,
+    /// Uniqueness constraint (hakodb#71). Additive key: older JSON
+    /// consumers ignore it; absent on legacy files → false.
+    #[serde(default)]
+    pub unique: bool,
+    /// Sparse (missing fields skip the doc) vs dense (missing = NULL
+    /// tuple). Inert for non-unique indexes; additive key as above.
+    #[serde(default)]
+    pub sparse: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -319,6 +327,16 @@ struct PersistedCompositeIndex {
     id: u32, 
     collection: String,
     fields: Vec<(String, String)>,
+    /// Unique-index constraint (hakodb#71). Additive with serde defaults:
+    /// legacy defs.json files load as non-unique exactly like before.
+    #[serde(default)]
+    unique: bool,
+    #[serde(default)]
+    sparse: bool,
+    /// Filtered-index predicate. Serialized as a full FilterGroup; older
+    /// files default to None.
+    #[serde(default)]
+    filter: Option<crate::query::filter::FilterGroup>,
 }
 
 pub struct Transaction {
@@ -332,6 +350,51 @@ struct ShardWork {
     index_puts: Vec<(String, Arc<HakoDoc>)>, 
     index_deletes: Vec<(String, HakoDoc)>,
     blob_queue_items: Vec<BlobWork>,
+}
+
+/// One unique index participating in write-batch admission (hakodb#71).
+/// Defs are cloned once per collection per batch; per-doc work reuses
+/// them. `index_id` mirrors `def.id` (the ledger keys by index id).
+#[derive(Clone)]
+struct GateDef {
+    index_id: u32,
+    def: crate::index::composite::definition::CompositeIndexDefinition,
+}
+
+/// Scope guard: on drop (batch abort â€” violation, WAL failure, panic)
+/// replays the batch's ledger mutations in reverse, restoring exact
+/// pre-batch claim state. Armed on construction, disarmed on success.
+/// Owns the undo vec so the write loop can pass `&mut` freely.
+///
+/// ponytail: a WAL failure after partial applies removes ledgers for
+/// rows that DID land â€” uniqueness for those rows under-enforces until
+/// they rewrite or reload. A WAL write failure is already the
+/// disk-full/corruption event path; acceptable trade, noted here.
+struct LedgerRollbackGuard<'a> {
+    ledger: &'a crate::index::composite::ledger::UniqueLedger,
+    undo: Vec<crate::index::composite::ledger::LedgerUndo>,
+    armed: bool,
+}
+
+impl<'a> LedgerRollbackGuard<'a> {
+    fn new(ledger: &'a crate::index::composite::ledger::UniqueLedger) -> Self {
+        Self {
+            ledger,
+            undo: Vec::new(),
+            armed: true,
+        }
+    }
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LedgerRollbackGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed && !self.undo.is_empty() {
+            self.ledger.rollback(&self.undo);
+        }
+    }
 }
 
 impl Transaction {
@@ -359,6 +422,11 @@ pub struct SerializableTransaction {
 }
 
 impl SerializableTransaction {
+    /// Issue #71/F5 item 3: registers the read-set from ONE atomic
+    /// shard-locked read (doc + version together). The previous
+    /// `db.get()` + `db.current_version()` pair left the window where a
+    /// commit landing between the two calls recorded the NEW version for
+    /// the OLD document â€” a silent lost-update read-modify-write.
     pub fn get(
         &mut self,
         db: &Hako,
@@ -366,10 +434,16 @@ impl SerializableTransaction {
         doc_id: &str,
     ) -> Result<Option<HakoDoc>> {
         let key = doc_id.to_string();
-        let doc = db.get(collection, doc_id)?;
-        let version = db.current_version(&key);
-        self.reads.insert(key, version);
-        Ok(doc)
+        match db.get_versioned(collection, doc_id)? {
+            Some((doc, version)) => {
+                self.reads.insert(key, Some(version));
+                Ok(Some(doc))
+            }
+            None => {
+                self.reads.insert(key, None);
+                Ok(None)
+            }
+        }
     }
     pub fn put(&mut self, collection: &str, doc_id: &str, doc: HakoDoc) {
         self.mutations.push(BatchMutation::Put {
@@ -399,8 +473,8 @@ pub(crate) enum IndexOp {
 }
 
 /// Snapshot of background activity behind `Hako::await_quiescent`.
-/// Fresh writes settle through four stages — open-time index recovery,
-/// async index updates, blob persistence, periodic maintenance — and a
+/// Fresh writes settle through four stages â€” open-time index recovery,
+/// async index updates, blob persistence, periodic maintenance â€” and a
 /// read benchmarked mid-flight measures contention, not the engine.
 /// Poll this to see what is outstanding instead of guessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -431,7 +505,7 @@ impl QuiescenceStatus {
     }
 }
 
-/// Decrements the backfill counter on scope exit — including panics, so a
+/// Decrements the backfill counter on scope exit â€” including panics, so a
 /// dying backfill thread can't wedge the quiescence verdict at nonzero.
 struct BackfillGuard {
     counter: Arc<std::sync::atomic::AtomicUsize>,
@@ -462,7 +536,7 @@ pub struct Hako {
     /// engine has ever emitted OR accepted from the wire. Local writes stamp
     /// at `max(now, watermark + 1)` so a wall-clock jump backward (NTP step,
     /// VM restore) can never emit a timestamp older than one already
-    /// circulating — which would let a jumped peer's stale-but-future-
+    /// circulating â€” which would let a jumped peer's stale-but-future-
     /// stamped bootstrap re-offer silently resurrect over newer local
     /// writes, forever. Remote ingest also raises the watermark (see
     /// sync_core / cloud_sync apply paths).
@@ -472,7 +546,7 @@ pub struct Hako {
     /// skips the RwLock acquisition on every op; set alongside the rules.
     security_enabled: std::sync::atomic::AtomicBool,
     /// Read-only enforcement (hakocluster phase 3): when set, write_batch
-    /// — the single admission gate for ALL local writes — refuses, while
+    /// â€” the single admission gate for ALL local writes â€” refuses, while
     /// replicated ingest (apply_replicated_batch, bypasses write_batch by
     /// design) keeps converging. Reads never check this.
     read_only: std::sync::atomic::AtomicBool,
@@ -483,7 +557,7 @@ pub struct Hako {
     /// Quiescence reads this instead of channel len (std mpsc has none).
     pub(crate) index_inflight: Arc<std::sync::atomic::AtomicUsize>,
     /// ponytail: create_*_index backfill threads in flight (one per index
-    /// build over existing docs). Quiescence covers these too — an index
+    /// build over existing docs). Quiescence covers these too â€” an index
     /// that exists-but-is-backfilling otherwise serves partial results
     /// with no signal at all.
     pub(crate) backfill_inflight: Arc<std::sync::atomic::AtomicUsize>,
@@ -491,7 +565,7 @@ pub struct Hako {
     /// open, newer than any snapshot import. Recovery import skips them
     /// (import-then-touch and touch-then-import converge identically;
     /// without this the late import clobbers fresh fills with stale
-    /// snapshot state — a load-bearing race on every lazy touch).
+    /// snapshot state â€” a load-bearing race on every lazy touch).
     index_touched: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Per-collection lazy-load backfill progress (done, total). Present
     /// only while a `start_collection_load` thread runs; removed on
@@ -508,7 +582,7 @@ pub struct Hako {
     /// ponytail: true while the 5s system thread runs maintenance
     /// (checkpoint, compaction, tombstone purge, index snapshots) on any
     /// shard. Try-locks make it polite, but readers still share cache and
-    /// IO with it — quiescence checks read this (see await_quiescent).
+    /// IO with it â€” quiescence checks read this (see await_quiescent).
     pub(crate) maintenance_running: Arc<std::sync::atomic::AtomicBool>,
     plan_cache: PlanCache,
     /// ponytail: hot decoded-doc cache. Key is `collection\0doc_id` (ids are
@@ -524,11 +598,16 @@ pub struct Hako {
     /// untouched (tombstones keep fresh timestamps, so the deleter never
     /// looks "behind" to a handshake); every sync outbound tailer and both
     /// handshake catch-up paths consult `is_local_only` and skip matches.
-    /// Key format is `col\0id` (NUL separator — ids may contain anything).
+    /// Key format is `col\0id` (NUL separator â€” ids may contain anything).
     /// Persisted best-effort into `__hako_system/local_only` so a
     /// restart can't re-tail un-checkpointed local-only ops upstream.
     pub(crate) local_only_cols: RwLock<HashSet<String>>,
     pub(crate) local_only_keys: RwLock<HashSet<String>>,
+    /// Unique-index claims ledger (hakodb#71). Synchronous admission for
+    /// unique composite indexes â€” the async tree leaves a duplicate
+    /// window, so writes consult this instead. Derived/rebuildable from
+    /// storage (trees + recovery fold); WAL stays the durability source.
+    pub(crate) unique_ledger: std::sync::Arc<crate::index::composite::ledger::UniqueLedger>,
 }
 
 /// Relocate report: moved ids + ids missing at source.
@@ -542,7 +621,7 @@ pub struct RelocateReport {
 ///
 /// **Not a transaction**: a concurrent writer mutates segments and WAL
 /// between reads, so fields may disagree by a few writes. For sizing,
-/// disk-pressure alerting and ordering decisions only — never diff them
+/// disk-pressure alerting and ordering decisions only â€” never diff them
 /// for correctness.
 #[derive(Debug, Clone)]
 pub struct CollectionStats {
@@ -570,7 +649,7 @@ pub struct DropReport {
     pub docs_removed: u64,
     /// On-disk bytes the shard directory held when it was unlinked.
     pub bytes_reclaimed: u64,
-    /// The dropped collection name(s) — always the requested one on
+    /// The dropped collection name(s) â€” always the requested one on
     /// success; empty when the collection did not exist (idempotent).
     pub collections_dropped: Vec<String>,
 }
@@ -634,14 +713,14 @@ impl Hako {
                 match op {
                     IndexOp::Update { collection, puts, deletes } => {
                         // P2: blob-resident embeddings must be durable
-                        // BEFORE the indexer resolves them — blob puts
+                        // BEFORE the indexer resolves them â€” blob puts
                         // land in an async flush queue, so resolving
                         // straight from the link would read unwritten
                         // regions (zeros/garbage indexed as vectors).
                         // Drain first, then resolve. Gated: only when a
                         // put actually carries a BlobLink in a vector
                         // field (lock-free scan, no guard held while
-                        // draining — never nest index/shard locks).
+                        // draining â€” never nest index/shard locks).
                         let vec_probe: Vec<String> = idx_clone
                             .read()
                             .map(|m| {
@@ -708,6 +787,11 @@ impl Hako {
                             let doc_ref: &HakoDoc = resolved.as_ref().unwrap_or(doc);
                             IndexingService::apply_put(&mut mgr, &collection, id, doc_ref);
                             for idx in mgr.indexes_for_collection(&collection) {
+                                // Filtered defs only log/serve matching docs
+                                // (hakodb#71) — the log must mirror the tree.
+                                if !idx.definition.filter_passes(id, doc_ref) {
+                                    continue;
+                                }
                                 if let Some(vals) = idx.document_values(&id, doc_ref) {
                                     let key_bytes = crate::index::composite::key_encoder::encode_composite_key(&idx.definition, &vals, &id);
                                     let _ = persist.insert(idx.definition.id, key_bytes.to_vec(), id.clone());
@@ -742,7 +826,7 @@ impl Hako {
 
         let indexes_sys_ptr = Arc::clone(&indexes);
         let root_path_sys = root_path.clone();
-        // ponytail: copied, not shared — a benchmark holds maintenance for
+        // ponytail: copied, not shared â€” a benchmark holds maintenance for
         // a whole run; live-toggling mid-run would only add a race for no
         // benefit (the tick re-reads every 5s anyway if this ever needs it).
         let maintenance_on = config.background_maintenance;
@@ -763,20 +847,20 @@ impl Hako {
                 if last_maint.elapsed() >= Duration::from_secs(5) {
                     // ponytail: holdable via background_maintenance=false
                     // (deterministic benchmarks, latency bounds). Skipping
-                    // is always safe — writes/reads never depend on this
+                    // is always safe â€” writes/reads never depend on this
                     // block, files just grow until it runs again.
                     if maintenance_on {
                     // ponytail: visible to quiescence checks for the whole
-                    // block (checkpoint, purge, snapshots) — set even though
+                    // block (checkpoint, purge, snapshots) â€” set even though
                     // the inner locks are try_-based, because readers still
                     // share page cache and IO bandwidth with it.
                     maintenance_for_system.store(true, Ordering::Release);
-                    // Query-aware shedding: queries in flight → skip the
+                    // Query-aware shedding: queries in flight â†’ skip the
                     // NON-DURABILITY heavy work this tick (tier compaction,
                     // segment spill, tombstone purge, both snapshots) so
                     // queries never queue behind their I/O. WAL flush
                     // stays (durability is never deferred). At most 3
-                    // consecutive sheds, then run regardless — backlog
+                    // consecutive sheds, then run regardless â€” backlog
                     // must drain under sustained load.
                     let shedding = crate::query::executor::executor::queries_inflight() > 0
                         && deferred_ticks < 3;
@@ -788,7 +872,7 @@ impl Hako {
                     let active_shards: Vec<Arc<RwLock<StorageEngine>>> = shards_sys_clone.read().unwrap().values().cloned().collect();
                     for s in active_shards {
                         // Tier compaction runs lock-free (prepare/commit
-                        // only) and only when not shedding — merge I/O
+                        // only) and only when not shedding â€” merge I/O
                         // never queues queries, guard held or not.
                         if !shedding {
                             let _ = StorageEngine::try_compact_tiers(&s);
@@ -840,7 +924,7 @@ impl Hako {
             // Meta-update completions waiting on a contended shard lock.
             // The worker NEVER blocks: a contended shard is skipped and
             // retried next tick (entries stay BlobPending, served from
-            // their Arc — reads stay correct meanwhile). Bounded: each
+            // their Arc â€” reads stay correct meanwhile). Bounded: each
             // item is carried at most until its shard frees.
             let mut carry: Vec<(Arc<RwLock<StorageEngine>>, String, Vec<u8>, i64, usize)> = Vec::new();
             loop {
@@ -955,7 +1039,7 @@ impl Hako {
             // theoretical). Micros always advance across restarts, so fresh
             // versions can never equal pre-restart ones (same-process
             // uniqueness still comes from fetch_add). Caveat: a clock
-            // stepped BACKWARD past the last run reopens the hole —
+            // stepped BACKWARD past the last run reopens the hole â€”
             // ETag users with strict needs should add a boot epoch.
             global_version: AtomicU64::new(crate::util::clock::now_micros().max(1) as u64),
             last_ts_watermark: std::sync::atomic::AtomicI64::new(crate::util::clock::now_micros() as i64),
@@ -982,6 +1066,7 @@ impl Hako {
             doc_cache: RwLock::new(HashMap::new()),
             local_only_cols: RwLock::new(HashSet::new()),
             local_only_keys: RwLock::new(HashSet::new()),
+            unique_ledger: std::sync::Arc::new(crate::index::composite::ledger::UniqueLedger::default()),
         };
 
         let _ = db.restore_index_defs();
@@ -994,6 +1079,7 @@ impl Hako {
         let config_thread = config.clone();
         let backfill_ptr = Arc::clone(&db.backfill_inflight);
         let index_touched_ptr = Arc::clone(&db.index_touched);
+        let ledger_ptr = Arc::clone(&db.unique_ledger);
         
         // Capture the new Crossbeam Sender
         let blob_tx_thread = db.blob_tx.clone(); 
@@ -1015,7 +1101,7 @@ impl Hako {
                 if let Ok(bytes) = std::fs::read(&snapshot_path) {
                     let mut mgr = indexes_ptr.write().unwrap();
                     // Collections touched after open are newer than any
-                    // snapshot — leave their entries alone (both orders
+                    // snapshot â€” leave their entries alone (both orders
                     // converge; otherwise a late import clobbers fresh
                     // fills with stale state).
                     let skip = index_touched_ptr.lock().map(|g| g.clone()).unwrap_or_default();
@@ -1023,6 +1109,26 @@ impl Hako {
                         snapshot_loaded = true;
                         composite_restored = restored;
                         snap_tails = tails;
+                        // hakodb#71: unique-def trees restored from the
+                        // snapshot refold into the claim ledger. Skipped
+                        // collections (touched after open, fresher than
+                        // the snapshot) fold from their STEP C rescan
+                        // instead. Legacy dumps (restored=false) leave
+                        // the fold to STEP E's backfill threads.
+                        if restored {
+                            let targets: Vec<u32> = mgr
+                                .composite
+                                .all_indexes()
+                                .filter(|i| i.definition.unique
+                                    && !skip.contains(&i.definition.collection))
+                                .map(|i| i.definition.id)
+                                .collect();
+                            for uid in targets {
+                                if let Some(idx) = mgr.composite.get(uid) {
+                                    let _ = ledger_ptr.load_from_tree(uid, &idx.tree);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1033,7 +1139,7 @@ impl Hako {
                 for entry in entries.flatten() {
                     if entry.path().is_dir() {
                         let name = entry.file_name().to_string_lossy().to_string();
-                        // Ignore system folders — and the lazy archive
+                        // Ignore system folders â€” and the lazy archive
                         // group (no WAL replay, sort, index or composite
                         // backfill, no blob setup; the dir merely existing
                         // suffices until first touch).
@@ -1063,19 +1169,19 @@ impl Hako {
                     storage.blob_tx = Some(blob_tx_thread.clone());
                     
                     // REBUILD ONLY IF STALE: a fresh snapshot (WAL tails
-                    // equal) means the RAM entries are complete — skip the
+                    // equal) means the RAM entries are complete â€” skip the
                     // scan. Anything else (no snapshot, legacy file, crash
                     // after the last snapshot) clears and rebuilds, so
                     // post-snapshot deletes leave no ghosts.
                     //
                     // P2 touched-branch: collections with post-open writes
-                    // ALWAYS rescan (fresh or not — a fresh snapshot plus
+                    // ALWAYS rescan (fresh or not â€” a fresh snapshot plus
                     // RAM-buffered Manual writes would otherwise skip both
                     // import and rescan and lose old rows), but refill
                     // ADDITIVELY: wiping would drop the live entries the
                     // writes just built (disk is older by construction).
                     // Crash-window ghosts from additive refill stay
-                    // invisible — every scan arm filters storage liveness.
+                    // invisible â€” every scan arm filters storage liveness.
                     let touched_now = index_touched_ptr
                         .lock()
                         .map(|g| g.contains(&col_name))
@@ -1091,7 +1197,7 @@ impl Hako {
                             if !touched_now {
                                 mgr.clear_collection(&col_name);
                             }
-                            // ponytail: selective decode — only indexed
+                            // ponytail: selective decode â€” only indexed
                             // fields materialize (same index state, no
                             // value allocs for the rest). Traverse forces
                             // full decode: refs live in any field, and any
@@ -1110,9 +1216,23 @@ impl Hako {
                                         mgr.index_document(&col_name, &doc_id, &doc);
                                     }
                                 }
+                                // hakodb#71: rescan rebuilt this collection's
+                                // trees newest-of-all — fold unique defs into
+                                // the claim ledger (write gate turns on).
+                                let unique_ids: Vec<u32> = mgr
+                                    .composite
+                                    .indexes_for_collection(&col_name)
+                                    .filter(|i| i.definition.unique)
+                                    .map(|i| i.definition.id)
+                                    .collect();
+                                for uid in unique_ids {
+                                    if let Some(idx) = mgr.composite.get(uid) {
+                                        let _ = ledger_ptr.load_from_tree(uid, &idx.tree);
+                                    }
+                                }
                             }
                             // Vector graphs refilled above through the
-                            // index_document hook — mark complete so ANN
+                            // index_document hook â€” mark complete so ANN
                             // may serve this collection.
                             mgr.complete_vector(&col_name);
                         }
@@ -1134,7 +1254,7 @@ impl Hako {
             // skipped (a fresh snapshot carries no HNSW bytes in P1) or
             // whose graphs are otherwise incomplete. Without this, graphs
             // stay incomplete forever and every KNN brute-forces. Runs
-            // under backfill_inflight (queries fail-closed meanwhile —
+            // under backfill_inflight (queries fail-closed meanwhile â€”
             // same rule as creation). Collections rescanned in STEP C
             // already flipped `complete` above and are skipped here.
             {
@@ -1184,7 +1304,7 @@ impl Hako {
                 let _ = crate::index::storage::index_recovery::replay_log(&log_path, &mut mgr.composite);
             }
 
-            // --- STEP E: legacy snapshot upgrade — secondary/fts came
+            // --- STEP E: legacy snapshot upgrade â€” secondary/fts came
             // from the file but composite trees did not (pre-fix format).
             // Backfill every registered composite from data (one-time;
             // quiescence covers it, queries sweep meanwhile, same as a
@@ -1213,6 +1333,7 @@ impl Hako {
                             Arc::clone(&backfill_ptr),
                             shard_arc,
                             id,
+                            Arc::clone(&ledger_ptr),
                         );
                     }
                 }
@@ -1269,7 +1390,7 @@ impl Hako {
     }
 
     /// Non-creating shard lookup (issue #6): read paths must not
-    /// materialize a collection as a side effect — a denied or failed
+    /// materialize a collection as a side effect â€” a denied or failed
     /// operation leaves `list_collections` untouched. Returns None when
     /// the shard is not currently loaded.
     pub(crate) fn try_get_shard(&self, collection: &str) -> Option<Arc<RwLock<StorageEngine>>> {
@@ -1281,9 +1402,9 @@ impl Hako {
 
     /// Read-path shard lookup that must NEVER register new collections
     /// (issue #6): returns an existing shard, opens one whose directory
-    /// already exists (recovery/WAL replay — preserves touch-load for
+    /// already exists (recovery/WAL replay â€” preserves touch-load for
     /// lazy and reopen-on-access for cold pages), and `None` otherwise.
-    /// A name never written has no directory ⇒ no shard, no listing leak.
+    /// A name never written has no directory â‡’ no shard, no listing leak.
     pub(crate) fn try_get_shard_on_disk(
         &self,
         collection: &str,
@@ -1310,7 +1431,7 @@ impl Hako {
         // 2. Creation Path (Outside of write lock to prevent poisoning during IO)
         let (shard_arc, created) = self.open_shard_new(collection)?;
         // Touch-load indexing: a lazily-opened collection carries real data
-        // the recovery skip never indexed — backfill RAM secondary/FTS (+
+        // the recovery skip never indexed â€” backfill RAM secondary/FTS (+
         // composite trees; set semantics, so a snapshot that already held
         // entries stays correct) and durable composite backfills. Without
         // this the touch degrades to FullCollection scans.
@@ -1321,7 +1442,7 @@ impl Hako {
     }
 
     /// Open + insert without any indexing. Returns the authoritative Arc
-    /// and whether this call created it (a racing thread may have won —
+    /// and whether this call created it (a racing thread may have won â€”
     /// its load path owns indexing then).
     fn open_shard_new(&self, collection: &str) -> Result<(Arc<RwLock<StorageEngine>>, bool)> {
         let path = self.root_path.join(collection);
@@ -1391,6 +1512,7 @@ impl Hako {
                 Arc::clone(&self.backfill_inflight),
                 shard_arc.clone(),
                 id,
+                Arc::clone(&self.unique_ledger),
             );
         }
         Ok(true)
@@ -1489,7 +1611,7 @@ impl Hako {
     /// just leaves queries sweeping until the next touch.
     /// Union of registered index fields for `collection` (secondary +
     /// FTS + composite): the exact set a backfill must decode. Everything
-    /// else is framing-skipped via `decode_projected` — same index state,
+    /// else is framing-skipped via `decode_projected` â€” same index state,
     /// no value allocs for unindexed fields. Empty = no indexes (decode
     /// path falls back to full, identical to today).
     pub(crate) fn indexed_fields_for(mgr: &IndexManager, collection: &str) -> Vec<String> {
@@ -1529,7 +1651,7 @@ impl Hako {
                 if let Ok(mut mgr) = self.indexes.write() {
                     // Clear-then-fill: the snapshot may hold stale
                     // entries (post-snapshot deletes, or a restart
-                    // mid-backfill) — refilling over them would leave
+                    // mid-backfill) â€” refilling over them would leave
                     // ghosts, and there is no per-collection completion
                     // marker to trust instead. Unload/retouch cycles pay
                     // a full rebuild; explicit background load covers the
@@ -1552,7 +1674,7 @@ impl Hako {
                                 mgr.index_document(collection, doc_id, &doc);
                             }
                         }
-                        // Owned refill flowed through the HNSW hook — the
+                        // Owned refill flowed through the HNSW hook â€” the
                         // graphs are whole again (borrowed path above never
                         // runs when vector defs exist, see its guard).
                         mgr.complete_vector(collection);
@@ -1579,6 +1701,7 @@ impl Hako {
                 Arc::clone(&self.backfill_inflight),
                 Arc::clone(shard_arc),
                 id,
+                Arc::clone(&self.unique_ledger),
             );
         }
     }
@@ -1646,7 +1769,7 @@ impl Hako {
     }
 
     /// Cheap policy check for the sync guards: does THIS node encrypt this
-    /// collection at rest? (No context is built — callers that need to
+    /// collection at rest? (No context is built â€” callers that need to
     /// encrypt/decrypt use `get_encryption_for_col`.)
     /// Only compiled when a sync transport exists to ask.
     #[cfg(any(feature = "net-sync", feature = "cloud-sync"))]
@@ -1663,7 +1786,11 @@ impl Hako {
 
         for (key, expected) in reads {
             if self.current_version(&key) != expected {
-                return Err(HakoError::Corrupt("Transaction Conflict".into()));
+                // ponytail: typed + retryable (issue #71/F5) â€” conflicts are
+                // a normal concurrency outcome, not `Corrupt`. SDK retry
+                // loops classify via HakoError::kind()/hk_error_kind, never
+                // by string-matching this message.
+                return Err(HakoError::Conflict { key });
             }
         }
 
@@ -1700,7 +1827,7 @@ impl Hako {
         let now_nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64;
         let mut now_micros = now_nanos / 1000;
         // Hybrid-clock guard (issue #80): never stamp below a timestamp
-        // already emitted or accepted — a backward wall-clock step would
+        // already emitted or accepted â€” a backward wall-clock step would
         // otherwise make every future local write lose LWW forever.
         let watermark = self.last_ts_watermark.load(std::sync::atomic::Ordering::Relaxed);
         if now_micros <= watermark {
@@ -1712,11 +1839,17 @@ impl Hako {
         let mut shard_map: HashMap<String, ShardWork> = HashMap::new();
         let mut assigned_ids = Vec::with_capacity(mutations.len());
 
+        // hakodb#71: unique-index admission ledger. All claims made while
+        // preparing this batch undo in reverse on ANY early return
+        // (violation, WAL error, panic) â€” the guard is the whole story.
+        let mut gg_memo: HashMap<String, Vec<GateDef>> = HashMap::new();
+        let mut gg_guard = LedgerRollbackGuard::new(&self.unique_ledger);
+
         // Simple local tracker to avoid changing ShardWork
         // let mut deletes_for_indexer: Vec<(String, String, HakoDoc)> = Vec::new();
 
         let t_encode = Instant::now();
-        // ponytail: last-collection cache — consecutive mutations usually hit
+        // ponytail: last-collection cache â€” consecutive mutations usually hit
         // the same shard, so reuse its handle + blob manager instead of a map
         // lookup and two lock acquisitions per mutation.
         let mut last_shard: Option<(String, Arc<RwLock<StorageEngine>>, Option<Arc<BlobManager>>)> = None;
@@ -1748,7 +1881,7 @@ impl Hako {
             assigned_ids.push(doc_id.clone());
 
             // 2. COMPUTE KEY ONCE
-            // ponytail: get_mut first — the old entry(col.clone()) allocated
+            // ponytail: get_mut first â€” the old entry(col.clone()) allocated
             // a key String per mutation even on hit (20K allocs/batch on
             // single-collection batches).
             let work = match shard_map.get_mut(&col) {
@@ -1763,6 +1896,15 @@ impl Hako {
             let key_arc: Arc<str> = Arc::from(doc_id.as_str());
             
             if is_delete {
+                // hakodb#71: release unique claims by doc id (before the
+                // pushes below move doc_id/key_arc into the WAL/event
+                // structures).
+                self.unique_gate_release(
+                    &col,
+                    key_arc.as_ref(),
+                    &mut gg_memo,
+                    &mut gg_guard.undo,
+                );
                 // ponytail: doc_id moves into the WAL op (zero copy);
                 // keys/events share the Arc (bumps, no String allocs).
                 work.ops.push(WalOp::Delete { key: doc_id, timestamp: now_micros });
@@ -1792,6 +1934,18 @@ impl Hako {
             let skeleton_bytes = doc.encode_buffered();
             WRITE_STATS.encdoc_ns.fetch_add(t_enc.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let doc_arc = Arc::new(doc);
+
+            // hakodb#71: unique-index admission. Violation (or
+            // backfilling) returns here; the drop guard above undoes all
+            // claims recorded so far in this batch.
+            self.unique_gate_admit(
+                &col,
+                key_arc.as_ref(),
+                &key_arc,
+                &doc_arc,
+                &mut gg_memo,
+                &mut gg_guard.undo,
+            )?;
             
             // REUSE KEY for WAL and Index
             work.ops.push(WalOp::PutInlined { key: key_arc.to_string(), value: skeleton_bytes });
@@ -1810,7 +1964,7 @@ impl Hako {
 
         // --- APPLY SHARD CHANGES ---
         for (col_name, mut work) in shard_map {
-            // P2: mark first — a concurrent recovery rescan must ADD to
+            // P2: mark first â€” a concurrent recovery rescan must ADD to
             // (not wipe+rebuild) collections with post-open writes; disk
             // state is older by construction (Manual WAL may still be
             // RAM-buffered). Same `touched` set the snapshot import
@@ -1826,7 +1980,7 @@ impl Hako {
 
             let t_apply = Instant::now();
             {
-                // ponytail: lock-wait sample — time blocked on the shard
+                // ponytail: lock-wait sample â€” time blocked on the shard
                 // write lock (the mixed r/w contention signal).
                 let t_lock = Instant::now();
                 let mut shard = shard_arc.write().unwrap();
@@ -1853,13 +2007,17 @@ impl Hako {
                     let tx_id = shard.next_tx_id;
                     shard.next_tx_id += 1;
                     let t_wal = Instant::now();
+                    // Any error here unwinds write_batch_internal; the
+                    // outer rollback guard (declared before the loop)
+                    // drops last, after both shard locks release, and
+                    // reverses the batch's ledger claims (hakodb#71).
                     shard.wal.append_batch_fast(tx_id, &work.ops, false)?;
                     WRITE_STATS.wal_ns.fetch_add(t_wal.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 }
 
                 // Apply storage index changes.
                 // ponytail: docs land Inlined with the bytes already encoded
-                // for WAL (matched by bare key) — no BlobPending detour, no
+                // for WAL (matched by bare key) â€” no BlobPending detour, no
                 // per-read re-encode until background conversion. The WAL op
                 // carries identical bytes, so durability is unchanged; the
                 // blob worker's BlobPending-gated swap simply no-ops, and
@@ -1868,7 +2026,7 @@ impl Hako {
                 // ponytail: PutInlined ops and index_puts are pushed in
                 // lockstep (one pair per put/patch; deletes touch ops only),
                 // so zip positionally. The old code built a full HashMap of
-                // every key first (SipHash ×2/row on big batches) — gone.
+                // every key first (SipHash Ã—2/row on big batches) â€” gone.
                 // index_puts stays put for the indexer send below.
                 let mut put_idx = 0;
                 for op in &work.ops {
@@ -1893,6 +2051,15 @@ impl Hako {
                     shard.blob_flush_queue.push_back(b);
                 }
                 shard.total_pending_blob_bytes.fetch_add(b_bytes, Ordering::Relaxed);
+
+                // Issue #71/F5: version bump inside the shard write lock â€”
+                // this is the linearization point the versioned read
+                // (`get_versioned`) serializes against. The old post-lock
+                // bump left `get()->current_version()` windows where the new
+                // version paired with the old document (silent lost update).
+                let t_ver = Instant::now();
+                self.bump_versions_by_keys(work.keys.clone());
+                WRITE_STATS.versions_ns.fetch_add(t_ver.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
             // apply wall time includes the WAL call above; report net below.
             WRITE_STATS.apply_ns.fetch_add(t_apply.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1902,7 +2069,7 @@ impl Hako {
             // ponytail: drop hot-cache entries for written keys. The version
             // bump alone would invalidate them; this reclaims memory eagerly.
             // ponytail: skip the whole pass when the cache is empty (the
-            // common batch/seed case) — 20K format!+remove for nothing.
+            // common batch/seed case) â€” 20K format!+remove for nothing.
             let t_cache = Instant::now();
             {
                 let mut cache = self.doc_cache.write().unwrap();
@@ -1937,9 +2104,9 @@ impl Hako {
             }
             WRITE_STATS.index_send_ns.fetch_add(t_idx.elapsed().as_nanos() as u64, Ordering::Relaxed);
             
-            let t_ver = Instant::now();
-            self.bump_versions_by_keys(work.keys);
-            WRITE_STATS.versions_ns.fetch_add(t_ver.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            // Issue #71/F5: the version bump moved INSIDE the shard write
+            // lock (linearization point for the versioned read). No second
+            // bump here â€” this comment is the tombstone for the moved code.
             let t_watch = Instant::now();
             for (c, e) in work.events { self.notify_watchers(&c, e); }
             WRITE_STATS.watchers_ns.fetch_add(t_watch.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1957,11 +2124,105 @@ impl Hako {
             });
         }
 
+        gg_guard.disarm();
         Ok(assigned_ids)
     }
 
+    // ================= hakodb#71: unique composite index gate ============
+
+    /// Snapshot the unique-index definitions of `collection` for gate
+    /// admission. Called once per (collection, batch) and memoized; the
+    /// read-lock cost on uncontended RwLock is ~ns and every other write
+    /// path already pays it for touched-marking, so no separate cache
+    /// layer is added.
+    fn unique_gate_defs(
+        &self,
+        col: &str,
+        memo: &mut HashMap<String, Vec<GateDef>>,
+    ) -> Vec<GateDef> {
+        if let Some(cached) = memo.get(col) {
+            return cached.clone();
+        }
+        let defs: Vec<GateDef> = {
+            let mgr = self.indexes.read().unwrap();
+            mgr.composite
+                .indexes_for_collection(col)
+                .filter(|i| i.definition.unique)
+                .map(|i| GateDef {
+                    index_id: i.definition.id,
+                    def: i.definition.clone(),
+                })
+                .collect()
+        };
+        memo.insert(col.to_string(), defs.clone());
+        defs
+    }
+
+
+    /// Admit one document to every unique index of its collection.
+    /// Claims are recorded in `undo`; any error (violation or
+    /// backfilling) aborts the whole batch (the caller's rollback guard
+    /// undoes prior claims). Filtered/sparse/structural skips leave the
+    /// doc unclaimed for that index â€” the tree mirrors the same rules,
+    /// so a later matching write still sees old tuples... unless the doc
+    /// was claimed under different rules â€” those tuples were claimed by
+    /// the SAME doc id, and `claim` releases the doc's previous claim
+    /// atomically (by_doc lookup), so no stale ownership survives.
+    fn unique_gate_admit(
+        &self,
+        col: &str,
+        doc_id: &str,
+        doc_id_arc: &Arc<str>,
+        doc: &HakoDoc,
+        memo: &mut HashMap<String, Vec<GateDef>>,
+        undo: &mut Vec<crate::index::composite::ledger::LedgerUndo>,
+    ) -> Result<()> {
+        let defs = self.unique_gate_defs(col, memo);
+        // ponytail: fast path â€” no unique index on the collection pays
+        // exactly one small-Vec clone above and nothing else.
+        if defs.is_empty() {
+            return Ok(());
+        }
+        for d in &defs {
+            if !self.unique_ledger.is_ready(d.index_id) {
+                return Err(HakoError::IndexBackfilling {
+                    collection: col.to_string(),
+                    index: d.index_id.to_string(),
+                });
+            }
+            if !d.def.filter_passes(doc_id, doc) {
+                continue;
+            }
+            let Some(values) = d.def.document_values_of(doc_id, doc) else { continue };
+            let prefix = crate::index::composite::key_encoder::encode_composite_prefix(
+                &d.def, &values,
+            );
+            self.unique_ledger
+                .claim(d.index_id, prefix, doc_id_arc, undo)?;
+        }
+        Ok(())
+    }
+
+    /// Release the claims a deleted doc held across every unique index
+    /// of its collection (delete path; O(1) via the by-doc map).
+    fn unique_gate_release(
+        &self,
+        col: &str,
+        doc_id: &str,
+        memo: &mut HashMap<String, Vec<GateDef>>,
+        undo: &mut Vec<crate::index::composite::ledger::LedgerUndo>,
+    ) {
+        let defs = self.unique_gate_defs(col, memo);
+        if defs.is_empty() {
+            return;
+        }
+        for d in &defs {
+            self.unique_ledger.release_doc(d.index_id, doc_id, undo);
+        }
+    }
+
     /// Move documents between collections (archive/restore) as paired
-    /// operations through existing machinery — never memcpy. Per doc,
+    /// operations through existing machinery â€” never memcpy. Per doc,
     /// in order: timestamp-preserving put at dest FIRST (duplicate-
     /// transient), then a fresh-timestamp tombstone at src. Stored
     /// bytes stay identical across moves (only live versions/caches
@@ -1995,7 +2256,7 @@ impl Hako {
                 report.missing.push(id.clone());
                 continue;
             };
-            // Dest put, timestamp preserved (no restamp — LWW identity
+            // Dest put, timestamp preserved (no restamp â€” LWW identity
             // is the move's whole point). Mirrors the write-batch put
             // prep; blob offsets re-reserve in the DEST file.
             let key_arc: Arc<str> = Arc::from(id.as_str());
@@ -2009,6 +2270,23 @@ impl Hako {
                 .unwrap_or_default();
             let skeleton = doc.encode_buffered();
             let doc_arc = Arc::new(doc);
+            // hakodb#71: unique admission at the dest gate. The src
+            // delete below routes through write_batch (its release hook
+            // runs); the put must claim before the WAL lands, same as
+            // the batch path. On violation: rollback, report, stop.
+            let mut rl_undo: Vec<crate::index::composite::ledger::LedgerUndo> = Vec::new();
+            let mut rl_memo: HashMap<String, Vec<GateDef>> = HashMap::new();
+            if let Err(e) = self.unique_gate_admit(
+                dst,
+                key_arc.as_ref(),
+                &key_arc,
+                &doc_arc,
+                &mut rl_memo,
+                &mut rl_undo,
+            ) {
+                self.unique_ledger.rollback(&rl_undo);
+                return Err(e);
+            }
             {
                 let mut shard = dst_arc.write().unwrap();
                 let tx_id = shard.next_tx_id;
@@ -2027,8 +2305,10 @@ impl Hako {
                     shard.blob_flush_queue.push_back(b);
                 }
                 shard.total_pending_blob_bytes.fetch_add(b_bytes, Ordering::Relaxed);
+                // F5 linearization: bump inside the shard lock like all
+                // other write paths.
+                self.bump_versions_by_keys(vec![key_arc.clone()]);
             }
-            self.bump_versions_by_keys(vec![key_arc.clone()]);
             // Indexer gets the put (secondary/FTS/composite would
             // otherwise miss the moved doc until backfill). Same
             // in-flight accounting as the write path (refund on dead
@@ -2102,7 +2382,7 @@ impl Hako {
         // populate below (the old code paid fxhash + sharded lock twice).
         let ver = self.current_version(doc_id);
         // ponytail: cache-key alloc only when a version exists to compare
-        // against — unversioned docs paid a format! for a probe that could
+        // against â€” unversioned docs paid a format! for a probe that could
         // never hit. Built once, shared by probe + populate below.
         let cache_key = ver.map(|_| format!("{collection}\0{doc_id}"));
         if let (Some(ver), Some(cache_key)) = (ver, &cache_key) {
@@ -2114,13 +2394,13 @@ impl Hako {
         }
 
         let Some(shard) = self.try_get_shard_on_disk(collection)? else { return Ok(None) };
-        // ponytail: lock-wait sample — readers blocked here are queued
+        // ponytail: lock-wait sample â€” readers blocked here are queued
         // behind the writer's flush (the mixed r/w contention signal).
         let t_lock = Instant::now();
         let storage = shard.safe_read()?;
         LOCK_STATS.read_wait_ns.fetch_add(t_lock.elapsed().as_nanos() as u64, Ordering::Relaxed);
         LOCK_STATS.read_acqs.fetch_add(1, Ordering::Relaxed);
-        // ponytail: decode borrowed from the shared Arc — the old
+        // ponytail: decode borrowed from the shared Arc â€” the old
         // storage.get() cloned the full bytes into a transient Vec just
         // to decode and drop them (one alloc + memcpy per get, found by
         // the alloc census). Identical output, zero copies.
@@ -2142,7 +2422,7 @@ impl Hako {
             self.resolve_doc(&mut doc, collection)?;
             // ponytail: populate post-resolve. Bounded at 8192 with single
             // arbitrary eviction when full.
-            // ponytail: try_write — a contended cache must not serialize
+            // ponytail: try_write â€” a contended cache must not serialize
             // readers. Skipped populate just means the next read re-decodes;
             // correctness is untouched (version check revalidates).
             if let (Some(ver), Some(cache_key)) = (ver, cache_key) {
@@ -2160,7 +2440,7 @@ impl Hako {
     }
 
     /// Borrowed point read (v0.8.10+): pins the stored bytes and returns a
-    /// `DocView` with lazy per-field access — no decode, no interning, no
+    /// `DocView` with lazy per-field access â€” no decode, no interning, no
     /// hot-cache interaction. The sqlite3 `SELECT` + typed-accessor analog:
     /// pull only the fields you touch. Deleted/missing reads None, same as
     /// [`Self::get`]; framing-invalid rows also read None (strict views).
@@ -2195,7 +2475,7 @@ impl Hako {
         self.put_owned(col, id, doc.clone())
     }
 
-    /// ponytail: owned-doc variant — skips the full deep clone that `put`
+    /// ponytail: owned-doc variant â€” skips the full deep clone that `put`
     /// pays (every String field). Use whenever the caller already owns the
     /// doc (FFI take-handles, Tauri JSON builds, subdocument assembly).
     pub fn put_owned(&self, col: &str, id: &str, doc: HakoDoc) -> Result<String> {
@@ -2217,7 +2497,7 @@ impl Hako {
 
     /// The single shared gate for the local-only signal. Collection-level
     /// flag OR per-key mark. `key` may arrive bare (`id`) or namespaced
-    /// (`col:id`) depending on the sync path — both forms are honored.
+    /// (`col:id`) depending on the sync path â€” both forms are honored.
     pub fn is_local_only(&self, col: &str, key: &str) -> bool {
         if self.local_only_cols.read().unwrap().contains(col) {
             return true;
@@ -2226,7 +2506,7 @@ impl Hako {
         if keys.contains(&format!("{col}\0{key}")) {
             return true;
         }
-        // ponytail: namespaced fallback — strip one leading `col:` only.
+        // ponytail: namespaced fallback â€” strip one leading `col:` only.
         if let Some(id) = key.strip_prefix(col).and_then(|s| s.strip_prefix(':')) {
             return keys.contains(&format!("{col}\0{id}"));
         }
@@ -2234,7 +2514,7 @@ impl Hako {
     }
 
     /// Mark a whole collection local-only (never emits, never accepts
-    /// remote ops for it once sync filters check this — fully local).
+    /// remote ops for it once sync filters check this â€” fully local).
     /// `false` rejoins: subsequent local writes replicate again, and any
     /// newer remote op applies per LWW (resurrect rule).
     pub fn set_collection_local(&self, col: &str, local: bool) {
@@ -2271,12 +2551,12 @@ impl Hako {
 
     /// Opt a whole collection back into replication: clears the collection
     /// flag and every key mark under it. Tombstones themselves are untouched
-    /// (still local history) — pair with `vacuum_collection` for restore.
+    /// (still local history) â€” pair with `vacuum_collection` for restore.
     pub fn replicate_collection(&self, col: &str) {
         self.local_only_cols.write().unwrap().remove(col);
         {
             let mut keys = self.local_only_keys.write().unwrap();
-            // ponytail: marks are `col\0id` — split on the separator instead
+            // ponytail: marks are `col\0id` â€” split on the separator instead
             // of prefix-matching, so col "ab" never eats col "abc" marks.
             keys.retain(|k| k.split_once('\0').map(|(c, _)| c != col).unwrap_or(true));
         }
@@ -2299,19 +2579,19 @@ impl Hako {
     /// Drop a collection entirely (issue #31): one batched delete emits
     /// per-doc tombstones (watchers + sync tail see the change through the
     /// normal write path), then the shard is flushed, evicted from memory,
-    /// and its directory unlinked — memory first, unlink last, so no
+    /// and its directory unlinked â€” memory first, unlink last, so no
     /// reader ever reaches for a disappearing directory. Index definitions
     /// (secondary/fts/composite/vector) are removed and re-persisted.
     ///
     /// Gates (fail-closed, same family as relocate_docs): sync-excluded
     /// plane, local-only collections, read-only engines, and
-    /// lazy-unloaded (archived) collections — the last refuses with
+    /// lazy-unloaded (archived) collections â€” the last refuses with
     /// "load it first" because dropping parked data needs it resident for
     /// the tombstone pass.
     ///
     /// Dropping a nonexistent collection is a no-op (empty report,
     /// idempotent). Peers that still hold the data converge to empty via
-    /// the emitted deletes; cross-instance drop is NOT atomic — drop on
+    /// the emitted deletes; cross-instance drop is NOT atomic â€” drop on
     /// the writer first.
     pub fn drop_collection(&self, collection: &str) -> Result<DropReport> {
         if self.read_only.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2329,7 +2609,7 @@ impl Hako {
         }
         if self.is_lazy_unloaded(collection) {
             return Err(HakoError::Corrupt(format!(
-                "drop: `{collection}` is an unloaded lazy collection — load it first"
+                "drop: `{collection}` is an unloaded lazy collection â€” load it first"
             )));
         }
 
@@ -2350,8 +2630,8 @@ impl Hako {
 
         // 1. Tombstone every live doc through the normal write path: one
         //    batch per 1000 ids (max_batch_ops convention). This is what
-        //    makes the drop visible — watchers fire, sync peers receive
-        //    deletes, versions advance — instead of silent unlinking.
+        //    makes the drop visible â€” watchers fire, sync peers receive
+        //    deletes, versions advance â€” instead of silent unlinking.
         let mut ids: Vec<String> = Vec::new();
         {
             let storage = shard_arc.read().unwrap();
@@ -2369,7 +2649,7 @@ impl Hako {
             self.write_batch(mutations)?;
         }
 
-        // 2. Evict from the shard map (memory first — the reverse order
+        // 2. Evict from the shard map (memory first â€” the reverse order
         //    risks a reader opening a shard whose directory is about to
         //    disappear), then flush the final state so the WAL on disk
         //    holds the complete tombstone record even for the unlink.
@@ -2389,8 +2669,21 @@ impl Hako {
         //    re-persist definitions.json without them, and drop the RAM
         //    structures + doc cache + plan cache entries.
         {
+            // Unique-ledger claims for this collection go with the defs
+            // (hakodb#71): collect the ids before dropping.
+            let unique_ids: Vec<u32> = {
+                let mgr = self.indexes.read().unwrap();
+                mgr.composite
+                    .indexes_for_collection(collection)
+                    .filter(|i| i.definition.unique)
+                    .map(|i| i.definition.id)
+                    .collect()
+            };
             let mut mgr = self.indexes.write().unwrap();
             mgr.drop_collection_defs(collection);
+            for id in unique_ids {
+                self.unique_ledger.reset(id);
+            }
         }
         self.persist_index_defs()?;
         if let Ok(mut cache) = self.doc_cache.write() {
@@ -2446,7 +2739,7 @@ impl Hako {
     }
 
     /// Local-only batch delete by explicit ids (single mark persist +
-    /// single batch — the CLI/SDK batch path).
+    /// single batch â€” the CLI/SDK batch path).
     pub fn delete_ids_local(&self, col: &str, ids: &[String]) -> Result<usize> {
         if ids.is_empty() { return Ok(0); }
         {
@@ -2468,7 +2761,7 @@ impl Hako {
 
     /// Best-effort durability for the marks. Lives in `__hako_system`,
     /// which net_sync already excludes from its tail and cloud_sync never
-    /// routes (no room prefix) — the marker itself never replicates.
+    /// routes (no room prefix) â€” the marker itself never replicates.
     fn persist_local_only(&self) {
         let cols: Vec<Value> = self.local_only_cols.read().unwrap().iter()
             .map(|c| Value::String(c.clone())).collect();
@@ -2518,7 +2811,7 @@ impl Hako {
         let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
 
         // Graph traversal (issue #53): cross-collection BFS can't ride
-        // the single-shard executor — dedicated path below. Normal scans
+        // the single-shard executor â€” dedicated path below. Normal scans
         // are untouched (perf: zero hot-path change).
         if matches!(plan.scan, crate::query::plan::ScanType::Traverse { .. }) {
             let results = self.execute_traverse_query(&plan)?;
@@ -2563,7 +2856,7 @@ impl Hako {
 
     /// Traverse-query path (issue #53): BFS via `find_paths`, hits
     /// filtered to the queried collection (cross-collection hits ride
-    /// `find_paths` — pipeline rows are single-collection), `extra`
+    /// `find_paths` â€” pipeline rows are single-collection), `extra`
     /// verified per hit (missing-field rejects, VectorKnn rule), then
     /// order/offset/limit mirroring the legacy manual sort.
     fn execute_traverse_query(
@@ -2642,7 +2935,7 @@ impl Hako {
 
     /// Raw scan: storage-encoded bytes instead of decoded docs. Same
     /// admission path as [`Self::query`] (security, plan cache, audit);
-    /// execution stops after the index walk — see
+    /// execution stops after the index walk â€” see
     /// `ParallelQueryExecutor::execute_raw` for the contract (opaque bytes,
     /// index-satisfied filters/ordering required). Sets `query.raw` so the
     /// plan-cache key can't collide with a decoded query of the same shape.
@@ -2676,7 +2969,7 @@ impl Hako {
     /// storage bytes) to `callback`; `false` stops early. Returns rows
     /// visited. See `ParallelQueryExecutor::execute_walk` for the contract
     /// (SortedKeys scans only for now; callback must not re-enter the
-    /// engine — the storage read lock is held for the whole walk).
+    /// engine â€” the storage read lock is held for the whole walk).
     pub fn walk<F>(&self, mut query: Query, callback: &mut F) -> Result<usize>
     where
         F: FnMut(&str, &[u8]) -> bool,
@@ -2854,7 +3147,7 @@ impl Hako {
         }
         drop(shards);
         // FS-aware tail: unopened (lazy-skipped or never-touched)
-        // collections are absent from the map, but their bytes are real —
+        // collections are absent from the map, but their bytes are real â€”
         // copy them with the same *.dat + wal.log filter the per-shard
         // backup uses (their WAL is untouched, so no flush is owed).
         let loaded: std::collections::HashSet<String> =
@@ -2914,6 +3207,36 @@ impl Hako {
         }
     }
 
+    ///
+    /// Issue #71/F5 item 3: the doc and its version are captured inside one
+    /// shard lock acquisition. The old pair (`get()` + `current_version()`)
+    /// is two calls â€” a commit landing between them recorded the NEW
+    /// version against the OLD document, silently reopening the
+    /// read-modify-write lost-update window this closes.
+    ///
+    /// (`bump_versions_by_keys` runs inside the same batch's shard write
+    /// lock â€” moved there as part of this â€” so the version read here has a
+    /// single serializable point per shard.)
+    pub fn get_versioned(
+        &self,
+        collection: &str,
+        doc_id: &str,
+    ) -> Result<Option<(HakoDoc, u64)>> {
+        if !self.allowed(collection, AccessOp::Get) {
+            return Err(self.deny(AccessOp::Get, collection, Some(doc_id)));
+        }
+        let Some(shard) = self.try_get_shard_on_disk(collection)? else {
+            return Ok(None);
+        };
+        let shard = shard.safe_read()?;
+        let doc = shard
+            .get_shared(doc_id)?
+            .and_then(|b| HakoDoc::decode(&b));
+        let Some(doc) = doc else { return Ok(None) };
+        let version = self.current_version(doc_id);
+        Ok(Some((doc, version.unwrap_or(0))))
+    }
+
     pub fn current_version(&self, key: &str) -> Option<u64> {
         // self.doc_versions.read().unwrap().get(key).cloned()
         let bucket = (fxhash::hash64(key) % 32) as usize;
@@ -2951,7 +3274,7 @@ impl Hako {
     /// Watch support for out-of-tree gateways: prebuild a filter plan for
     /// a subscription once, then match per-event bytes against it. The match itself is
     /// zero-decode (borrows the stored bytes, no allocation), so the hot
-    /// path costs the same as the former in-tree call — only the location
+    /// path costs the same as the former in-tree call â€” only the location
     /// moved, not the complexity.
     pub fn plan_for_watch(&self, query: &crate::query::query::Query) -> crate::query::plan::QueryPlan {        let indexes = self.indexes.read().unwrap();
         let is_ready = self.index_query_ready();
@@ -2960,7 +3283,7 @@ impl Hako {
 
     /// Zero-decode view match for one watch event: true when the stored
     /// `bytes` for `doc_id` satisfy `plan` (built by `plan_for_watch`).
-    /// Handles the exit case too — returns false when an update stops
+    /// Handles the exit case too â€” returns false when an update stops
     /// matching, so callers emit the removal.
     pub fn matches_watch(
         doc_id: &str,
@@ -3106,7 +3429,7 @@ impl Hako {
         self.is_sync_excluded_effective(col) || self.is_lazy_unloaded(col)
     }
 
-    /// Archive-group collections present on disk but not loaded — the
+    /// Archive-group collections present on disk but not loaded â€” the
     /// stats surface for "marked unloaded" (sync/backup consult the gate
     /// directly, not this listing).
     pub fn unloaded_lazy_collections(&self) -> Vec<String> {
@@ -3129,7 +3452,7 @@ impl Hako {
 
     /// Sync enumeration: EVERY collection on disk (including `_`-hidden
     /// ones) minus the withheld plane (static exclusions + lazy-unloaded).
-    /// Sync is opt-out, not opt-in — `list_collections()` stays the
+    /// Sync is opt-out, not opt-in â€” `list_collections()` stays the
     /// user-visible listing with `_` hiding, but sync must never depend
     /// on naming conventions.
     pub fn sync_collections(&self) -> Result<Vec<String>> {
@@ -3168,7 +3491,7 @@ impl Hako {
     /// only, so dropped stale ops can't drag the stamp forward. The chase
     /// clamps at a generous skew ceiling: a doc stamped beyond it still
     /// applies (content wins), but an absurd/attacker timestamp can't pin
-    /// the watermark at i64::MAX — that would tie every later stamp and
+    /// the watermark at i64::MAX â€” that would tie every later stamp and
     /// tombstone comparison into permanent drops.
     pub(crate) fn observe_remote_ts(&self, ts: i64) {
         const SKEW_CEILING_MICROS: i64 = 100 * 365 * 24 * 60 * 60 * 1_000_000; // 100y
@@ -3303,6 +3626,9 @@ impl Hako {
                 fields: idx.definition.fields.iter().map(|f| {
                     (f.field.clone(), if matches!(f.direction, SortDirection::Desc) { "desc".to_string() } else { "asc".to_string() })
                 }).collect(),
+                unique: idx.definition.unique,
+                sparse: idx.definition.sparse,
+                filter: idx.definition.filter.clone(),
             });
         }
 
@@ -3359,7 +3685,7 @@ impl Hako {
         // 2b. Populate vector defs. Invalid entries (bad dim/metric from
         // a newer writer) are skipped, never fatal to open. Graphs are
         // ensured empty here; STEP C(2) fills them (rescan hook or
-        // rebuild) — never trust a snapshot for derived ANN state.
+        // rebuild) â€” never trust a snapshot for derived ANN state.
         for (collection, defs) in state.vector {
             for def in defs {
                 let metric = match def.metric.as_str() {
@@ -3372,7 +3698,7 @@ impl Hako {
         }
 
         // 2c. Populate traverse targets (issue #53). Backlink edges are
-        // derived and rebuild in STEP C through the hook — only the
+        // derived and rebuild in STEP C through the hook â€” only the
         // tracked set persists.
         for collection in state.traverse {
             mgr.traverse.track(&collection);
@@ -3380,21 +3706,21 @@ impl Hako {
 
         // 3. Populate Composite (Directly in manager)
         for def in state.composite {
-            let fields: Vec<_> = def.fields.into_iter().map(|(field, dir)| {
+            let fields: Vec<(String, SortDirection)> = def.fields.into_iter().map(|(field, dir)| {
                 let direction = if dir.eq_ignore_ascii_case("desc") { 
                     SortDirection::Desc 
                 } else { 
                     SortDirection::Asc 
                 };
-                crate::index::composite::definition::CompositeField { field, direction }
+                (field, direction)
             }).collect();
 
             if !fields.is_empty() {
-                mgr.composite.restore_index(crate::index::composite::definition::CompositeIndexDefinition {
-                    id: def.id,
-                    collection: def.collection,
-                    fields,
-                });
+                let mut definition = crate::index::composite::definition::CompositeIndexDefinition::new(&def.collection)
+                    .with_fields(fields)
+                    .with_constraints(def.unique, def.sparse, def.filter);
+                definition.id = def.id;
+                mgr.composite.restore_index(definition);
             }
         }
         
@@ -3434,6 +3760,8 @@ impl Hako {
             composite.push(CompositeIndexInfo {
                 id: idx.definition.id,
                 collection: idx.definition.collection.clone(),
+                unique: idx.definition.unique,
+                sparse: idx.definition.sparse,
                 fields: idx.definition.fields.iter().map(|f| CompositeIndexFieldInfo {
                     field: f.field.clone(),
                     direction: match f.direction {
@@ -3516,7 +3844,7 @@ impl Hako {
             };
 
             // Process in chunks to avoid blocking
-            // ponytail: selective decode — a new index only needs the
+            // ponytail: selective decode â€” a new index only needs the
             // registered fields (same entries, no value allocs for rest).
             let wanted: Vec<String> = idx_mgr
                 .read()
@@ -3634,7 +3962,7 @@ impl Hako {
 
     /// Register a vector index on `field`. Registers the def, ensures an
     /// (empty, incomplete) HNSW graph, and spawns the backfill that fills
-    /// it — queries fail-closed to exact until `complete` flips.
+    /// it â€” queries fail-closed to exact until `complete` flips.
     /// Re-registering overwrites dim/metric and rebuilds the graph.
     pub fn create_vector_index(
         &self,
@@ -3682,7 +4010,7 @@ impl Hako {
         backfill_count.fetch_add(1, Ordering::Relaxed);
         thread::spawn(move || {
             let _guard = BackfillGuard { counter: backfill_count };
-            // Graphs may predate this pass (re-registration) — reset to
+            // Graphs may predate this pass (re-registration) â€” reset to
             // incomplete so a concurrent query can't ANN-serve a half
             // graph; `complete` flips only after the full pass below.
             {
@@ -3786,7 +4114,7 @@ impl Hako {
     /// Metric of a registered vector index, for FFI score recompute
     /// (`hk_engine_find_near`): the query pipeline drops scores, so the
     /// FFI layer recomputes the exact distance per hit from the stored
-    /// document vector — same `distance()` the rescore uses, O(k·D).
+    /// document vector â€” same `distance()` the rescore uses, O(kÂ·D).
     pub fn vector_metric(
         &self,
         collection: &str,
@@ -3802,7 +4130,7 @@ impl Hako {
 
     /// Register an edge collection (issue #53, Phase B): tracks the
     /// collection for inbound lookup AND indexes `_from`/`_to` for edge
-    /// lookup — all three ride existing machinery (traverse defs, plain
+    /// lookup â€” all three ride existing machinery (traverse defs, plain
     /// secondary indexes), so sync + persistence need no new shapes.
     /// Idempotent like every other create.
     pub fn create_edge_index(&self, edge_collection: &str) -> Result<()> {
@@ -3815,7 +4143,7 @@ impl Hako {
     /// Opt a collection in as a traversal target (issue #53, Phase A):
     /// inbound edges to its docs are tracked from here on (live writes
     /// via the hook, existing docs via the backfill below). Idempotent
-    /// (secondary norm — re-create is a no-op, never a backfill storm).
+    /// (secondary norm â€” re-create is a no-op, never a backfill storm).
     /// Forward traversal needs no state and works regardless; incoming
     /// into an untracked collection is a loud error at query time.
     pub fn create_traverse_index(&self, collection: &str) -> Result<()> {
@@ -3872,7 +4200,7 @@ impl Hako {
     /// outgoing refs (weight 1.0), edge-collection hops in `via_edge`
     /// (weight from the edge doc), verified backlinks (weight 1.0), and
     /// edge-collection reverse hops. Sorted for determinism; NOT deduped
-    /// (visited/dist maps own that — Dijkstra must see every route).
+    /// (visited/dist maps own that â€” Dijkstra must see every route).
     /// Stale entries (overwrites, secondary over-approximation) are
     /// re-verified against storage before following.
     fn expand_neighbors(
@@ -3934,7 +4262,7 @@ impl Hako {
     /// One edge-collection hop (Phase B): edge docs in `edge_col` whose
     /// `match_field` (`_from` outgoing / `_to` incoming) references the
     /// anchor; the neighbor is the other end, weighted by `weight_field`
-    /// (missing/non-numeric/non-finite → 1.0, negative → clamped 0 —
+    /// (missing/non-numeric/non-finite â†’ 1.0, negative â†’ clamped 0 â€”
     /// documented, never silent-skip). Secondary lookup + verify, same
     /// tolerance as backlinks.
     fn edge_step(
@@ -4026,7 +4354,7 @@ impl Hako {
             return Ok(Vec::new());
         }
         // Weighted walks ride Dijkstra (Phase B); unweighted stay on the
-        // proven BFS below (untouched — its tests pin the behavior).
+        // proven BFS below (untouched â€” its tests pin the behavior).
         if spec.weight_field.is_some() {
             return self.find_paths_weighted(collection, id, spec);
         }
@@ -4068,7 +4396,7 @@ impl Hako {
     /// Dijkstra over the same expansion as BFS (issue #53, Phase B):
     /// cost-ordered cheapest paths, same depth cap / limit / liveness /
     /// determinism rules. Twin of the BFS loop above (kept separate so
-    /// the proven path stays byte-identical — see expand_neighbors note
+    /// the proven path stays byte-identical â€” see expand_neighbors note
     /// if they ever diverge).
     fn find_paths_weighted(
         &self,
@@ -4128,6 +4456,7 @@ impl Hako {
         backfill_count: Arc<AtomicUsize>,
         shard_arc: Arc<RwLock<StorageEngine>>,
         index_id: u32,
+        unique_ledger: std::sync::Arc<crate::index::composite::ledger::UniqueLedger>,
     ) {
         backfill_count.fetch_add(1, Ordering::Relaxed);
         thread::spawn(move || {
@@ -4157,7 +4486,10 @@ impl Hako {
                             let _ = resolve_doc_static(&mut doc, &shard_arc, enc_key.as_deref());
                             composite_idx.index_document(&doc_id, &doc);
 
-                            // 2. Insert LEAN KEY into index.log
+                            // 2. Insert LEAN KEY into index.log. Filtered
+                            // defs (hakodb#71) only log matching docs —
+                            // the log must mirror the tree.
+                            if composite_idx.definition.filter_passes(&doc_id, &doc) {
                             if let Some(vals) = composite_idx.document_values(&doc_id, &doc) {
                                 let key_bytes =
                                     crate::index::composite::key_encoder::encode_composite_key(
@@ -4171,6 +4503,7 @@ impl Hako {
                                     doc_id.to_string(),
                                 );
                             }
+                            }
                         }
                     }
                 }
@@ -4180,42 +4513,186 @@ impl Hako {
                 drop(mgr);
                 thread::yield_now();
             }
+
+            // hakodb#71: a unique index built here (legacy snapshot
+            // upgrade, lazy touch-load) folds its sorted tree into the
+            // claim ledger on completion, turning the admission gate
+            // on. Non-unique trees skip the fold entirely.
+            let is_unique = idx_mgr.read().ok().and_then(|mgr| {
+                mgr.composite.get(index_id).map(|i| i.definition.unique)
+            });
+            if let Some(true) = is_unique {
+                if let Ok(mgr) = idx_mgr.read() {
+                    if let Some(idx) = mgr.composite.get(index_id) {
+                        let _ = unique_ledger.load_from_tree(index_id, &idx.tree);
+                    }
+                }
+            }
         });
     }
 
     pub fn create_composite_index(&self, col: &str, fields: Vec<(String, SortDirection)>) -> Result<u32> {
+        self.create_composite_index_ex(col, fields, false, true, None)
+    }
+
+    /// Composite index creation with uniqueness constraints (hakodb#71).
+    /// Dedupe compares fields AND constraints: a field-identical but
+    /// constraint-different def creates a SEPARATE index (never silently
+    /// reuse an id without the constraints being asked for). Unique
+    /// indexes backfill synchronously â€” tree + claim ledger populate, an
+    /// adjacent-prefix duplicate scan runs over the sorted tree, and the
+    /// admission gate turns on the moment this returns. Historical
+    /// duplicates reject the whole creation (def + ledger rolled back):
+    /// loud failure, never a panic. Filter is deduped by its JSON form
+    /// (cold path, one call per create).
+    pub fn create_composite_index_ex(
+        &self,
+        col: &str,
+        fields: Vec<(String, SortDirection)>,
+        unique: bool,
+        sparse: bool,
+        filter: Option<crate::query::filter::FilterGroup>,
+    ) -> Result<u32> {
         {
             let mgr = self.indexes.read().unwrap();
             for idx in mgr.indexes_for_collection(col) {
-                let same = idx.definition.fields.len() == fields.len()
-                    && idx
-                        .definition
-                        .fields
+                let d = &idx.definition;
+                let fields_same = d.fields.len() == fields.len()
+                    && d.fields
                         .iter()
                         .zip(fields.iter())
                         .all(|(a, b)| a.field == b.0 && a.direction == b.1);
-                if same {
-                    return Ok(idx.definition.id);
+                let filter_same = match (&d.filter, &filter) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => {
+                        serde_json::to_string(a).ok() == serde_json::to_string(b).ok()
+                    }
+                    _ => false,
+                };
+                // sparse is inert for non-unique indexes; compare the
+                // canonical "dense" bit so legacy defs dedupe cleanly.
+                if fields_same
+                    && d.unique == unique
+                    && (d.unique && !d.sparse) == (unique && !sparse)
+                    && filter_same
+                {
+                    return Ok(d.id);
                 }
             }
         }
 
-        let def = CompositeIndexDefinition::new(col).with_fields(fields);
+        let def = CompositeIndexDefinition::new(col)
+            .with_fields(fields)
+            .with_constraints(unique, sparse, filter);
         let index_id = self.indexes.write().unwrap().create_index(def);
 
         let shard_arc = self.get_shard(col)?;
-        Self::spawn_composite_backfill(
-            Arc::clone(&self.indexes),
-            Arc::clone(&self.index_storage),
-            self.config.encryption_key.clone(),
-            Arc::clone(&self.backfill_inflight),
-            shard_arc,
-            index_id,
-        );
+        if !unique {
+            Self::spawn_composite_backfill(
+                Arc::clone(&self.indexes),
+                Arc::clone(&self.index_storage),
+                self.config.encryption_key.clone(),
+                Arc::clone(&self.backfill_inflight),
+                shard_arc,
+                index_id,
+                Arc::clone(&self.unique_ledger),
+            );
+        } else {
+            // Synchronous unique backfill (hakodb#71): blocks the caller
+            // for one scan â€” operator-driven, once per index lifetime.
+            if let Err(e) = self.backfill_unique_sync(&shard_arc, index_id) {
+                // Roll the not-ready def back: tree registration gone,
+                // ledger never went live, defs re-persisted without it.
+                self.indexes.write().unwrap().composite.drop_index(index_id);
+                self.unique_ledger.reset(index_id);
+                let _ = self.persist_index_defs();
+                self.plan_cache.invalidate();
+                return Err(e);
+            }
+        }
 
         let _ = self.persist_index_defs();
         self.plan_cache.invalidate();
         Ok(index_id)
+    }
+
+    /// One-shot scan feeding BOTH the composite tree and the unique
+    /// claim ledger (hakodb#71). Mirrors spawn_composite_backfill's
+    /// resolve/chunk/yield structure, minus the thread. Finishes inside
+    /// the backfill_inflight window so quiescence covers it.
+    /// ponytail: sync instead of entity-backed async because the
+    /// admission gate needs a COMPLETE claim set before it may fire;
+    /// an async variant would need ready-signalling plumbing (worker
+    /// â†’ engine) â€” revisit if creations over multi-GB collections get
+    /// slow to a fault.
+    fn backfill_unique_sync(
+        &self,
+        shard_arc: &Arc<RwLock<StorageEngine>>,
+        index_id: u32,
+    ) -> Result<()> {
+        self.backfill_inflight.fetch_add(1, Ordering::Relaxed);
+        let enc_key = self.config.encryption_key.clone();
+        {
+            let _guard = BackfillGuard { counter: Arc::clone(&self.backfill_inflight) };
+            let pointers = shard_arc.read().unwrap().get_physical_index_snapshot();
+            for chunk in pointers.chunks(500) {
+                let mut resolved = Vec::new();
+                {
+                    let storage = shard_arc.read().unwrap();
+                    for (key, ptr) in chunk {
+                        if let Ok(Some(bytes)) = storage.read_pointer_internal(ptr, false) {
+                            resolved.push((key.clone(), bytes));
+                        }
+                    }
+                }
+
+                {
+                    let mut mgr = self.indexes.write().unwrap();
+                    let mut persist = self.index_storage.lock().unwrap();
+                    if let Some(idx) = mgr.composite.get_mut(index_id) {
+                        for (doc_id, bytes) in resolved {
+                            if let Some(mut doc) = HakoDoc::decode(&bytes) {
+                                let _ =
+                                    resolve_doc_static(&mut doc, shard_arc, enc_key.as_deref());
+                                idx.index_document(&doc_id, &doc);
+                                // Lean key into index.log (same as the
+                                // async backfill — recovery parity).
+                                // Filtered defs only log matching docs.
+                                if idx.definition.filter_passes(&doc_id, &doc) {
+                                    if let Some(vals) = idx.document_values(&doc_id, &doc) {
+                                        let key_bytes =
+                                            crate::index::composite::key_encoder::encode_composite_key(
+                                                &idx.definition, &vals, &doc_id,
+                                            );
+                                        let _ = persist.insert(
+                                            index_id,
+                                            key_bytes.to_vec(),
+                                            doc_id.to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Def vanished mid-backfill (concurrent drop):
+                        // nothing left to enforce, bail quietly.
+                        return Ok(());
+                    }
+                    thread::yield_now();
+                }
+            }
+        }
+
+        // Fold the sorted tree into the claim ledger. Adjacent equal
+        // prefixes = historical duplicates â†’ dense error, no claims
+        // registered (load_from_tree keeps partial state private).
+        let mgr = self.indexes.read().unwrap();
+        match mgr.composite.get(index_id) {
+            Some(idx) => {
+                self.unique_ledger.load_from_tree(index_id, &idx.tree).map(|_| ())
+            }
+            None => Ok(()),
+        }
     }
 
     /// Explicitly trigger a snapshot (called by Maintenance Thread or FFI)
@@ -4256,7 +4733,7 @@ impl Hako {
         let tmp = dir.join("ram_indexes.bin.tmp");
         let dst = dir.join("ram_indexes.bin");
         std::fs::write(&tmp, &bytes)?;
-        // ponytail: best-effort durability only — a failed sync still
+        // ponytail: best-effort durability only â€” a failed sync still
         // leaves the previous good snapshot (rename is atomic).
         if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) {
             let _ = f.sync_all();
@@ -4336,7 +4813,7 @@ impl Hako {
         // Single acquisition: snapshot queue + manager under one read
         // guard, then resolve without holding any lock. Re-acquiring
         // inside resolve (nested read behind a queued writer) is a
-        // self-deadlock under writer-preference RwLocks — never do it.
+        // self-deadlock under writer-preference RwLocks â€” never do it.
         let shard_arc = self.get_shard(collection)?;
         let (blob_manager, queue_snapshot) = {
             let shard = shard_arc.read().map_err(|_| HakoError::LockPoisoned("shard".into()))?;
@@ -4471,7 +4948,7 @@ impl Hako {
 
     /// True once the background open-recovery pass has rebuilt indexes.
     /// Queries issued before this silently plan `FullCollection` (the
-    /// planner's `index_ready` gate) — poll after open/seed in benchmarks
+    /// planner's `index_ready` gate) â€” poll after open/seed in benchmarks
     /// and tests before measuring. Mirrors `hk_engine_is_indexes_ready`.
     pub fn is_indexes_ready(&self) -> bool {
         self.indexes_ready.load(std::sync::atomic::Ordering::Acquire)
@@ -4480,7 +4957,7 @@ impl Hako {
     /// Query planning may trust indexes only when open-recovery is done AND
     /// no runtime backfill is in flight. A new index registers before its
     /// backfill thread finishes; planning against the partial index returns
-    /// wrong (empty/partial) results — fall back to `FullCollection`
+    /// wrong (empty/partial) results â€” fall back to `FullCollection`
     /// instead. The plan cache is invalidated at index creation, so no
     /// stale fast plan survives into the build window (a slow plan cached
     /// during the window self-heals at TTL).
@@ -4513,7 +4990,7 @@ impl Hako {
     }
 
     /// True when nothing background is outstanding (see
-    /// `QuiescenceStatus::is_quiescent`). One sample — use
+    /// `QuiescenceStatus::is_quiescent`). One sample â€” use
     /// `await_quiescent` for a settled verdict.
     pub fn is_quiescent(&self) -> bool {
         self.quiescence_status().is_quiescent()
@@ -4522,7 +4999,7 @@ impl Hako {
     /// Block until background work settles or `timeout` lapses. Requires
     /// TWO consecutive clear samples (5ms apart) so a millisecond gap
     /// between write batches doesn't read as settled. Returns true when
-    /// settled. A continuously-written DB correctly never settles — poll
+    /// settled. A continuously-written DB correctly never settles â€” poll
     /// `quiescence_status` to see what is outstanding instead.
     pub fn await_quiescent(&self, timeout: Duration) -> bool {
         let t0 = Instant::now();
@@ -4577,7 +5054,7 @@ impl Hako {
 
     pub fn get_version_map(&self) -> std::collections::HashMap<String, i64> {
         let mut map = std::collections::HashMap::new();
-        // Sync enumeration (hidden included, excluded dropped) — the manual
+        // Sync enumeration (hidden included, excluded dropped) â€” the manual
         // `__hako_security` re-add this replaces is gone: enumeration
         // covers it now that sync no longer depends on `_` hiding.
         let cols = self.sync_collections().unwrap_or_default();
@@ -4826,7 +5303,7 @@ mod profile_tests {
         let db = Hako::open(&dir, cfg).expect("open");
         db.put_owned("c", "k", test_doc(1)).expect("put");
         let v1 = db.current_version("k").expect("version after write");
-        // Micros since 2026 ≈ 1.78e15: proves the wall-clock seed (the old
+        // Micros since 2026 â‰ˆ 1.78e15: proves the wall-clock seed (the old
         // code issued 1 here). Deterministic: no timing involved.
         assert!(v1 > 1_000_000_000_000_000, "seeded, not restarted-at-1: {v1}");
         db.put_owned("c", "k", test_doc(2)).expect("put");
@@ -4915,7 +5392,7 @@ mod profile_tests {
 
     /// Selective decode keeps indexed entries identical while skipping
     /// value allocs for the rest (backfill paths feed it only registered
-    /// fields — see indexed_fields_for).
+    /// fields â€” see indexed_fields_for).
     #[test]
     fn decode_projected_matches_full_on_wanted() {
         let mut d = HakoDoc::default();
@@ -4973,7 +5450,7 @@ mod profile_tests {
         // Second start while loading-or-loaded is a no-op false.
         let _ = db.start_collection_load("arc").expect("second");
         // Either we observe progress mid-build, or the build already
-        // finished on a fast box — both converge below.
+        // finished on a fast box â€” both converge below.
         let t0 = std::time::Instant::now();
         let mut saw_progress = false;
         while t0.elapsed() < std::time::Duration::from_secs(15) {
@@ -5128,7 +5605,7 @@ mod profile_tests {
             assert!(db.await_quiescent(std::time::Duration::from_secs(30)));
         }
         // Phase 2: raw engine moves WAL past the snapshot (no RAM index
-        // involved) — then drops (WAL flushed, snapshot untouched).
+        // involved) â€” then drops (WAL flushed, snapshot untouched).
         {
             let cfg = HakoConfig::default();
             let mut eng =
@@ -5150,7 +5627,7 @@ mod profile_tests {
                 .unwrap()
                 .lookup_secondary("c", "kind", &enc)
                 .unwrap_or_default();
-            // a3 joined, a1's ghost gone — exactly one live "x".
+            // a3 joined, a1's ghost gone â€” exactly one live "x".
             assert_eq!(hits.len(), 1);
             assert!(db.get("c", "a1").expect("get").is_none());
             assert!(db.get("c", "a3").expect("get").is_some());
@@ -5160,7 +5637,7 @@ mod profile_tests {
     }
 
     /// Early termination (issue #22): unordered bounded queries return
-    /// the scan-order prefix — identical rows to full scan + truncate.
+    /// the scan-order prefix â€” identical rows to full scan + truncate.
     #[test]
     fn early_termination_matches_full_scan() {
         use crate::query::filter::Operator;
@@ -5239,7 +5716,7 @@ mod profile_tests {
 
     /// Relocate refuses every sync-excluded side (config, builtin,
     /// whole-collection local-only, unloaded-lazy) in lockstep with what
-    /// sync withholds — a move must never launder data onto the mesh.
+    /// sync withholds â€” a move must never launder data onto the mesh.
     #[test]
     fn relocate_refuses_excluded_sides() {
         let nanos = std::time::SystemTime::now()
@@ -5338,7 +5815,7 @@ mod profile_tests {
             .unwrap_or_default();
         assert!(hits.iter().any(|id| id.as_ref() == "a1"));
         assert!(db.sync_collections().unwrap().contains(&"archive".to_string()));
-        // Phase 4: evict → withheld again, data intact, hot protected.
+        // Phase 4: evict â†’ withheld again, data intact, hot protected.
         db.unload_collection("archive").expect("unload");
         db.unload_collection("archive").expect("idempotent");
         assert!(db.is_lazy_unloaded("archive"));
@@ -5349,7 +5826,7 @@ mod profile_tests {
         db.backup(&bdir).expect("backup");
         assert!(bdir.join("archive").join("wal.log").exists());
         assert!(bdir.join("hot").join("wal.log").exists());
-        // Phase 6: re-touch after evict → identical data.
+        // Phase 6: re-touch after evict â†’ identical data.
         let back = db.get("archive", "a2").expect("get").expect("reloaded");
         assert_eq!(back.get("kind"), Some(&Value::String("memo".into())));
         std::fs::remove_dir_all(&bdir).ok();

@@ -33,13 +33,13 @@ pub enum Operator {
     Traverse,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum FilterLogic {
     And,
     Or,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FilterGroup {
     pub logic: FilterLogic,
     pub filters: Vec<Filter>,
