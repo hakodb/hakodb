@@ -304,3 +304,67 @@ fn non_unique_composite_paths_unchanged() {
         id
     );
 }
+
+// --- fkip-234 report regressions (hakodb#71 Release B branch) ---
+
+/// BUG-1: after a restart, delete() then re-inserting the freed tuple
+/// must succeed — a late STEP-C fold (mixed touched-collection tree)
+/// must not revive the released claim. Poll-based: recovery is async.
+#[test]
+fn delete_after_restart_frees_claim_even_with_late_fold() {
+    let dir = tmp_dir("ghost");
+    {
+        let db = Hako::open(&dir, HakoConfig::default()).unwrap();
+        db.create_composite_index_ex(
+            "keep",
+            vec![("region".into(), hakodb::index::composite::definition::SortDirection::Asc)],
+            true, false, None,
+        ).unwrap();
+        db.put("keep", "k1", &doc("p", "r1")).unwrap();
+        // Worker settles first so the snapshot carries the tree row
+        // (STEP A fold path).
+        assert!(db.await_quiescent(std::time::Duration::from_secs(10)), "settle");
+        db.export_index_snapshot().unwrap();
+    }
+    {
+        let db = Hako::open(&dir, HakoConfig::default()).unwrap();
+        // Delete FIRST (pre- or post-fold order must both end sound),
+        // then the claim must be free. The delete marks the collection
+        // touched → STEP C folds a stale tree merged with fresh state —
+        // the tombstone keeps that fold from resurrecting k1's claim.
+        db.delete("keep", "k1").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match db.put("keep", "k2", &doc("p", "r1")) {
+                Ok(_) => break,
+                Err(e) if matches!(e.kind(), ErrorKind::UniqueViolation) => {
+                    panic!("ghost claim survived delete: {e:?}")
+                }
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                other => panic!("expected claim reuse, got {other:?}"),
+            }
+        }
+    }
+}
+
+/// BUG-2: read-your-writes without await_quiescent — a query right
+/// after put() must see the doc even while the index worker still owes
+/// ops (index_query_ready gates on index_inflight == 0 now).
+#[test]
+fn query_right_after_put_sees_the_put() {
+    let dir = tmp_dir("ryw");
+    let db = Hako::open(&dir, HakoConfig::default()).unwrap();
+    db.create_composite_index(
+        "ryw",
+        vec![("region".into(), hakodb::index::composite::definition::SortDirection::Asc)],
+    ).unwrap();
+    for i in 0..50 {
+        let r = format!("r{i}");
+        db.put("ryw", &format!("d{i}"), &doc("p", &r)).unwrap();
+        // Immediately: planner must NOT ride the not-yet-updated tree.
+        let hits = db.query(Query::new("ryw").where_eq("region", Value::String(r.into()))).unwrap();
+        assert_eq!(hits.len(), 1, "iteration {i}: read-your-writes window");
+    }
+}

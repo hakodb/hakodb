@@ -1,4 +1,4 @@
-use std::collections::hash_map::DefaultHasher;
+﻿use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,7 +12,7 @@ use crate::index::manager::IndexManager;
 use crate::query::query::Query;
 
 /// LRU-ish cache of compiled QueryPlans keyed by a structural hash of the query.
-/// The plan is a pure function of (Query, IndexManager-version) — the bench
+/// The plan is a pure function of (Query, IndexManager-version) â€” the bench
 /// re-issues the same shape 300 times in the stress loop, so caching it skips
 /// the planner clone + filter walks per call.
 ///
@@ -48,7 +48,18 @@ impl PlanCache {
         collection_rows: usize,
         worker_count: usize,
         index_ready: bool,
+        vector_ready: bool,
     ) -> Arc<QueryPlan> {
+        // Not ready (backfill or pending IndexOps, hakodb#71 BUG-2): plan
+        // must reflect THIS instant (full-scan fallback), never a cached
+        // index-backed plan from a readier moment; the fallback pollutes
+        // no cache key either.
+        if !index_ready {
+            return Arc::new(QueryPlanner::plan(
+                query, indexes, collection_rows, worker_count, false, vector_ready,
+            ));
+        }
+
         let key = hash_query(query);
         let now = Instant::now();
 
@@ -61,7 +72,7 @@ impl PlanCache {
         }
 
         // Slow path: build a fresh plan.
-        let plan = QueryPlanner::plan(query, indexes, collection_rows, worker_count, index_ready);
+        let plan = QueryPlanner::plan(query, indexes, collection_rows, worker_count, index_ready, true);
         let arc = Arc::new(plan);
 
         self.map.lock().insert(key, (arc.clone(), now));
@@ -84,7 +95,7 @@ impl Default for PlanCache {
     }
 }
 
-/// Hash a query's STRUCTURE — collection, filters (field+op+value), order,
+/// Hash a query's STRUCTURE â€” collection, filters (field+op+value), order,
 /// limit, offset, projection, cursor bounds. Anything that changes the plan.
 /// `aggregation` and `or_groups` included because both affect `ScanType`.
 fn hash_query(q: &Query) -> u64 {
@@ -110,17 +121,17 @@ fn hash_query(q: &Query) -> u64 {
     q.limit.hash(&mut h);
     q.offset.hash(&mut h);
     // ponytail: defer_blobs changes executor output (inflated vs BlobLink),
-    // so it must key the plan — otherwise a deferred query reuses an eager
+    // so it must key the plan â€” otherwise a deferred query reuses an eager
     // plan's output shape or vice versa.
     q.defer_blobs.hash(&mut h);
-    // ponytail: raw changes executor output (bytes vs docs) — same
+    // ponytail: raw changes executor output (bytes vs docs) â€” same
     // keying requirement as defer_blobs.
     q.raw.hash(&mut h);
     for p in &q.projection { p.hash(&mut h); }
     for a in &q.aggregations { hash_agg(a, &mut h); }
 
-    // Cursor bounds — these change the index range and must invalidate.
-    // ponytail: tag WHICH bound is set, not just its value — start_at=[k]
+    // Cursor bounds â€” these change the index range and must invalidate.
+    // ponytail: tag WHICH bound is set, not just its value â€” start_at=[k]
     // and start_after=[k] hash identically otherwise and share a plan
     // (inclusive vs exclusive), returning wrong rows.
     if let Some(v) = &q.start_at { 0u8.hash(&mut h); for x in v { hash_value(x, &mut h); } }
@@ -133,7 +144,7 @@ fn hash_query(q: &Query) -> u64 {
 
 fn hash_value(v: &crate::document::value::Value, h: &mut DefaultHasher) {
     // Discriminant-only hash for value variants we care about for plan shape.
-    // We don't need to hash the *contents* of large Array/Map — they don't
+    // We don't need to hash the *contents* of large Array/Map â€” they don't
     // change the plan, only the filter clause. The filter clause already
     // hashes each value via the per-filter hash above.
     match v {
@@ -157,7 +168,7 @@ fn hash_value(v: &crate::document::value::Value, h: &mut DefaultHasher) {
 }
 
 /// Per-filter value hash. Binary normally keys on length only (contents
-/// never change an exact-key plan) — EXCEPT under `Near`, where the query
+/// never change an exact-key plan) â€” EXCEPT under `Near`, where the query
 /// vector rides the Binary AND the plan embeds it (VectorKnn carries the
 /// bytes). Same-dim different-vector queries would otherwise share one
 /// plan and return each other's neighbors.
@@ -174,7 +185,7 @@ fn hash_filter_value(
         }
     }
     // Traverse marker carries the whole walk in a Map (anchor, dir, edge,
-    // depth): same rule as Near — two walks with different payloads must
+    // depth): same rule as Near â€” two walks with different payloads must
     // never share a plan. Hash the entries, sorted for determinism.
     if matches!(op, crate::query::filter::Operator::Traverse) {
         if let crate::document::value::Value::Map(pairs) = v {
@@ -218,11 +229,11 @@ mod tests {
     fn same_shape_returns_same_plan() {
         let cache = PlanCache::default();
         let idx = IndexManager::default();
-        let p1 = cache.get_or_compute(&q_active_eq(), &idx, 1000, 4, true);
-        let p2 = cache.get_or_compute(&q_active_eq(), &idx, 1000, 4, true);
-        // Same shape, different collection_rows — plan must be the same (collection_rows
+        let p1 = cache.get_or_compute(&q_active_eq(), &idx, 1000, 4, true, true);
+        let p2 = cache.get_or_compute(&q_active_eq(), &idx, 1000, 4, true, true);
+        // Same shape, different collection_rows â€” plan must be the same (collection_rows
         // is a planner hint, not a structural input that changes ScanType).
-        let p3 = cache.get_or_compute(&q_active_eq(), &idx, 10000, 4, true);
+        let p3 = cache.get_or_compute(&q_active_eq(), &idx, 10000, 4, true, true);
         assert!(Arc::ptr_eq(&p1, &p2));
         assert!(Arc::ptr_eq(&p1, &p3));
         assert_eq!(cache.hits.load(std::sync::atomic::Ordering::Relaxed), 2);
@@ -233,12 +244,12 @@ mod tests {
     fn different_filter_field_invalidates() {
         let cache = PlanCache::default();
         let idx = IndexManager::default();
-        let p1 = cache.get_or_compute(&q_active_eq(), &idx, 1000, 4, true);
+        let p1 = cache.get_or_compute(&q_active_eq(), &idx, 1000, 4, true, true);
 
         let q2 = Query::new("bench")
             .where_filter("tenant", Operator::Eq, Value::String("tenant-2".into()))
             .limit(50);
-        let p2 = cache.get_or_compute(&q2, &idx, 1000, 4, true);
+        let p2 = cache.get_or_compute(&q2, &idx, 1000, 4, true, true);
         assert!(!Arc::ptr_eq(&p1, &p2));
     }
 
@@ -246,9 +257,9 @@ mod tests {
     fn ttl_expires_old_plan() {
         let cache = PlanCache::new(Duration::from_millis(10));
         let idx = IndexManager::default();
-        let p1 = cache.get_or_compute(&q_active_eq(), &idx, 1000, 4, true);
+        let p1 = cache.get_or_compute(&q_active_eq(), &idx, 1000, 4, true, true);
         std::thread::sleep(Duration::from_millis(20));
-        let p2 = cache.get_or_compute(&q_active_eq(), &idx, 1000, 4, true);
+        let p2 = cache.get_or_compute(&q_active_eq(), &idx, 1000, 4, true, true);
         assert!(!Arc::ptr_eq(&p1, &p2));
     }
 
@@ -260,13 +271,13 @@ mod tests {
         q1.order_by.push(OrderBy { field: "id".into(), ascending: true });
         q1.start_at = Some(vec![Value::String("b_100".into())]);
         q1.limit = Some(5);
-        let p1 = cache.get_or_compute(&q1, &idx, 1000, 4, true);
+        let p1 = cache.get_or_compute(&q1, &idx, 1000, 4, true, true);
 
         let mut q2 = Query::new("bench");
         q2.order_by.push(OrderBy { field: "id".into(), ascending: true });
         q2.start_at = Some(vec![Value::String("b_500".into())]);
         q2.limit = Some(5);
-        let p2 = cache.get_or_compute(&q2, &idx, 1000, 4, true);
+        let p2 = cache.get_or_compute(&q2, &idx, 1000, 4, true, true);
         assert!(!Arc::ptr_eq(&p1, &p2));
     }
 
@@ -274,9 +285,9 @@ mod tests {
     fn invalidate_clears() {
         let cache = PlanCache::default();
         let idx = IndexManager::default();
-        let p1 = cache.get_or_compute(&q_active_eq(), &idx, 1000, 4, true);
+        let p1 = cache.get_or_compute(&q_active_eq(), &idx, 1000, 4, true, true);
         cache.invalidate();
-        let p2 = cache.get_or_compute(&q_active_eq(), &idx, 1000, 4, true);
+        let p2 = cache.get_or_compute(&q_active_eq(), &idx, 1000, 4, true, true);
         assert!(!Arc::ptr_eq(&p1, &p2));
     }
 
@@ -285,9 +296,9 @@ mod tests {
         let cache = PlanCache::default();
         let idx = IndexManager::default();
         let q1 = Query::new("bench").where_filter("age", Operator::Gt, Value::Int(20));
-        let p1 = cache.get_or_compute(&q1, &idx, 1000, 4, true);
+        let p1 = cache.get_or_compute(&q1, &idx, 1000, 4, true, true);
         let q2 = Query::new("bench").where_filter("age", Operator::Lt, Value::Int(20));
-        let p2 = cache.get_or_compute(&q2, &idx, 1000, 4, true);
+        let p2 = cache.get_or_compute(&q2, &idx, 1000, 4, true, true);
         assert!(!Arc::ptr_eq(&p1, &p2));
     }
 
@@ -296,9 +307,9 @@ mod tests {
         let cache = PlanCache::default();
         let idx = IndexManager::default();
         let q1 = Query::new("bench").aggregate(AggregateOp::Count);
-        let p1 = cache.get_or_compute(&q1, &idx, 1000, 4, true);
+        let p1 = cache.get_or_compute(&q1, &idx, 1000, 4, true, true);
         let q2 = Query::new("bench").aggregate(AggregateOp::Sum("age".into()));
-        let p2 = cache.get_or_compute(&q2, &idx, 1000, 4, true);
+        let p2 = cache.get_or_compute(&q2, &idx, 1000, 4, true, true);
         assert!(!Arc::ptr_eq(&p1, &p2));
     }
 }

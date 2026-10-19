@@ -1,4 +1,4 @@
-use super::filter::{Filter, Operator};
+﻿use super::filter::{Filter, Operator};
 use super::plan::{QueryPlan, ScanType};
 use super::query::Query;
 use crate::document::value::Value;
@@ -12,15 +12,65 @@ use std::ops::Bound; // Required for range definitions
 
 pub struct QueryPlanner;
 
+use crate::index::composite::definition::CompositeIndexDefinition;
+
 impl QueryPlanner {
+    /// Filtered (partial) composite-index consistency gate (hakodb#71):
+    /// a probe over a filtered index's tree answers ONLY docs matching
+    /// the tree's predicate, so the planner may ride it only when the
+    /// query implies that predicate â€” otherwise results would silently
+    /// miss non-tree docs. Conservative: every And-group condition must
+    /// be pinned by the query's AND conjunction with the exact same
+    /// Eq/In-single value; Or-filters and range/other ops are unprovable
+    /// (fail-closed â†’ full-scan lanes instead). Runs at plan build only
+    /// (plan-cache TTL amortizes it); with â‰¤8 conditions it is a couple
+    /// of nanoseconds â€” a memo map would cost more than the check.
+    fn composite_def_usable(def: &CompositeIndexDefinition, query: &Query) -> bool {
+        use crate::query::filter::FilterLogic;
+        let Some(group) = &def.filter else { return true };
+        if group.logic != FilterLogic::And {
+            return false;
+        }
+        group.filters.iter().all(|cond| {
+            query.filters.iter().any(|f| f.field == cond.field && match (&f.op, &cond.op) {
+                (Operator::Eq, Operator::Eq) => f.value == cond.value,
+                (Operator::In, Operator::Eq) => matches!(
+                    &f.value,
+                    Value::Array(a) if a.len() == 1 && a[0] == cond.value
+                ),
+                _ => false,
+            })
+        })
+    }
+
     pub fn plan(
-        query: &Query,
-        indexes: &IndexManager,
+        query: &Query,        indexes: &IndexManager,
         collection_rows: usize,
         worker_count: usize,
         index_ready: bool,
+        vector_ready: bool,
     ) -> QueryPlan {
         if !index_ready {
+            // Vector lanes survive pending writer ops: the executor
+            // live-filters handles (delete invisibility), so tree lag
+            // only lowers recall â€” never serves ghost rows. FullCollection
+            // cannot score Near at all and would serve empty results
+            // (vector_hnsw delete_stays_invisible). Still gated on
+            // backfill (partial initial build = genuinely bad ANN).
+            if vector_ready {
+                if let Some(plan) = Self::try_plan_vector(query, indexes) {
+                    return plan;
+                }
+            }
+            // The `id`-order SortedKeys slice is index-INDEPENDENT (natural
+            // storage key order), so keep it alive even in the not-ready
+            // window â€” otherwise cursor pagination falls back to
+            // FullCollection, which ignores cursor bounds (repeated rows,
+            // oplog_fuzz page-walk). Everything index-backed stays behind
+            // the gate (hakodb#71 BUG-2).
+            if let Some(scan) = Self::id_order_sortedkeys(query) {
+                return Self::make_plan(query, scan, query.limit, true, true);
+            }
             return Self::make_plan(query, ScanType::FullCollection, None, false, false);
         }
 
@@ -52,51 +102,17 @@ impl QueryPlanner {
         // 1b. PRIORITY 1b: Vector KNN (exact, P0).
         // Gate: exactly one Near filter, no OR groups, Binary LE-f32
         // value, registered def with matching dim. Anything else falls
-        // through — Near is fail-closed in compare_values, so unsupported
+        // through â€” Near is fail-closed in compare_values, so unsupported
         // shapes return empty, never unranked rows.
-        let near_count = query.filters.iter().filter(|f| matches!(f.op, Operator::Near)).count();
-        if near_count == 1 && query.or_groups.is_empty() {
-            if let Some(nf) = query.filters.iter().find(|f| matches!(f.op, Operator::Near)) {
-                if let Value::Binary(qb) = &nf.value {
-                    let def = indexes.vector.get(&query.collection).and_then(|m| m.get(&nf.field));
-                    if let Some(def) = def {
-                        if qb.len() % 4 == 0 && qb.len() / 4 == def.dim as usize {
-                            let extra: Vec<Filter> = query
-                                .filters
-                                .iter()
-                                .filter(|f| !matches!(f.op, Operator::Near))
-                                .cloned()
-                                .collect();
-                            let mut plan = Self::make_plan(
-                                query,
-                                ScanType::VectorKnn {
-                                    field: nf.field.clone(),
-                                    query: qb.clone(),
-                                    metric: def.metric,
-                                    extra,
-                                },
-                                query.limit.map(|l| l + query.offset.unwrap_or(0)),
-                                false,
-                                true,
-                            );
-                            // The arm verifies everything itself (Near
-                            // scoring + remaining Eq filters), so strip
-                            // Near: downstream re-verify (incl. the
-                            // projected path) must only see boolean
-                            // filters.
-                            plan.filters.retain(|f| !matches!(f.op, Operator::Near));
-                            return plan;
-                        }
-                    }
-                }
-            }
+        if let Some(plan) = Self::try_plan_vector(query, indexes) {
+            return plan;
         }
 
         // 1c. PRIORITY 1c: Graph traversal (issue #53, Phase A).
         // Gate: exactly one Traverse filter, no OR groups, anchor
         // collection in the field, Map value (id/dir/edge?/depth), sane
         // depth, tracked start when incoming. Anything else falls through
-        // — Traverse is fail-closed in compare_values, so unsupported
+        // â€” Traverse is fail-closed in compare_values, so unsupported
         // shapes return empty, never unranked rows. Combined Near+Traverse
         // is unsupported (first marker wins, the other fail-closes).
         let trav_count = query.filters.iter().filter(|f| matches!(f.op, Operator::Traverse)).count();
@@ -175,8 +191,8 @@ impl QueryPlanner {
         // limit) than a composite prefix walk (prefix-range build + FULL
         // materialization of every matching tuple key before truncation).
         // So yield to P6 whenever it would accept this filter. The conditions
-        // below mirror P6's acceptance exactly — Eq op, secondary present,
-        // no numeric-string ambiguity, size heuristic on — so we can never
+        // below mirror P6's acceptance exactly â€” Eq op, secondary present,
+        // no numeric-string ambiguity, size heuristic on â€” so we can never
         // fall through to a full scan by yielding.
         // Multi-filter and ordered queries keep the composite: conjunction
         // narrowing and pre-sorted output are worth more than the cheaper
@@ -191,7 +207,7 @@ impl QueryPlanner {
             && !matches!(&query.filters[0].value, Value::String(s) if s.parse::<i64>().is_ok());
         if !yield_to_secondary {
         if let Some((eq_scan, satisfied, filters_done)) = Self::try_plan_composite_eq(query, indexes) {
-            // ponytail: include offset like every P3/P6 path does — bare
+            // ponytail: include offset like every P3/P6 path does â€” bare
             // `limit` under-collected when offset > 0 (scan grabs `limit`,
             // executor then skips `offset`).
             let safe_limit = if satisfied {
@@ -212,7 +228,7 @@ impl QueryPlanner {
             // PONYTAIL: special-case the `id` field. When the user orders by
             // `id` with no filters, the storage sorted_keys vec is already
             // sorted by id. We can slice it directly (O(log N + limit))
-            // instead of walking any index — including for cursor queries
+            // instead of walking any index â€” including for cursor queries
             // (`start_at`/`start_after` resolve to a binary search + slice
             // in the executor). hk_engine_create_index("id") registers `id`
             // as a composite index with one field, so this short-circuit has
@@ -224,43 +240,23 @@ impl QueryPlanner {
                 && query.filters.is_empty() && query.or_groups.is_empty()
                 && query.order_by.len() == 1
             {
-                // Resolve the cursor anchor (order by id => anchor is a doc id).
-                // None = supported shape with no bound; outer None =
-                // unsupported anchor type => fall through.
-                let anchor: Option<(Option<String>, bool)> =
-                    match (&query.start_at, &query.start_after) {
-                        (Some(v), _) if !v.is_empty() => Self::anchor_id(&v[0]).map(|s| (Some(s), false)),
-                        (_, Some(v)) if !v.is_empty() => Self::anchor_id(&v[0]).map(|s| (Some(s), true)),
-                        (None, None) => Some((None, false)),
-                        _ => Some((None, false)),
-                    };
-                if first_order.ascending {
-                    if let Some((start_key, start_exclusive)) = anchor {
-                        let safe_limit = query.limit;
-                        return Self::make_plan(
-                            query,
-                            ScanType::SortedKeys { start_key, start_exclusive, reverse: false },
-                            safe_limit,
-                            true,
-                            true,
-                        );
-                    }
-                } else if let Some((start_key, start_exclusive)) = anchor {
-                    // Descending with or without cursor bounds: the executor
-                    // binary-searches the anchor and walks backward
-                    // (O(log N + limit)) — same fast path as ascending.
-                    let safe_limit = query.limit;
+                if let Some(scan) = Self::id_order_sortedkeys(query) {
                     return Self::make_plan(
                         query,
-                        ScanType::SortedKeys { start_key, start_exclusive, reverse: true },
-                        safe_limit,
+                        scan,
+                        query.limit,
                         true,
                         true,
                     );
                 }
+                // Unsupported anchor shape: fall through to the composite
+                // loop below (end bounds / exotic values).
             }
             // Check Composite Indices for both Cursors AND pure OrderBy Pagination
             for idx in indexes.indexes_for_collection(&query.collection) {
+                if !Self::composite_def_usable(&idx.definition, query) {
+                    continue;
+                }
                 if !idx.definition.fields.is_empty() && idx.definition.fields[0].field == first_order.field {
                     let mut matches_all = true;
                     let mut reverse_scan = false;
@@ -336,7 +332,7 @@ impl QueryPlanner {
         }
 
         // 4. PRIORITY 4: Composite Range (e.g. WHERE price > 100)
-        // ponytail: also gated on !yield_to_secondary — P4 accepts all-Eq
+        // ponytail: also gated on !yield_to_secondary â€” P4 accepts all-Eq
         // filters too, and would otherwise recapture the queries we just
         // yielded with a WORSE plan (full prefix materialization, no limit
         // pushdown, per-doc filter re-verify). P6 takes them instead.
@@ -372,9 +368,9 @@ impl QueryPlanner {
         // 21ms). One BTree get per candidate is O(log n); ties keep the
         // first filter (same plan as before). Single-Eq is unchanged.
         // No sweep fallback: measured index wins even at 90% selectivity
-        // unbounded (454ms vs 802ms) — the premise in #22 was wrong.
+        // unbounded (454ms vs 802ms) â€” the premise in #22 was wrong.
         if use_index_heuristic {
-            // (posting_len, filter_idx, encoded value) — index, not &Filter,
+            // (posting_len, filter_idx, encoded value) â€” index, not &Filter,
             // so the build below stays a plain move.
             let mut best: Option<(usize, usize, Vec<u8>)> = None;
             for (fi, filter) in query.filters.iter().enumerate() {
@@ -384,7 +380,7 @@ impl QueryPlanner {
                             // Ambiguous-class values (numeric strings AND
                             // bare Int/Float: the stored side may encode
                             // the number differently) take the alternatives
-                            // union instead of one exact bucket — the DHP
+                            // union instead of one exact bucket â€” the DHP
                             // `passw` hole was a single-key trust here.
                             // Union scans verify downstream; the single-key
                             // path below keeps its trust (same-type keys
@@ -426,7 +422,7 @@ impl QueryPlanner {
                 let filter = &query.filters[fi];
                                 // CRITICAL FIX: Mark filters satisfied if this is the ONLY filter
                                 let filters_satisfied = query.filters.len() == 1 && query.or_groups.is_empty();
-                                // ponytail: no limit pushdown under ORDER BY — the
+                                // ponytail: no limit pushdown under ORDER BY â€” the
                                 // point scan is NOT in sort order, so truncating
                                 // before the executor sort returns the wrong
                                 // TOP-N (same trap as the FullCollection
@@ -449,7 +445,7 @@ impl QueryPlanner {
         // This is the "Safety Net". If no index was found for 'id:eq',
         // it lands here and the Worker checks the storage keys manually.
         // ponytail: push limit+offset into the scan ONLY when no filters
-        // need matching AND no ORDER BY is requested — unordered scans can
+        // need matching AND no ORDER BY is requested â€” unordered scans can
         // satisfy TOP-N from ANY rows, but pre-truncating before filter
         // matching returns wrong (usually empty) results, and pre-truncating
         // before the executor's in-memory sort returns the wrong TOP-N.
@@ -510,6 +506,66 @@ impl QueryPlanner {
         }
     }
 
+    /// Vector KNN planning: exactly one Near filter, no Or groups, Binary
+    /// LE-f32 value, registered def with matching dim. The arm verifies
+    /// everything itself (Near scoring + remaining Eq filters), so the
+    /// returned plan strips Near: downstream re-verify (incl. projected
+    /// path) sees only boolean filters.
+    fn try_plan_vector(query: &Query, indexes: &IndexManager) -> Option<QueryPlan> {
+        let near_count = query.filters.iter().filter(|f| matches!(f.op, Operator::Near)).count();
+        if near_count != 1 || !query.or_groups.is_empty() {
+            return None;
+        }
+        let nf = query.filters.iter().find(|f| matches!(f.op, Operator::Near))?;
+        let Value::Binary(qb) = &nf.value else { return None };
+        let def = indexes.vector.get(&query.collection).and_then(|m| m.get(&nf.field))?;
+        if qb.len() % 4 != 0 || qb.len() / 4 != def.dim as usize {
+            return None;
+        }
+        let extra: Vec<Filter> = query
+            .filters
+            .iter()
+            .filter(|f| !matches!(f.op, Operator::Near))
+            .cloned()
+            .collect();
+        let mut plan = Self::make_plan(
+            query,
+            ScanType::VectorKnn {
+                field: nf.field.clone(),
+                query: qb.clone(),
+                metric: def.metric,
+                extra,
+            },
+            query.limit.map(|l| l + query.offset.unwrap_or(0)),
+            false,
+            true,
+        );
+        plan.filters.retain(|f| !matches!(f.op, Operator::Near));
+        Some(plan)
+    }
+
+    /// The index-free `id`-order paging shape (planner P3 short-circuit):    /// order by `id` only, no filters/Or groups/end bounds, anchor
+    /// resolvable to a string. Returns the SortedKeys scan or None â€”
+    /// callers must not treat None as an error, just continue planning.
+    fn id_order_sortedkeys(query: &Query) -> Option<ScanType> {
+        let first_order = query.order_by.first()?;
+        if first_order.field != "id"
+            || query.end_at.is_some()
+            || query.end_before.is_some()
+            || !query.filters.is_empty()
+            || !query.or_groups.is_empty()
+            || query.order_by.len() != 1
+        {
+            return None;
+        }
+        let (start_key, start_exclusive) = match (&query.start_at, &query.start_after) {
+            (Some(v), _) if !v.is_empty() => (Some(Self::anchor_id(&v[0])?), false),
+            (_, Some(v)) if !v.is_empty() => (Some(Self::anchor_id(&v[0])?), true),
+            _ => (None, false),
+        };
+        Some(ScanType::SortedKeys { start_key, start_exclusive, reverse: !first_order.ascending })
+    }
+
     fn try_plan_union(query: &Query, indexes: &IndexManager) -> Option<ScanType> {        let mut scans = Vec::new();
         for filter in &query.filters {
             if matches!(filter.op, Operator::In) {
@@ -557,7 +613,7 @@ impl QueryPlanner {
     /// the stored side may carry the number as a String (legacy imports,
     /// CSV seeds) or float, so an exact-key index probe must try every
     /// encoding the semantic compare would accept. Original first; order
-    /// otherwise irrelevant (union dedups nothing — keys are type-tagged,
+    /// otherwise irrelevant (union dedups nothing â€” keys are type-tagged,
     /// so alternatives never collide).
     fn numeric_alternatives(val: &Value) -> Vec<Value> {
         let mut out = vec![val.clone()];
@@ -583,11 +639,11 @@ impl QueryPlanner {
             Value::Float(f) => {
                 // String form is best-effort (float textual forms are
                 // unbounded: "4.75" vs "4.750" vs "4.75e0" all parse equal
-                // but key differently — a miss here falls through to the
+                // but key differently â€” a miss here falls through to the
                 // executor's empty-index sweep fallback, still correct).
                 out.push(Value::String(f.to_string()));
                 if f.is_finite() {
-                    // Integral floats name an int ("4" for 4.0 — matches a
+                    // Integral floats name an int ("4" for 4.0 â€” matches a
                     // stored String("4") via parse, and stored Int(4) via
                     // total_cmp). Non-integral floats have no int form.
                     if f.fract() == 0.0
@@ -610,7 +666,7 @@ impl QueryPlanner {
         indexes: &IndexManager,
         _query: &Query,
     ) -> Option<ScanType> {
-        // Cross-type alternatives (Int/String/Float closure — see
+        // Cross-type alternatives (Int/String/Float closure â€” see
         // numeric_alternatives): the stored side may encode the number
         // differently than the filter does.
         let alternatives = Self::numeric_alternatives(val);
@@ -620,6 +676,9 @@ impl QueryPlanner {
             let mut found_for_this_type = false;
             // Look for Composite Index first
             for idx in indexes.indexes_for_collection(col) {
+                if !Self::composite_def_usable(&idx.definition, _query) {
+                    continue;
+                }
                 if idx.definition.fields.first().map_or(false, |f| f.field == field) {
                     sub_scans.push(ScanType::CompositeIndex {
                         index_id: idx.definition.id,
@@ -658,17 +717,20 @@ impl QueryPlanner {
 
 
     fn try_plan_composite_range(query: &Query, indexes: &IndexManager) -> Option<ScanType> {
-        
+
         let is_point_lookup = |f: &crate::query::filter::Filter| {
-            matches!(f.op, Operator::Eq) || 
+            matches!(f.op, Operator::Eq) ||
             (matches!(f.op, Operator::In) && matches!(&f.value, Value::Array(a) if a.len() == 1))
         };
 
         if query.filters.is_empty() || !query.filters.iter().all(is_point_lookup) {
             return None;
         }
-        
+
         for idx in indexes.indexes_for_collection(&query.collection) {
+            if !Self::composite_def_usable(&idx.definition, query) {
+                continue;
+            }
             let mut eq_prefix = Vec::new();
             let mut range_filter = None;
             let mut supported = true;
@@ -778,7 +840,7 @@ impl QueryPlanner {
         }
 
         // 1. Probing: alternate types for the FIRST filter field (shared
-        // numeric closure — the stored side may encode the number
+        // numeric closure â€” the stored side may encode the number
         // differently than the filter does).
         let first_filter = &query.filters[0];
         let alternatives = Self::numeric_alternatives(&first_filter.value);
@@ -788,6 +850,9 @@ impl QueryPlanner {
         // 2. Try to find a matching index for each alternative type
         for alt_val in alternatives {
             for idx in indexes.indexes_for_collection(&query.collection) {
+                if !Self::composite_def_usable(&idx.definition, query) {
+                    continue;
+                }
                 let mut matched_fields = Vec::new();
                 let mut matched_values = Vec::new();
 
@@ -811,7 +876,7 @@ impl QueryPlanner {
                 // If this index covers ALL our filters
                 if matched_fields.len() == query.filters.len() {
                     // ponytail: no ORDER BY means any subset is correctly
-                    // ordered, so limit pushdown is safe — treat as
+                    // ordered, so limit pushdown is safe â€” treat as
                     // satisfied. (make_plan already does this for the plan
                     // flag; the raw bool here gates safe_limit below.)
                     let mut order_satisfied = query.order_by.is_empty();
@@ -904,7 +969,7 @@ mod tests {
         let q = Query::new("bench")
             .where_eq("tenant", Value::String("tenant-2".into()))
             .limit(20);
-        let plan = QueryPlanner::plan(&q, &m, 1000, 8, true);
+        let plan = QueryPlanner::plan(&q, &m, 1000, 8, true, true);
         assert!(
             matches!(plan.scan, ScanType::SecondaryIndex { .. }),
             "unordered point lookup should use secondary, got {:?}",
@@ -923,7 +988,7 @@ mod tests {
             .where_eq("tenant", Value::String("tenant-2".into()))
             .order_by("score", false)
             .limit(20);
-        let plan = QueryPlanner::plan(&q, &m, 1000, 8, true);
+        let plan = QueryPlanner::plan(&q, &m, 1000, 8, true, true);
         assert!(
             matches!(plan.scan, ScanType::CompositeIndex { .. }),
             "ordered query should keep composite, got {:?}",
@@ -935,7 +1000,7 @@ mod tests {
     #[test]
     fn ordered_eq_no_limit_pushdown() {
         // Single Eq on a secondary-only field + ORDER BY on another field:
-        // Int filters route to the alternatives union (cross-type safety —
+        // Int filters route to the alternatives union (cross-type safety â€”
         // the stored side may encode the number differently), which
         // verifies downstream, so pushing limit would truncate before the
         // executor sort AND verification (wrong TOP-N). scan_limit None.
@@ -945,7 +1010,7 @@ mod tests {
             .where_eq("age", Value::Int(30))
             .order_by("score", false)
             .limit(20);
-        let plan = QueryPlanner::plan(&q, &m, 1000, 8, true);
+        let plan = QueryPlanner::plan(&q, &m, 1000, 8, true, true);
         assert!(
             matches!(plan.scan, ScanType::UnionIndex { .. }),
             "ambiguous Int should take the alternatives union, got {:?}",
@@ -954,7 +1019,7 @@ mod tests {
         assert_eq!(plan.scan_limit, None);
         // Same shape unordered: union too (verify downstream), no pushdown.
         let q2 = Query::new("bench").where_eq("age", Value::Int(30)).limit(20);
-        let plan2 = QueryPlanner::plan(&q2, &m, 1000, 8, true);
+        let plan2 = QueryPlanner::plan(&q2, &m, 1000, 8, true, true);
         assert!(
             matches!(plan2.scan, ScanType::UnionIndex { .. }),
             "unordered ambiguous Int also unions, got {:?}",
@@ -966,7 +1031,7 @@ mod tests {
             .where_eq("tenant", Value::String("x".into()))
             .limit(20);
         let m2 = bench_manager();
-        let plan3 = QueryPlanner::plan(&q3, &m2, 1000, 8, true);
+        let plan3 = QueryPlanner::plan(&q3, &m2, 1000, 8, true, true);
         assert!(
             matches!(plan3.scan, ScanType::SecondaryIndex { .. }),
             "plain strings keep single-key trust, got {:?}",
@@ -980,11 +1045,11 @@ mod tests {
         // not (full scan + executor sort, then truncate).
         let m = IndexManager::default();
         let q = Query::new("plain").order_by("age", false).limit(100);
-        let plan = QueryPlanner::plan(&q, &m, 1000, 8, true);
+        let plan = QueryPlanner::plan(&q, &m, 1000, 8, true, true);
         assert!(matches!(plan.scan, ScanType::FullCollection));
         assert_eq!(plan.scan_limit, None);
         let q2 = Query::new("plain").limit(100);
-        let plan2 = QueryPlanner::plan(&q2, &m, 1000, 8, true);
+        let plan2 = QueryPlanner::plan(&q2, &m, 1000, 8, true, true);
         assert!(matches!(plan2.scan, ScanType::FullCollection));
         assert_eq!(plan2.scan_limit, Some(100));
     }

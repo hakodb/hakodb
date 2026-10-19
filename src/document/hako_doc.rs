@@ -48,6 +48,33 @@ impl HakoDoc {
             .map(|pos| &self.fields[pos].1)
     }
 
+    /// Dotted-path fetch hook (hakodb#71 F2): `profile.address.city`
+    /// descends through Map values only. Single-segment paths behave
+    /// exactly like [`Self::get`]. None on any miss, on empty segments,
+    /// or on descent into a non-Map value (arrays are F3 territory —
+    /// fail-closed absent for now). Borrowed: zero decode, the doc is
+    /// already materialized.
+    pub fn get_path(&self, path: &str) -> Option<&Value> {
+        let mut segs = path.split('.');
+        let first = segs.next()?;
+        if first.is_empty() {
+            return None;
+        }
+        let mut cur = self.get(first)?;
+        for seg in segs {
+            if seg.is_empty() {
+                return None;
+            }
+            match cur {
+                Value::Map(m) => {
+                    cur = &m.iter().find(|(k, _)| k.as_ref() == seg)?.1;
+                }
+                _ => return None,
+            }
+        }
+        Some(cur)
+    }
+
     pub fn insert(&mut self, key: impl Into<String>, value: Value) {
         let key_str = key.into();
         match self.fields.binary_search_by(|(k, _)| k.as_ref().cmp(&key_str)) {
@@ -500,6 +527,63 @@ impl<'a> HakoDocView<'a> {
     /// Field count from the header, without walking the framing.
     pub(crate) fn field_count(&self) -> usize {
         self.fields_count as usize
+    }
+
+    /// Dotted-path fetch hook, borrowed cursor flavor (hakodb#71 F2).
+    /// Same contract as [`DocView::get_path`]: Map-only descent, None on
+    /// any miss / empty segment / non-Map mid-path, no decode of skipped
+    /// subtrees, terminal decodes once.
+    pub fn get_path(&self, path: &str) -> Option<Value> {
+        let mut segs = path.split('.');
+        let first = segs.next()?;
+        if first.is_empty() {
+            return None;
+        }
+        let bytes: &[u8] = self.bytes;
+        let mut pos = 12usize;
+        let mut cur: Option<(u8, &[u8])> = None;
+        for _ in 0..self.fields_count {
+            let k_len = *bytes.get(pos)? as usize;
+            pos += 1;
+            let key = std::str::from_utf8(bytes.get(pos..pos + k_len)?).ok()?;
+            pos += k_len;
+            let tag = *bytes.get(pos)?;
+            pos += 1;
+            let start = pos;
+            skip_value(tag, bytes, &mut pos)?;
+            if key == first {
+                cur = Some((tag, &bytes[start..pos]));
+                break;
+            }
+        }
+        let (mut tag, mut span) = cur?;
+        for seg in segs {
+            if seg.is_empty() || tag != 8 {
+                return None;
+            }
+            let count = u16::from_le_bytes(span.get(4..6)?.try_into().ok()?) as usize;
+            let mut p = 6usize;
+            let mut hit = None;
+            for _ in 0..count {
+                let k_len = *span.get(p)? as usize;
+                p += 1;
+                let key = span.get(p..p + k_len)?;
+                p += k_len;
+                let t = *span.get(p)?;
+                p += 1;
+                let s = p;
+                let mut q = s;
+                skip_value(t, span, &mut q)?;
+                std::str::from_utf8(key).ok()?;
+                if key == seg.as_bytes() {
+                    hit = Some((t, &span[s..q]));
+                    break;
+                }
+                p = q;
+            }
+            (tag, span) = hit?;
+        }
+        decode_value(tag, span)
     }
 }
 

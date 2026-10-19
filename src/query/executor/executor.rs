@@ -131,6 +131,9 @@ fn top_keys(view: &HakoDocView, orders: &[OrderBy]) -> Vec<TopKey> {
         .map(|o| match o.field.as_str() {
             "id" => TopKey::Id,
             "_time" => TopKey::Time(view._time),
+            // Dotted ORDER BY (hakodb#71 F2): nested walk off the raw
+            // view, Map-only descent, fail-closed absent.
+            f if f.contains('.') => TopKey::Field(view.get_path(f)),
             f => TopKey::Field(
                 view.iter()
                     .find(|(k, _, _)| *k == f)
@@ -379,7 +382,7 @@ impl ParallelQueryExecutor {
                         let cmp = match order.field.as_str() {
                             "id" => id_a.cmp(id_b),
                             "_time" => doc_a._time.cmp(&doc_b._time),
-                            _ => doc_a.get(&order.field).cmp(&doc_b.get(&order.field)),
+                            _ => doc_a.get_path(&order.field).cmp(&doc_b.get_path(&order.field)),
                         };
                         if cmp != std::cmp::Ordering::Equal {
                             return if order.ascending { cmp } else { cmp.reverse() };
@@ -531,11 +534,13 @@ impl ParallelQueryExecutor {
                     let cmp = match order.field.as_str() {
                         "id" => id_a.cmp(id_b),
                         "_time" => doc_a._time.cmp(&doc_b._time),
-                        _ => {
-                            let av = doc_a.get(&order.field);
-                            let bv = doc_b.get(&order.field);
-                            av.cmp(&bv)
-                        }
+                    _ => {
+                        // Dotted ORDER BY (hakodb#71 F2) rides the fetch
+                        // hook; single segments behave like `get`.
+                        let av = doc_a.get_path(&order.field);
+                        let bv = doc_b.get_path(&order.field);
+                        av.cmp(&bv)
+                    }
                     };
 
                     if cmp != std::cmp::Ordering::Equal {

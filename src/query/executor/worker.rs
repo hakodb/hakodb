@@ -261,6 +261,10 @@ pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::que
         });
         // Missing field => stays false => rejected, same as the old path.
         verified = validate_final_match(plan, &match_bufs.and_matches, &match_bufs.or_group_results);
+        if !verified {
+            apply_dotted_filters(&view, plan, &mut match_bufs.and_matches, &mut match_bufs.or_group_results);
+            verified = validate_final_match(plan, &match_bufs.and_matches, &match_bufs.or_group_results);
+        }
     }
 
     // 2/3. Body Field Scanning (Decodes every field for the final object).
@@ -278,7 +282,14 @@ pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::que
         fields.push((crate::document::hako_doc::intern_field(key), val));
     }
 
-    if verified || validate_final_match(plan, &match_bufs.and_matches, &match_bufs.or_group_results) {
+    // Dotted filters decided post-scan when the top-level pass could not.
+    let verified = verified
+        || {
+            apply_dotted_filters(&view, plan, &mut match_bufs.and_matches, &mut match_bufs.or_group_results);
+            validate_final_match(plan, &match_bufs.and_matches, &match_bufs.or_group_results)
+        };
+
+    if verified {
         Some(HakoDoc { fields, _time: view._time })
     } else {
         None
@@ -311,6 +322,7 @@ pub(crate) fn unified_match_projected(doc_id: &str, bytes: &[u8], plan: &crate::
             }
         }
     }
+    apply_dotted_filters(&view, plan, &mut match_bufs.and_matches, &mut match_bufs.or_group_results);
 
     if validate_final_match(plan, &match_bufs.and_matches, &match_bufs.or_group_results) {
         Some(extracted)
@@ -458,6 +470,45 @@ pub(crate) fn inflate_blobs(doc: &mut HakoDoc, blob_manager: &crate::storage::bl
     Ok(())
 }
 
+/// Dotted filters (hakodb#71 F2): the per-field passes above never see
+/// nested keys. Post-pass applies each dotted filter straight from the
+/// view (raw walk, terminal decode only, Map-only descent). Absent
+/// path => no match for EVERY op including ne (fail-closed, decided in
+/// #71); null != absent; type mismatch fail-closed; array mid-path is
+/// F3 territory and reads absent until then.
+fn apply_dotted_filters(
+    view: &HakoDocView,
+    plan: &crate::query::plan::QueryPlan,
+    and_matches: &mut [bool],
+    or_group_results: &mut [bool],
+) {
+    if !plan.filters.iter().any(|f| f.field.contains('.'))
+        && !plan.or_groups.iter().any(|g| g.iter().any(|f| f.field.contains('.')))
+    {
+        return;
+    }
+    for (i, f) in plan.filters.iter().enumerate() {
+        if and_matches[i] || !f.field.contains('.') { continue; }
+        if let Some(v) = view.get_path(&f.field) {
+            if crate::query::filter::compare_values(&v, &f.op, &f.value) {
+                and_matches[i] = true;
+            }
+        }
+    }
+    for (gi, group) in plan.or_groups.iter().enumerate() {
+        if or_group_results[gi] { continue; }
+        for f in group {
+            if !f.field.contains('.') { continue; }
+            if let Some(v) = view.get_path(&f.field) {
+                if crate::query::filter::compare_values(&v, &f.op, &f.value) {
+                    or_group_results[gi] = true;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn matches_filters_view(doc_id: &str, bytes: &[u8], plan: &crate::query::plan::QueryPlan) -> bool {
     let doc_time = i64::from_le_bytes(bytes[2..10].try_into().unwrap_or([0;8]));
     let mut and_matches = vec![false; plan.filters.len()];
@@ -483,6 +534,9 @@ pub(crate) fn matches_filters_view(doc_id: &str, bytes: &[u8], plan: &crate::que
             }
         }
     }
+    // Dotted filters (hakodb#71 F2): the top-level scan above never
+    // sees nested keys — resolve them from the view instead.
+    apply_dotted_filters(&view, plan, &mut and_matches, &mut or_group_results);
     validate_final_match(plan, &and_matches, &or_group_results)
 }
 

@@ -44,7 +44,10 @@ fn seed(db: &Hako) {
 /// Poll until background open-recovery finishes (see `seed`).
 fn wait_ready(db: &Hako) {
     let t0 = std::time::Instant::now();
-    while !db.is_indexes_ready() {
+    // Pending index ops count against query-readiness too (hakodb#71
+    // BUG-2): poll both flags or walk/raw lanes get a legitimately
+    // unsatisfied FullCollection plan out of the not-ready window.
+    while !db.is_indexes_ready() || db.quiescence_status().pending_index_ops != 0 {
         assert!(t0.elapsed() < std::time::Duration::from_secs(30), "indexes never ready");
         std::thread::sleep(std::time::Duration::from_millis(5));
     }

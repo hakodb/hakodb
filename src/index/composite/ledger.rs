@@ -15,7 +15,7 @@
 //! add when the profile says priority, 10k writes/s on one collection
 //! needs ~Âµs-scale ops so this is fine for now.
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use smallvec::SmallVec;
 use std::sync::{Arc, Mutex};
 
@@ -29,6 +29,17 @@ struct ClaimMap {
     fwd: HashMap<ClaimPrefix, Arc<str>>,
     /// doc id -> live prefix (O(1) release on delete / tuple switch)
     by_doc: HashMap<Arc<str>, ClaimPrefix>,
+    /// Docs whose claim this process has RETRACTED since load (delete
+    /// or tuple switch). A late recovery fold must not re-introduce
+    /// claims for them (hakodb#71 BUG-1): the fold's tree can lag the
+    /// live ledger because tree rows are removed asynchronously, and
+    /// merge semantics cannot retract — only tombstones prevent a
+    /// fold from reviving a released claim as a ghost.
+    ///
+    /// ponytail: bounded by the number of DISTINCT deleted doc ids per
+    /// unique index; entries free on re-claim. Shrink Sawtooth-style if
+    /// churn profiles show unbounded growth (add a low-water sweep).
+    freed: HashSet<Arc<str>>,
 }
 
 impl Default for ClaimMap {
@@ -36,6 +47,7 @@ impl Default for ClaimMap {
         Self {
             fwd: HashMap::default(),
             by_doc: HashMap::default(),
+            freed: HashSet::default(),
         }
     }
 }
@@ -55,6 +67,10 @@ pub(crate) enum LedgerUndo {
 #[derive(Default)]
 pub struct UniqueLedger {
     inner: Mutex<HashMap<u32, ClaimMap>>,
+    /// Tombstones for releases that happened while the index had no
+    /// claim set yet (delete racing the very first fold). Drained into
+    /// the live map at fold/prepare time; never flips is_ready.
+    pending: Mutex<HashMap<u32, HashSet<Arc<str>>>>,
 }
 
 impl UniqueLedger {
@@ -64,18 +80,23 @@ impl UniqueLedger {
     }
 
     /// Drop a claim set (index removal / failed creation rollback).
+    /// Pending tombstones belong to the same lifecycle — drop them too
+    /// (index id can be recycled by a later create).
     pub fn reset(&self, index_id: u32) {
+        self.pending.lock().unwrap().remove(&index_id);
         self.inner.lock().unwrap().remove(&index_id);
     }
 
     /// Mark ready with no initial claims (fresh collection: nothing to
     /// enforce against yet).
     pub fn prepare_empty(&self, index_id: u32) {
-        self.inner
-            .lock()
-            .unwrap()
-            .entry(index_id)
-            .or_default();
+        let mut pendings = self.pending.lock().unwrap();
+        let shipped = pendings.remove(&index_id);
+        let mut map = self.inner.lock().unwrap();
+        let claims = map.entry(index_id).or_default();
+        if let Some(set) = shipped {
+            claims.freed.extend(set);
+        }
     }
 
     /// Bulk-load claims from a backfilled tree (hakodb#71). MERGE
@@ -94,7 +115,7 @@ impl UniqueLedger {
         // the tail rides the last (2 + len) bytes.
         let mut fresh: Vec<(ClaimPrefix, Arc<str>)> = Vec::new();
         // Pure scan first — nothing merges when a duplicate exists.
-        let mut last: Option<ClaimPrefix> = None;
+        let mut last: Option<(ClaimPrefix, Arc<str>)> = None;
         for (key, doc_id) in tree {
             // Tree key layout (key_encoder): [index_id 4B][tuple bytes]
             // [doc-id-len u16][doc-id bytes]. The value carries the
@@ -110,20 +131,33 @@ impl UniqueLedger {
                 continue;
             }
             let prefix = ClaimPrefix::from_slice(&key[..n - idl - 2]);
-            if last.as_ref() == Some(&prefix) {
-                return Err(HakoError::UniqueViolation {
-                    collection: String::new(),
-                    index: index_id.to_string(),
-                    key: String::new(),
-                });
+            if let Some((last_prefix, last_doc)) = &last {
+                if *last_prefix == prefix {
+                    return Err(HakoError::UniqueViolation {
+                        collection: String::new(),
+                        index: index_id.to_string(),
+                        key: last_doc.to_string(),
+                    });
+                }
             }
             fresh.push((prefix.clone(), doc_id.clone()));
-            last = Some(prefix);
+            last = Some((prefix, doc_id.clone()));
         }
         let n = fresh.len();
+        let mut pendings = self.pending.lock().unwrap();
+        let shipped = pendings.remove(&index_id);
         let mut map = self.inner.lock().unwrap();
         let claims = map.entry(index_id).or_default();
+        if let Some(set) = shipped {
+            claims.freed.extend(set);
+        }
         for (prefix, doc_id) in fresh {
+            // Ghost-claim guards (BUG-1): a fold's tree can lag live
+            // state (tree rows clear asynchronously), so the fold may
+            // not overrule a release or a newer live claim.
+            if claims.freed.contains(&doc_id) || claims.by_doc.contains_key(&doc_id) {
+                continue;
+            }
             match claims.fwd.entry(prefix.clone()) {
                 hashbrown::hash_map::Entry::Vacant(v) => {
                     v.insert(doc_id.clone());
@@ -136,7 +170,7 @@ impl UniqueLedger {
                         return Err(HakoError::UniqueViolation {
                             collection: String::new(),
                             index: index_id.to_string(),
-                            key: String::new(),
+                            key: o.get().to_string(),
                         });
                     }
                 }
@@ -170,7 +204,7 @@ impl UniqueLedger {
                 return Err(HakoError::UniqueViolation {
                     collection: String::new(),
                     index: index_id.to_string(),
-                    key: String::new(),
+                    key: owner.to_string(),
                 });
             }
             // Same owner, same tuple â€” nothing to record.
@@ -182,18 +216,36 @@ impl UniqueLedger {
         }
         claims.fwd.insert(prefix.clone(), doc_id.clone());
         claims.by_doc.insert(doc_id.clone(), prefix.clone());
+        // A live claim retracts any tombstone: a later fold may safely
+        // see this doc's rows again.
+        claims.freed.remove(doc_id);
         undo.push(LedgerUndo::Remove(index_id, prefix));
         Ok(())
     }
 
     /// Release all claims owned by `doc_id` (delete path / tuple
-    /// switch). No-op when the doc holds no claims.
+    /// switch). Tombstones the doc either way — even when it held no
+    /// claim or the ledger is not ready yet (pending shelf, drained at
+    /// the next fold) — so no late recovery fold can revive its claim
+    /// (BUG-1: folds' trees can lag the live ledger until the async
+    /// worker clears the rows).
     pub(crate) fn release_doc(&self, index_id: u32, doc_id: &str, undo: &mut Vec<LedgerUndo>) {
+        let id_arc: Arc<str> = Arc::from(doc_id);
+        // Lock order: pending BEFORE inner (matches fold/prepare paths).
+        let mut pendings = self.pending.lock().unwrap();
+        let slot = pendings.entry(index_id).or_default();
         let mut map = self.inner.lock().unwrap();
-        let Some(claims) = map.get_mut(&index_id) else { return };
-        let Some(prefix) = claims.by_doc.remove(doc_id) else { return };
-        claims.fwd.remove(&prefix);
-        undo.push(LedgerUndo::Restore(index_id, prefix, Arc::from(doc_id)));
+        let Some(claims) = map.get_mut(&index_id) else {
+            // Index not ready yet: shelf the tombstone for the fold.
+            slot.insert(id_arc);
+            return;
+        };
+        let prefix = claims.by_doc.remove(doc_id);
+        if let Some(p) = &prefix {
+            claims.fwd.remove(p);
+            undo.push(LedgerUndo::Restore(index_id, p.clone(), id_arc.clone()));
+        }
+        claims.freed.insert(id_arc);
     }
 
     /// Replay a batch's ledger mutations in reverse, restoring the
@@ -220,6 +272,9 @@ impl UniqueLedger {
                     claims.by_doc.remove(owner.as_ref());
                     claims.fwd.insert(prefix.clone(), owner.clone());
                     claims.by_doc.insert(owner.clone(), prefix.clone());
+                    // The release this restore undoes had tombstoned the
+                    // doc; resurrecting the claim un-tombstones it.
+                    claims.freed.remove(owner);
                 }
             }
         }
