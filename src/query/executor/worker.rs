@@ -309,19 +309,23 @@ pub(crate) fn unified_match_projected(doc_id: &str, bytes: &[u8], plan: &crate::
     }
 
     let mut extracted = Vec::with_capacity(plan.projection.len());
+    let proj_prefixes = crate::document::value::projection_prefixes(&plan.projection);
     for (key, tag, data) in view.iter() {
         let is_needed_for_filter = plan.filters.iter().any(|f| f.field == key) ||
                                    plan.or_groups.iter().any(|g| g.iter().any(|f| f.field == key));
-        // ponytail: borrow-compare the projection list â€” the old
+        // ponytail: borrow-compare the projection list — the old
         // `projection.contains(&key.to_string())` allocated one String per
         // field per row just to compare.
-        let is_needed_for_proj = plan.projection.iter().any(|p| p == key);
+        // hakodb#71 F6: a dotted projection matches by top-level prefix.
+        let is_needed_for_proj = proj_prefixes.iter().any(|p| *p == key);
 
         if is_needed_for_filter || is_needed_for_proj {
             let val = crate::document::hako_doc::decode_value(tag, data)?;
             apply_filter_logic(key, &val, plan, &mut match_bufs.and_matches, &mut match_bufs.or_group_results);
             if is_needed_for_proj {
-                extracted.push((key.to_string(), val));
+                if let Some(pruned) = crate::document::value::prune_field_value(&val, &plan.projection, key) {
+                    extracted.push((key.to_string(), pruned));
+                }
             }
         }
     }

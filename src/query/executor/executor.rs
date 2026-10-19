@@ -1293,8 +1293,27 @@ impl ParallelQueryExecutor {
         }
         let doc_count = docs_to_process.len();
 
+        // --- INDEX-ONLY (covering) PATH: hakodb#71 F6 -------------------
+        // Filters, order and projection are all covered by the composite
+        // point scan, so every field value is already in the plan: no
+        // document is read or decoded. Rows still come from the scan
+        // (liveness/tombstones included).
+        if let Some(mut template) = plan.covering_projection() {
+            {
+                let storage_guard = storage_arc.read().unwrap();
+                if let Some(ref manager) = storage_guard.blob_manager {
+                    for (_, val) in template.iter_mut() {
+                        if let Value::BlobLink { offset, len } = *val {
+                            *val = crate::query::executor::worker::resolve_single_blob_in_worker(manager, offset, len);
+                        }
+                    }
+                }
+            }
+            for (id, _pointer) in docs_to_process {
+                results.push((id, template.clone()));
+            }
+        } else if doc_count <= 250 {
         // --- FAST PATH ---
-        if doc_count <= 250 {
             let storage_guard = storage_arc.read().unwrap();
             let blob_manager = storage_guard.blob_manager.clone();
             let optimized_plan = crate::query::executor::worker::prepare_optimized_plan(&plan);

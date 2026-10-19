@@ -231,3 +231,89 @@ impl Ord for Value {
         }
     }
 }
+// --- hakodb#71 F6: prefix-path projection -------------------------------
+// A projection path may descend with dots (profile.city). Pruning keeps
+// only the selected subtrees and is leaf-preserving: when a path cannot
+// descend (the value is not a Map), the value is kept as-is rather than
+// dropped — returning nothing would hide data. Fields absent under a
+// selected prefix are simply omitted (an empty Map is left behind), and
+// arrays prune every element with the same relative path.
+
+/// Prune alue down to the subtrees named by paths, where every path is
+/// a *relative* non-empty segment list.
+pub fn prune_value(value: &Value, paths: &[Vec<&str>]) -> Value {
+    if paths.is_empty() {
+        return value.clone();
+    }
+    match value {
+        Value::Map(entries) => {
+            let mut out: Vec<(std::sync::Arc<str>, Value)> = Vec::new();
+            for (k, v) in entries {
+                let mut subs: Vec<Vec<&str>> = Vec::new();
+                let mut whole = false;
+                for p in paths {
+                    match p.first() {
+                        Some(seg) if *seg == k.as_ref() => {
+                            if p.len() == 1 {
+                                whole = true;
+                                break;
+                            }
+                            subs.push(p[1..].to_vec());
+                        }
+                        _ => {}
+                    }
+                }
+                if whole {
+                    out.push((k.clone(), v.clone()));
+                } else if !subs.is_empty() {
+                    out.push((k.clone(), prune_value(v, &subs)));
+                }
+            }
+            Value::Map(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(|i| prune_value(i, paths)).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Prune the value of top-level key for a full dotted projection.
+/// None means the key is not selected at all.
+pub fn prune_field_value(value: &Value, projection: &[String], key: &str) -> Option<Value> {
+    let mut whole = false;
+    let mut subs: Vec<Vec<&str>> = Vec::new();
+    for p in projection {
+        let mut segs = p.split('.');
+        if segs.next() != Some(key) {
+            continue;
+        }
+        let rest: Vec<&str> = segs.collect();
+        if rest.is_empty() {
+            whole = true;
+            break;
+        }
+        if rest.iter().any(|s| s.is_empty()) {
+            continue; // malformed path selects nothing
+        }
+        subs.push(rest);
+    }
+    if whole {
+        Some(value.clone())
+    } else if subs.is_empty() {
+        None
+    } else {
+        Some(prune_value(value, &subs))
+    }
+}
+
+/// Top-level field names a projection needs decoded (prefix segments).
+pub fn projection_prefixes(projection: &[String]) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::with_capacity(projection.len());
+    for p in projection {
+        if let Some(first) = p.split('.').next() {
+            if !first.is_empty() && !out.contains(&first) {
+                out.push(first);
+            }
+        }
+    }
+    out
+}

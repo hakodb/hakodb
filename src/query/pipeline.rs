@@ -8,11 +8,13 @@
 //! the materialised rows.
 //!
 //! Deliberate first-slice limits (fail-closed with `InvalidInput`, not
-//! silent wrong answers): `project` and `unwind` take top-level field
-//! names only — nested/covering projection is F6. `group` keys and accum
-//! fields do accept dotted paths (F2). `unwind` skips docs whose field is
-//! missing or not an array; scalar elements are kept as the field value,
-//! so a scalar element cannot be traversed further (F2 Map-only rule).
+//! silent wrong answers): `unwind` takes a top-level field name only —
+//! nested unwind rides the F2 rule later. `project` accepts dotted paths
+//! (F6) and prunes subtrees with the same leaf-preserving semantics as
+//! query projection. `group` keys and accum fields do accept dotted paths
+//! (F2). `unwind` skips docs whose field is missing or not an array;
+//! scalar elements are kept as the field value, so a scalar element cannot
+//! be traversed further (F2 Map-only rule).
 
 use crate::document::hako_doc::HakoDoc;
 use crate::document::value::Value;
@@ -189,10 +191,12 @@ pub fn validate(p: &Pipeline) -> Result<(), HakoError> {
     for stage in &p.stages {
         match stage {
             Stage::Project(fields) => {
-                if let Some(f) = fields.iter().find(|f| f.contains('.')) {
-                    return Err(HakoError::InvalidInput(format!(
-                        "pipeline project: nested projection ({f}) is not supported yet (F6)"
-                    )));
+                for f in fields {
+                    if f.is_empty() || f.split('.').any(|s| s.is_empty()) {
+                        return Err(HakoError::InvalidInput(format!(
+                            "pipeline project: invalid field path ({f})"
+                        )));
+                    }
                 }
             }
             Stage::Unwind { field } => {
@@ -234,9 +238,13 @@ pub fn run_stages(
             Stage::Project(fields) => {
                 rows = rows
                     .into_iter()
-                    .map(|(id, mut doc)| {
-                        doc.fields.retain(|(k, _)| fields.iter().any(|f| f.as_str() == k.as_ref()));
-                        (id, doc)
+                    .map(|(id, doc)| {
+                        let mut next = HakoDoc::default();
+                        next._time = doc._time;
+                        // F6: dotted paths prune subtrees, same semantics as
+                        // query projection.
+                        next.fields = doc.project_fields(fields);
+                        (id, next)
                     })
                     .collect();
             }

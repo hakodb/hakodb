@@ -160,3 +160,40 @@ impl ScanType {
         }
     }
 }
+
+impl QueryPlan {
+    /// hakodb#71 F6 — index-only (covering) projection. When the scan is a
+    /// composite point lookup whose prefix already covers every filter, the
+    /// requested order, and the whole projection (top-level fields only),
+    /// the projected values are known from the plan itself and the executor
+    /// can answer without reading a single document.
+    ///
+    /// Fail-closed by construction: anything not provably covered returns
+    /// None and the normal decode path runs.
+    pub fn covering_projection(&self) -> Option<Vec<(String, Value)>> {
+        if !self.filters_satisfied_by_index
+            || !self.order_by_satisfied
+            || self.has_cursor_bounds
+            || self.raw
+            || self.projection.is_empty()
+            || !self.elem_match.is_empty()
+        {
+            return None;
+        }
+        let (fields, values) = match &self.scan {
+            ScanType::CompositeIndex { fields, values, .. } => (fields, values),
+            _ => return None,
+        };
+        let mut out = Vec::with_capacity(self.projection.len());
+        for path in &self.projection {
+            if path.contains('.') {
+                // Nested rebuild from an index prefix is a later step; the
+                // decode path handles it correctly today.
+                return None;
+            }
+            let pos = fields.iter().position(|f| f == path)?;
+            out.push((path.clone(), values.get(pos)?.clone()));
+        }
+        Some(out)
+    }
+}
