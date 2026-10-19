@@ -29,3 +29,4 @@ pub use cloud_sync::{CloudPacket, CloudStatus, CloudSync, CloudSyncMode};
 
 pub use engine::Hako;
 pub use engine::QuiescenceStatus;
+pub mod schema;

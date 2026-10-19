@@ -133,6 +133,7 @@ impl UniqueLedger {
             let prefix = ClaimPrefix::from_slice(&key[..n - idl - 2]);
             if let Some((last_prefix, last_doc)) = &last {
                 if *last_prefix == prefix {
+                    crate::engine::engine::record_unique_violation();
                     return Err(HakoError::UniqueViolation {
                         collection: String::new(),
                         index: index_id.to_string(),
@@ -167,6 +168,7 @@ impl UniqueLedger {
                     // Live write beat the fold to this tuple (or the
                     // fold ran twice). Same owner: nothing to do.
                     if o.get() != &doc_id {
+                        crate::engine::engine::record_unique_violation();
                         return Err(HakoError::UniqueViolation {
                             collection: String::new(),
                             index: index_id.to_string(),
@@ -201,6 +203,7 @@ impl UniqueLedger {
         };
         if let Some(owner) = claims.fwd.get(&prefix) {
             if owner != doc_id {
+                crate::engine::engine::record_unique_violation();
                 return Err(HakoError::UniqueViolation {
                     collection: String::new(),
                     index: index_id.to_string(),
