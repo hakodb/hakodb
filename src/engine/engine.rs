@@ -57,6 +57,10 @@ pub(crate) struct WritePhaseStats {
     pub cache_ns: AtomicU64,
     pub blob_ns: AtomicU64,
     pub encdoc_ns: AtomicU64,
+    // hakodb#71/F7 — operational counters on the same always-on hook.
+    pub queries: AtomicU64,
+    pub tx_conflicts: AtomicU64,
+    pub unique_violations: AtomicU64,
 }
 pub(crate) static WRITE_STATS: WritePhaseStats = WritePhaseStats {
     batches: AtomicU64::new(0),
@@ -71,7 +75,27 @@ pub(crate) static WRITE_STATS: WritePhaseStats = WritePhaseStats {
     cache_ns: AtomicU64::new(0),
     blob_ns: AtomicU64::new(0),
     encdoc_ns: AtomicU64::new(0),
+    queries: AtomicU64::new(0),
+    tx_conflicts: AtomicU64::new(0),
+    unique_violations: AtomicU64::new(0),
 };
+
+/// Per-index scan counter (F7): how often the planner actually routed a
+/// query through each index. Mutex is fine — one lock per indexed query,
+/// against an actual index walk.
+static INDEX_SCANS: std::sync::LazyLock<Mutex<std::collections::HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// F7: count one admitted unique-index rejection (called from the ledger).
+pub(crate) fn record_unique_violation() {
+    WRITE_STATS.unique_violations.fetch_add(1, Ordering::Relaxed);
+}
+
+fn record_index_scan(label: &str) {
+    if let Ok(mut m) = INDEX_SCANS.lock() {
+        *m.entry(label.to_string()).or_insert(0) += 1;
+    }
+}
 
 /// Human-readable phase table + reset. All figures per batch unless noted.
 pub fn write_stats_report() -> String {
@@ -104,6 +128,24 @@ pub fn write_stats_report() -> String {
         &WRITE_STATS.watchers_ns, &WRITE_STATS.cache_ns,
         &WRITE_STATS.blob_ns, &WRITE_STATS.encdoc_ns] {
         v.store(0, Ordering::Relaxed);
+    }
+    // F7 operational counters ride the same hook (also reset above).
+    let conflicts = WRITE_STATS.tx_conflicts.swap(0, Ordering::Relaxed);
+    let unique = WRITE_STATS.unique_violations.swap(0, Ordering::Relaxed);
+    let queries = WRITE_STATS.queries.swap(0, Ordering::Relaxed);
+    s.push_str(&format!(
+        "ops: {queries} queries, {conflicts} tx conflicts, {unique} unique violations\n"
+    ));
+    if let Ok(mut scans) = INDEX_SCANS.lock() {
+        if !scans.is_empty() {
+            let mut entries: Vec<(String, u64)> = scans.drain().collect();
+            entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            s.push_str("index scans:");
+            for (label, n) in entries {
+                s.push_str(&format!(" {label}={n}"));
+            }
+            s.push('\n');
+        }
     }
     s
 }
@@ -416,6 +458,8 @@ impl Transaction {
     }
 }
 
+/// Serializable transaction read-set + mutations (issue #71/F5).
+#[derive(Default)]
 pub struct SerializableTransaction {
     pub reads: HashMap<String, Option<u64>>,
     pub mutations: Vec<BatchMutation>,
@@ -608,6 +652,12 @@ pub struct Hako {
     /// window, so writes consult this instead. Derived/rebuildable from
     /// storage (trees + recovery fold); WAL stays the durability source.
     pub(crate) unique_ledger: std::sync::Arc<crate::index::composite::ledger::UniqueLedger>,
+    /// Optional per-collection schemas (hakodb#71/F8). Empty by default;
+    /// `schema_enabled` is the lock-free gate so schemaless deployments pay
+    /// no RwLock on the write path. Persisted to `_indices/schemas.json`
+    /// (defs, like indexes — never derived data).
+    schemas: RwLock<HashMap<String, crate::schema::CollectionSchema>>,
+    schema_enabled: std::sync::atomic::AtomicBool,
 }
 
 /// Relocate report: moved ids + ids missing at source.
@@ -639,6 +689,55 @@ pub struct CollectionStats {
     pub tombstone_count: u64,
     /// Lazy residency: parked on disk, absent from the shard map.
     pub unloaded: bool,
+}
+
+/// Result of [`Hako::explain_report`] (issue #71/F7). Plan-only: no query
+/// execution, so `collection_rows` is the scan's upper bound and
+/// `filter_count` the predicates applied after it.
+#[derive(Debug, Clone)]
+pub struct ExplainReport {
+    pub collection: String,
+    pub scan: String,
+    pub index: Option<String>,
+    pub collection_rows: usize,
+    pub filter_count: usize,
+    pub or_group_count: usize,
+    pub elem_match_count: usize,
+    pub filters_satisfied_by_index: bool,
+    pub order_by_satisfied: bool,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub projection: Vec<String>,
+    /// Index definitions that exist on the collection (candidates the
+    /// planner could have used — "why didn't my index run?").
+    pub available_indexes: Vec<String>,
+}
+
+impl std::fmt::Display for ExplainReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "collection: {} ({} docs)", self.collection, self.collection_rows)?;
+        match &self.index {
+            Some(idx) => writeln!(f, "scan: {}  [index: {idx}]", self.scan)?,
+            None => writeln!(f, "scan: {}  [no index]", self.scan)?,
+        }
+        writeln!(
+            f,
+            "filters: {} post-scan, {} or-groups, {} elemMatch (satisfied_by_index: {})",
+            self.filter_count, self.or_group_count, self.elem_match_count,
+            self.filters_satisfied_by_index
+        )?;
+        writeln!(f, "order satisfied by scan: {}", self.order_by_satisfied)?;
+        if self.limit.is_some() || self.offset.is_some() {
+            writeln!(f, "limit: {:?} offset: {:?}", self.limit, self.offset)?;
+        }
+        if !self.projection.is_empty() {
+            writeln!(f, "projection: {}", self.projection.join(","))?;
+        }
+        if !self.available_indexes.is_empty() {
+            writeln!(f, "available indexes: {}", self.available_indexes.join(", "))?;
+        }
+        Ok(())
+    }
 }
 
 /// Result of [`Hako::drop_collection`].
@@ -1067,9 +1166,12 @@ impl Hako {
             local_only_cols: RwLock::new(HashSet::new()),
             local_only_keys: RwLock::new(HashSet::new()),
             unique_ledger: std::sync::Arc::new(crate::index::composite::ledger::UniqueLedger::default()),
+            schemas: RwLock::new(HashMap::new()),
+            schema_enabled: std::sync::atomic::AtomicBool::new(false),
         };
 
         let _ = db.restore_index_defs();
+        let _ = db.restore_schemas();
         let _ = db.restore_local_only();
 
         // 6. ORCHESTRATED BACKGROUND RECOVERY
@@ -1790,6 +1892,7 @@ impl Hako {
                 // a normal concurrency outcome, not `Corrupt`. SDK retry
                 // loops classify via HakoError::kind()/hk_error_kind, never
                 // by string-matching this message.
+                WRITE_STATS.tx_conflicts.fetch_add(1, Ordering::Relaxed);
                 return Err(HakoError::Conflict { key });
             }
         }
@@ -1879,6 +1982,13 @@ impl Hako {
             }
 
             assigned_ids.push(doc_id.clone());
+
+            // hakodb#71/F8: schema defaults + validation in the admission
+            // gate (same place as F1), before any WAL append — a violating
+            // batch member rejects the whole batch atomically.
+            if !is_delete {
+                self.apply_schema(&col, &mut doc)?;
+            }
 
             // 2. COMPUTE KEY ONCE
             // ponytail: get_mut first â€” the old entry(col.clone()) allocated
@@ -2705,6 +2815,15 @@ impl Hako {
             }
         }
         self.persist_index_defs()?;
+        // F8: a dropped collection's schema goes with its defs.
+        {
+            let mut schemas = self.schemas.write().unwrap();
+            if schemas.remove(collection).is_some() {
+                self.schema_enabled
+                    .store(!schemas.is_empty(), std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _ = self.persist_schemas();
         if let Ok(mut cache) = self.doc_cache.write() {
             if !cache.is_empty() {
                 let prefix = format!("{collection}\0");
@@ -2859,6 +2978,10 @@ impl Hako {
         let vec_ready = self.vector_query_ready();
 
         let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
+        WRITE_STATS.queries.fetch_add(1, Ordering::Relaxed);
+        if let Some(label) = plan.scan.index_label() {
+            record_index_scan(&label);
+        }
 
         // Graph traversal (issue #53): cross-collection BFS can't ride
         // the single-shard executor â€” dedicated path below. Normal scans
@@ -2903,6 +3026,67 @@ impl Hako {
         let vec_ready = self.vector_query_ready();
         let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
         Ok((*plan).clone())
+    }
+
+    /// F7: human-readable plan report for one query. Plan-only (nothing is
+    /// executed); `collection_rows` is the scan's upper bound and
+    /// `filter_count` the predicates applied after the scan, so "why is my
+    /// index not used?" is answerable without instrumenting the app.
+    pub fn explain_report(&self, query: Query) -> Result<ExplainReport> {
+        if !self.allowed(&query.collection, AccessOp::Query) {
+            return Err(HakoError::Corrupt("Denied".into()));
+        }
+        let shard_arc = self.get_shard(&query.collection)?;
+        let indexes = self.indexes.read().unwrap();
+        let rows = shard_arc.read().unwrap().count_prefix("");
+        let is_ready = self.index_query_ready();
+        let vec_ready = self.vector_query_ready();
+        let plan = self.plan_cache.get_or_compute(
+            &query,
+            &indexes,
+            rows,
+            self.config.query_workers,
+            is_ready,
+            vec_ready,
+        );
+        let mut available = Vec::new();
+        if let Some(fields) = indexes.secondary.get(&plan.collection) {
+            for field in fields.keys() {
+                available.push(format!("secondary_index({field})"));
+            }
+        }
+        if let Some(fields) = indexes.fts.get(&plan.collection) {
+            for field in fields.keys() {
+                available.push(format!("inverted_index({field})"));
+            }
+        }
+        if let Some(fields) = indexes.vector.get(&plan.collection) {
+            for field in fields.keys() {
+                available.push(format!("vector_knn({field})"));
+            }
+        }
+        for idx in indexes.composite.indexes_for_collection(&plan.collection) {
+            let fields: Vec<&str> =
+                idx.definition.fields.iter().map(|f| f.field.as_str()).collect();
+            available.push(format!("composite_index({})", fields.join(",")));
+        }
+        available.sort();
+        drop(indexes);
+        Ok(ExplainReport {
+            collection: plan.collection.clone(),
+            scan: plan.scan.describe(),
+            index: plan.scan.index_label(),
+            collection_rows: rows,
+            filter_count: plan.filters.len(),
+            or_group_count: plan.or_groups.len(),
+            elem_match_count: plan.elem_match.len(),
+            filters_satisfied_by_index: plan.filters_satisfied_by_index,
+            order_by_satisfied: plan.order_by_satisfied,
+            limit: plan.limit,
+            offset: plan.offset,
+            projection: plan.projection.clone(),
+            available_indexes: available,
+        })
     }
 
     /// Traverse-query path (issue #53): BFS via `find_paths`, hits
@@ -3783,6 +3967,101 @@ impl Hako {
         
         // NO persist_index_defs() call here. We just loaded what was already on disk.
         Ok(())
+    }
+
+    // --- Per-collection schemas (hakodb#71/F8) ------------------------
+
+    fn schemas_path(&self) -> PathBuf {
+        self.root_path.join("_indices").join("schemas.json")
+    }
+
+    /// Declare (or replace) a collection schema. Validates the declaration
+    /// itself; existing documents are NOT re-validated (enforcement starts
+    /// with the next write — documented, same as unique indexes backfilled
+    /// over historical duplicates). Empty `fields` clears the schema.
+    pub fn set_schema(
+        &self,
+        collection: &str,
+        schema: crate::schema::CollectionSchema,
+    ) -> Result<()> {
+        schema.validate()?;
+        {
+            let mut guard = self
+                .schemas
+                .write()
+                .map_err(|_| HakoError::LockPoisoned("schemas".into()))?;
+            if schema.fields.is_empty() {
+                guard.remove(collection);
+            } else {
+                guard.insert(collection.to_string(), schema);
+            }
+            self.schema_enabled
+                .store(!guard.is_empty(), std::sync::atomic::Ordering::Relaxed);
+        }
+        self.persist_schemas()
+    }
+
+    pub fn schema(&self, collection: &str) -> Option<crate::schema::CollectionSchema> {
+        self.schemas.read().ok()?.get(collection).cloned()
+    }
+
+    pub fn clear_schema(&self, collection: &str) -> Result<()> {
+        self.set_schema(collection, crate::schema::CollectionSchema::default())
+    }
+
+    pub fn list_schemas(&self) -> HashMap<String, crate::schema::CollectionSchema> {
+        self.schemas.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    fn persist_schemas(&self) -> Result<()> {
+        let path = self.schemas_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let map = self.list_schemas();
+        let json = serde_json::to_vec_pretty(&map)
+            .map_err(|e| HakoError::Corrupt(e.to_string()))?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    fn restore_schemas(&self) -> Result<()> {
+        let path = self.schemas_path();
+        if !path.exists() {
+            return Ok(());
+        }
+        let data = std::fs::read(path)?;
+        // A malformed file must not brick the store: schemas are defs, and
+        // silently dropping them would be worse — surface as Corrupt and
+        // let the caller decide (open() logs it best-effort).
+        let map: HashMap<String, crate::schema::CollectionSchema> = serde_json::from_slice(&data)
+            .map_err(|e| HakoError::Corrupt(format!("schemas.json: {e}")))?;
+        let enabled = !map.is_empty();
+        *self
+            .schemas
+            .write()
+            .map_err(|_| HakoError::LockPoisoned("schemas".into()))? = map;
+        self.schema_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Admission-gate hook: apply defaults + validate declared fields.
+    /// No-op (no lock) when no schema exists anywhere.
+    fn apply_schema(&self, collection: &str, doc: &mut HakoDoc) -> Result<()> {
+        if !self.schema_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        let schema = self
+            .schemas
+            .read()
+            .map_err(|_| HakoError::LockPoisoned("schemas".into()))?
+            .get(collection)
+            .cloned();
+        match schema {
+            Some(s) => s.apply(collection, doc),
+            None => Ok(()),
+        }
     }
 
     pub fn list_indexes(&self, collection: Option<&str>) -> IndexList {

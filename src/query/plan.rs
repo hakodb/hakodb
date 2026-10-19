@@ -121,3 +121,42 @@ pub struct QueryPlan {
     /// lane refuses such plans and they keep the legacy full path.
     pub has_cursor_bounds: bool,
 }
+
+impl ScanType {
+    /// Human-readable scan kind for explain and metrics labels.
+    pub fn describe(&self) -> String {
+        match self {
+            ScanType::FullCollection => "full_collection".into(),
+            ScanType::SortedKeys { .. } => "sorted_keys".into(),
+            ScanType::CompositeIndex { fields, .. } => {
+                format!("composite_index({})", fields.join(","))
+            }
+            ScanType::CompositeIndexRange { index_id, .. } => {
+                format!("composite_index_range({index_id})")
+            }
+            ScanType::SecondaryIndex { field, .. } => format!("secondary_index({field})"),
+            ScanType::SecondaryIndexRange { field, .. } => {
+                format!("secondary_index_range({field})")
+            }
+            ScanType::UnionIndex { scans } => {
+                let parts: Vec<String> = scans.iter().map(|s| s.describe()).collect();
+                format!("union({})", parts.join("|"))
+            }
+            ScanType::InvertedIndex { field, .. } => format!("inverted_index({field})"),
+            ScanType::VectorKnn { field, .. } => format!("vector_knn({field})"),
+            ScanType::Traverse { .. } => "traverse".into(),
+            ScanType::CursorIndex { index_id, .. } => format!("cursor_index({index_id})"),
+        }
+    }
+
+    /// The index a scan rides, or None for plain collection/key walks.
+    /// This is the label the per-index hit counters use.
+    pub fn index_label(&self) -> Option<String> {
+        match self {
+            ScanType::FullCollection | ScanType::SortedKeys { .. } | ScanType::Traverse { .. } => {
+                None
+            }
+            other => Some(other.describe()),
+        }
+    }
+}

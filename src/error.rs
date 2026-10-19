@@ -61,6 +61,15 @@ pub enum HakoError {
         collection: String,
         index: String,
     },
+    /// A per-collection schema rejected the write (issue #71/F8): a
+    /// declared field is missing (and has no default) or has the wrong
+    /// declared type. Retrying unchanged input deterministically fails.
+    #[error("schema violation on `{collection}.{field}`: expected {expected}")]
+    SchemaViolation {
+        collection: String,
+        field: String,
+        expected: String,
+    },
 }
 
 impl HakoError {
@@ -72,6 +81,7 @@ impl HakoError {
                 ErrorKind::RetryableConflict
             }
             HakoError::UniqueViolation { .. } => ErrorKind::UniqueViolation,
+            HakoError::SchemaViolation { .. } => ErrorKind::ConstraintMismatch,
             _ => ErrorKind::Generic,
         }
     }
