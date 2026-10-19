@@ -383,6 +383,67 @@ pub extern "C" fn hk_config_set_wal_reserve_bytes(config: *mut HK_Config, bytes:
     }
 }
 
+#[no_mangle]
+pub extern "C" fn hk_config_set_page_cache_capacity(config: *mut HK_Config, capacity: usize) {
+    if let Some(cfg) = unsafe { config.as_mut() } {
+        cfg.inner.page_cache_capacity = capacity;
+    }
+}
+
+/// JSON string-array parameter shared by the collection-list setters
+/// (issue #33: sync_excluded / lazy_collections / replication_collections
+/// were unreachable from non-Rust bindings).
+fn config_set_string_list(
+    config: *mut HK_Config,
+    json: *const c_char,
+    apply: impl FnOnce(&mut HakoConfig, Vec<String>),
+) -> i32 {
+    let Some(cfg) = (unsafe { config.as_mut() }) else { return -1 };
+    let Ok(s) = cstr_to_string(json) else { return -1 };
+    match serde_json::from_str::<Vec<String>>(&s) {
+        Ok(list) => {
+            apply(&mut cfg.inner, list);
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
+/// Collections pinned OUT of every sync plane (mesh/cloud/socket), both
+/// directions. JSON array of names.
+#[no_mangle]
+pub extern "C" fn hk_config_set_sync_excluded(
+    config: *mut HK_Config,
+    collections_json: *const c_char,
+) -> i32 {
+    config_set_string_list(config, collections_json, |cfg, list| {
+        cfg.sync_excluded = list;
+    })
+}
+
+/// Lazy-residency groups (exact names or trailing-`*` prefixes). JSON
+/// array; archived collections stay on disk, load on touch.
+#[no_mangle]
+pub extern "C" fn hk_config_set_lazy_collections(
+    config: *mut HK_Config,
+    collections_json: *const c_char,
+) -> i32 {
+    config_set_string_list(config, collections_json, |cfg, list| {
+        cfg.lazy_collections = list;
+    })
+}
+
+/// Replication opt-in list (None = all collections). JSON array of names.
+#[no_mangle]
+pub extern "C" fn hk_config_set_replication_collections(
+    config: *mut HK_Config,
+    collections_json: *const c_char,
+) -> i32 {
+    config_set_string_list(config, collections_json, |cfg, list| {
+        cfg.replication_collections = Some(list);
+    })
+}
+
 /// Write-path phase breakdown (see engine::write_stats_report). Returns a
 /// fresh C string the caller frees with hk_string_free. Counters reset.
 #[no_mangle]

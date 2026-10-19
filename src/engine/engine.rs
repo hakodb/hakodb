@@ -221,6 +221,21 @@ pub fn is_sync_excluded(col: &str) -> bool {
     SYNC_EXCLUDED_COLLECTIONS.contains(&col)
 }
 
+/// Recursively sum file sizes under `dir` (issue #31 DropReport).
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() {
+            total += dir_size(&entry.path());
+        } else {
+            total += meta.len();
+        }
+    }
+    total
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AuditEntry {
     pub op: AccessOp,
@@ -521,6 +536,43 @@ pub struct Hako {
 pub struct RelocateReport {
     pub moved: Vec<String>,
     pub missing: Vec<String>,
+}
+
+/// Per-collection size/accounting snapshot (issue #32).
+///
+/// **Not a transaction**: a concurrent writer mutates segments and WAL
+/// between reads, so fields may disagree by a few writes. For sizing,
+/// disk-pressure alerting and ordering decisions only — never diff them
+/// for correctness.
+#[derive(Debug, Clone)]
+pub struct CollectionStats {
+    pub collection: String,
+    /// Live (non-tombstoned) documents currently in the RAM index.
+    pub doc_count: u64,
+    /// Post-tombstone accounting: the shard's tracked inlined bytes.
+    pub live_bytes: u64,
+    /// On-disk total: every file under the shard directory (segments +
+    /// WAL + blobs + any residue).
+    pub total_bytes: u64,
+    pub segment_count: u32,
+    pub wal_bytes: u64,
+    pub blob_bytes: u64,
+    pub tombstone_count: u64,
+    /// Lazy residency: parked on disk, absent from the shard map.
+    pub unloaded: bool,
+}
+
+/// Result of [`Hako::drop_collection`].
+#[derive(Debug, Clone)]
+pub struct DropReport {
+    /// Live docs that existed at drop time (each now tombstoned on the
+    /// WAL, so sync peers converge to empty via the normal tail).
+    pub docs_removed: u64,
+    /// On-disk bytes the shard directory held when it was unlinked.
+    pub bytes_reclaimed: u64,
+    /// The dropped collection name(s) — always the requested one on
+    /// success; empty when the collection did not exist (idempotent).
+    pub collections_dropped: Vec<String>,
 }
 
 impl Hako {
@@ -1213,6 +1265,36 @@ impl Hako {
                 shard.update_index_entry(key, Some(Pointer::Inlined(Arc::new(skeleton))));
                 // NOTE: We DO NOT write to WAL here. Main thread already did it.
             }
+        }
+    }
+
+    /// Non-creating shard lookup (issue #6): read paths must not
+    /// materialize a collection as a side effect — a denied or failed
+    /// operation leaves `list_collections` untouched. Returns None when
+    /// the shard is not currently loaded.
+    pub(crate) fn try_get_shard(&self, collection: &str) -> Option<Arc<RwLock<StorageEngine>>> {
+        self.shards
+            .read()
+            .ok()
+            .and_then(|m| m.get(collection).cloned())
+    }
+
+    /// Read-path shard lookup that must NEVER register new collections
+    /// (issue #6): returns an existing shard, opens one whose directory
+    /// already exists (recovery/WAL replay — preserves touch-load for
+    /// lazy and reopen-on-access for cold pages), and `None` otherwise.
+    /// A name never written has no directory ⇒ no shard, no listing leak.
+    pub(crate) fn try_get_shard_on_disk(
+        &self,
+        collection: &str,
+    ) -> Result<Option<Arc<RwLock<StorageEngine>>>> {
+        if let Some(s) = self.try_get_shard(collection) {
+            return Ok(Some(s));
+        }
+        if self.root_path.join(collection).is_dir() {
+            Ok(Some(self.get_shard(collection)?))
+        } else {
+            Ok(None)
         }
     }
 
@@ -2031,7 +2113,7 @@ impl Hako {
             }
         }
 
-        let shard = self.get_shard(collection)?;
+        let Some(shard) = self.try_get_shard_on_disk(collection)? else { return Ok(None) };
         // ponytail: lock-wait sample — readers blocked here are queued
         // behind the writer's flush (the mixed r/w contention signal).
         let t_lock = Instant::now();
@@ -2214,6 +2296,132 @@ impl Hako {
         Ok(shard.purge_tombstones())
     }
 
+    /// Drop a collection entirely (issue #31): one batched delete emits
+    /// per-doc tombstones (watchers + sync tail see the change through the
+    /// normal write path), then the shard is flushed, evicted from memory,
+    /// and its directory unlinked — memory first, unlink last, so no
+    /// reader ever reaches for a disappearing directory. Index definitions
+    /// (secondary/fts/composite/vector) are removed and re-persisted.
+    ///
+    /// Gates (fail-closed, same family as relocate_docs): sync-excluded
+    /// plane, local-only collections, read-only engines, and
+    /// lazy-unloaded (archived) collections — the last refuses with
+    /// "load it first" because dropping parked data needs it resident for
+    /// the tombstone pass.
+    ///
+    /// Dropping a nonexistent collection is a no-op (empty report,
+    /// idempotent). Peers that still hold the data converge to empty via
+    /// the emitted deletes; cross-instance drop is NOT atomic — drop on
+    /// the writer first.
+    pub fn drop_collection(&self, collection: &str) -> Result<DropReport> {
+        if self.read_only.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(HakoError::Corrupt("ReadOnly".into()));
+        }
+        if self.is_sync_excluded_effective(collection) {
+            return Err(HakoError::Corrupt(format!(
+                "drop: `{collection}` is on the sync-excluded plane (system store)"
+            )));
+        }
+        if self.is_collection_local(collection) {
+            return Err(HakoError::Corrupt(format!(
+                "drop: `{collection}` is marked local-only"
+            )));
+        }
+        if self.is_lazy_unloaded(collection) {
+            return Err(HakoError::Corrupt(format!(
+                "drop: `{collection}` is an unloaded lazy collection — load it first"
+            )));
+        }
+
+        // Nothing loaded under this name -> nothing to drop (idempotent).
+        let Some(shard_arc) = self
+            .shards
+            .read()
+            .map_err(|_| HakoError::LockPoisoned("shards".into()))?
+            .get(collection)
+            .cloned()
+        else {
+            return Ok(DropReport {
+                docs_removed: 0,
+                bytes_reclaimed: 0,
+                collections_dropped: Vec::new(),
+            });
+        };
+
+        // 1. Tombstone every live doc through the normal write path: one
+        //    batch per 1000 ids (max_batch_ops convention). This is what
+        //    makes the drop visible — watchers fire, sync peers receive
+        //    deletes, versions advance — instead of silent unlinking.
+        let mut ids: Vec<String> = Vec::new();
+        {
+            let storage = shard_arc.read().unwrap();
+            ids.extend(storage.index.keys().cloned());
+        }
+        let docs_removed = ids.len() as u64;
+        for chunk in ids.chunks(1000) {
+            let mutations: Vec<BatchMutation> = chunk
+                .iter()
+                .map(|id| BatchMutation::Delete {
+                    collection: collection.to_string(),
+                    doc_id: id.clone(),
+                })
+                .collect();
+            self.write_batch(mutations)?;
+        }
+
+        // 2. Evict from the shard map (memory first — the reverse order
+        //    risks a reader opening a shard whose directory is about to
+        //    disappear), then flush the final state so the WAL on disk
+        //    holds the complete tombstone record even for the unlink.
+        let evicted = self
+            .shards
+            .write()
+            .map_err(|_| HakoError::LockPoisoned("shards".into()))?
+            .remove(collection);
+        if let Some(shard) = evicted {
+            if let Ok(mut storage) = shard.write() {
+                let _ = storage.drain_blob_queue();
+                let _ = storage.flush_all();
+            }
+        }
+
+        // 3. Index definitions: remove every family's RAM registration,
+        //    re-persist definitions.json without them, and drop the RAM
+        //    structures + doc cache + plan cache entries.
+        {
+            let mut mgr = self.indexes.write().unwrap();
+            mgr.drop_collection_defs(collection);
+        }
+        self.persist_index_defs()?;
+        if let Ok(mut cache) = self.doc_cache.write() {
+            if !cache.is_empty() {
+                let prefix = format!("{collection}\0");
+                cache.retain(|k, _| !k.starts_with(&prefix));
+            }
+        }
+        self.plan_cache.invalidate();
+
+        // 4. Unlink last: the directory only disappears once nothing in
+        //    the engine references it anymore.
+        let dir = self.root_path.join(collection);
+        let bytes_reclaimed = dir_size(&dir);
+        std::fs::remove_dir_all(&dir)
+            .map_err(|e| HakoError::Io(std::io::Error::new(e.kind(), format!("drop `{collection}`: {e}"))))?;
+
+        self.record_audit(AuditEntry {
+            op: AccessOp::Batch,
+            collection: collection.to_string(),
+            doc_id: None,
+            ok: true,
+        });
+
+        Ok(DropReport {
+            docs_removed,
+            bytes_reclaimed,
+            collections_dropped: vec![collection.to_string()],
+        })
+    }
+
     /// Local-only mass delete ("reset this query scope, don't propagate"):
     /// marks every matched key first (single persist), then batch-deletes.
     pub fn delete_where_local(&self, query: crate::query::query::Query) -> Result<usize> {
@@ -2301,7 +2509,7 @@ impl Hako {
             return Err(self.deny(AccessOp::Query, &query.collection, None));
         }
 
-        let shard_arc = self.get_shard(&query.collection)?;
+        let Some(shard_arc) = self.try_get_shard_on_disk(&query.collection)? else { return Ok(Vec::new()) };
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
 
@@ -2444,7 +2652,7 @@ impl Hako {
             return Err(self.deny(AccessOp::Query, &query.collection, None));
         }
 
-        let shard_arc = self.get_shard(&query.collection)?;
+        let Some(shard_arc) = self.try_get_shard_on_disk(&query.collection)? else { return Ok(Vec::new()) };
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
 
@@ -2478,7 +2686,7 @@ impl Hako {
             return Err(self.deny(AccessOp::Query, &query.collection, None));
         }
 
-        let shard_arc = self.get_shard(&query.collection)?;
+        let Some(shard_arc) = self.try_get_shard_on_disk(&query.collection)? else { return Ok(0) };
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
 
@@ -2510,7 +2718,7 @@ impl Hako {
             return Err(self.deny(AccessOp::Query, &query.collection, None));
         }
 
-        let shard_arc = self.get_shard(&query.collection)?;
+        let Some(shard_arc) = self.try_get_shard_on_disk(&query.collection)? else { return Ok(0) };
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
 
@@ -2543,7 +2751,7 @@ impl Hako {
         let mut q = query.clone();
         q.projection = fields.to_vec();
 
-        let shard_arc = self.get_shard(&q.collection)?;
+        let Some(shard_arc) = self.try_get_shard_on_disk(&q.collection)? else { return Ok(Vec::new()) };
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
 
@@ -2765,7 +2973,7 @@ impl Hako {
     /// Raw stored bytes for one document (watch event hydration without a
     /// full decoded point-get).
     pub fn get_raw_bytes(&self, collection: &str, doc_id: &str) -> Result<Option<Vec<u8>>> {
-        let shard = self.get_shard(collection)?;
+        let Some(shard) = self.try_get_shard_on_disk(collection)? else { return Ok(None) };
         let storage = shard.read().unwrap();
         storage.get(doc_id)
     }
@@ -2834,6 +3042,53 @@ impl Hako {
     /// True when `col` is lazy AND not currently loaded (absent from the
     /// shard map). The dynamic half of the sync gate: archived data never
     /// meshes until touched, then normal rules apply.
+    /// Account one collection (issue #32): doc/tombstone counts and live
+    /// bytes from the RAM index, WAL/segment/blob/total bytes from disk.
+    /// See [`CollectionStats`] for the consistency caveat. A collection
+    /// that was never created returns zeroed stats with `unloaded`
+    /// reflecting lazy residency.
+    pub fn collection_stats(&self, collection: &str) -> Result<CollectionStats> {
+        let unloaded = self.is_lazy_unloaded(collection);
+        let Some(shard_arc) = self.try_get_shard(collection) else {
+            let dir = self.root_path.join(collection);
+            return Ok(CollectionStats {
+                collection: collection.to_string(),
+                doc_count: 0,
+                live_bytes: 0,
+                total_bytes: dir_size(&dir),
+                segment_count: 0,
+                wal_bytes: 0,
+                blob_bytes: 0,
+                tombstone_count: 0,
+                unloaded,
+            });
+        };
+        let storage = shard_arc.read().unwrap();
+        let mut doc_count = 0u64;
+        let mut tombstone_count = 0u64;
+        for ptr in storage.index.values() {
+            match ptr {
+                Pointer::Deleted { .. } => tombstone_count += 1,
+                _ => doc_count += 1,
+            }
+        }
+        let dir = self.root_path.join(collection);
+        let total_bytes = dir_size(&dir);
+        let wal_bytes = storage.wal.file_len();
+        let blob_bytes = std::fs::metadata(dir.join("blobs.dat")).map(|m| m.len()).unwrap_or(0);
+        Ok(CollectionStats {
+            collection: collection.to_string(),
+            doc_count,
+            live_bytes: storage.inlined_bytes as u64,
+            total_bytes,
+            segment_count: storage.segment_count(),
+            wal_bytes,
+            blob_bytes,
+            tombstone_count,
+            unloaded,
+        })
+    }
+
     pub fn is_lazy_unloaded(&self, col: &str) -> bool {
         self.is_lazy_collection(col)
             && !self
@@ -2971,7 +3226,7 @@ impl Hako {
             return Err(self.deny(AccessOp::Query, &query.collection, None));
         }
 
-        let shard_arc = self.get_shard(&query.collection)?;
+        let Some(shard_arc) = self.try_get_shard_on_disk(&query.collection)? else { return Ok(HashMap::new()) };
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc
             .read()
@@ -4018,7 +4273,7 @@ impl Hako {
     }
 
     pub fn list_storage_keys(&self, collection: &str) -> Result<Vec<String>> {
-        let shard = self.get_shard(collection)?;
+        let Some(shard) = self.try_get_shard_on_disk(collection)? else { return Ok(Vec::new()) };
         let guard = shard.read().unwrap();
         let mut keys: Vec<String> = guard.index.iter()
             .filter(|(_, ptr)| !matches!(ptr, crate::storage::engine::Pointer::Deleted { .. }))

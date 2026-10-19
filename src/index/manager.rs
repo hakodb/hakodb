@@ -321,6 +321,19 @@ impl IndexManager {
         self.composite.clear_collection(collection);
     }
 
+    /// Remove every registration AND RAM structure for `collection`
+    /// (issue #31 drop). Unlike [`Self::clear_collection`], definitions
+    /// do not survive: the caller re-persists definitions.json after
+    /// this, so a dropped collection's indexes are gone for good.
+    pub fn drop_collection_defs(&mut self, collection: &str) {
+        self.secondary.remove(collection);
+        self.fts.remove(collection);
+        self.vector.remove(collection);
+        self.hnsw.remove(collection);
+        self.traverse.clear_collection(collection);
+        self.composite.drop_collection(collection);
+    }
+
     // pub fn import_state(&mut self, bytes: &[u8]) -> Result<(), HakoError> {
     //     // By importing hashbrown::HashMap at the top, 'HashMap' here 
     //     // now correctly refers to the hashbrown version.

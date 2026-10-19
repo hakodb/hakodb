@@ -28,6 +28,17 @@ impl CompositeIndexManager {
         }
     }
 
+    /// Remove every tree AND registration for `collection` (issue #31
+    /// drop). Definitions are gone after this; the caller re-persists
+    /// definitions.json. `next_id` is untouched — id gaps are fine.
+    pub fn drop_collection(&mut self, collection: &str) {
+        if let Some(ids) = self.by_collection.remove(collection) {
+            for id in ids {
+                self.by_id.remove(&id);
+            }
+        }
+    }
+
     /// True when any tree is registered for `collection`.
     pub fn has_collection(&self, collection: &str) -> bool {
         self.by_collection.contains_key(collection)
