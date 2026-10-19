@@ -81,7 +81,9 @@ impl CompositeIndexDefinition {
             let v = match f.field.as_str() {
                 "id" => crate::document::value::Value::String(doc_id.to_string()),
                 "_time" => crate::document::value::Value::Int(doc._time),
-                _ => match doc.get(&f.field) {
+                // Dotted paths (hakodb#71 F2) ride the fetch hook; single
+                // segments behave exactly like `get`.
+                _ => match doc.get_path(&f.field) {
                     Some(v) => v.clone(),
                     None => {
                         if self.unique && !self.sparse {
@@ -121,7 +123,7 @@ impl CompositeIndexDefinition {
             match field {
                 "id" => Some(crate::document::value::Value::String(doc_id.to_string())),
                 "_time" => Some(crate::document::value::Value::Int(doc._time)),
-                _ => doc.get(field).cloned(),
+                _ => doc.get_path(field).cloned(),
             }
         };
         let matches = |f: &crate::query::filter::Filter| {

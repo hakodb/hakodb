@@ -74,12 +74,24 @@ fn runtime_build_never_serves_partial() {
 
     // Create the index and query IMMEDIATELY — no waiting. Pre-fix this
     // returned partial/empty rows from the half-built secondary index.
+    // Row-SHIP (set) comparison: equal-age ties may order differently
+    // between the full-scan and the index lanes — the readiness flip
+    // mid-loop legitimately changes the plan (hakodb#71 BUG-2 gate).
+    let sorted_base = {
+        let mut s = base.clone();
+        s.sort();
+        s
+    };
     db.create_index("rd", "age").expect("create");
     for _ in 0..20 {
-        assert_eq!(ages(&db), base, "partial index served");
+        let mut got = ages(&db);
+        got.sort();
+        assert_eq!(got, sorted_base, "partial index served");
     }
     // After the drain the fast path serves the same rows.
     wait_quiescent(&db);
-    assert_eq!(ages(&db), base, "post-build divergence");
+    let mut post = ages(&db);
+    post.sort();
+    assert_eq!(post, sorted_base, "post-build divergence");
     let _ = std::fs::remove_dir_all(&dir);
 }

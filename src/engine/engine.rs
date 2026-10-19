@@ -2198,7 +2198,26 @@ impl Hako {
                 &d.def, &values,
             );
             self.unique_ledger
-                .claim(d.index_id, prefix, doc_id_arc, undo)?;
+                .claim(d.index_id, prefix, doc_id_arc, undo)
+                // Fill caller-actionable context (fkip-234 report): the
+                // ledger knows only the index id; the gate owns the
+                // collection and a readable tuple summary.
+                .map_err(|e| match e {
+                    HakoError::UniqueViolation { key, .. } => {
+                        HakoError::UniqueViolation {
+                            collection: col.to_string(),
+                            index: d.index_id.to_string(),
+                            key,
+                        }
+                    }
+                    HakoError::IndexBackfilling { index, .. } => {
+                        HakoError::IndexBackfilling {
+                            collection: col.to_string(),
+                            index,
+                        }
+                    }
+                    other => other,
+                })?;
         }
         Ok(())
     }
@@ -2807,8 +2826,9 @@ impl Hako {
         let rows = shard_arc.read().unwrap().count_prefix("");
 
         let is_ready = self.index_query_ready();
+        let vec_ready = self.vector_query_ready();
 
-        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
+        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
 
         // Graph traversal (issue #53): cross-collection BFS can't ride
         // the single-shard executor â€” dedicated path below. Normal scans
@@ -2850,7 +2870,8 @@ impl Hako {
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
         let is_ready = self.index_query_ready();
-        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
+        let vec_ready = self.vector_query_ready();
+        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
         Ok((*plan).clone())
     }
 
@@ -2950,8 +2971,9 @@ impl Hako {
         let rows = shard_arc.read().unwrap().count_prefix("");
 
         let is_ready = self.index_query_ready();
+        let vec_ready = self.vector_query_ready();
 
-        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
+        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
 
         let results = self.executor.execute_raw(shard_arc, &indexes, (*plan).clone())?;
 
@@ -2984,8 +3006,9 @@ impl Hako {
         let rows = shard_arc.read().unwrap().count_prefix("");
 
         let is_ready = self.index_query_ready();
+        let vec_ready = self.vector_query_ready();
 
-        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
+        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
 
         let visited = self.executor.execute_walk(shard_arc, &indexes, (*plan).clone(), callback)?;
 
@@ -3016,8 +3039,9 @@ impl Hako {
         let rows = shard_arc.read().unwrap().count_prefix("");
 
         let is_ready = self.index_query_ready();
+        let vec_ready = self.vector_query_ready();
 
-        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
+        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
 
         let visited = self.executor.execute_walk_view(shard_arc, &indexes, (*plan).clone(), callback)?;
 
@@ -3049,7 +3073,8 @@ impl Hako {
         let rows = shard_arc.read().unwrap().count_prefix("");
 
         let is_ready = self.index_query_ready();
-        let plan = self.plan_cache.get_or_compute(&q, &indexes, rows, self.config.query_workers, is_ready);
+        let vec_ready = self.vector_query_ready();
+        let plan = self.plan_cache.get_or_compute(&q, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
 
         // SIMPLE CALL: Worker handles blob resolution internally
         let results = self.executor.execute_projected(shard_arc, &indexes, (*plan).clone())?;
@@ -3278,7 +3303,8 @@ impl Hako {
     /// moved, not the complexity.
     pub fn plan_for_watch(&self, query: &crate::query::query::Query) -> crate::query::plan::QueryPlan {        let indexes = self.indexes.read().unwrap();
         let is_ready = self.index_query_ready();
-        crate::query::planner::QueryPlanner::plan(query, &indexes, 0, 1, is_ready)
+        let vec_ready = self.vector_query_ready();
+        crate::query::planner::QueryPlanner::plan(query, &indexes, 0, 1, is_ready, vec_ready)
     }
 
     /// Zero-decode view match for one watch event: true when the stored
@@ -3557,8 +3583,9 @@ impl Hako {
             .count_prefix("");
 
         let is_ready = self.index_query_ready();
+        let vec_ready = self.vector_query_ready();
         // FIX: Add self.config.query_workers as the 4th argument
-        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready);
+        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
 
         let res = self
             .executor
@@ -4553,6 +4580,21 @@ impl Hako {
         sparse: bool,
         filter: Option<crate::query::filter::FilterGroup>,
     ) -> Result<u32> {
+        // Dotted-path validation (hakodb#71 F2): bounded nesting, no
+        // empty segments. The fetch hook itself accepts any depth —
+        // this refuses to BUILD an index on unreasonable paths.
+        for (field, _) in &fields {
+            if field.contains("..") || field.starts_with('.') || field.ends_with('.') {
+                return Err(HakoError::InvalidInput(format!(
+                    "invalid indexed field `{field}`: empty dotted segment"
+                )));
+            }
+            if field.split('.').count() > 16 {
+                return Err(HakoError::InvalidInput(format!(
+                    "indexed field `{field}` exceeds 16 path segments"
+                )));
+            }
+        }
         {
             let mgr = self.indexes.read().unwrap();
             for idx in mgr.indexes_for_collection(col) {
@@ -4688,9 +4730,20 @@ impl Hako {
         // registered (load_from_tree keeps partial state private).
         let mgr = self.indexes.read().unwrap();
         match mgr.composite.get(index_id) {
-            Some(idx) => {
-                self.unique_ledger.load_from_tree(index_id, &idx.tree).map(|_| ())
-            }
+            Some(idx) => self
+                .unique_ledger
+                .load_from_tree(index_id, &idx.tree)
+                .map(|_| ())
+                .map_err(|e| match e {
+                    HakoError::UniqueViolation { collection: _, index, key } => {
+                        HakoError::UniqueViolation {
+                            collection: idx.definition.collection.clone(),
+                            index,
+                            key,
+                        }
+                    }
+                    other => other,
+                }),
             None => Ok(()),
         }
     }
@@ -4962,6 +5015,23 @@ impl Hako {
     /// stale fast plan survives into the build window (a slow plan cached
     /// during the window self-heals at TTL).
     pub(crate) fn index_query_ready(&self) -> bool {
+        self.indexes_ready.load(std::sync::atomic::Ordering::Acquire)
+            && self.backfill_inflight.load(std::sync::atomic::Ordering::Acquire) == 0
+            // Pending IndexOps (hakodb#71 BUG-2, report from box fkip-234):
+            // a write returns Ok after enqueueing its index update; a query
+            // that lets the planner trust a composite/secondary tree before
+            // the worker applied the ops loses read-your-writes. Pending
+            // ops => full-scan lane (correct, incremental cost only until
+            // the queue drains).
+            && self.index_inflight.load(std::sync::atomic::Ordering::Acquire) == 0
+    }
+
+    /// Vector planning keeps the backfill gate but drops the pending IndexOps
+    /// one: ANN runs against in-memory handles that the executor live-filters
+    /// (deleted ids stay invisible), so tree lag only lowers recall — never
+    /// serves ghost rows. FullCollection cannot score Near at all; falling
+    /// back to it during a write burst would rather serve empty results.
+    pub(crate) fn vector_query_ready(&self) -> bool {
         self.indexes_ready.load(std::sync::atomic::Ordering::Acquire)
             && self.backfill_inflight.load(std::sync::atomic::Ordering::Acquire) == 0
     }
