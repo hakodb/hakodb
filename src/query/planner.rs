@@ -477,11 +477,17 @@ impl QueryPlanner {
             .iter()
             .any(|b| matches!(b, Some(v) if !v.is_empty()));
 
+        // hakodb#71 F3: elemMatch clauses are matcher passes — every
+        // candidate row must be decoded and element-checked, so no scan
+        // lane may claim it covered the filters when clauses exist.
+        let filters_satisfied = filters_satisfied && query.elem_match.is_empty();
+
         QueryPlan {
             collection: query.collection.clone(),
             scan,
             filters: query.filters.clone(),
             or_groups: query.or_groups.clone(),
+            elem_match: query.elem_match.clone(),
             order_by: query.order_by.clone(),
             limit: query.limit,
             scan_limit,

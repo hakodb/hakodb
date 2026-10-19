@@ -114,6 +114,15 @@ fn hash_query(q: &Query) -> u64 {
             hash_filter_value(&f.op, &f.value, &mut h);
         }
     }
+    // elemMatch clauses (F3): field + each sub-filter.
+    for c in &q.elem_match {
+        c.field.hash(&mut h);
+        for f in &c.filters {
+            f.field.hash(&mut h);
+            (f.op as u8).hash(&mut h);
+            hash_filter_value(&f.op, &f.value, &mut h);
+        }
+    }
     for o in &q.order_by {
         o.field.hash(&mut h);
         o.ascending.hash(&mut h);

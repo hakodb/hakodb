@@ -182,6 +182,14 @@ impl ParallelQueryExecutor {
     #[inline]
     fn check_index_satisfied(plan: &QueryPlan) -> Result<()> {
         use crate::error::HakoError;
+        // hakodb#71 F3: elemMatch clauses are decode-time passes — raw
+        // bytes carry no element verdict, so refuse loudly instead of
+        // silently returning every row.
+        if !plan.elem_match.is_empty() {
+            return Err(HakoError::QueryError(
+                "query requires index-satisfied filters (decode to match)".into(),
+            ));
+        }
         if (!plan.filters.is_empty() || !plan.or_groups.is_empty())
             && !plan.filters_satisfied_by_index
         {
