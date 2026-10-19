@@ -1201,6 +1201,11 @@ impl StorageEngine {
 
     pub fn base_dir(&self) -> &Path { &self.base_dir }
 
+    /// Count of registered segment files (issue #32 stats surface).
+    pub fn segment_count(&self) -> u32 {
+        self.segments.len() as u32
+    }
+
     pub fn backup(&mut self, destination_path: impl AsRef<Path>) -> Result<()> {
         // 1. Move all inlined data from RAM into segment files on Disk.
         // This ensures the backup is complete.
