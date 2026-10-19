@@ -39,6 +39,19 @@ impl CompositeIndexManager {
         }
     }
 
+    /// Remove a single index (registration + tree). Definitions are gone
+    /// after this; the caller re-persists definitions.json. Used by
+    /// create-unique rollback (hakodb#71).
+    pub fn drop_index(&mut self, id: u32) {
+        self.by_id.remove(&id);
+        for (_, ids) in self.by_collection.iter_mut() {
+            if let Some(pos) = ids.iter().position(|i| *i == id) {
+                ids.swap_remove(pos);
+                break;
+            }
+        }
+    }
+
     /// True when any tree is registered for `collection`.
     pub fn has_collection(&self, collection: &str) -> bool {
         self.by_collection.contains_key(collection)

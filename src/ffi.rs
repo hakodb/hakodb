@@ -22,7 +22,7 @@ macro_rules! safety_shield {
             Ok(val) => val,
             Err(_) => {
                 // Set the thread-local error so C++ can see it
-                crate::ffi::set_last_error("CRITICAL: Internal Engine Panic. The operation was aborted to prevent a process crash.");
+                crate::ffi::set_last_error_err("CRITICAL: Internal Engine Panic. The operation was aborted to prevent a process crash.");
                 $fallback
             }
         }
@@ -122,6 +122,10 @@ pub struct HK_CloudSync {
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+    /// Issue #71/F5: retry policy must never string-match. Written from
+    /// `HakoError::kind()` wherever a typed error reaches the FFI
+    /// boundary; 1 (generic) defaults for the untyped sites.
+    static LAST_ERROR_KIND: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 }
 
 fn set_last_error(msg: impl Into<String>) -> i32 {
@@ -130,6 +134,60 @@ fn set_last_error(msg: impl Into<String>) -> i32 {
     LAST_ERROR.with(|slot| {
         *slot.borrow_mut() = Some(message);
     });
+    LAST_ERROR_KIND.with(|k| k.set(crate::error::ErrorKind::Generic as i32));
+    -1
+}
+
+/// Anything an `Err(e) => set_last_error_err(e)` arm wants to report. Allows
+/// one mechanical sweep of all sites without type-specific call sites —
+/// typed errors keep their retry classification (issue #71/F5), strings
+/// degrade to Generic, exactly as before.
+pub(crate) trait LastErrorPayload {
+    fn payload(self) -> (String, crate::error::ErrorKind);
+}
+
+impl LastErrorPayload for crate::error::HakoError {
+    fn payload(self) -> (String, crate::error::ErrorKind) {
+        (self.to_string(), self.kind())
+    }
+}
+
+impl LastErrorPayload for &crate::error::HakoError {
+    fn payload(self) -> (String, crate::error::ErrorKind) {
+        (self.to_string(), self.kind())
+    }
+}
+
+impl LastErrorPayload for std::io::Error {
+    fn payload(self) -> (String, crate::error::ErrorKind) {
+        (self.to_string(), crate::error::ErrorKind::Generic)
+    }
+}
+
+impl LastErrorPayload for String {
+    fn payload(self) -> (String, crate::error::ErrorKind) {
+        (self, crate::error::ErrorKind::Generic)
+    }
+}
+
+impl LastErrorPayload for &str {
+    fn payload(self) -> (String, crate::error::ErrorKind) {
+        (self.to_string(), crate::error::ErrorKind::Generic)
+    }
+}
+
+impl LastErrorPayload for &&str {
+    fn payload(self) -> (String, crate::error::ErrorKind) {
+        (self.to_string(), crate::error::ErrorKind::Generic)
+    }
+}
+
+/// Set the last error from a typed engine error — records its retry
+/// classification alongside the message (issue #71/F5).
+pub(crate) fn set_last_error_err(payload: impl LastErrorPayload) -> i32 {
+    let (msg, kind) = payload.payload();
+    set_last_error(msg);
+    LAST_ERROR_KIND.with(|k| k.set(kind as i32));
     -1
 }
 
@@ -137,6 +195,7 @@ fn clear_last_error() {
     LAST_ERROR.with(|slot| {
         *slot.borrow_mut() = None;
     });
+    LAST_ERROR_KIND.with(|k| k.set(crate::error::ErrorKind::None as i32));
 }
 
 fn cstr_to_string(ptr: *const c_char) -> Result<String, String> {
@@ -177,7 +236,7 @@ pub extern "C" fn hk_engine_open(path: *const c_char) -> *mut HK_Engine {
     let path = match cstr_to_string(path) {
         Ok(v) => v,
         Err(e) => {
-            set_last_error(e);
+            set_last_error_err(e);
             return ptr::null_mut();
         }
     };
@@ -189,7 +248,7 @@ pub extern "C" fn hk_engine_open(path: *const c_char) -> *mut HK_Engine {
             Box::into_raw(Box::new(HK_Engine { db: std::sync::Arc::new(db) }))
         }
         Err(e) => {
-            set_last_error(e.to_string());
+            set_last_error_err(e.to_string());
             ptr::null_mut()
         }
     }
@@ -225,7 +284,7 @@ pub extern "C" fn hk_engine_await_quiescent(engine: *mut HK_Engine, timeout_ms: 
 #[no_mangle]
 pub extern "C" fn hk_engine_quiescence_status(engine: *mut HK_Engine) -> *mut c_char {
     if engine.is_null() {
-        set_last_error("null engine handle");
+        set_last_error_err("null engine handle");
         return ptr::null_mut();
     }
     let engine = unsafe { &*engine };
@@ -246,7 +305,7 @@ pub extern "C" fn hk_engine_quiescence_status(engine: *mut HK_Engine) -> *mut c_
             cs.into_raw()
         }
         Err(e) => {
-            set_last_error(e.to_string());
+            set_last_error_err(e.to_string());
             ptr::null_mut()
         }
     }
@@ -465,13 +524,13 @@ pub extern "C" fn hk_engine_open_with_config(
         let path_str = match cstr_to_string(path) {
             Ok(v) => v,
             Err(e) => {
-                set_last_error(e);
+                set_last_error_err(e);
                 return std::ptr::null_mut();
             }
         };
 
         if config.is_null() {
-            set_last_error("Null config provided");
+            set_last_error_err("Null config provided");
             return std::ptr::null_mut();
         }
 
@@ -485,7 +544,7 @@ pub extern "C" fn hk_engine_open_with_config(
                 Box::into_raw(Box::new(HK_Engine { db: std::sync::Arc::new(db) }))
             }
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 std::ptr::null_mut()
             }
         }
@@ -607,15 +666,15 @@ pub extern "C" fn hk_doc_insert_str(
     value: *const c_char,
 ) -> i32 {
     if doc.is_null() {
-        return set_last_error("null HK_Doc");
+        return set_last_error_err("null HK_Doc");
     }
     let key = match cstr_to_string(key) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let value = match cstr_to_string(value) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let doc = unsafe { &mut *doc };
     doc.doc.insert(key, Value::String(value));
@@ -626,11 +685,11 @@ pub extern "C" fn hk_doc_insert_str(
 #[no_mangle]
 pub extern "C" fn hk_doc_insert_int(doc: *mut HK_Doc, key: *const c_char, value: i64) -> i32 {
     if doc.is_null() {
-        return set_last_error("null HK_Doc");
+        return set_last_error_err("null HK_Doc");
     }
     let key = match cstr_to_string(key) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let doc = unsafe { &mut *doc };
     doc.doc.insert(key, Value::Int(value));
@@ -641,11 +700,11 @@ pub extern "C" fn hk_doc_insert_int(doc: *mut HK_Doc, key: *const c_char, value:
 #[no_mangle]
 pub extern "C" fn hk_doc_insert_float(doc: *mut HK_Doc, key: *const c_char, value: f64) -> i32 {
     if doc.is_null() {
-        return set_last_error("null HK_Doc");
+        return set_last_error_err("null HK_Doc");
     }
     let key = match cstr_to_string(key) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let doc = unsafe { &mut *doc };
     doc.doc.insert(key, Value::Float(value));
@@ -656,11 +715,11 @@ pub extern "C" fn hk_doc_insert_float(doc: *mut HK_Doc, key: *const c_char, valu
 #[no_mangle]
 pub extern "C" fn hk_doc_insert_bool(doc: *mut HK_Doc, key: *const c_char, value: bool) -> i32 {
     if doc.is_null() {
-        return set_last_error("null HK_Doc");
+        return set_last_error_err("null HK_Doc");
     }
     let key = match cstr_to_string(key) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let doc = unsafe { &mut *doc };
     doc.doc.insert(key, Value::Bool(value));
@@ -671,11 +730,11 @@ pub extern "C" fn hk_doc_insert_bool(doc: *mut HK_Doc, key: *const c_char, value
 #[no_mangle]
 pub extern "C" fn hk_doc_insert_null(doc: *mut HK_Doc, key: *const c_char) -> i32 {
     if doc.is_null() {
-        return set_last_error("null HK_Doc");
+        return set_last_error_err("null HK_Doc");
     }
     let key = match cstr_to_string(key) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let doc = unsafe { &mut *doc };
     doc.doc.insert(key, Value::Null);
@@ -691,14 +750,14 @@ pub extern "C" fn hk_doc_insert_bin(
     len: usize,
 ) -> i32 {
     if doc.is_null() {
-        return set_last_error("null HK_Doc");
+        return set_last_error_err("null HK_Doc");
     }
     if data.is_null() && len > 0 {
-        return set_last_error("null binary data");
+        return set_last_error_err("null binary data");
     }
     let key = match cstr_to_string(key) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let bytes = if len == 0 {
         Vec::new()
@@ -721,22 +780,22 @@ pub extern "C" fn hk_engine_insert(
     safety_shield!(-1, {
         // Returns -1 if Rust panics
         if engine.is_null() || doc.is_null() {
-            return set_last_error("null engine/doc handle");
+            return set_last_error_err("null engine/doc handle");
         }
         let collection = match cstr_to_string(collection) {
             Ok(v) => v,
-            Err(e) => return set_last_error(e),
+            Err(e) => return set_last_error_err(e),
         };
         let doc_id = match cstr_to_string(doc_id) {
             Ok(v) => v,
-            Err(e) => return set_last_error(e),
+            Err(e) => return set_last_error_err(e),
         };
 
         let engine = unsafe { &mut *engine };
         let doc = unsafe { &*doc };
         match engine.db.put(&collection, &doc_id, &doc.doc) {
             Ok(_) => 0,
-            Err(e) => set_last_error(format!("{}", e)),
+            Err(e) => set_last_error_err(format!("{}", e)),
         }
     })
 }
@@ -753,15 +812,15 @@ pub extern "C" fn hk_engine_insert_take(
 ) -> i32 {
     safety_shield!(-1, {
         if engine.is_null() || doc.is_null() {
-            return set_last_error("null engine/doc handle");
+            return set_last_error_err("null engine/doc handle");
         }
         let collection = match cstr_to_string(collection) {
             Ok(v) => v,
-            Err(e) => return set_last_error(e),
+            Err(e) => return set_last_error_err(e),
         };
         let doc_id = match cstr_to_string(doc_id) {
             Ok(v) => v,
-            Err(e) => return set_last_error(e),
+            Err(e) => return set_last_error_err(e),
         };
 
         let engine = unsafe { &mut *engine };
@@ -769,7 +828,7 @@ pub extern "C" fn hk_engine_insert_take(
         let owned = unsafe { *Box::from_raw(doc) };
         match engine.db.put_owned(&collection, &doc_id, owned.doc) {
             Ok(_) => 0,
-            Err(e) => set_last_error(format!("{}", e)),
+            Err(e) => set_last_error_err(format!("{}", e)),
         }
     })
 }
@@ -782,18 +841,18 @@ pub extern "C" fn hk_engine_get(
 ) -> *mut HK_Doc {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() {
-            set_last_error("null engine handle");
+            set_last_error_err("null engine handle");
             return ptr::null_mut();
         }
         // ponytail: borrow the caller's C strings — the old code allocated
         // two Strings per get (strlen + validate + copy each). Only doc_id
         // still needs ownership (moved into the HK_Doc handle).
         if collection.is_null() {
-            set_last_error("null collection handle");
+            set_last_error_err("null collection handle");
             return ptr::null_mut();
         }
         if doc_id.is_null() {
-            set_last_error("null doc_id handle");
+            set_last_error_err("null doc_id handle");
             return ptr::null_mut();
         }
         let collection_c = unsafe { CStr::from_ptr(collection) };
@@ -801,14 +860,14 @@ pub extern "C" fn hk_engine_get(
         let collection = match collection_c.to_str() {
             Ok(v) => v,
             Err(_) => {
-                set_last_error("invalid utf8");
+                set_last_error_err("invalid utf8");
                 return ptr::null_mut();
             }
         };
         let doc_id_owned = match doc_id_c.to_str() {
             Ok(v) => v.to_string(),
             Err(_) => {
-                set_last_error("invalid utf8");
+                set_last_error_err("invalid utf8");
                 return ptr::null_mut();
             }
         };
@@ -829,15 +888,15 @@ pub extern "C" fn hk_engine_delete(
     doc_id: *const c_char,
 ) -> i32 {
     if engine.is_null() {
-        return set_last_error("null engine handle");
+        return set_last_error_err("null engine handle");
     }
     let collection = match cstr_to_string(collection) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let doc_id = match cstr_to_string(doc_id) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
 
     let engine = unsafe { &mut *engine };
@@ -847,7 +906,7 @@ pub extern "C" fn hk_engine_delete(
             0
         }
         Err(e) => {
-            set_last_error(e.to_string());
+            set_last_error_err(e.to_string());
             -1 // or ptr::null_mut() depending on function return type
         }
     }
@@ -863,15 +922,15 @@ pub extern "C" fn hk_engine_delete_local(
     doc_id: *const c_char,
 ) -> i32 {
     if engine.is_null() {
-        return set_last_error("null engine handle");
+        return set_last_error_err("null engine handle");
     }
     let collection = match cstr_to_string(collection) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let doc_id = match cstr_to_string(doc_id) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
 
     let engine = unsafe { &mut *engine };
@@ -881,7 +940,7 @@ pub extern "C" fn hk_engine_delete_local(
             0
         }
         Err(e) => {
-            set_last_error(e.to_string());
+            set_last_error_err(e.to_string());
             -1
         }
     }
@@ -896,11 +955,11 @@ pub extern "C" fn hk_engine_set_collection_local(
     local: i32,
 ) -> i32 {
     if engine.is_null() {
-        return set_last_error("null engine handle");
+        return set_last_error_err("null engine handle");
     }
     let collection = match cstr_to_string(collection) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let engine = unsafe { &mut *engine };
     engine.db.set_collection_local(&collection, local != 0);
@@ -916,15 +975,15 @@ pub extern "C" fn hk_engine_replicate_key(
     doc_id: *const c_char,
 ) -> i32 {
     if engine.is_null() {
-        return set_last_error("null engine handle");
+        return set_last_error_err("null engine handle");
     }
     let collection = match cstr_to_string(collection) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let doc_id = match cstr_to_string(doc_id) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let engine = unsafe { &mut *engine };
     engine.db.replicate_key(&collection, &doc_id);
@@ -939,11 +998,11 @@ pub extern "C" fn hk_engine_replicate_collection(
     collection: *const c_char,
 ) -> i32 {
     if engine.is_null() {
-        return set_last_error("null engine handle");
+        return set_last_error_err("null engine handle");
     }
     let collection = match cstr_to_string(collection) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let engine = unsafe { &mut *engine };
     engine.db.replicate_collection(&collection);
@@ -960,11 +1019,11 @@ pub extern "C" fn hk_engine_vacuum_collection(
     collection: *const c_char,
 ) -> i32 {
     if engine.is_null() {
-        return set_last_error("null engine handle");
+        return set_last_error_err("null engine handle");
     }
     let collection = match cstr_to_string(collection) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let engine = unsafe { &mut *engine };
     match engine.db.vacuum_collection(&collection) {
@@ -972,7 +1031,7 @@ pub extern "C" fn hk_engine_vacuum_collection(
             clear_last_error();
             n as i32
         }
-        Err(e) => set_last_error(e.to_string()),
+        Err(e) => set_last_error_err(e.to_string()),
     }
 }
 
@@ -989,34 +1048,34 @@ pub extern "C" fn hk_engine_relocate_docs(
 ) -> *mut c_char {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() {
-            set_last_error("null engine handle");
+            set_last_error_err("null engine handle");
             return std::ptr::null_mut();
         }
         let src = match cstr_to_string(src) {
             Ok(v) => v,
             Err(e) => {
-                set_last_error(e);
+                set_last_error_err(e);
                 return std::ptr::null_mut();
             }
         };
         let dst = match cstr_to_string(dst) {
             Ok(v) => v,
             Err(e) => {
-                set_last_error(e);
+                set_last_error_err(e);
                 return std::ptr::null_mut();
             }
         };
         let ids_raw = match cstr_to_string(ids_json) {
             Ok(v) => v,
             Err(e) => {
-                set_last_error(e);
+                set_last_error_err(e);
                 return std::ptr::null_mut();
             }
         };
         let ids: Vec<String> = match serde_json::from_str(&ids_raw) {
             Ok(v) => v,
             Err(e) => {
-                set_last_error(format!("ids_json must be a JSON string array: {e}"));
+                set_last_error_err(format!("ids_json must be a JSON string array: {e}"));
                 return std::ptr::null_mut();
             }
         };
@@ -1033,7 +1092,7 @@ pub extern "C" fn hk_engine_relocate_docs(
                 }
             }
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 std::ptr::null_mut()
             }
         }
@@ -1048,11 +1107,11 @@ pub extern "C" fn hk_engine_load_collection(
     collection: *const c_char,
 ) -> i32 {
     if engine.is_null() {
-        return set_last_error("null engine handle");
+        return set_last_error_err("null engine handle");
     }
     let collection = match cstr_to_string(collection) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let engine = unsafe { &*engine };
     match engine.db.load_collection(&collection) {
@@ -1060,7 +1119,7 @@ pub extern "C" fn hk_engine_load_collection(
             clear_last_error();
             0
         }
-        Err(e) => set_last_error(e.to_string()),
+        Err(e) => set_last_error_err(e.to_string()),
     }
 }
 
@@ -1072,11 +1131,11 @@ pub extern "C" fn hk_engine_unload_collection(
     collection: *const c_char,
 ) -> i32 {
     if engine.is_null() {
-        return set_last_error("null engine handle");
+        return set_last_error_err("null engine handle");
     }
     let collection = match cstr_to_string(collection) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let engine = unsafe { &*engine };
     match engine.db.unload_collection(&collection) {
@@ -1084,7 +1143,7 @@ pub extern "C" fn hk_engine_unload_collection(
             clear_last_error();
             0
         }
-        Err(e) => set_last_error(e.to_string()),
+        Err(e) => set_last_error_err(e.to_string()),
     }
 }
 
@@ -1094,7 +1153,7 @@ pub extern "C" fn hk_engine_unload_collection(
 pub extern "C" fn hk_engine_unloaded_collections(engine: *mut HK_Engine) -> *mut c_char {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() {
-            set_last_error("null engine handle");
+            set_last_error_err("null engine handle");
             return std::ptr::null_mut();
         }
         let engine = unsafe { &*engine };
@@ -1130,15 +1189,15 @@ pub extern "C" fn hk_batch_set(
     doc: *mut HK_Doc,
 ) -> i32 {
     if batch.is_null() || doc.is_null() {
-        return set_last_error("null batch/doc handle");
+        return set_last_error_err("null batch/doc handle");
     }
     let collection = match cstr_to_string(collection) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let doc_id = match cstr_to_string(doc_id) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
 
     let batch = unsafe { &mut *batch };
@@ -1162,15 +1221,15 @@ pub extern "C" fn hk_batch_delete(
     doc_id: *const c_char,
 ) -> i32 {
     if batch.is_null() {
-        return set_last_error("null batch handle");
+        return set_last_error_err("null batch handle");
     }
     let collection = match cstr_to_string(collection) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let doc_id = match cstr_to_string(doc_id) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
 
     let batch = unsafe { &mut *batch };
@@ -1183,7 +1242,7 @@ pub extern "C" fn hk_batch_delete(
 pub extern "C" fn hk_batch_commit(engine: *mut HK_Engine, batch: *mut HK_Batch) -> i32 {
     safety_shield!(-1, {
         if engine.is_null() || batch.is_null() {
-            return set_last_error("null engine/batch handle");
+            return set_last_error_err("null engine/batch handle");
         }
 
         let engine = unsafe { &mut *engine };
@@ -1196,7 +1255,7 @@ pub extern "C" fn hk_batch_commit(engine: *mut HK_Engine, batch: *mut HK_Batch) 
                 0
             }
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 -1 // or ptr::null_mut() depending on function return type
             }
         }
@@ -1208,7 +1267,7 @@ pub extern "C" fn hk_query_new(collection: *const c_char) -> *mut HK_Query {
     let collection = match cstr_to_string(collection) {
         Ok(v) => v,
         Err(e) => {
-            set_last_error(e);
+            set_last_error_err(e);
             return ptr::null_mut();
         }
     };
@@ -1233,15 +1292,15 @@ pub extern "C" fn hk_query_where_eq_str(
     value: *const c_char,
 ) -> i32 {
     // if query.is_null() {
-    //     return set_last_error("null query handle");
+    //     return set_last_error_err("null query handle");
     // }
     // let field = match cstr_to_string(field) {
     //     Ok(v) => v,
-    //     Err(e) => return set_last_error(e),
+    //     Err(e) => return set_last_error_err(e),
     // };
     // let value = match cstr_to_string(value) {
     //     Ok(v) => v,
-    //     Err(e) => return set_last_error(e),
+    //     Err(e) => return set_last_error_err(e),
     // };
     // let query = unsafe { &mut *query };
     // query.query = query
@@ -1260,12 +1319,12 @@ pub extern "C" fn hk_query_where_eq_bool(
     value: bool, // Receive the bool directly
 ) -> i32 {
     // if query.is_null() {
-    //     return set_last_error("null query handle");
+    //     return set_last_error_err("null query handle");
     // }
 
     // let field = match cstr_to_string(field) {
     //     Ok(v) => v,
-    //     Err(e) => return set_last_error(e),
+    //     Err(e) => return set_last_error_err(e),
     // };
 
     // let query_ptr = unsafe { &mut *query };
@@ -1278,8 +1337,8 @@ pub extern "C" fn hk_query_where_eq_bool(
 
     // clear_last_error();
     // 0
-    if query.is_null() { return set_last_error("null query handle"); }
-    let field = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e), };
+    if query.is_null() { return set_last_error_err("null query handle"); }
+    let field = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error_err(e), };
     let query_ptr = unsafe { &mut *query };
     
     // FIX: Push directly
@@ -1306,7 +1365,7 @@ pub extern "C" fn hk_query_delete(engine: *mut HK_Engine, query: *mut HK_Query) 
                 clear_last_error();
                 count as i32
             },
-            Err(e) => set_last_error(e.to_string()),
+            Err(e) => set_last_error_err(e.to_string()),
         }
     })
 }
@@ -1325,7 +1384,7 @@ pub extern "C" fn hk_query_delete_local(engine: *mut HK_Engine, query: *mut HK_Q
                 clear_last_error();
                 count as i32
             },
-            Err(e) => set_last_error(e.to_string()),
+            Err(e) => set_last_error_err(e.to_string()),
         }
     })
 }
@@ -1354,7 +1413,7 @@ pub extern "C" fn hk_query_patch(
                 clear_last_error();
                 count as i32
             },
-            Err(e) => set_last_error(e.to_string()),
+            Err(e) => set_last_error_err(e.to_string()),
         }
     })
 }
@@ -1366,15 +1425,15 @@ fn apply_string_filter(
     op: Operator,
 ) -> i32 {
     // if query.is_null() {
-    //     return set_last_error("null query handle");
+    //     return set_last_error_err("null query handle");
     // }
     // let field = match cstr_to_string(field) {
     //     Ok(v) => v,
-    //     Err(e) => return set_last_error(e),
+    //     Err(e) => return set_last_error_err(e),
     // };
     // let value = match cstr_to_string(value) {
     //     Ok(v) => v,
-    //     Err(e) => return set_last_error(e),
+    //     Err(e) => return set_last_error_err(e),
     // };
     // let query = unsafe { &mut *query };
     // query.query = query
@@ -1383,9 +1442,9 @@ fn apply_string_filter(
     //     .where_filter(&field, op, Value::String(value));
     // clear_last_error();
     // 0
-    if query.is_null() { return set_last_error("null query handle"); }
-    let field = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e), };
-    let value = match cstr_to_string(value) { Ok(v) => v, Err(e) => return set_last_error(e), };
+    if query.is_null() { return set_last_error_err("null query handle"); }
+    let field = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error_err(e), };
+    let value = match cstr_to_string(value) { Ok(v) => v, Err(e) => return set_last_error_err(e), };
     let query = unsafe { &mut *query };
     
     // FIX: Push directly without cloning the query struct
@@ -1400,11 +1459,11 @@ fn apply_string_filter(
 
 fn apply_int_filter(query: *mut HK_Query, field: *const c_char, value: i64, op: Operator) -> i32 {
     // if query.is_null() {
-    //     return set_last_error("null query handle");
+    //     return set_last_error_err("null query handle");
     // }
     // let field = match cstr_to_string(field) {
     //     Ok(v) => v,
-    //     Err(e) => return set_last_error(e),
+    //     Err(e) => return set_last_error_err(e),
     // };
     // let query = unsafe { &mut *query };
     // query.query = query
@@ -1413,8 +1472,8 @@ fn apply_int_filter(query: *mut HK_Query, field: *const c_char, value: i64, op: 
     //     .where_filter(&field, op, Value::Int(value));
     // clear_last_error();
     // 0
-    if query.is_null() { return set_last_error("null query handle"); }
-    let field = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e), };
+    if query.is_null() { return set_last_error_err("null query handle"); }
+    let field = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error_err(e), };
     let query = unsafe { &mut *query };
     
     // FIX: Push directly
@@ -1434,11 +1493,11 @@ pub extern "C" fn hk_query_where_eq_int(
     value: i64,
 ) -> i32 {
     // if query.is_null() {
-    //     return set_last_error("null query handle");
+    //     return set_last_error_err("null query handle");
     // }
     // let field = match cstr_to_string(field) {
     //     Ok(v) => v,
-    //     Err(e) => return set_last_error(e),
+    //     Err(e) => return set_last_error_err(e),
     // };
     // let query = unsafe { &mut *query };
     // query.query = query
@@ -1548,11 +1607,11 @@ pub extern "C" fn hk_query_where_array_contains(
 ) -> i32 {
     let f = match cstr_to_string(field) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let v = match cstr_to_string(value) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let q = unsafe { &mut *query };
     q.query = q
@@ -1574,7 +1633,7 @@ pub extern "C" fn hk_query_where_array_contains_any(
     let q = unsafe { &mut *query };
     let f = match cstr_to_string(field) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let array_inner = unsafe { Box::from_raw(array) };
     q.query.filters.push(crate::query::filter::Filter {
@@ -1597,7 +1656,7 @@ pub extern "C" fn hk_query_where_not_in(
     let q = unsafe { &mut *query };
     let f = match cstr_to_string(field) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let array_inner = unsafe { Box::from_raw(array) };
     q.query.filters.push(crate::query::filter::Filter {
@@ -1615,18 +1674,18 @@ pub extern "C" fn hk_query_order_by(
     ascending: bool,
 ) -> i32 {
     // if query.is_null() {
-    //     return set_last_error("null query handle");
+    //     return set_last_error_err("null query handle");
     // }
     // let field = match cstr_to_string(field) {
     //     Ok(v) => v,
-    //     Err(e) => return set_last_error(e),
+    //     Err(e) => return set_last_error_err(e),
     // };
     // let query = unsafe { &mut *query };
     // query.query = query.query.clone().order_by(&field, ascending);
     // clear_last_error();
     // 0
-    if query.is_null() { return set_last_error("null query handle"); }
-    let field = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e), };
+    if query.is_null() { return set_last_error_err("null query handle"); }
+    let field = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error_err(e), };
     let query = unsafe { &mut *query };
     
     // FIX: Push directly
@@ -1672,17 +1731,17 @@ pub extern "C" fn hk_doc_resolve_blobs(
 ) -> i32 {
     safety_shield!(-1, {
         if engine.is_null() || doc.is_null() {
-            return set_last_error("null engine/doc handle");
+            return set_last_error_err("null engine/doc handle");
         }
         let collection = match cstr_to_string(collection) {
             Ok(v) => v,
-            Err(e) => return set_last_error(e),
+            Err(e) => return set_last_error_err(e),
         };
         let engine = unsafe { &*engine };
         let doc = unsafe { &mut *doc };
         match engine.db.resolve_document_blobs(&mut doc.doc, &collection) {
             Ok(_) => 0,
-            Err(e) => set_last_error(format!("{}", e)),
+            Err(e) => set_last_error_err(format!("{}", e)),
         }
     })
 }
@@ -1701,18 +1760,18 @@ pub extern "C" fn hk_query_offset(query: *mut HK_Query, offset: usize) -> i32 {
 #[no_mangle]
 pub extern "C" fn hk_query_select_field(query: *mut HK_Query, field: *const c_char) -> i32 {
     // if query.is_null() {
-    //     return set_last_error("null query handle");
+    //     return set_last_error_err("null query handle");
     // }
     // let field = match cstr_to_string(field) {
     //     Ok(v) => v,
-    //     Err(e) => return set_last_error(e),
+    //     Err(e) => return set_last_error_err(e),
     // };
     // let query = unsafe { &mut *query };
     // query.query = query.query.clone().select(&field);
     // clear_last_error();
     // 0
-    if query.is_null() { return set_last_error("null query handle"); }
-    let field = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e), };
+    if query.is_null() { return set_last_error_err("null query handle"); }
+    let field = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error_err(e), };
     let query = unsafe { &mut *query };
     
     // FIX: Push directly
@@ -1725,7 +1784,7 @@ pub extern "C" fn hk_query_select_field(query: *mut HK_Query, field: *const c_ch
 pub extern "C" fn hk_query_execute(engine: *mut HK_Engine, query: *const HK_Query) -> *mut c_char {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() || query.is_null() {
-            set_last_error("null engine/query handle");
+            set_last_error_err("null engine/query handle");
             return ptr::null_mut();
         }
 
@@ -1769,13 +1828,13 @@ pub extern "C" fn hk_query_execute(engine: *mut HK_Engine, query: *const HK_Quer
                         s.into_raw()
                     }
                     Err(e) => {
-                        set_last_error(e.to_string());
+                        set_last_error_err(e.to_string());
                         ptr::null_mut()
                     }
                 }
             }
             Err(e) => {
-                set_last_error(e);
+                set_last_error_err(e);
                 ptr::null_mut()
             }
         }
@@ -1884,7 +1943,7 @@ pub extern "C" fn hk_query_execute_raw(
 ) -> *mut HK_RawResultSet {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() || query.is_null() {
-            set_last_error("null engine/query handle");
+            set_last_error_err("null engine/query handle");
             return std::ptr::null_mut();
         }
         let engine = unsafe { &*engine };
@@ -1975,7 +2034,7 @@ pub extern "C" fn hk_query_start_after_raw(query: *mut HK_Query, anchor_doc: *co
         let q = unsafe { &mut *query };
         let raw = unsafe { &*anchor_doc };
         if q.query.order_by.is_empty() {
-            return set_last_error("raw anchor needs order_by");
+            return set_last_error_err("raw anchor needs order_by");
         }
         let mut vals = Vec::with_capacity(q.query.order_by.len());
         let mut decoded: Option<HakoDoc> = None;
@@ -1987,7 +2046,7 @@ pub extern "C" fn hk_query_start_after_raw(query: *mut HK_Query, anchor_doc: *co
             if decoded.is_none() {
                 decoded = match HakoDoc::decode(&raw.bytes) {
                     Some(d) => Some(d),
-                    None => return set_last_error("raw anchor bytes do not decode"),
+                    None => return set_last_error_err("raw anchor bytes do not decode"),
                 };
             }
             let d = decoded.as_ref().unwrap();
@@ -1996,7 +2055,7 @@ pub extern "C" fn hk_query_start_after_raw(query: *mut HK_Query, anchor_doc: *co
             } else {
                 match d.get(&order.field) {
                     Some(v) => vals.push(v.clone()),
-                    None => return set_last_error("Anchor document missing one or more fields from sort chain"),
+                    None => return set_last_error_err("Anchor document missing one or more fields from sort chain"),
                 }
             }
         }
@@ -2015,14 +2074,14 @@ pub extern "C" fn hk_rawdoc_to_doc(
 ) -> *mut HK_Doc {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() || raw_doc.is_null() || collection.is_null() {
-            set_last_error("null engine/raw_doc/collection handle");
+            set_last_error_err("null engine/raw_doc/collection handle");
             return std::ptr::null_mut();
         }
         let collection_c = unsafe { CStr::from_ptr(collection) };
         let collection = match collection_c.to_str() {
             Ok(v) => v,
             Err(_) => {
-                set_last_error("invalid utf8");
+                set_last_error_err("invalid utf8");
                 return std::ptr::null_mut();
             }
         };
@@ -2031,12 +2090,12 @@ pub extern "C" fn hk_rawdoc_to_doc(
         let mut doc = match HakoDoc::decode(&raw.bytes) {
             Some(d) => d,
             None => {
-                set_last_error("raw bytes do not decode");
+                set_last_error_err("raw bytes do not decode");
                 return std::ptr::null_mut();
             }
         };
         if let Err(e) = engine.db.resolve_document_blobs(&mut doc, collection) {
-            set_last_error(e.to_string());
+            set_last_error_err(e.to_string());
             return std::ptr::null_mut();
         }
         Box::into_raw(Box::new(HK_Doc { id: raw.id.clone(), doc }))
@@ -2074,13 +2133,13 @@ pub extern "C" fn hk_cursor_walk(
 ) -> i64 {
     safety_shield!(-1, {
         if engine.is_null() || query.is_null() {
-            set_last_error("null engine/query handle");
+            set_last_error_err("null engine/query handle");
             return -1;
         }
         let cb = match callback {
             Some(f) => f,
             None => {
-                set_last_error("null walk callback");
+                set_last_error_err("null walk callback");
                 return -1;
             }
         };
@@ -2100,7 +2159,7 @@ pub extern "C" fn hk_cursor_walk(
         match res {
             Ok(n) => n as i64,
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 -1
             }
         }
@@ -2126,7 +2185,7 @@ pub extern "C" fn hk_view_get(
 ) -> *mut HK_ViewDoc {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() || collection.is_null() || doc_id.is_null() {
-            set_last_error("null engine/collection/doc_id handle");
+            set_last_error_err("null engine/collection/doc_id handle");
             return std::ptr::null_mut();
         }
         let collection_c = unsafe { CStr::from_ptr(collection) };
@@ -2134,7 +2193,7 @@ pub extern "C" fn hk_view_get(
         let (collection, doc_id) = match (collection_c.to_str(), doc_id_c.to_str()) {
             (Ok(c), Ok(d)) => (c, d),
             _ => {
-                set_last_error("invalid utf8");
+                set_last_error_err("invalid utf8");
                 return std::ptr::null_mut();
             }
         };
@@ -2143,7 +2202,7 @@ pub extern "C" fn hk_view_get(
             Ok(Some(view)) => Box::into_raw(Box::new(HK_ViewDoc { view })),
             Ok(None) => std::ptr::null_mut(),
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 std::ptr::null_mut()
             }
         }
@@ -2298,14 +2357,14 @@ pub extern "C" fn hk_view_get_bytes(
 pub extern "C" fn hk_view_to_doc(view: *const HK_ViewDoc, doc_id: *const c_char) -> *mut HK_Doc {
     safety_shield!(std::ptr::null_mut(), {
         if view.is_null() || doc_id.is_null() {
-            set_last_error("null view/doc_id handle");
+            set_last_error_err("null view/doc_id handle");
             return std::ptr::null_mut();
         }
         let id_c = unsafe { CStr::from_ptr(doc_id) };
         let id = match id_c.to_str() {
             Ok(v) => v.to_string(),
             Err(_) => {
-                set_last_error("invalid utf8");
+                set_last_error_err("invalid utf8");
                 return std::ptr::null_mut();
             }
         };
@@ -2313,7 +2372,7 @@ pub extern "C" fn hk_view_to_doc(view: *const HK_ViewDoc, doc_id: *const c_char)
         match view.view.to_owned_doc() {
             Some(doc) => Box::into_raw(Box::new(HK_Doc { id, doc })),
             None => {
-                set_last_error("view bytes do not decode");
+                set_last_error_err("view bytes do not decode");
                 std::ptr::null_mut()
             }
         }
@@ -2344,13 +2403,13 @@ pub extern "C" fn hk_cursor_walk_view(
 ) -> i64 {
     safety_shield!(-1, {
         if engine.is_null() || query.is_null() {
-            set_last_error("null engine/query handle");
+            set_last_error_err("null engine/query handle");
             return -1;
         }
         let cb = match callback {
             Some(f) => f,
             None => {
-                set_last_error("null walk callback");
+                set_last_error_err("null walk callback");
                 return -1;
             }
         };
@@ -2372,7 +2431,7 @@ pub extern "C" fn hk_cursor_walk_view(
         match res {
             Ok(n) => n as i64,
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 -1
             }
         }
@@ -2505,7 +2564,7 @@ impl<'a> Serialize for SlabJson<'a> {
 pub extern "C" fn hk_result_set_to_json(results: *mut HK_ResultSet) -> *mut c_char {
     safety_shield!(ptr::null_mut(), {
         if results.is_null() {
-            set_last_error("null result set handle");
+            set_last_error_err("null result set handle");
             return ptr::null_mut();
         }
         let rs = unsafe { &*results };
@@ -2516,12 +2575,12 @@ pub extern "C" fn hk_result_set_to_json(results: *mut HK_ResultSet) -> *mut c_ch
                     c.into_raw()
                 }
                 Err(e) => {
-                    set_last_error(e.to_string());
+                    set_last_error_err(e.to_string());
                     ptr::null_mut()
                 }
             },
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 ptr::null_mut()
             }
         }
@@ -2531,7 +2590,7 @@ pub extern "C" fn hk_result_set_to_json(results: *mut HK_ResultSet) -> *mut c_ch
 #[no_mangle]
 pub extern "C" fn hk_doc_to_json(doc: *const HK_Doc) -> *mut c_char {
     if doc.is_null() {
-        set_last_error("null doc handle");
+        set_last_error_err("null doc handle");
         return ptr::null_mut();
     }
 
@@ -2542,7 +2601,7 @@ pub extern "C" fn hk_doc_to_json(doc: *const HK_Doc) -> *mut c_char {
             s.into_raw()
         }
         Err(e) => {
-            set_last_error(e);
+            set_last_error_err(e);
             ptr::null_mut()
         }
     }
@@ -2556,6 +2615,15 @@ pub extern "C" fn hk_last_error() -> *const c_char {
             .map(|s| s.as_ptr())
             .unwrap_or(ptr::null())
     })
+}
+
+/// Classification code of the last error on this thread (issue #71/F5):
+/// 0 = none, 1 = generic do-not-retry, 2 = retryable conflict /
+/// backfill-in-progress, 3 = unique-index violation. SDK retry loops
+/// branch on this — never on the message string. Stable numeric contract.
+#[no_mangle]
+pub extern "C" fn hk_error_last_kind() -> i32 {
+    LAST_ERROR_KIND.with(|k| k.get())
 }
 
 /// Enable library diagnostic logging to stderr. Default OFF. Idempotent.
@@ -2582,7 +2650,7 @@ pub extern "C" fn hk_string_free(value: *mut c_char) {
 #[no_mangle]
 pub extern "C" fn hk_query_aggregate_count(query: *mut HK_Query) -> i32 {
     if query.is_null() {
-        return set_last_error("null query handle");
+        return set_last_error_err("null query handle");
     }
     let q = unsafe { &mut *query };
     q.query.aggregations.push(AggregateOp::Count);
@@ -2593,11 +2661,11 @@ pub extern "C" fn hk_query_aggregate_count(query: *mut HK_Query) -> i32 {
 #[no_mangle]
 pub extern "C" fn hk_query_aggregate_sum(query: *mut HK_Query, field: *const c_char) -> i32 {
     if query.is_null() {
-        return set_last_error("null query handle");
+        return set_last_error_err("null query handle");
     }
     let field = match cstr_to_string(field) {
         Ok(s) => s,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let q = unsafe { &mut *query };
     q.query.aggregations.push(AggregateOp::Sum(field));
@@ -2608,11 +2676,11 @@ pub extern "C" fn hk_query_aggregate_sum(query: *mut HK_Query, field: *const c_c
 #[no_mangle]
 pub extern "C" fn hk_query_aggregate_avg(query: *mut HK_Query, field: *const c_char) -> i32 {
     if query.is_null() {
-        return set_last_error("null query handle");
+        return set_last_error_err("null query handle");
     }
     let field = match cstr_to_string(field) {
         Ok(s) => s,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let q = unsafe { &mut *query };
     q.query.aggregations.push(AggregateOp::Avg(field));
@@ -2627,7 +2695,7 @@ pub extern "C" fn hk_query_execute_aggregation(
 ) -> *mut c_char {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() || query.is_null() {
-            set_last_error("null engine or query handle");
+            set_last_error_err("null engine or query handle");
             return std::ptr::null_mut();
         }
 
@@ -2647,18 +2715,18 @@ pub extern "C" fn hk_query_execute_aggregation(
                             c_str.into_raw()
                         }
                         Err(e) => {
-                            set_last_error(e.to_string());
+                            set_last_error_err(e.to_string());
                             std::ptr::null_mut()
                         }
                     },
                     Err(e) => {
-                        set_last_error(e.to_string());
+                        set_last_error_err(e.to_string());
                         std::ptr::null_mut()
                     }
                 }
             }
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 std::ptr::null_mut()
             }
         }
@@ -2672,11 +2740,11 @@ pub extern "C" fn hk_doc_insert_timestamp(
     micros: i64,
 ) -> i32 {
     if doc.is_null() {
-        return set_last_error("null doc");
+        return set_last_error_err("null doc");
     }
     let key = match cstr_to_string(key) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let doc = unsafe { &mut *doc };
     doc.doc.insert(key, Value::Timestamp(micros));
@@ -2686,11 +2754,11 @@ pub extern "C" fn hk_doc_insert_timestamp(
 #[no_mangle]
 pub extern "C" fn hk_doc_insert_server_timestamp(doc: *mut HK_Doc, key: *const c_char) -> i32 {
     if doc.is_null() {
-        return set_last_error("null doc");
+        return set_last_error_err("null doc");
     }
     let key = match cstr_to_string(key) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let doc = unsafe { &mut *doc };
     doc.doc.insert(key, Value::ServerTimestamp);
@@ -2701,17 +2769,17 @@ pub extern "C" fn hk_doc_insert_server_timestamp(doc: *mut HK_Doc, key: *const c
 pub extern "C" fn hk_engine_backup(engine: *mut HK_Engine, path: *const c_char) -> i32 {
     safety_shield!(-1, {
         if engine.is_null() {
-            return set_last_error("null engine");
+            return set_last_error_err("null engine");
         }
         let engine = unsafe { &*engine };
         let path = match cstr_to_string(path) {
             Ok(v) => v,
-            Err(e) => return set_last_error(e),
+            Err(e) => return set_last_error_err(e),
         };
         match engine.db.backup(path) {
             Ok(_) => 0,
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 -1 // or ptr::null_mut() depending on function return type
             }
         }
@@ -2726,11 +2794,11 @@ pub extern "C" fn hk_query_where_match(
 ) -> i32 {
     // let f = match cstr_to_string(field) {
     //     Ok(v) => v,
-    //     Err(e) => return set_last_error(e),
+    //     Err(e) => return set_last_error_err(e),
     // };
     // let v = match cstr_to_string(value) {
     //     Ok(v) => v,
-    //     Err(e) => return set_last_error(e),
+    //     Err(e) => return set_last_error_err(e),
     // };
     // let q = unsafe { &mut *query };
     // q.query = q
@@ -2758,11 +2826,11 @@ pub extern "C" fn hk_query_where_contains(
 ) -> i32 {
     // let f = match cstr_to_string(field) {
     //     Ok(v) => v,
-    //     Err(e) => return set_last_error(e),
+    //     Err(e) => return set_last_error_err(e),
     // };
     // let v = match cstr_to_string(value) {
     //     Ok(v) => v,
-    //     Err(e) => return set_last_error(e),
+    //     Err(e) => return set_last_error_err(e),
     // };
     // let q = unsafe { &mut *query };
     // q.query = q
@@ -2781,11 +2849,11 @@ pub extern "C" fn hk_query_where_starts_with(
 ) -> i32 {
     // let f = match cstr_to_string(field) {
     //     Ok(v) => v,
-    //     Err(e) => return set_last_error(e),
+    //     Err(e) => return set_last_error_err(e),
     // };
     // let v = match cstr_to_string(value) {
     //     Ok(v) => v,
-    //     Err(e) => return set_last_error(e),
+    //     Err(e) => return set_last_error_err(e),
     // };
     // let q = unsafe { &mut *query };
     // q.query = q
@@ -2800,7 +2868,7 @@ pub extern "C" fn hk_query_where_starts_with(
 pub extern "C" fn hk_engine_list_collections(engine: *mut HK_Engine) -> *mut c_char {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() {
-            set_last_error("null engine handle");
+            set_last_error_err("null engine handle");
             return std::ptr::null_mut();
         }
 
@@ -2818,7 +2886,7 @@ pub extern "C" fn hk_engine_list_collections(engine: *mut HK_Engine) -> *mut c_c
                 }
             }
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 std::ptr::null_mut()
             }
         }
@@ -2842,7 +2910,7 @@ pub extern "C" fn hk_array_free(array: *mut HK_Array) {
 pub extern "C" fn hk_array_append_str(array: *mut HK_Array, value: *const c_char) -> i32 {
     let s = match cstr_to_string(value) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     unsafe {
         (*array).items.push(Value::String(s));
@@ -2862,7 +2930,7 @@ pub extern "C" fn hk_array_append_int(array: *mut HK_Array, value: i64) -> i32 {
 pub extern "C" fn hk_array_append_doc(array: *mut HK_Array, doc: *const HK_Doc) -> i32 {
     safety_shield!(-1, {
         if array.is_null() || doc.is_null() {
-            return set_last_error("null array or doc handle");
+            return set_last_error_err("null array or doc handle");
         }
 
         let array_ptr = unsafe { &mut *array };
@@ -2888,7 +2956,7 @@ pub extern "C" fn hk_doc_insert_doc(
     safety_shield!(-1, {
         let key = match cstr_to_string(key) {
             Ok(v) => v,
-            Err(e) => return set_last_error(e),
+            Err(e) => return set_last_error_err(e),
         };
         let parent_doc = unsafe { &mut *parent };
         let child_doc = unsafe { &*child };
@@ -2911,7 +2979,7 @@ pub extern "C" fn hk_doc_insert_array(
     safety_shield!(-1, {
         let key = match cstr_to_string(key) {
             Ok(v) => v,
-            Err(e) => return set_last_error(e),
+            Err(e) => return set_last_error_err(e),
         };
         let doc = unsafe { &mut *doc };
         let array_inner = unsafe { Box::from_raw(array) }; // Take ownership and free HK_Array
@@ -2935,11 +3003,11 @@ pub extern "C" fn hk_engine_patch(
         let engine = unsafe { &*engine };
         let col = match cstr_to_string(collection) {
             Ok(v) => v,
-            Err(e) => return set_last_error(e),
+            Err(e) => return set_last_error_err(e),
         };
         let id = match cstr_to_string(doc_id) {
             Ok(v) => v,
-            Err(e) => return set_last_error(e),
+            Err(e) => return set_last_error_err(e),
         };
         let update_doc = unsafe { &*updates };
 
@@ -2952,7 +3020,7 @@ pub extern "C" fn hk_engine_patch(
         match engine.db.patch(&col, &id, updates_vec) {
             Ok(_) => 0,
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 -1
             }
         }
@@ -2963,6 +3031,10 @@ pub extern "C" fn hk_engine_patch(
 
 /// Creates a composite index from C++.
 /// fields_json should be like: [{"field": "age", "desc": false}]
+/// Optional constraint form (hakodb#71):
+///   {"fields": [...], "unique": true, "sparse": false,
+///    "filter": {"logic": "And", "filters": [...]}
+/// — legacy bare arrays keep working (non-unique, sparse semantics).
 #[no_mangle]
 pub extern "C" fn hk_engine_create_index(
     engine: *mut HK_Engine,
@@ -2987,7 +3059,32 @@ pub extern "C" fn hk_engine_create_index(
     };
 
     let mut fields = Vec::new();
-    for item in fields_raw {
+    let mut unique = false;
+    let mut sparse = true;
+    let mut filter: Option<crate::query::filter::FilterGroup> = None;
+    let items: &[serde_json::Value] = match fields_raw.first() {
+        None => return 0,
+        Some(first) => {
+            // Envelope object unless the first item is already a bare
+            // field spec ({"field": ...} or {"field","desc"}).
+            if first.is_object() && first.get("field").is_none() && first.get("fields").is_some() {
+                let env = &fields_raw[0];
+                let Some(arr) = env["fields"].as_array() else { return 0 };
+                unique = env.get("unique").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                sparse = env.get("sparse").and_then(serde_json::Value::as_bool).unwrap_or(true);
+                filter = env.get("filter")
+                    .map(|v| serde_json::from_value(v.clone()))
+                    .transpose()
+                    .ok()
+                    .flatten();
+                arr
+            } else {
+                &fields_raw
+            }
+        }
+    };
+
+    for item in items {
         let f = item["field"].as_str().unwrap_or("").to_string();
         let desc = item["desc"].as_bool().unwrap_or(false);
         let dir = if desc {
@@ -2998,10 +3095,10 @@ pub extern "C" fn hk_engine_create_index(
         fields.push((f, dir));
     }
 
-    match engine.db.create_composite_index(&col, fields) {
+    match engine.db.create_composite_index_ex(&col, fields, unique, sparse, filter) {
         Ok(id) => id,
         Err(e) => {
-            set_last_error(e.to_string());
+            set_last_error_err(&e);
             0 // Return 0 to indicate failure
         }
     }
@@ -3080,14 +3177,14 @@ pub extern "C" fn hk_engine_create_vector_index(
     };
     let m = match crate::index::vector::Metric::from_u32(metric) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e.to_string()),
+        Err(e) => return set_last_error_err(e.to_string()),
     };
     match engine.db.create_vector_index(&col, &fld, dim, m) {
         Ok(_) => {
             clear_last_error();
             0
         }
-        Err(e) => set_last_error(e.to_string()),
+        Err(e) => set_last_error_err(e.to_string()),
     }
 }
 
@@ -3098,9 +3195,9 @@ pub extern "C" fn hk_query_where_near(
     vec_ptr: *const f32,
     vec_len: usize,
 ) -> i32 {
-    if query.is_null() { return set_last_error("null query handle"); }
-    if vec_ptr.is_null() { return set_last_error("null vector pointer"); }
-    let field = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error(e), };
+    if query.is_null() { return set_last_error_err("null query handle"); }
+    if vec_ptr.is_null() { return set_last_error_err("null vector pointer"); }
+    let field = match cstr_to_string(field) { Ok(v) => v, Err(e) => return set_last_error_err(e), };
     let slice = unsafe { std::slice::from_raw_parts(vec_ptr, vec_len) };
     let query = unsafe { &mut *query };
     query.query.filters.push(crate::query::filter::Filter {
@@ -3131,25 +3228,25 @@ pub extern "C" fn hk_engine_find_near(
 ) -> *mut c_char {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() {
-            set_last_error("null engine handle");
+            set_last_error_err("null engine handle");
             return ptr::null_mut();
         }
         if vec_ptr.is_null() {
-            set_last_error("null vector pointer");
+            set_last_error_err("null vector pointer");
             return ptr::null_mut();
         }
         let engine = unsafe { &*engine };
         let col = match cstr_to_string(collection) {
             Ok(v) => v,
             Err(e) => {
-                set_last_error(e);
+                set_last_error_err(e);
                 return ptr::null_mut();
             }
         };
         let fld = match cstr_to_string(field) {
             Ok(v) => v,
             Err(e) => {
-                set_last_error(e);
+                set_last_error_err(e);
                 return ptr::null_mut();
             }
         };
@@ -3167,7 +3264,7 @@ pub extern "C" fn hk_engine_find_near(
         let rows = match engine.db.find_near(&col, &fld, query_vec, k) {
             Ok(r) => r,
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 return ptr::null_mut();
             }
         };
@@ -3198,7 +3295,7 @@ pub extern "C" fn hk_engine_find_near(
                 s.into_raw()
             }
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 ptr::null_mut()
             }
         }
@@ -3225,7 +3322,7 @@ pub extern "C" fn hk_engine_create_traverse_index(
             clear_last_error();
             0
         }
-        Err(e) => set_last_error(e.to_string()),
+        Err(e) => set_last_error_err(e.to_string()),
     }
 }
 
@@ -3241,17 +3338,17 @@ pub extern "C" fn hk_query_where_traverse(
     edge_field: *const c_char,
     max_depth: usize,
 ) -> i32 {
-    if query.is_null() { return set_last_error("null query handle"); }
-    let scol = match cstr_to_string(start_col) { Ok(v) => v, Err(e) => return set_last_error(e), };
-    let sid = match cstr_to_string(start_id) { Ok(v) => v, Err(e) => return set_last_error(e), };
+    if query.is_null() { return set_last_error_err("null query handle"); }
+    let scol = match cstr_to_string(start_col) { Ok(v) => v, Err(e) => return set_last_error_err(e), };
+    let sid = match cstr_to_string(start_id) { Ok(v) => v, Err(e) => return set_last_error_err(e), };
     let dir = match crate::index::traverse::TraverseDir::from_u32(direction) {
         Ok(d) => d,
-        Err(e) => return set_last_error(e.to_string()),
+        Err(e) => return set_last_error_err(e.to_string()),
     };
     let edge: Option<String> = if edge_field.is_null() {
         None
     } else {
-        match cstr_to_string(edge_field) { Ok(v) => Some(v), Err(e) => return set_last_error(e), }
+        match cstr_to_string(edge_field) { Ok(v) => Some(v), Err(e) => return set_last_error_err(e), }
     };
     let f = crate::query::builder::traverse_filter(&scol, &sid, dir, edge.as_deref(), max_depth);
     let query = unsafe { &mut *query };
@@ -3280,28 +3377,28 @@ pub extern "C" fn hk_engine_find_paths(
 ) -> *mut c_char {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() {
-            set_last_error("null engine handle");
+            set_last_error_err("null engine handle");
             return ptr::null_mut();
         }
         let engine = unsafe { &*engine };
         let col = match cstr_to_string(collection) {
             Ok(v) => v,
             Err(e) => {
-                set_last_error(e);
+                set_last_error_err(e);
                 return ptr::null_mut();
             }
         };
         let id = match cstr_to_string(doc_id) {
             Ok(v) => v,
             Err(e) => {
-                set_last_error(e);
+                set_last_error_err(e);
                 return ptr::null_mut();
             }
         };
         let dir = match crate::index::traverse::TraverseDir::from_u32(direction) {
             Ok(d) => d,
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 return ptr::null_mut();
             }
         };
@@ -3311,7 +3408,7 @@ pub extern "C" fn hk_engine_find_paths(
             match cstr_to_string(edge_field) {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    set_last_error(e);
+                    set_last_error_err(e);
                     return ptr::null_mut();
                 }
             }
@@ -3327,7 +3424,7 @@ pub extern "C" fn hk_engine_find_paths(
         let rows = match engine.db.find_paths(&col, &id, &spec) {
             Ok(r) => r,
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 return ptr::null_mut();
             }
         };
@@ -3351,7 +3448,7 @@ pub extern "C" fn hk_engine_find_paths(
                 s.into_raw()
             }
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 ptr::null_mut()
             }
         }
@@ -3380,7 +3477,7 @@ pub extern "C" fn hk_engine_create_edge_index(
             clear_last_error();
             0
         }
-        Err(e) => set_last_error(e.to_string()),
+        Err(e) => set_last_error_err(e.to_string()),
     }
 }
 
@@ -3405,28 +3502,28 @@ pub extern "C" fn hk_engine_shortest_paths(
 ) -> *mut c_char {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() {
-            set_last_error("null engine handle");
+            set_last_error_err("null engine handle");
             return ptr::null_mut();
         }
         let engine = unsafe { &*engine };
         let col = match cstr_to_string(collection) {
             Ok(v) => v,
             Err(e) => {
-                set_last_error(e);
+                set_last_error_err(e);
                 return ptr::null_mut();
             }
         };
         let id = match cstr_to_string(doc_id) {
             Ok(v) => v,
             Err(e) => {
-                set_last_error(e);
+                set_last_error_err(e);
                 return ptr::null_mut();
             }
         };
         let dir = match crate::index::traverse::TraverseDir::from_u32(direction) {
             Ok(d) => d,
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 return ptr::null_mut();
             }
         };
@@ -3448,7 +3545,7 @@ pub extern "C" fn hk_engine_shortest_paths(
         let rows = match engine.db.find_paths(&col, &id, &spec) {
             Ok(r) => r,
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 return ptr::null_mut();
             }
         };
@@ -3472,7 +3569,7 @@ pub extern "C" fn hk_engine_shortest_paths(
                 s.into_raw()
             }
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 ptr::null_mut()
             }
         }
@@ -3495,7 +3592,7 @@ pub extern "C" fn hk_engine_list_indexes(
             match cstr_to_string(collection) {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    set_last_error(e);
+                    set_last_error_err(e);
                     return ptr::null_mut();
                 }
             }
@@ -3589,7 +3686,7 @@ pub extern "C" fn hk_transaction_commit(engine: *mut HK_Engine, tx: *mut HK_Tran
         match tx.tx.commit(&engine.db) {
             Ok(_) => 0,
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 -1 // or ptr::null_mut() depending on function return type
             }
         }
@@ -3636,7 +3733,7 @@ pub extern "C" fn hk_engine_insert_subdoc(
     match engine.db.put_subdocument(&c, &i, &sc, &si, &d.doc) {
         Ok(_) => 0,
         Err(e) => {
-            set_last_error(e.to_string());
+            set_last_error_err(e.to_string());
             -1 // or ptr::null_mut() depending on function return type
         }
     }
@@ -3651,7 +3748,7 @@ pub extern "C" fn hk_engine_compact(engine: *mut HK_Engine) -> i32 {
         match engine.db.compact() {
             Ok(_) => 0,
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 -1 // or ptr::null_mut() depending on function return type
             }
         }
@@ -3684,15 +3781,15 @@ pub extern "C" fn hk_doc_insert_reference(
     }
     let key_str = match cstr_to_string(key) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let col = match cstr_to_string(target_collection) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let id = match cstr_to_string(target_id) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
 
     let doc_ptr = unsafe { &mut *doc };
@@ -3724,14 +3821,14 @@ pub extern "C" fn hk_engine_get_by_ref(
         let key = match cstr_to_string(field_key) {
             Ok(k) => k,
             Err(e) => {
-                set_last_error(e);
+                set_last_error_err(e);
                 return ptr::null_mut();
             }
         };
 
         // 1. Find the value in the provided document
         let Some(val) = doc_ptr.doc.get(&key) else {
-            set_last_error("Field not found in document");
+            set_last_error_err("Field not found in document");
             return ptr::null_mut();
         };
 
@@ -3740,7 +3837,7 @@ pub extern "C" fn hk_engine_get_by_ref(
             Ok(Some(target_doc)) => Box::into_raw(Box::new(HK_Doc { doc: target_doc, id: doc_ptr.id.clone() })),
             Ok(None) => ptr::null_mut(), // Document doesn't exist (Dangling reference)
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 ptr::null_mut()
             }
         }
@@ -3786,7 +3883,7 @@ fn get_anchor_values(q: &crate::query::query::Query, hk_doc: &HK_Doc) -> Option<
 //             q.query.start_after = Some(vals);
 //             0
 //         } else {
-//             set_last_error("Anchor document missing one or more fields from sort chain");
+//             set_last_error_err("Anchor document missing one or more fields from sort chain");
 //             -1
 //         }
 //     })
@@ -3803,7 +3900,7 @@ pub extern "C" fn hk_query_start_after(query: *mut HK_Query, anchor_doc: *const 
             q.query.start_after = Some(vals);
             0
         } else {
-            set_last_error("Anchor document missing one or more fields from sort chain");
+            set_last_error_err("Anchor document missing one or more fields from sort chain");
             -1
         }
     })
@@ -3821,7 +3918,7 @@ pub extern "C" fn hk_query_start_after(query: *mut HK_Query, anchor_doc: *const 
 //             q.query.start_at = Some(vals);
 //             0
 //         } else {
-//             set_last_error("Anchor document missing sort field");
+//             set_last_error_err("Anchor document missing sort field");
 //             -1
 //         }
 //     })
@@ -3838,7 +3935,7 @@ pub extern "C" fn hk_query_start_at(query: *mut HK_Query, anchor_doc: *const HK_
             q.query.start_at = Some(vals);
             0
         } else {
-            set_last_error("Anchor document missing one or more fields from sort chain");
+            set_last_error_err("Anchor document missing one or more fields from sort chain");
             -1
         }
     })
@@ -3856,7 +3953,7 @@ pub extern "C" fn hk_query_end_at(query: *mut HK_Query, anchor_doc: *const HK_Do
             q.query.end_at = Some(vals);
             0
         } else {
-            set_last_error("Anchor document missing sort field");
+            set_last_error_err("Anchor document missing sort field");
             -1
         }
     })
@@ -3874,7 +3971,7 @@ pub extern "C" fn hk_query_end_before(query: *mut HK_Query, anchor_doc: *const H
             q.query.end_before = Some(vals);
             0
         } else {
-            set_last_error("Anchor document missing sort field");
+            set_last_error_err("Anchor document missing sort field");
             -1
         }
     })
@@ -3912,11 +4009,11 @@ pub extern "C" fn hk_query_where_or_str(
     let q = unsafe { &mut *query };
     let f = match cstr_to_string(field) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
     let v = match cstr_to_string(value) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
 
     // Each call to hk_query_where_or creates a new standalone OR group
@@ -3937,7 +4034,7 @@ pub extern "C" fn hk_query_where_or_int(
     let q = unsafe { &mut *query };
     let f = match cstr_to_string(field) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
 
     q.query.or_groups.push(vec![crate::query::filter::Filter {
@@ -3964,7 +4061,7 @@ pub extern "C" fn hk_query_where_in(
     let q = unsafe { &mut *query };
     let f = match cstr_to_string(field) {
         Ok(v) => v,
-        Err(e) => return set_last_error(e),
+        Err(e) => return set_last_error_err(e),
     };
 
     // Take the items from the FFI array and destroy the handle
@@ -3988,7 +4085,7 @@ pub extern "C" fn hk_engine_snapshot_indices(engine: *mut HK_Engine) -> i32 {
     match engine.db.save_index_snapshots() {
         Ok(_) => 0,
         Err(e) => {
-            set_last_error(e.to_string());
+            set_last_error_err(e.to_string());
             -1
         }
     }
@@ -4055,7 +4152,7 @@ pub extern "C" fn hk_net_syncer_set_discovery(syncer: *mut HK_NetSyncer, mode: i
         0 => crate::net_sync::DiscoveryMode::Mdns,
         1 => crate::net_sync::DiscoveryMode::Broadcast,
         2 => crate::net_sync::DiscoveryMode::Both,
-        _ => return set_last_error("invalid discovery mode (0=mdns, 1=broadcast, 2=both)"),
+        _ => return set_last_error_err("invalid discovery mode (0=mdns, 1=broadcast, 2=both)"),
     };
     s_ref.inner.set_discovery(m);
     clear_last_error();
@@ -4072,13 +4169,13 @@ pub extern "C" fn hk_net_syncer_start(syncer: *mut HK_NetSyncer, port: u16) -> i
     // Use block_on to bridge synchronous FFI to the async start method
     let rt = match tokio::runtime::Handle::try_current() {
         Ok(h) => h,
-        Err(_) => return set_last_error("No tokio runtime found"),
+        Err(_) => return set_last_error_err("No tokio runtime found"),
     };
 
     match rt.block_on(async move { inner.start(port).await }) {
         Ok(_) => 0,
         Err(e) => {
-            set_last_error(e.to_string());
+            set_last_error_err(e.to_string());
             -1
         }
     }
@@ -4137,17 +4234,17 @@ pub extern "C" fn hk_socket_sync_serve(syncer: *mut HK_SocketSync, path: *const 
     let s_ref = unsafe { &*syncer };
     let path_str = cstr_to_string(path).unwrap_or_default();
     if path_str.is_empty() {
-        return set_last_error("empty socket path");
+        return set_last_error_err("empty socket path");
     }
     // tokio::spawn inside serve() needs a runtime context.
     let rt = match tokio::runtime::Handle::try_current() {
         Ok(h) => h,
-        Err(_) => return set_last_error("No tokio runtime found"),
+        Err(_) => return set_last_error_err("No tokio runtime found"),
     };
     let inner = s_ref.inner.clone();
     match rt.block_on(async move { inner.serve(&path_str) }) {
         Ok(_) => 0,
-        Err(e) => set_last_error(e.to_string()),
+        Err(e) => set_last_error_err(e.to_string()),
     }
 }
 
@@ -4160,16 +4257,16 @@ pub extern "C" fn hk_socket_sync_dial(syncer: *mut HK_SocketSync, path: *const c
     let s_ref = unsafe { &*syncer };
     let path_str = cstr_to_string(path).unwrap_or_default();
     if path_str.is_empty() {
-        return set_last_error("empty socket path");
+        return set_last_error_err("empty socket path");
     }
     let rt = match tokio::runtime::Handle::try_current() {
         Ok(h) => h,
-        Err(_) => return set_last_error("No tokio runtime found"),
+        Err(_) => return set_last_error_err("No tokio runtime found"),
     };
     let inner = s_ref.inner.clone();
     match rt.block_on(async move { inner.dial(&path_str).await }) {
         Ok(_) => 0,
-        Err(e) => set_last_error(e.to_string()),
+        Err(e) => set_last_error_err(e.to_string()),
     }
 }
 
@@ -4210,7 +4307,7 @@ pub extern "C" fn hk_cloud_sync_new(
 ) -> *mut HK_CloudSync {
     safety_shield!(ptr::null_mut(), {
         if engine.is_null() {
-            set_last_error("Null engine handle");
+            set_last_error_err("Null engine handle");
             return ptr::null_mut();
         }
 
@@ -4256,7 +4353,7 @@ pub extern "C" fn hk_cloud_sync_server_new(
 ) -> *mut HK_CloudSync {
     safety_shield!(ptr::null_mut(), {
         if engine.is_null() {
-            set_last_error("Null engine handle");
+            set_last_error_err("Null engine handle");
             return ptr::null_mut();
         }
 
@@ -4295,7 +4392,7 @@ pub extern "C" fn hk_cloud_sync_client_new(
 ) -> *mut HK_CloudSync {
     safety_shield!(ptr::null_mut(), {
         if engine.is_null() {
-            set_last_error("Null engine handle");
+            set_last_error_err("Null engine handle");
             return ptr::null_mut();
         }
 
@@ -4325,12 +4422,12 @@ pub extern "C" fn hk_cloud_sync_client_new(
 pub extern "C" fn hk_cloud_sync_start(cloud_sync: *mut HK_CloudSync, address: *const c_char) -> i32 {
     safety_shield!(-1, {
         if cloud_sync.is_null() {
-            return set_last_error("Null cloud_sync handle");
+            return set_last_error_err("Null cloud_sync handle");
         }
         let cs_ref = unsafe { &*cloud_sync };
         let addr_str = match cstr_to_string(address) {
             Ok(a) => a,
-            Err(e) => return set_last_error(e),
+            Err(e) => return set_last_error_err(e),
         };
         let inner = cs_ref.inner.clone();
 
@@ -4343,19 +4440,19 @@ pub extern "C" fn hk_cloud_sync_start(cloud_sync: *mut HK_CloudSync, address: *c
                     clear_last_error();
                     0
                 }
-                Err(e) => set_last_error(e.to_string()),
+                Err(e) => set_last_error_err(e.to_string()),
             }
         } else {
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(r) => r,
-                Err(e) => return set_last_error(format!("Failed to create Tokio runtime: {}", e)),
+                Err(e) => return set_last_error_err(format!("Failed to create Tokio runtime: {}", e)),
             };
             match rt.block_on(run_sync) {
                 Ok(_) => {
                     clear_last_error();
                     0
                 }
-                Err(e) => set_last_error(e.to_string()),
+                Err(e) => set_last_error_err(e.to_string()),
             }
         }
     })
@@ -4366,7 +4463,7 @@ pub extern "C" fn hk_cloud_sync_start(cloud_sync: *mut HK_CloudSync, address: *c
 pub extern "C" fn hk_cloud_sync_status(cloud_sync: *mut HK_CloudSync) -> *mut c_char {
     safety_shield!(ptr::null_mut(), {
         if cloud_sync.is_null() {
-            set_last_error("Null cloud_sync handle");
+            set_last_error_err("Null cloud_sync handle");
             return ptr::null_mut();
         }
         let cs_ref = unsafe { &*cloud_sync };
@@ -4379,12 +4476,12 @@ pub extern "C" fn hk_cloud_sync_status(cloud_sync: *mut HK_CloudSync) -> *mut c_
                     c_str.into_raw()
                 }
                 Err(e) => {
-                    set_last_error(e.to_string());
+                    set_last_error_err(e.to_string());
                     ptr::null_mut()
                 }
             },
             Err(e) => {
-                set_last_error(e.to_string());
+                set_last_error_err(e.to_string());
                 ptr::null_mut()
             }
         }

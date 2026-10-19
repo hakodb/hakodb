@@ -25,6 +25,21 @@ pub fn encode_composite_key(
     out
 }
 
+/// Unique-index claim prefix (hakodb#71): the index-id + tuple head of a
+/// composite key WITHOUT the doc-id tail. Two documents share a claim iff
+/// their full keys differ only in the tail — the uniqueness condition.
+pub fn encode_composite_prefix(
+    def: &CompositeIndexDefinition,
+    values: &[Value],
+) -> SmallVec<[u8; 32]> {
+    let mut out: SmallVec<[u8; 32]> = SmallVec::new();
+    out.extend_from_slice(&def.id.to_be_bytes());
+    for (value, field) in values.iter().zip(def.fields.iter()) {
+        encode_value(value, &field.direction, &mut out);
+    }
+    out
+}
+
 pub(crate) fn encode_value(
     value: &Value,
     direction: &SortDirection,

@@ -28,20 +28,15 @@ impl CompositeIndex {
         self.tree.clear();
     }
 
+    /// Tuple values for this index (delegates to the definition's
+    /// dense/sparse rules — hakodb#71).
     pub fn document_values(&self, doc_id: &str, doc: &HakoDoc) -> Option<Vec<Value>> {
-        let mut values = Vec::with_capacity(self.definition.fields.len());
+        self.definition.document_values_of(doc_id, doc)
+    }
 
-        for f in &self.definition.fields {
-            // NEW: Check if the index is requesting the id and timestamp
-            let v = match f.field.as_str() {
-                "id" => Value::String(doc_id.to_string()), // Index the metadata ID
-                "_time" => Value::Int(doc._time),          // Index the metadata Time
-                _ => doc.get(&f.field)?.clone(),           // Index body fields
-            };
-            values.push(v);
-        }
-
-        Some(values)
+    /// Filtered-index predicate (delegates to the definition).
+    fn filter_passes(&self, doc_id: &str, doc: &HakoDoc) -> bool {
+        self.definition.filter_passes(doc_id, doc)
     }
 
     // pub fn index_document(&mut self, doc_id: &str, doc: &HakoDoc) {
@@ -54,6 +49,9 @@ impl CompositeIndex {
     //     }
     // }
     pub fn index_document(&mut self, doc_id: &str, doc: &HakoDoc) {
+        if !self.filter_passes(doc_id, doc) {
+            return;
+        }
         if let Some(values) = self.document_values(doc_id, doc) {
             // Use the doc_id exactly as provided
             self.tree.insert(
@@ -70,6 +68,9 @@ impl CompositeIndex {
         let new_entries = docs
             .into_iter()
             .filter_map(|(doc_id, doc)| {
+                if !self.filter_passes(&doc_id, doc) {
+                    return None;
+                }
                 self.document_values(&doc_id, doc).map(|values| {
                     let key = encode_composite_key(&self.definition, &values, doc_id);
                     (key, Arc::from(doc_id))
@@ -81,6 +82,9 @@ impl CompositeIndex {
     }
 
     pub fn remove_document(&mut self, doc_id: &str, doc: &HakoDoc) {
+        if !self.filter_passes(doc_id, doc) {
+            return;
+        }
         if let Some(values) = self.document_values(&doc_id, doc) {
             self.tree
                 .remove(&encode_composite_key(&self.definition, &values, doc_id));
@@ -92,6 +96,9 @@ impl CompositeIndex {
         I: IntoIterator<Item = (&'a str, &'a HakoDoc)>,
     {
         for (doc_id, doc) in docs {
+            if !self.filter_passes(&doc_id, doc) {
+                continue;
+            }
             if let Some(values) = self.document_values(&doc_id, doc) {
                 let key = encode_composite_key(&self.definition, &values, doc_id);
                 self.tree.remove(&key);
