@@ -17,6 +17,11 @@ pub enum Operator {
     In,
     ArrayContains,
     ArrayContainsAny,
+    /// All array elements compare equal to the value (whole-value
+    /// membership semantics, hakodb#71 F3 `all_eq`). Empty array fails
+    /// closed (the elemMatch empty-array rule); cross-type numerics
+    /// compare equal per `Value::PartialEq`.
+    ArrayAllEq,
     NotIn,
     /// KNN marker (appended last: `as u8` discriminants of older variants
     /// must stay stable for the plan-cache key). The query vector rides
@@ -82,6 +87,16 @@ pub fn compare_values(a: &Value, op: &Operator, b: &Value) -> bool {
         Operator::ArrayContainsAny => {
             return if let (Value::Array(items), Value::Array(query_items)) = (a, b) {
                 query_items.iter().any(|qi| items.contains(qi))
+            } else {
+                false
+            };
+        }
+        // hakodb#71 F3 `all_eq`: every element must compare equal. Empty
+        // arrays fail closed (elemMatch empty-array rule), non-array left
+        // side never matches.
+        Operator::ArrayAllEq => {
+            return if let Value::Array(items) = a {
+                !items.is_empty() && items.iter().all(|item| item == b)
             } else {
                 false
             };
@@ -245,6 +260,7 @@ fn eval_ordering(ord: Ordering, op: &Operator) -> bool {
         | Operator::NotIn
         | Operator::ArrayContains
         | Operator::ArrayContainsAny
+        | Operator::ArrayAllEq
         // Near is a scan, not a predicate: only the VectorKnn arm (which
         // verifies everything itself and marks the plan satisfied) may
         // produce rows for it. Any re-verification path answers false.

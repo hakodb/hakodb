@@ -3,11 +3,28 @@ use crate::document::value::Value; // Fixed typo 'cuse'
 use super::filter::{Filter, Operator};
 use super::order::OrderBy;
 
+/// hakodb#71 F3 — one `elemMatch` clause: the stored field must be an
+/// array containing an element where ALL the sub-filters hold. Sub-filter
+/// fields are element-relative paths (`"sku"` or `"meta.notes"`; empty
+/// `""` means the element value itself). Stored element must be a Map
+/// whenever a sub-path is non-empty (fail-closed); absent/non-arrays
+/// never match; empty sub-filter lists are refused at plan time (the
+/// clause would be vacuously true and match every doc).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ElemMatch {
+    pub field: String,
+    pub filters: Vec<Filter>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Query {
     pub collection: String,
     pub filters: Vec<Filter>,
     pub or_groups: Vec<Vec<crate::query::filter::Filter>>,
+    /// hakodb#71 F3 — elemMatch clauses, always And-combined with the
+    /// rest of the filters. Verified at decode time by the matchers
+    /// (scan fallback, no index acceleration initially).
+    pub elem_match: Vec<ElemMatch>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
@@ -45,6 +62,7 @@ impl Query {
             collection: collection.to_string(),
             filters: Vec::new(),
             or_groups: Vec::new(),
+            elem_match: Vec::new(),
             order_by: Vec::new(),
             limit: None,
             offset: None, 
@@ -107,6 +125,16 @@ impl Query {
 
     pub fn aggregate(mut self, op: AggregateOp) -> Self {
         self.aggregations.push(op);
+        self
+    }
+
+    /// hakodb#71 F3 — element match: an element of the array at `field`
+    /// satisfying ALL `filters` (element-relative paths). See `ElemMatch`.
+    pub fn elem_match(mut self, field: &str, filters: Vec<Filter>) -> Self {
+        self.elem_match.push(ElemMatch {
+            field: field.to_string(),
+            filters,
+        });
         self
     }
 

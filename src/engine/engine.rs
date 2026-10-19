@@ -2816,6 +2816,36 @@ impl Hako {
         Collection::new(self, name)
     }
 
+    /// hakodb#71 Release C — F4 aggregation pipeline. `Match` stages run
+    /// through the normal query executor (planner/F2/F3 included); the
+    /// remaining stages stream over the materialised rows. A pipeline
+    /// whose first stage is not `Match` seeds from a full collection scan.
+    pub fn run_pipeline(
+        &self,
+        pipeline: crate::query::pipeline::Pipeline,
+    ) -> Result<Vec<(String, HakoDoc)>> {
+        use crate::query::pipeline::{self, Stage};
+        pipeline::validate(&pipeline)?;
+        let mut rows: Option<Vec<(String, HakoDoc)>> = None;
+        for stage in &pipeline.stages {
+            match stage {
+                Stage::Match(q) => {
+                    // A Match stage replaces the row set (each one runs the
+                    // full query machinery on its own collection).
+                    rows = Some(self.query(q.clone())?);
+                }
+                other => {
+                    if rows.is_none() {
+                        rows = Some(self.query(Query::new(&pipeline.collection))?);
+                    }
+                    let current = rows.take().unwrap_or_default();
+                    rows = Some(pipeline::run_stages(current, std::slice::from_ref(other))?);
+                }
+            }
+        }
+        Ok(rows.unwrap_or_default())
+    }
+
     pub fn query(&self, query: Query) -> Result<Vec<(String, HakoDoc)>> {
         if !self.allowed(&query.collection, AccessOp::Query) {
             return Err(self.deny(AccessOp::Query, &query.collection, None));

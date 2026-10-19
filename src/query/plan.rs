@@ -5,6 +5,7 @@ use std::ops::Bound;
 
 use super::filter::Filter;
 use super::order::OrderBy;
+use super::query::ElemMatch;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScanType {
@@ -96,6 +97,11 @@ pub struct QueryPlan {
     pub scan: ScanType,
     pub filters: Vec<Filter>,
     pub or_groups: Vec<Vec<crate::query::filter::Filter>>, // <--- ADD THIS
+    /// hakodb#71 F3 — elemMatch clauses riding the plan. Non-empty
+    /// plans always decode (the clauses are matcher passes), so
+    /// `make_plan` forces `filters_satisfied_by_index` false and the
+    /// raw/walk gate refuses them.
+    pub elem_match: Vec<ElemMatch>,
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,

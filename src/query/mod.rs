@@ -8,3 +8,4 @@ pub mod plan_cache;
 pub mod planner;
 pub mod query;
 pub mod builder;
+pub mod pipeline;

@@ -1,4 +1,4 @@
-use crate::document::hako_doc::{HakoDoc, HakoDocView};
+﻿use crate::document::hako_doc::{HakoDoc, HakoDocView};
 use crate::document::value::Value;
 use super::task::QueryTask;
 use crate::query::filter::Operator;
@@ -17,7 +17,7 @@ thread_local! {
 
 /// Per-row match buffers borrowed from [`MATCH_SCRATCH`]. Parked back on
 /// drop, so every exit path (including `?` and early returns) recycles.
-/// Falls back to fresh Vecs if the scratch is busy or gone — never
+/// Falls back to fresh Vecs if the scratch is busy or gone â€” never
 /// panics, never leaks correctness, at worst one throwaway allocation.
 struct MatchScratch {
     and_matches: Vec<bool>,
@@ -78,7 +78,7 @@ pub fn run_task(task: QueryTask) -> Vec<(String, HakoDoc)> {
     let optimized_plan = prepare_optimized_plan(&task.plan);
 
     for (id, pointer) in task.docs {
-        // ponytail: same borrowed-Inlined fast path as execute() — decode
+        // ponytail: same borrowed-Inlined fast path as execute() â€” decode
         // borrows the Arc-shared buffer, zero copy per row. Skeletons only;
         // blob inflation happens once below, concurrently (see execute()).
         match pointer {
@@ -86,7 +86,7 @@ pub fn run_task(task: QueryTask) -> Vec<(String, HakoDoc)> {
                 decode_row(id, &shared, &task.plan, &optimized_plan, &mut out);
             }
             other => {
-                // ponytail: shared read (see run_task above) — decode
+                // ponytail: shared read (see run_task above) â€” decode
                 // borrows, no per-row clone.
                 if let Ok(Some(bytes)) = storage_guard.read_pointer_shared(&other) {
                     decode_row(id, &bytes, &task.plan, &optimized_plan, &mut out);
@@ -112,7 +112,7 @@ pub fn run_task(task: QueryTask) -> Vec<(String, HakoDoc)> {
 }
 
 /// Shared decode+push helper for run_task's borrowed/owned sources.
-/// Inflation is the caller's job (once, concurrently — see above).
+/// Inflation is the caller's job (once, concurrently â€” see above).
 fn decode_row(
     id: String,
     bytes: &[u8],
@@ -121,7 +121,7 @@ fn decode_row(
     out: &mut Vec<(String, HakoDoc)>,
 ) {
     // CRITICAL FIX: If index handled everything, bypass `unified_match_decode` completely.
-    // Skeletons only — the caller inflates once, concurrently (see above).
+    // Skeletons only â€” the caller inflates once, concurrently (see above).
     if plan.filters_satisfied_by_index {
         if let Some(doc) = HakoDoc::decode(bytes) {
             out.push((id, doc));
@@ -142,7 +142,7 @@ pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)
     let optimized_plan = prepare_optimized_plan(&task.plan);
 
     for (id, pointer) in task.docs {
-        // ponytail: shared read — the projected match borrows, no clone.
+        // ponytail: shared read â€” the projected match borrows, no clone.
         if let Ok(Some(bytes)) = storage_guard.read_pointer_shared(&pointer) {
             // HIGH PERFORMANCE: Single-pass filtering and partial decoding.
             if let Some(fields) = unified_match_projected(&id, &bytes, &optimized_plan) {
@@ -152,7 +152,7 @@ pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)
     }
 
     // ponytail: parallel blob inflation over rows (same shape as run_task).
-    // Link-free rows skip via one scan — no rayon dispatch when idle.
+    // Link-free rows skip via one scan â€” no rayon dispatch when idle.
     if !task.plan.defer_blobs {
         if let Some(ref manager) = blob_manager {
             let has_links = out.iter().any(|(_, fields)| {
@@ -173,7 +173,7 @@ pub fn run_task_projected(task: QueryTask) -> Vec<(String, Vec<(String, Value)>)
     out
 }
 
-/// ponytail: fast BlobLink probe — lets callers skip the inflate pass
+/// ponytail: fast BlobLink probe â€” lets callers skip the inflate pass
 /// entirely for link-free rows (the common small-doc case) instead of
 /// paying per-doc scan+Vec overhead inside `inflate_blobs`.
 #[inline]
@@ -205,7 +205,7 @@ pub(crate) fn prepare_optimized_plan(plan: &crate::query::plan::QueryPlan) -> cr
 ///
 /// ponytail: two-pass shape. When every undecided filter is a byte-comparable
 /// Eq/Ne on a body field (no OR groups), pass 1 memcmps the row's encoded
-/// bytes against the filter's encoding — zero allocation — and only rows
+/// bytes against the filter's encoding â€” zero allocation â€” and only rows
 /// that match pay for pass 2 (full decode). Non-matching rows previously paid
 /// a full decode (~15 allocs) just to be discarded.
 pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::query::plan::QueryPlan) -> Option<HakoDoc> {
@@ -224,7 +224,7 @@ pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::que
     // 2. Fast path eligibility: no ORs, every undecided filter an Eq on a
     // byte-encodable scalar. Ne stays OUT: a byte-miss means "different
     // bytes", but cross-type values (Int 7 vs String "7") compare EQUAL
-    // semantically — trusting the miss would wrongly KEEP the row, and the
+    // semantically â€” trusting the miss would wrongly KEEP the row, and the
     // add-only match buffers cannot retract it. Ne always verifies below.
     let mut fast = plan.or_groups.is_empty();
     if fast {
@@ -237,7 +237,7 @@ pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::que
         }
     }
 
-    // PASS 1 (fast only): match on encoded bytes — exact-type equality is
+    // PASS 1 (fast only): match on encoded bytes â€” exact-type equality is
     // provably identical to the semantic compare (deterministic encoding),
     // so hits are final. Misses are NOT final: a cross-type value encodes
     // differently yet compares equal (the DHP `passw` hole: stored Int vs
@@ -282,12 +282,15 @@ pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::que
         fields.push((crate::document::hako_doc::intern_field(key), val));
     }
 
-    // Dotted filters decided post-scan when the top-level pass could not.
-    let verified = verified
+    // Dotted filters decided post-scan when the top-level pass could not;
+    // elemMatch clauses are matcher passes too â€” final verdict includes
+    // them (any clause without a matching element rejects the row).
+    let verified = (verified
         || {
             apply_dotted_filters(&view, plan, &mut match_bufs.and_matches, &mut match_bufs.or_group_results);
             validate_final_match(plan, &match_bufs.and_matches, &match_bufs.or_group_results)
-        };
+        })
+        && elem_match_pass(&view, plan);
 
     if verified {
         Some(HakoDoc { fields, _time: view._time })
@@ -309,7 +312,7 @@ pub(crate) fn unified_match_projected(doc_id: &str, bytes: &[u8], plan: &crate::
     for (key, tag, data) in view.iter() {
         let is_needed_for_filter = plan.filters.iter().any(|f| f.field == key) ||
                                    plan.or_groups.iter().any(|g| g.iter().any(|f| f.field == key));
-        // ponytail: borrow-compare the projection list — the old
+        // ponytail: borrow-compare the projection list â€” the old
         // `projection.contains(&key.to_string())` allocated one String per
         // field per row just to compare.
         let is_needed_for_proj = plan.projection.iter().any(|p| p == key);
@@ -324,7 +327,9 @@ pub(crate) fn unified_match_projected(doc_id: &str, bytes: &[u8], plan: &crate::
     }
     apply_dotted_filters(&view, plan, &mut match_bufs.and_matches, &mut match_bufs.or_group_results);
 
-    if validate_final_match(plan, &match_bufs.and_matches, &match_bufs.or_group_results) {
+    if validate_final_match(plan, &match_bufs.and_matches, &match_bufs.or_group_results)
+        && elem_match_pass(&view, plan)
+    {
         Some(extracted)
     } else {
         None
@@ -509,6 +514,54 @@ fn apply_dotted_filters(
     }
 }
 
+/// F2 map-only path walk over a decoded Value (element-relative paths in
+/// elemMatch clauses; mirrors `HakoDoc::get_path` semantics: absent,
+/// empty segments and descent into non-Map values all read absent).
+fn value_path<'a>(mut v: &'a Value, path: &str) -> Option<&'a Value> {
+    if path.is_empty() {
+        return Some(v);
+    }
+    for seg in path.split('.') {
+        if seg.is_empty() {
+            return None;
+        }
+        match v {
+            Value::Map(m) => {
+                v = &m.iter().find(|(k, _)| k.as_ref() == seg)?.1;
+            }
+            _ => return None,
+        }
+    }
+    Some(v)
+}
+
+/// hakodb#71 F3 â€” elemMatch pass. True iff EVERY clause finds an array
+/// element holding all its sub-filters. Fail-closed: missing stored
+/// field, non-array values (incl. maps/scalars), missing element paths
+/// and empty sub-filter lists (refused at plan time; belt at runtime)
+/// all match nothing. Cheap precondition: clauses usually absent.
+fn elem_match_pass(view: &HakoDocView, plan: &crate::query::plan::QueryPlan) -> bool {
+    if plan.elem_match.is_empty() {
+        return true;
+    }
+    'clauses: for clause in &plan.elem_match {
+        let Some(v) = view.get_path(&clause.field) else { return false };
+        let Value::Array(items) = v else { return false };
+        for elem in items {
+            if clause.filters.iter().all(|f| {
+                // Absent element path => the sub-filter fails (absent is
+                // never null â€” F2 rule); the element is just ineligible.
+                value_path(&elem, &f.field)
+                    .is_some_and(|v| crate::query::filter::compare_values(v, &f.op, &f.value))
+            }) {
+                continue 'clauses;
+            }
+        }
+        return false;
+    }
+    true
+}
+
 pub(crate) fn matches_filters_view(doc_id: &str, bytes: &[u8], plan: &crate::query::plan::QueryPlan) -> bool {
     let doc_time = i64::from_le_bytes(bytes[2..10].try_into().unwrap_or([0;8]));
     let mut and_matches = vec![false; plan.filters.len()];
@@ -535,9 +588,10 @@ pub(crate) fn matches_filters_view(doc_id: &str, bytes: &[u8], plan: &crate::que
         }
     }
     // Dotted filters (hakodb#71 F2): the top-level scan above never
-    // sees nested keys — resolve them from the view instead.
+    // sees nested keys â€” resolve them from the view instead.
     apply_dotted_filters(&view, plan, &mut and_matches, &mut or_group_results);
     validate_final_match(plan, &and_matches, &or_group_results)
+        && elem_match_pass(&view, plan)
 }
 
 // fn compare_raw_bytes(tag: u8, data: &[u8], op: &Operator, b: &Value) -> bool {
