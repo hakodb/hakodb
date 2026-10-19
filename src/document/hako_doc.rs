@@ -139,15 +139,42 @@ impl HakoDoc {
         doc._time = view._time;
         doc.fields = Vec::with_capacity(view.fields_count as usize);
         let mut it = view.iter();
+        let prefixes = crate::document::value::projection_prefixes(projection);
         for (key, tag, data) in it.by_ref() {
-            if projection.is_empty() || projection.iter().any(|p| p == key) {
-                doc.fields.push((intern_field(key), decode_value(tag, data)?));
+            // hakodb#71 F6: a dotted projection only needs its top-level
+            // prefix decoded; the subtree is pruned in memory afterwards.
+            let wanted = projection.is_empty() || prefixes.iter().any(|p| *p == key);
+            if wanted {
+                let val = decode_value(tag, data)?;
+                if projection.is_empty() {
+                    doc.fields.push((intern_field(key), val));
+                } else if let Some(pruned) =
+                    crate::document::value::prune_field_value(&val, projection, key)
+                {
+                    doc.fields.push((intern_field(key), pruned));
+                }
             }
         }
         if it.remaining() != 0 || it.position() != bytes.len() {
             return None;
         }
         Some(doc)
+    }
+
+    /// hakodb#71 F6: prune an already-decoded doc to a projection (dotted
+    /// paths supported). Empty projection = full doc. Used by the pipeline
+    /// `project` stage so it matches the query projection semantics.
+    pub fn project_fields(&self, projection: &[String]) -> Vec<(Arc<str>, Value)> {
+        if projection.is_empty() {
+            return self.fields.clone();
+        }
+        let mut out = Vec::with_capacity(self.fields.len());
+        for (k, v) in &self.fields {
+            if let Some(pruned) = crate::document::value::prune_field_value(v, projection, k) {
+                out.push((k.clone(), pruned));
+            }
+        }
+        out
     }
 
     pub fn get_logical_time(&self) -> i64 { self._time }

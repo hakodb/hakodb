@@ -165,13 +165,28 @@ fn elem_match_inside_pipeline_match() {
 }
 
 #[test]
-fn nested_project_and_unwind_are_refused() {
+fn nested_unwind_is_refused_but_nested_project_prunes() {
     let db = Hako::open(&tmp_dir("refuse"), HakoConfig::default()).unwrap();
     seed(&db);
 
-    let p = Pipeline::new("orders").project(vec!["profile.city"]);
-    assert!(db.run_pipeline(p).is_err(), "nested projection refused (F6)");
-
     let p = Pipeline::new("orders").unwind("meta.items");
-    assert!(db.run_pipeline(p).is_err(), "nested unwind refused (F6)");
+    assert!(db.run_pipeline(p).is_err(), "nested unwind refused");
+
+    let p = Pipeline::new("orders").project(vec!["items.sku"]);
+    let rows = db.run_pipeline(p).unwrap();
+    assert_eq!(rows.len(), 3);
+    for (_, doc) in &rows {
+        let items = doc.get("items").expect("items prefix kept");
+        match items {
+            Value::Array(arr) => {
+                for el in arr {
+                    match el {
+                        Value::Map(m) => assert!(m.iter().all(|(k, _)| k.as_ref() == "sku")),
+                        other => panic!("unexpected element {other:?}"),
+                    }
+                }
+            }
+            other => panic!("unexpected items value {other:?}"),
+        }
+    }
 }

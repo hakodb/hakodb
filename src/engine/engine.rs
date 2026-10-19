@@ -708,6 +708,9 @@ pub struct ExplainReport {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub projection: Vec<String>,
+    /// F6: true when the projected fields are served straight from the
+    /// composite index (no document read) — the query is covering.
+    pub covering: bool,
     /// Index definitions that exist on the collection (candidates the
     /// planner could have used — "why didn't my index run?").
     pub available_indexes: Vec<String>,
@@ -731,7 +734,8 @@ impl std::fmt::Display for ExplainReport {
             writeln!(f, "limit: {:?} offset: {:?}", self.limit, self.offset)?;
         }
         if !self.projection.is_empty() {
-            writeln!(f, "projection: {}", self.projection.join(","))?;
+            writeln!(f, "projection: {}{}", self.projection.join(","),
+                if self.covering { " (covering: index-only)" } else { "" })?;
         }
         if !self.available_indexes.is_empty() {
             writeln!(f, "available indexes: {}", self.available_indexes.join(", "))?;
@@ -3085,6 +3089,7 @@ impl Hako {
             limit: plan.limit,
             offset: plan.offset,
             projection: plan.projection.clone(),
+            covering: plan.covering_projection().is_some(),
             available_indexes: available,
         })
     }
