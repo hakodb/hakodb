@@ -60,6 +60,7 @@ pub(crate) struct WritePhaseStats {
     // hakodb#71/F7 — operational counters on the same always-on hook.
     pub queries: AtomicU64,
     pub tx_conflicts: AtomicU64,
+    pub tx_retries: AtomicU64,
     pub unique_violations: AtomicU64,
 }
 pub(crate) static WRITE_STATS: WritePhaseStats = WritePhaseStats {
@@ -77,6 +78,7 @@ pub(crate) static WRITE_STATS: WritePhaseStats = WritePhaseStats {
     encdoc_ns: AtomicU64::new(0),
     queries: AtomicU64::new(0),
     tx_conflicts: AtomicU64::new(0),
+    tx_retries: AtomicU64::new(0),
     unique_violations: AtomicU64::new(0),
 };
 
@@ -131,10 +133,11 @@ pub fn write_stats_report() -> String {
     }
     // F7 operational counters ride the same hook (also reset above).
     let conflicts = WRITE_STATS.tx_conflicts.swap(0, Ordering::Relaxed);
+    let retries = WRITE_STATS.tx_retries.swap(0, Ordering::Relaxed);
     let unique = WRITE_STATS.unique_violations.swap(0, Ordering::Relaxed);
     let queries = WRITE_STATS.queries.swap(0, Ordering::Relaxed);
     s.push_str(&format!(
-        "ops: {queries} queries, {conflicts} tx conflicts, {unique} unique violations\n"
+        "ops: {queries} queries, {conflicts} tx conflicts, {retries} tx retries, {unique} unique violations\n"
     ));
     if let Ok(mut scans) = INDEX_SCANS.lock() {
         if !scans.is_empty() {
@@ -458,6 +461,31 @@ impl Transaction {
     }
 }
 
+/// Bounded retry policy for [`Hako::transaction`] (issue #71/F5 item 2).
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    pub max_attempts: u32,
+    pub base_delay: Duration,
+    pub max_delay: Duration,
+}
+
+impl RetryPolicy {
+    /// Exponential backoff, doubling from `base_delay` up to `max_delay`.
+    pub fn exponential(max_attempts: u32, base_delay: Duration, max_delay: Duration) -> Self {
+        Self {
+            max_attempts,
+            base_delay,
+            max_delay,
+        }
+    }
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self::exponential(8, Duration::from_millis(1), Duration::from_millis(100))
+    }
+}
+
 /// Serializable transaction read-set + mutations (issue #71/F5).
 #[derive(Default)]
 pub struct SerializableTransaction {
@@ -466,6 +494,11 @@ pub struct SerializableTransaction {
 }
 
 impl SerializableTransaction {
+    /// The FIRST read of a key wins: a later re-read (e.g. the one inside
+    /// `patch`) must not quietly refresh the read-set, or a transaction that
+    /// already based a decision on the old version would commit over a
+    /// concurrent write instead of conflicting.
+    ///
     /// Issue #71/F5 item 3: registers the read-set from ONE atomic
     /// shard-locked read (doc + version together). The previous
     /// `db.get()` + `db.current_version()` pair left the window where a
@@ -480,11 +513,11 @@ impl SerializableTransaction {
         let key = doc_id.to_string();
         match db.get_versioned(collection, doc_id)? {
             Some((doc, version)) => {
-                self.reads.insert(key, Some(version));
+                self.reads.entry(key).or_insert(Some(version));
                 Ok(Some(doc))
             }
             None => {
-                self.reads.insert(key, None);
+                self.reads.entry(key).or_insert(None);
                 Ok(None)
             }
         }
@@ -501,6 +534,38 @@ impl SerializableTransaction {
             collection: collection.to_string(),
             doc_id: doc_id.to_string(),
         });
+    }
+    /// Issue #71/F5 item 5: patch inside the transaction. `get` first so the
+    /// doc version joins the read-set (a concurrent commit conflicts), then
+    /// queue the same `Patch` mutation `Hako::patch` uses — top-level field
+    /// upsert semantics included.
+    pub fn patch(
+        &mut self,
+        db: &Hako,
+        collection: &str,
+        doc_id: &str,
+        updates: Vec<(String, Value)>,
+    ) -> Result<()> {
+        self.get(db, collection, doc_id)?;
+        self.mutations.push(BatchMutation::Patch {
+            collection: collection.to_string(),
+            doc_id: doc_id.to_string(),
+            updates,
+        });
+        Ok(())
+    }
+    /// Issue #71/F5 item 5: batched read-set registration via the item-3
+    /// atomic read. One hash lookup per id, same shard lock each time.
+    pub fn get_many(
+        &mut self,
+        db: &Hako,
+        collection: &str,
+        doc_ids: &[String],
+    ) -> Result<Vec<Option<HakoDoc>>> {
+        doc_ids
+            .iter()
+            .map(|id| self.get(db, collection, id))
+            .collect()
     }
     pub fn commit(&self, db: &Hako) -> Result<Vec<String>> {
         Ok(db.commit_serializable(self.reads.clone(), self.mutations.clone())?)
@@ -701,7 +766,7 @@ pub struct CollectionStats {
 /// Result of [`Hako::explain_report`] (issue #71/F7). Plan-only: no query
 /// execution, so `collection_rows` is the scan's upper bound and
 /// `filter_count` the predicates applied after it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ExplainReport {
     pub collection: String,
     pub scan: String,
@@ -3527,6 +3592,37 @@ impl Hako {
             reads: HashMap::new(),
             mutations: Vec::new(),
         }
+    }
+
+    /// Issue #71/F5 item 2: run a serializable read-modify-write with a
+    /// bounded retry loop. Retries only on `is_retryable()` errors (read-set
+    /// conflicts); the closure runs against a FRESH transaction each
+    /// attempt, so a retry re-reads and re-applies the whole body.
+    ///
+    /// `ponytail:` fixed exponential backoff, no jitter — a handful of
+    /// writers under the global tx lock serialize anyway; add jitter if the
+    /// retry counter shows a thundering herd on a contending workload.
+    pub fn transaction<T>(
+        &self,
+        policy: RetryPolicy,
+        mut body: impl FnMut(&mut SerializableTransaction) -> Result<T>,
+    ) -> Result<T> {
+        let attempts = policy.max_attempts.max(1);
+        let mut backoff = policy.base_delay;
+        for attempt in 1..=attempts {
+            let mut tx = self.begin_serializable_transaction();
+            let out = body(&mut tx)?;
+            match tx.commit(self) {
+                Ok(_) => return Ok(out),
+                Err(e) if e.is_retryable() && attempt < attempts => {
+                    WRITE_STATS.tx_retries.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(policy.max_delay);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!("retry loop returns on the last attempt")
     }
 
     pub fn watch_collection(&self, col: &str) -> Receiver<ChangeEvent> {

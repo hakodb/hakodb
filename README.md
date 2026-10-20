@@ -62,6 +62,20 @@ while let Ok(event) = rx.recv() {
 
 See [`example/rust/basic`](example/rust/basic) for a complete runnable project.
 
+### Transactions
+
+`db.transaction(RetryPolicy::exponential(8, base, cap), |tx| { ... })` reruns the
+whole body on retryable read-set conflicts; `tx.get` / `tx.get_many` /
+`tx.patch` register the read-set atomically (doc + version from one shard
+read, and the *first* read of a key wins). Drain the final error with
+`HakoError::kind()` in Rust or `hk_error_last_kind()` /
+`hk_error_is_retryable()` over the C ABI — never string-match.
+
+Queries inside a transaction are **not** tracked: point reads are
+serializable, but `query() -> write` based on the result has no snapshot
+guarantee. If the invariant matters, re-check the affected docs with
+`tx.get` before writing.
+
 ## Vector search (KNN)
 
 `create_vector_index(collection, field, dim, metric)` + `find_near(collection, field, query, k)`: nearest-first hits over a binary LE-`f32` field, cosine or L2, HNSW with exact rescore.
@@ -76,7 +90,7 @@ See [`example/rust/basic`](example/rust/basic) for a complete runnable project.
 
 ## C ABI (multi-language)
 
-Flat C API over opaque handles (`HK_Engine`, `HK_Doc`, `HK_Query`, `HK_Batch`, `HK_Transaction`, `HK_Watch`, `HK_ResultSet`, sync handles): CRUD, batches, transactions, queries, watch, result sets, sync. Build outputs: `target/release/libhakodb.so` (Linux), `.dylib` (macOS), `hakodb.dll` (Windows) + per-target `hakodb.h`.
+Flat C API over opaque handles (`HK_Engine`, `HK_Doc`, `HK_Query`, `HK_Pipeline`, `HK_Batch`, `HK_Transaction`, `HK_Watch`, `HK_ResultSet`, sync handles): CRUD, batches, transactions (typed retry codes), queries (dotted paths, `elemMatch`, `explain`), aggregation pipelines, watch, result sets, sync. Build outputs: `target/release/libhakodb.so` (Linux), `.dylib` (macOS), `hakodb.dll` (Windows) + per-target `hakodb.h`.
 
 ```bash
 cargo build --release                                   # full (sync + compression)

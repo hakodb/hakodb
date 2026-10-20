@@ -102,10 +102,11 @@ fn counters_cover_unique_violations_and_tx_conflicts() {
         .split_whitespace()
         .filter_map(|t| t.parse::<u64>().ok())
         .collect();
-    assert_eq!(nums.len(), 3, "ops line: {ops}");
+    assert_eq!(nums.len(), 4, "ops line: {ops}");
     assert!(nums[0] >= 1, "query counter: {ops}");
     assert!(nums[1] >= 1, "conflict counter: {ops}");
-    assert!(nums[2] >= 1, "unique counter: {ops}");
+    assert!(nums[2] == 0, "no helper retry in a manual commit: {ops}");
+    assert!(nums[3] >= 1, "unique counter: {ops}");
 }
 
 fn schema() -> CollectionSchema {
