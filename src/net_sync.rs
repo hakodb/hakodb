@@ -775,6 +775,7 @@ impl NetSyncer {
         let caps_tail = caps_static.clone();
         
         let handle_tailer = tokio::task::spawn_blocking(move || {
+            let is_read_only = db_tail.is_read_only();
             let mut last_checkpoint_save = Instant::now(); // Use Instant for timing
             loop {
                 if peers_tail.blocking_lock().is_empty() {
@@ -853,7 +854,10 @@ impl NetSyncer {
                                     logical_ops.push(op);
                                 }
                             }
-                            if !logical_ops.is_empty() {
+                            // Read-only replicas only ingest. Broadcasting
+                            // their local WAL would deadlock against the
+                            // writer's snapshot and leak stale rows.
+                            if !logical_ops.is_empty() && !is_read_only {
                                 if enc_cols.contains(&col) {
                                     // Encrypted room: fan out only to
                                     // fingerprint-matched peers (same msg_id
@@ -1274,6 +1278,12 @@ static NET_WARN_LAST: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Insta
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 async fn handle_bootstrap(db: &Arc<Hako>, peers: &Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>>, peer_id: &str, excluded: &HashSet<String>, caps: &Arc<CapsMap>) {
+    // Read-only replicas only ingest. A demoted writer still holds a full
+    // snapshot; serving it back while the writer serves its own fills both
+    // socket buffers and deadlocks the handshake (#74 failover drill).
+    if db.is_read_only() {
+        return;
+    }
     let encryption_key = db.config.encryption_key.as_deref();
 
     // Sync enumeration covers hidden collections; the excluded plane is
@@ -2125,6 +2135,32 @@ mod tests {
         // is the encoded HakoDoc, a few header bytes over the raw chunk).
         assert_eq!(seen["k000"], chunk.len() + 19);
         assert_eq!(seen["k095"], chunk.len() + 19);
+    }
+
+    /// #74 failover: a read-only replica must never answer a SyncRequest
+    /// with its own snapshot. A demoted writer still has one, and two
+    /// concurrent full sends fill both socket buffers (the drill hangs).
+    #[tokio::test]
+    async fn read_only_replica_sends_no_bootstrap() {
+        let (db, _dir) = temp_db("ro-boot");
+        put_simple(&db, "c", "a");
+        db.set_read_only(true);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (mut c_read, _c_write) = client.into_split();
+        let (_s_read, s_write) = server.into_split();
+
+        let peers: Arc<AsyncMutex<HashMap<String, OwnedWriteHalf>>> = Arc::new(
+            AsyncMutex::new(HashMap::from([("u1".to_string(), s_write)])),
+        );
+        let caps: Arc<CapsMap> = Arc::new(CapsMap::default());
+        handle_bootstrap(&db, &peers, "u1", &HashSet::new(), &caps).await;
+
+        let got = tokio::time::timeout(Duration::from_millis(250), recv_frame(&mut c_read)).await;
+        assert!(got.is_err(), "read-only replica sent a bootstrap frame: {got:?}");
     }
 
     /// #72 phase 1: the relay carriers survive the wire and keep the
