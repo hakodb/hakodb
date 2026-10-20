@@ -14,8 +14,6 @@ use crate::document::hako_doc::HakoDoc;
 #[cfg(feature = "cloud-sync")]
 use crate::document::value::Value;
 #[cfg(feature = "cloud-sync")]
-use crate::engine::engine::IndexOp;
-#[cfg(feature = "cloud-sync")]
 use crate::engine::{ChangeEvent, ChangeKind, Hako};
 #[cfg(feature = "cloud-sync")]
 use crate::error::{HakoError, Result as FLResult};
@@ -867,11 +865,11 @@ impl CloudSync {
         db.bump_versions_by_keys(keys);
 
         if !index_puts.is_empty() {
-            let _ = db.index_tx.send(IndexOp::Update {
-                collection: collection.to_string(),
-                puts: Arc::new(index_puts),
-                deletes: vec![],
-            });
+            db.enqueue_index_update(
+                collection.to_string(),
+                Arc::new(index_puts),
+                vec![],
+            );
         }
 
         for op in &ops {
