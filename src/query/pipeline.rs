@@ -77,7 +77,7 @@ impl Pipeline {
         self.stage(Stage::Match(query))
     }
 
-    pub fn project(mut self, fields: Vec<&str>) -> Self {
+    pub fn project(self, fields: Vec<&str>) -> Self {
         self.stage(Stage::Project(fields.into_iter().map(|s| s.to_string()).collect()))
     }
 

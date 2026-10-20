@@ -82,6 +82,12 @@ pub struct HK_Transaction {
     pub tx: crate::engine::SerializableTransaction,
 }
 
+/// F4 aggregation pipeline builder handle (`hk_pipeline_*`).
+#[allow(non_camel_case_types)]
+pub struct HK_Pipeline {
+    pipeline: crate::query::pipeline::Pipeline,
+}
+
 #[allow(non_camel_case_types)]
 pub struct HK_ResultSet {
     pub docs: Vec<HK_Doc>,
@@ -243,6 +249,92 @@ fn projection_to_json(fields: Vec<(String, Value)>) -> Result<serde_json::Value,
         map.insert(k, value_to_json(&v));
     }
     Ok(serde_json::Value::Object(map))
+}
+
+/// JSON -> `Value` for FFI arguments (filters, patches, pipeline accums).
+/// Written out instead of `serde_json::from_value` because `Value` is
+/// untagged and its serde `Map` arm expects the internal pair encoding, so
+/// a plain JSON object would fail to deserialize.
+fn json_to_value(v: &serde_json::Value) -> Value {
+    match v {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(i) => Value::Int(i),
+            None => Value::Float(n.as_f64().unwrap_or(0.0)),
+        },
+        serde_json::Value::String(s) => Value::String(s.clone()),
+        serde_json::Value::Array(items) => Value::Array(items.iter().map(json_to_value).collect()),
+        serde_json::Value::Object(map) => Value::Map(
+            map.iter()
+                .map(|(k, v)| (std::sync::Arc::from(k.as_str()), json_to_value(v)))
+                .collect(),
+        ),
+    }
+}
+
+fn parse_json_arg(raw: *const c_char, what: &str) -> Result<serde_json::Value, String> {
+    let s = cstr_to_string(raw)?;
+    serde_json::from_str(&s).map_err(|e| format!("invalid {what} JSON: {e}"))
+}
+
+fn parse_filter_op(name: &str) -> Result<Operator, String> {
+    Ok(match name {
+        "eq" => Operator::Eq,
+        "ne" => Operator::Ne,
+        "gt" => Operator::Gt,
+        "gte" => Operator::Gte,
+        "lt" => Operator::Lt,
+        "lte" => Operator::Lte,
+        "match" => Operator::Match,
+        "match_prefix" => Operator::MatchPrefix,
+        "contains" => Operator::Contains,
+        "starts_with" => Operator::StartsWith,
+        "in" => Operator::In,
+        "array_contains" => Operator::ArrayContains,
+        "array_contains_any" => Operator::ArrayContainsAny,
+        "array_all_eq" => Operator::ArrayAllEq,
+        "not_in" => Operator::NotIn,
+        other => return Err(format!("unknown filter op `{other}`")),
+    })
+}
+
+/// `[{"field":"qty","op":"gt","value":2}, ...]` -> filters (F3 elemMatch).
+fn parse_filters_json(raw: *const c_char) -> Result<Vec<crate::query::filter::Filter>, String> {
+    let value = parse_json_arg(raw, "filters")?;
+    let arr = value
+        .as_array()
+        .ok_or("filters must be a JSON array")?;
+    arr.iter()
+        .map(|entry| {
+            let obj = entry
+                .as_object()
+                .ok_or("each filter must be a JSON object")?;
+            let field = obj
+                .get("field")
+                .and_then(|v| v.as_str())
+                .ok_or("filter.field must be a string")?;
+            let op = obj
+                .get("op")
+                .and_then(|v| v.as_str())
+                .ok_or("filter.op must be a string")?;
+            let value = obj.get("value").ok_or("filter.value is required")?;
+            Ok(crate::query::filter::Filter {
+                field: field.to_string(),
+                op: parse_filter_op(op)?,
+                value: json_to_value(value),
+            })
+        })
+        .collect()
+}
+
+/// `{"field": <json>, ...}` -> top-level patch updates.
+fn parse_updates_json(raw: *const c_char) -> Result<Vec<(String, Value)>, String> {
+    let value = parse_json_arg(raw, "updates")?;
+    let obj = value
+        .as_object()
+        .ok_or("updates must be a JSON object")?;
+    Ok(obj.iter().map(|(k, v)| (k.clone(), json_to_value(v))).collect())
 }
 
 #[no_mangle]
@@ -809,7 +901,7 @@ pub extern "C" fn hk_engine_insert(
         let doc = unsafe { &*doc };
         match engine.db.put(&collection, &doc_id, &doc.doc) {
             Ok(_) => 0,
-            Err(e) => set_last_error_err(format!("{}", e)),
+            Err(e) => set_last_error_err(e),
         }
     })
 }
@@ -842,7 +934,7 @@ pub extern "C" fn hk_engine_insert_take(
         let owned = unsafe { *Box::from_raw(doc) };
         match engine.db.put_owned(&collection, &doc_id, owned.doc) {
             Ok(_) => 0,
-            Err(e) => set_last_error_err(format!("{}", e)),
+            Err(e) => set_last_error_err(e),
         }
     })
 }
@@ -891,6 +983,59 @@ pub extern "C" fn hk_engine_get(
             // already a freshly-allocated String and we don't reuse it.
             Ok(Some(doc)) => Box::into_raw(Box::new(HK_Doc { id: doc_id_owned, doc })),
             _ => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Atomic `(doc, version)`: both are captured under one shard read, so an
+/// RMW loop cannot pair a new version with a stale doc (issue #71/F5 item
+/// 3). `out_version` may be NULL; it receives 0 when the doc is absent.
+#[no_mangle]
+pub extern "C" fn hk_engine_get_versioned(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    doc_id: *const c_char,
+    out_version: *mut u64,
+) -> *mut HK_Doc {
+    safety_shield!(ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error_err("null engine handle");
+            return ptr::null_mut();
+        }
+        if !out_version.is_null() {
+            unsafe { *out_version = 0 };
+        }
+        let collection = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let doc_id = match cstr_to_string(doc_id) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let engine = unsafe { &*engine };
+        match engine.db.get_versioned(&collection, &doc_id) {
+            Ok(Some((doc, version))) => {
+                if !out_version.is_null() {
+                    unsafe { *out_version = version };
+                }
+                clear_last_error();
+                Box::into_raw(Box::new(HK_Doc { id: doc_id, doc }))
+            }
+            Ok(None) => {
+                clear_last_error();
+                ptr::null_mut()
+            }
+            Err(e) => {
+                set_last_error_err(e);
+                ptr::null_mut()
+            }
         }
     })
 }
@@ -1268,10 +1413,9 @@ pub extern "C" fn hk_batch_commit(engine: *mut HK_Engine, batch: *mut HK_Batch) 
                 clear_last_error();
                 0
             }
-            Err(e) => {
-                set_last_error_err(e.to_string());
-                -1 // or ptr::null_mut() depending on function return type
-            }
+            // Typed payload: unique violations arrive as kind 3 (issue
+            // #71/F1/F5), not generic.
+            Err(e) => set_last_error_err(e),
         }
     })
 }
@@ -1658,6 +1802,72 @@ pub extern "C" fn hk_query_where_array_contains_any(
     0
 }
 
+/// F3 `all_eq`: every element of `field` compares equal to the value.
+/// `value_json` is a scalar JSON value (`2`, `"open"`, `true`, ...).
+#[no_mangle]
+pub extern "C" fn hk_query_where_array_all_eq(
+    query: *mut HK_Query,
+    field: *const c_char,
+    value_json: *const c_char,
+) -> i32 {
+    if query.is_null() {
+        return set_last_error_err("null query handle");
+    }
+    let f = match cstr_to_string(field) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    let raw = match parse_json_arg(value_json, "value") {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    if raw.is_array() {
+        return set_last_error_err("all_eq value must be a scalar, not an array");
+    }
+    let q = unsafe { &mut *query };
+    q.query.filters.push(crate::query::filter::Filter {
+        field: f,
+        op: Operator::ArrayAllEq,
+        value: json_to_value(&raw),
+    });
+    clear_last_error();
+    0
+}
+
+/// F3 `elemMatch`: some element of the array at `field` satisfies ALL the
+/// filters in `filters_json`. Sub-filter fields are element-relative paths
+/// (`"sku"`, `"meta.qty"`, `""` for the element itself).
+///
+/// `filters_json`: `[{"field":"qty","op":"gt","value":2}, ...]`.
+#[no_mangle]
+pub extern "C" fn hk_query_where_elem_match(
+    query: *mut HK_Query,
+    field: *const c_char,
+    filters_json: *const c_char,
+) -> i32 {
+    if query.is_null() {
+        return set_last_error_err("null query handle");
+    }
+    let f = match cstr_to_string(field) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    let filters = match parse_filters_json(filters_json) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    if filters.is_empty() {
+        return set_last_error_err("elemMatch requires at least one filter");
+    }
+    let q = unsafe { &mut *query };
+    q.query.elem_match.push(crate::query::query::ElemMatch {
+        field: f,
+        filters,
+    });
+    clear_last_error();
+    0
+}
+
 #[no_mangle]
 pub extern "C" fn hk_query_where_not_in(
     query: *mut HK_Query,
@@ -1847,6 +2057,43 @@ pub extern "C" fn hk_query_execute(engine: *mut HK_Engine, query: *const HK_Quer
                     }
                 }
             }
+            Err(e) => {
+                set_last_error_err(e);
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// F7: plan explanation without executing the query. Returns JSON
+/// (`ExplainReport`: scan/index, counts, covering, available indexes).
+/// Caller frees with `hk_string_free`.
+#[no_mangle]
+pub extern "C" fn hk_query_explain(
+    engine: *mut HK_Engine,
+    query: *const HK_Query,
+) -> *mut c_char {
+    safety_shield!(ptr::null_mut(), {
+        if engine.is_null() || query.is_null() {
+            set_last_error_err("null engine/query handle");
+            return ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let query = unsafe { &*query };
+        match engine.db.explain_report(query.query.clone()) {
+            Ok(report) => match serde_json::to_string(&report)
+                .ok()
+                .and_then(|s| CString::new(s).ok())
+            {
+                Some(s) => {
+                    clear_last_error();
+                    s.into_raw()
+                }
+                None => {
+                    set_last_error_err("failed to encode explain report");
+                    ptr::null_mut()
+                }
+            },
             Err(e) => {
                 set_last_error_err(e);
                 ptr::null_mut()
@@ -2640,6 +2887,14 @@ pub extern "C" fn hk_error_last_kind() -> i32 {
     LAST_ERROR_KIND.with(|k| k.get())
 }
 
+/// Convenience predicate for SDK retry loops: true iff the last error on
+/// this thread is classified retryable (kind 2, issue #71/F5). Equivalent to
+/// `hk_error_last_kind() == 2`; kept so bindings do not hardcode the code.
+#[no_mangle]
+pub extern "C" fn hk_error_is_retryable() -> bool {
+    LAST_ERROR_KIND.with(|k| k.get()) == crate::error::ErrorKind::RetryableConflict as i32
+}
+
 /// Enable library diagnostic logging to stderr. Default OFF. Idempotent.
 #[no_mangle]
 pub extern "C" fn hk_log_enable_stderr() {
@@ -3033,10 +3288,7 @@ pub extern "C" fn hk_engine_patch(
         // FIX: Access .db and ensure set_last_error returns correctly
         match engine.db.patch(&col, &id, updates_vec) {
             Ok(_) => 0,
-            Err(e) => {
-                set_last_error_err(e.to_string());
-                -1
-            }
+            Err(e) => set_last_error_err(e),
         }
     })
 }
@@ -3623,6 +3875,282 @@ pub extern "C" fn hk_engine_list_indexes(
     })
 }
 
+// --- AGGREGATION PIPELINES (F4) ---
+
+#[no_mangle]
+pub extern "C" fn hk_pipeline_new(collection: *const c_char) -> *mut HK_Pipeline {
+    let collection = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(e) => {
+            set_last_error_err(e);
+            return ptr::null_mut();
+        }
+    };
+    clear_last_error();
+    Box::into_raw(Box::new(HK_Pipeline {
+        pipeline: crate::query::pipeline::Pipeline::new(&collection),
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn hk_pipeline_free(pipeline: *mut HK_Pipeline) {
+    if !pipeline.is_null() {
+        unsafe { drop(Box::from_raw(pipeline)) };
+    }
+}
+
+/// Append a `match` stage from a query handle. The query is copied; the
+/// caller keeps ownership of `query`.
+#[no_mangle]
+pub extern "C" fn hk_pipeline_match(pipeline: *mut HK_Pipeline, query: *const HK_Query) -> i32 {
+    if pipeline.is_null() || query.is_null() {
+        return set_last_error_err("null pipeline/query handle");
+    }
+    let p = unsafe { &mut *pipeline };
+    let q = unsafe { &*query };
+    p.pipeline
+        .stages
+        .push(crate::query::pipeline::Stage::Match(q.query.clone()));
+    clear_last_error();
+    0
+}
+
+/// `fields_json`: JSON array of field names (`["id","items.qty"]`).
+#[no_mangle]
+pub extern "C" fn hk_pipeline_project(
+    pipeline: *mut HK_Pipeline,
+    fields_json: *const c_char,
+) -> i32 {
+    if pipeline.is_null() {
+        return set_last_error_err("null pipeline handle");
+    }
+    let raw = match parse_json_arg(fields_json, "projection") {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    let Some(items) = raw.as_array() else {
+        return set_last_error_err("projection must be a JSON array");
+    };
+    let mut fields = Vec::with_capacity(items.len());
+    for item in items {
+        match item.as_str() {
+            Some(s) => fields.push(s.to_string()),
+            None => return set_last_error_err("projection entries must be strings"),
+        }
+    }
+    let p = unsafe { &mut *pipeline };
+    p.pipeline
+        .stages
+        .push(crate::query::pipeline::Stage::Project(fields));
+    clear_last_error();
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn hk_pipeline_sort(
+    pipeline: *mut HK_Pipeline,
+    field: *const c_char,
+    ascending: bool,
+) -> i32 {
+    if pipeline.is_null() {
+        return set_last_error_err("null pipeline handle");
+    }
+    let field = match cstr_to_string(field) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    let p = unsafe { &mut *pipeline };
+    p.pipeline
+        .stages
+        .push(crate::query::pipeline::Stage::Sort { field, ascending });
+    clear_last_error();
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn hk_pipeline_limit(pipeline: *mut HK_Pipeline, limit: usize) -> i32 {
+    if pipeline.is_null() {
+        return set_last_error_err("null pipeline handle");
+    }
+    let p = unsafe { &mut *pipeline };
+    p.pipeline
+        .stages
+        .push(crate::query::pipeline::Stage::Limit(limit));
+    clear_last_error();
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn hk_pipeline_offset(pipeline: *mut HK_Pipeline, offset: usize) -> i32 {
+    if pipeline.is_null() {
+        return set_last_error_err("null pipeline handle");
+    }
+    let p = unsafe { &mut *pipeline };
+    p.pipeline
+        .stages
+        .push(crate::query::pipeline::Stage::Offset(offset));
+    clear_last_error();
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn hk_pipeline_unwind(
+    pipeline: *mut HK_Pipeline,
+    field: *const c_char,
+) -> i32 {
+    if pipeline.is_null() {
+        return set_last_error_err("null pipeline handle");
+    }
+    let field = match cstr_to_string(field) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    let p = unsafe { &mut *pipeline };
+    p.pipeline
+        .stages
+        .push(crate::query::pipeline::Stage::Unwind { field });
+    clear_last_error();
+    0
+}
+
+/// `key` may be NULL for a single global group.
+/// `accums_json`: `[{"out":"total","op":"sum","field":"items.qty"},
+/// {"out":"n","op":"count"}]`. `field` is ignored by `count`.
+#[no_mangle]
+pub extern "C" fn hk_pipeline_group(
+    pipeline: *mut HK_Pipeline,
+    key: *const c_char,
+    accums_json: *const c_char,
+) -> i32 {
+    use crate::query::pipeline::{Accum, AccumSpec};
+    if pipeline.is_null() {
+        return set_last_error_err("null pipeline handle");
+    }
+    let key = if key.is_null() {
+        None
+    } else {
+        match cstr_to_string(key) {
+            Ok(v) => Some(v),
+            Err(e) => return set_last_error_err(e),
+        }
+    };
+    let raw = match parse_json_arg(accums_json, "accums") {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    let Some(items) = raw.as_array() else {
+        return set_last_error_err("accums must be a JSON array");
+    };
+    let mut accums = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            return set_last_error_err("each accum must be a JSON object");
+        };
+        let out = match obj.get("out").and_then(|v| v.as_str()) {
+            Some(v) => v.to_string(),
+            None => return set_last_error_err("accum.out must be a string"),
+        };
+        let op_name = obj.get("op").and_then(|v| v.as_str()).unwrap_or("");
+        let field = obj.get("field").and_then(|v| v.as_str()).unwrap_or("");
+        let op = match op_name {
+            "count" => Accum::Count,
+            "sum" | "min" | "max" | "avg" if field.is_empty() => {
+                return set_last_error_err(format!("accum `{out}` ({op_name}) needs a field"))
+            }
+            "sum" => Accum::Sum(field.to_string()),
+            "min" => Accum::Min(field.to_string()),
+            "max" => Accum::Max(field.to_string()),
+            "avg" => Accum::Avg(field.to_string()),
+            other => return set_last_error_err(format!("unknown accum op `{other}`")),
+        };
+        accums.push(AccumSpec { out, op });
+    }
+    let p = unsafe { &mut *pipeline };
+    p.pipeline
+        .stages
+        .push(crate::query::pipeline::Stage::Group { key, accums });
+    clear_last_error();
+    0
+}
+
+/// Run the pipeline; returns a JSON array of result documents (caller frees
+/// with `hk_string_free`).
+#[no_mangle]
+pub extern "C" fn hk_pipeline_execute(
+    engine: *mut HK_Engine,
+    pipeline: *const HK_Pipeline,
+) -> *mut c_char {
+    safety_shield!(ptr::null_mut(), {
+        if engine.is_null() || pipeline.is_null() {
+            set_last_error_err("null engine/pipeline handle");
+            return ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let p = unsafe { &*pipeline };
+        let rows = match engine.db.run_pipeline(p.pipeline.clone()) {
+            Ok(rows) => rows,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let mut docs = Vec::with_capacity(rows.len());
+        for (_, doc) in rows {
+            match doc_to_json(&doc).and_then(|s| {
+                serde_json::from_str::<serde_json::Value>(&s).map_err(|e| e.to_string())
+            }) {
+                Ok(v) => docs.push(v),
+                Err(e) => {
+                    set_last_error_err(e);
+                    return ptr::null_mut();
+                }
+            }
+        }
+        match CString::new(serde_json::to_string(&docs).unwrap_or_else(|_| "[]".to_string())) {
+            Ok(s) => {
+                clear_last_error();
+                s.into_raw()
+            }
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Run the pipeline and return owned doc handles (mirrors
+/// `hk_query_execute_to_handles`; release with `hk_result_set_free`).
+#[no_mangle]
+pub extern "C" fn hk_pipeline_execute_to_handles(
+    engine: *mut HK_Engine,
+    pipeline: *const HK_Pipeline,
+) -> *mut HK_ResultSet {
+    safety_shield!(ptr::null_mut(), {
+        if engine.is_null() || pipeline.is_null() {
+            set_last_error_err("null engine/pipeline handle");
+            return ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let p = unsafe { &*pipeline };
+        match engine.db.run_pipeline(p.pipeline.clone()) {
+            Ok(rows) => {
+                clear_last_error();
+                Box::into_raw(Box::new(HK_ResultSet {
+                    docs: rows
+                        .into_iter()
+                        .map(|(id, doc)| HK_Doc { id, doc })
+                        .collect(),
+                }))
+            }
+            Err(e) => {
+                set_last_error_err(e);
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
 // --- 2. SERIALIZABLE TRANSACTIONS (Read-Modify-Write) ---
 
 #[no_mangle]
@@ -3689,6 +4217,129 @@ pub extern "C" fn hk_transaction_set(
     })
 }
 
+/// Patch inside the transaction (issue #71/F5 item 5): the doc version joins
+/// the read-set, then the updates are applied at commit.
+/// `updates_json`: `{"field": <json>, ...}` (top-level fields).
+#[no_mangle]
+pub extern "C" fn hk_transaction_patch(
+    engine: *mut HK_Engine,
+    tx: *mut HK_Transaction,
+    collection: *const c_char,
+    doc_id: *const c_char,
+    updates_json: *const c_char,
+) -> i32 {
+    safety_shield!(-1, {
+        if engine.is_null() || tx.is_null() {
+            return set_last_error_err("null engine/tx handle");
+        }
+        let engine = unsafe { &*engine };
+        let tx = unsafe { &mut *tx };
+        let collection = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => return set_last_error_err(e),
+        };
+        let doc_id = match cstr_to_string(doc_id) {
+            Ok(v) => v,
+            Err(e) => return set_last_error_err(e),
+        };
+        let updates = match parse_updates_json(updates_json) {
+            Ok(v) => v,
+            Err(e) => return set_last_error_err(e),
+        };
+        match tx.tx.patch(&engine.db, &collection, &doc_id, updates) {
+            Ok(()) => {
+                clear_last_error();
+                0
+            }
+            Err(e) => set_last_error_err(e),
+        }
+    })
+}
+
+/// Read many docs into the transaction read-set. Returns a JSON array with
+/// one entry per id (`null` when absent). Caller frees with
+/// `hk_string_free`.
+#[no_mangle]
+pub extern "C" fn hk_transaction_get_many(
+    engine: *mut HK_Engine,
+    tx: *mut HK_Transaction,
+    collection: *const c_char,
+    ids_json: *const c_char,
+) -> *mut c_char {
+    safety_shield!(ptr::null_mut(), {
+        if engine.is_null() || tx.is_null() {
+            set_last_error_err("null engine/tx handle");
+            return ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let tx = unsafe { &mut *tx };
+        let collection = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let raw = match parse_json_arg(ids_json, "ids") {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let Some(items) = raw.as_array() else {
+            set_last_error_err("ids must be a JSON array");
+            return ptr::null_mut();
+        };
+        let mut ids = Vec::with_capacity(items.len());
+        for item in items {
+            match item.as_str() {
+                Some(s) => ids.push(s.to_string()),
+                None => {
+                    set_last_error_err("id entries must be strings");
+                    return ptr::null_mut();
+                }
+            }
+        }
+        let rows = match tx.tx.get_many(&engine.db, &collection, &ids) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for doc in rows {
+            match doc {
+                Some(doc) => match doc_to_json(&doc) {
+                    Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {
+                        Ok(v) => out.push(v),
+                        Err(e) => {
+                            set_last_error_err(e.to_string());
+                            return ptr::null_mut();
+                        }
+                    },
+                    Err(e) => {
+                        set_last_error_err(e);
+                        return ptr::null_mut();
+                    }
+                },
+                None => out.push(serde_json::Value::Null),
+            }
+        }
+        match CString::new(serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())) {
+            Ok(s) => {
+                clear_last_error();
+                s.into_raw()
+            }
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn hk_transaction_commit(engine: *mut HK_Engine, tx: *mut HK_Transaction) -> i32 {
     safety_shield!(-1, {
@@ -3699,10 +4350,9 @@ pub extern "C" fn hk_transaction_commit(engine: *mut HK_Engine, tx: *mut HK_Tran
 
         match tx.tx.commit(&engine.db) {
             Ok(_) => 0,
-            Err(e) => {
-                set_last_error_err(e.to_string());
-                -1 // or ptr::null_mut() depending on function return type
-            }
+            // Typed payload keeps the retry classification (issue #71/F5):
+            // commit conflicts must arrive as kind 2, not generic.
+            Err(e) => set_last_error_err(e),
         }
     })
 }
