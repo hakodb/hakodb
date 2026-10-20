@@ -105,6 +105,62 @@ fn shapes_match_serde() {
 }
 
 #[test]
+fn long_runs_match_serde() {
+    // Multi-KB clean runs split by escapes at irregular offsets: exercises
+    // the bulk-copy path (one append per run) against serde's own writer.
+    let mut s = String::new();
+    for i in 0..5000 {
+        s.push('a');
+        if i % 97 == 0 {
+            s.push('"');
+        }
+        if i % 149 == 0 {
+            s.push('\n');
+        }
+        if i % 211 == 0 {
+            s.push('\u{1}');
+        }
+        if i % 307 == 0 {
+            s.push('😀');
+        }
+        if i % 401 == 0 {
+            s.push('\\');
+        }
+    }
+    assert!(s.len() > 4096);
+    check(&doc_with_time(
+        vec![
+            ("body", Value::String(s)),
+            ("bin", Value::Binary((0..=255).collect())),
+        ],
+        11,
+    ));
+    // Escapes hugging both ends of a long run (run-start / run-end edges).
+    check(&doc_with_time(
+        vec![(
+            "edge",
+            Value::String(format!("\"\\\n{}{}", "x".repeat(5000), "\t\x00\"")),
+        )],
+        12,
+    ));
+}
+
+#[test]
+fn escapes_at_every_lane_offset() {
+    // SWAR skip works 8 bytes at a time; place each escape byte at every
+    // lane offset (and in the tail) so a missed lane fails loudly.
+    let specials = ['"', '\\', '\n', '\r', '\t', '\u{8}', '\u{c}', '\u{0}', '\u{1f}'];
+    for &c in &specials {
+        for off in 0..=16usize {
+            let mut s = "a".repeat(off);
+            s.push(c);
+            s.push_str(&"b".repeat(20));
+            check(&doc_with_time(vec![("k", Value::String(s))], 1));
+        }
+    }
+}
+
+#[test]
 fn writer_appends_to_existing_buffer() {
     let d = doc_with_time(vec![("a", Value::Int(1))], 5);
     let mut out = b"prefix:".to_vec();

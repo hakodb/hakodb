@@ -242,72 +242,6 @@ impl HakoDoc {
         out
     }
 
-    /// Crossover (bytes): a single String/Binary run longer than this emits
-    /// faster via serde's SIMD scan than the write_json byte-loop. Duel
-    /// bench `json_emit` pins both sides: 250 B ties (either arm within
-    /// 10%), 7 KB differs 2.8x in serde's favor, everything smaller favors
-    /// write_json up to 5.7x. 512 sits in the empty middle with 2x+ margins.
-    pub const JSON_EMIT_BUDGET: usize = 512;
-
-    /// Adaptive JSON emit, byte-identical to [`Self::to_json_bytes`] either
-    /// way. Walks value tags only (length reads, no byte scan, early-out
-    /// past budget: ~100-300 ns vs µs-scale emits), then takes the faster
-    /// arm. Non-finite floats can make serde fail where write_json emits
-    /// null — the fallback keeps totality (same bytes as before).
-    pub fn to_json_bytes_auto(&self) -> Vec<u8> {
-        if self.max_blob_run() > Self::JSON_EMIT_BUDGET {
-            let dom = self.to_json();
-            serde_json::to_vec(&dom).unwrap_or_else(|_| self.to_json_bytes())
-        } else {
-            self.to_json_bytes()
-        }
-    }
-
-    /// Longest single String/Binary run anywhere in the doc (early-out past
-    /// budget — the common small-doc case walks every tag once, ~ns each).
-    fn max_blob_run(&self) -> usize {
-        fn run_in_value(v: &Value, best: &mut usize) {
-            match v {
-                Value::String(s) => {
-                    if s.len() > *best {
-                        *best = s.len();
-                    }
-                }
-                Value::Binary(b) => {
-                    // itoa-per-byte is even slower than string escaping.
-                    if b.len() > *best {
-                        *best = b.len();
-                    }
-                }
-                Value::Array(items) => {
-                    for item in items {
-                        run_in_value(item, best);
-                        if *best > HakoDoc::JSON_EMIT_BUDGET {
-                            return;
-                        }
-                    }
-                }
-                Value::Map(fields) => {
-                    for (_, fv) in fields {
-                        run_in_value(fv, best);
-                        if *best > HakoDoc::JSON_EMIT_BUDGET {
-                            return;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut best = 0;
-        for (_, v) in &self.fields {
-            run_in_value(v, &mut best);
-            if best > Self::JSON_EMIT_BUDGET {
-                break;
-            }
-        }
-        best
-    }
-
 /// JSON string escaping, byte-identical to serde_json: `"`, `\` and
 /// U+0000–U+001F escape (`\b \f \n \r \t` short, rest `\u00XX` lowercase);
 /// all other bytes (including multi-byte UTF-8, never split: only ASCII
@@ -320,24 +254,81 @@ fn write_json_str(out: &mut Vec<u8>, s: &str) {
 
 /// Escaping core without quotes (lets Reference write `col/id` under one
 /// open quote — byte-identical to escaping the joined string).
+///
+/// Runs of clean bytes are copied in bulk (`extend_from_slice`), one append
+/// per escape instead of one per byte. Same shape as serde_json's
+/// `format_escaped_str_contents`, which is why the old 512 B crossover arm
+/// (whole-doc serde DOM fallback) is gone: this loop is fast at every size.
 fn write_json_raw(out: &mut Vec<u8>, s: &str) {
-    for &b in s.as_bytes() {
-        match b {
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            b'\n' => out.extend_from_slice(b"\\n"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            b'\t' => out.extend_from_slice(b"\\t"),
-            0x08 => out.extend_from_slice(b"\\b"),
-            0x0C => out.extend_from_slice(b"\\f"),
-            0x00..=0x1F => {
-                out.extend_from_slice(b"\\u00");
-                out.push(b"0123456789abcdef"[(b >> 4) as usize]);
-                out.push(b"0123456789abcdef"[(b & 0xF) as usize]);
+    /// Escape byte to emit after `\`; `0` = clean, `u` = `\u00XX`.
+    const ESCAPE: [u8; 256] = {
+        let mut t = [0u8; 256];
+        let mut i = 0usize;
+        while i < 0x20 {
+            t[i] = b'u';
+            i += 1;
+        }
+        t[0x08] = b'b';
+        t[0x09] = b't';
+        t[0x0A] = b'n';
+        t[0x0C] = b'f';
+        t[0x0D] = b'r';
+        t[b'"' as usize] = b'"';
+        t[b'\\' as usize] = b'\\';
+        t
+    };
+    let bytes = s.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Clean runs are the norm: skip 8 bytes at a time (SWAR) before
+        // paying for the per-byte table lookup.
+        if i + 8 <= bytes.len() {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&bytes[i..i + 8]);
+            if !Self::needs_escape(u64::from_le_bytes(w)) {
+                i += 8;
+                continue;
             }
-            _ => out.push(b),
+        }
+        let b = bytes[i];
+        let esc = ESCAPE[b as usize];
+        if esc == 0 {
+            i += 1;
+            continue;
+        }
+        if start < i {
+            out.extend_from_slice(&bytes[start..i]);
+        }
+        i += 1;
+        start = i;
+        out.push(b'\\');
+        if esc == b'u' {
+            out.extend_from_slice(b"u00");
+            out.push(b"0123456789abcdef"[(b >> 4) as usize]);
+            out.push(b"0123456789abcdef"[(b & 0xF) as usize]);
+        } else {
+            out.push(esc);
         }
     }
+    if start < bytes.len() {
+        out.extend_from_slice(&bytes[start..]);
+    }
+}
+
+/// True iff any byte of `w` needs JSON escaping: `< 0x20`, `"` or `\`.
+/// SWAR (Hacker's Delight hasless/haszero): boolean-exact, may set extra
+/// lanes on borrow but never misses — callers only use it to skip 8 clean
+/// bytes, then fall back to the exact table lookup.
+#[inline]
+fn needs_escape(w: u64) -> bool {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let lt_0x20 = w.wrapping_sub(ONES.wrapping_mul(0x20)) & !w & HIGH;
+    let q = w ^ ONES.wrapping_mul(0x22);
+    let s = w ^ ONES.wrapping_mul(0x5C);
+    let eq = ((q.wrapping_sub(ONES)) & !q & HIGH) | ((s.wrapping_sub(ONES)) & !s & HIGH);
+    (lt_0x20 | eq) != 0
 }
 
 fn push_int(out: &mut Vec<u8>, n: i64) {

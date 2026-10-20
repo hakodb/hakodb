@@ -303,8 +303,9 @@ fn bench_query_offset_big(c: &mut Criterion) {
 
 // ---------------------------------------------------------------------------
 // 7. JSON emit duel: write_json (single-pass, no DOM) vs to_json + serde
-//    to_vec (DOM + SIMD emit). Four shapes — the winner depends on the
-//    shape, so both stay until the data says otherwise (see 0.9.4 notes).
+//    to_vec (DOM + serde emit). Both arms stay as a tripwire: the writer
+//    now wins every shape (bulk-copied clean runs + SWAR 8-byte skip), so
+//    a serde win here means the writer regressed.
 // ---------------------------------------------------------------------------
 
 fn shape_small() -> HakoDoc {
