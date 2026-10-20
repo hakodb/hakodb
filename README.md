@@ -2,7 +2,7 @@
 
 **Embedded document database with native vector + graph search and multi-plane sync, written in Rust.**
 
-Stores typed JSON-like documents in binary form, runs **fully in-process** like SQLite (no server, no daemon), and exposes a **flat C ABI** (`hakodb.h`, generated per-target by the build) so any language can embed it. SDKs (Go, JS/TS, Pascal, Tauri, HTTP backend) live in their own repos under the [`hakodb`](https://github.com/hakodb) organization.
+Stores typed JSON-like documents in binary form, runs **fully in-process** like SQLite (no server, no daemon), and exposes a **flat C ABI** (`hakodb.h`, generated per-target by the build) so any language can embed it. SDKs (Go, JS/TS, Pascal, Tauri, HTTP backend) and the [`hakomcp`](https://github.com/hakodb/hakomcp) MCP server live in their own repos under the [`hakodb`](https://github.com/hakodb) organization.
 
 ## What is HakoDB?
 
