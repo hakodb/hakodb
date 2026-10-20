@@ -20,7 +20,7 @@ use std::sync::atomic::Ordering;
 
 use crate::document::hako_doc::HakoDoc;
 use crate::document::value::Value;
-use crate::engine::engine::{IndexList, IndexOp};
+use crate::engine::engine::IndexList;
 use crate::engine::{ChangeEvent, ChangeKind, Hako};
 use crate::storage::blob::BlobWork;
 use crate::storage::engine::{Pointer, StorageEngine};
@@ -260,11 +260,7 @@ pub async fn apply_replicated_batch(
 
     if !index_docs.is_empty() {
         // Send the batch to the persistent index worker.
-        let _ = db.index_tx.send(IndexOp::Update {
-            collection: collection.clone(),
-            puts: Arc::new(index_docs),
-            deletes: vec![],
-        });
+        db.enqueue_index_update(collection.clone(), Arc::new(index_docs), vec![]);
     }
 
     // 5. PHASE 5: notify watchers (the tailer skips re-broadcast:

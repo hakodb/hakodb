@@ -578,6 +578,9 @@ pub(crate) enum IndexOp {
         // puts: Arc<Vec<(String, HakoDoc)>>, 
         puts: Arc<Vec<(String, Arc<HakoDoc>)>>, 
         deletes: Vec<(String, HakoDoc)>,
+        /// Per-collection count carried with the op: the query gate reads
+        /// it without locking the worker or the global counter.
+        pending: Arc<AtomicUsize>,
     },
 }
 
@@ -665,6 +668,11 @@ pub struct Hako {
     /// ponytail: ops sent to the async index worker but not yet applied.
     /// Quiescence reads this instead of channel len (std mpsc has none).
     pub(crate) index_inflight: Arc<std::sync::atomic::AtomicUsize>,
+    /// Per-collection pending IndexOps. A write in collection A must not
+    /// force a full scan in collection B; the global counter remains for
+    /// quiescence. Entries stay at zero after drain (bounded by collections)
+    /// so a concurrent enqueue can never race a map removal.
+    index_inflight_by_collection: Arc<RwLock<HashMap<String, Arc<AtomicUsize>>>>,
     /// ponytail: create_*_index backfill threads in flight (one per index
     /// build over existing docs). Quiescence covers these too â€” an index
     /// that exists-but-is-backfilling otherwise serves partial results
@@ -876,6 +884,8 @@ impl Hako {
 
         // --- WORKER 1: PERSISTENT INDEX WORKER ---
         let index_inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let index_inflight_by_collection =
+            Arc::new(RwLock::new(HashMap::<String, Arc<AtomicUsize>>::new()));
         let idx_clone = Arc::clone(&indexes);
         let index_inflight_worker = Arc::clone(&index_inflight);
         let storage_persist = Arc::clone(&index_storage);
@@ -886,7 +896,7 @@ impl Hako {
         thread::spawn(move || {
             while let Ok(op) = index_rx.recv() {
                 match op {
-                    IndexOp::Update { collection, puts, deletes } => {
+                    IndexOp::Update { collection, puts, deletes, pending } => {
                         // P2: blob-resident embeddings must be durable
                         // BEFORE the indexer resolves them â€” blob puts
                         // land in an async flush queue, so resolving
@@ -984,10 +994,11 @@ impl Hako {
                         }
                         // Physically flush the Composite Index buffer to disk so queries find it instantly
                         let _ = persist.flush_log();
+                        pending.fetch_sub(1, Ordering::AcqRel);
+                        index_inflight_worker.fetch_sub(1, Ordering::Relaxed);
                     }
 
                 }
-                index_inflight_worker.fetch_sub(1, Ordering::Relaxed);
             }
         });
 
@@ -1224,6 +1235,7 @@ impl Hako {
             audit_tx,
             index_tx,
             index_inflight,
+            index_inflight_by_collection,
             backfill_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             backfill_progress: Arc::new(Mutex::new(HashMap::new())),
             index_touched: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -2280,14 +2292,11 @@ impl Hako {
                 // before send; the worker drops it after applying. A failed
                 // send (worker gone) refunds immediately so the counter
                 // can't wedge the quiescence verdict.
-                self.index_inflight.fetch_add(1, Ordering::Relaxed);
-                if self.index_tx.send(IndexOp::Update {
-                    collection: col_name,
-                    puts: Arc::new(work.index_puts),
-                    deletes: work.index_deletes
-                }).is_err() {
-                    self.index_inflight.fetch_sub(1, Ordering::Relaxed);
-                }
+                self.enqueue_index_update(
+                    col_name,
+                    Arc::new(work.index_puts),
+                    work.index_deletes,
+                );
             }
             WRITE_STATS.index_send_ns.fetch_add(t_idx.elapsed().as_nanos() as u64, Ordering::Relaxed);
             
@@ -2539,18 +2548,11 @@ impl Hako {
             if let Ok(mut touched) = self.index_touched.lock() {
                 touched.insert(dst.to_string());
             }
-            self.index_inflight.fetch_add(1, Ordering::Relaxed);
-            if self
-                .index_tx
-                .send(IndexOp::Update {
-                    collection: dst.to_string(),
-                    puts: Arc::new(vec![(id.clone(), Arc::clone(&doc_arc))]),
-                    deletes: vec![],
-                })
-                .is_err()
-            {
-                self.index_inflight.fetch_sub(1, Ordering::Relaxed);
-            }
+            self.enqueue_index_update(
+                dst.to_string(),
+                Arc::new(vec![(id.clone(), Arc::clone(&doc_arc))]),
+                vec![],
+            );
             {
                 let mut cache = self.doc_cache.write().unwrap();
                 if !cache.is_empty() {
@@ -3068,7 +3070,7 @@ impl Hako {
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
 
-        let is_ready = self.index_query_ready();
+        let is_ready = self.index_query_ready(&query.collection);
         let vec_ready = self.vector_query_ready();
 
         let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
@@ -3116,7 +3118,7 @@ impl Hako {
         let shard_arc = self.get_shard(&query.collection)?;
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
-        let is_ready = self.index_query_ready();
+        let is_ready = self.index_query_ready(&query.collection);
         let vec_ready = self.vector_query_ready();
         let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
         Ok((*plan).clone())
@@ -3133,7 +3135,7 @@ impl Hako {
         let shard_arc = self.get_shard(&query.collection)?;
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
-        let is_ready = self.index_query_ready();
+        let is_ready = self.index_query_ready(&query.collection);
         let vec_ready = self.vector_query_ready();
         let plan = self.plan_cache.get_or_compute(
             &query,
@@ -3279,7 +3281,7 @@ impl Hako {
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
 
-        let is_ready = self.index_query_ready();
+        let is_ready = self.index_query_ready(&query.collection);
         let vec_ready = self.vector_query_ready();
 
         let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
@@ -3314,7 +3316,7 @@ impl Hako {
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
 
-        let is_ready = self.index_query_ready();
+        let is_ready = self.index_query_ready(&query.collection);
         let vec_ready = self.vector_query_ready();
 
         let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
@@ -3347,7 +3349,7 @@ impl Hako {
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
 
-        let is_ready = self.index_query_ready();
+        let is_ready = self.index_query_ready(&query.collection);
         let vec_ready = self.vector_query_ready();
 
         let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
@@ -3381,7 +3383,7 @@ impl Hako {
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
 
-        let is_ready = self.index_query_ready();
+        let is_ready = self.index_query_ready(&query.collection);
         let vec_ready = self.vector_query_ready();
         let plan = self.plan_cache.get_or_compute(&q, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
 
@@ -3642,7 +3644,7 @@ impl Hako {
     /// path costs the same as the former in-tree call â€” only the location
     /// moved, not the complexity.
     pub fn plan_for_watch(&self, query: &crate::query::query::Query) -> crate::query::plan::QueryPlan {        let indexes = self.indexes.read().unwrap();
-        let is_ready = self.index_query_ready();
+        let is_ready = self.index_query_ready(&query.collection);
         let vec_ready = self.vector_query_ready();
         crate::query::planner::QueryPlanner::plan(query, &indexes, 0, 1, is_ready, vec_ready)
     }
@@ -3922,7 +3924,7 @@ impl Hako {
             .unwrap()
             .count_prefix("");
 
-        let is_ready = self.index_query_ready();
+        let is_ready = self.index_query_ready(&query.collection);
         let vec_ready = self.vector_query_ready();
         // FIX: Add self.config.query_workers as the 4th argument
         let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
@@ -5457,16 +5459,61 @@ impl Hako {
     /// instead. The plan cache is invalidated at index creation, so no
     /// stale fast plan survives into the build window (a slow plan cached
     /// during the window self-heals at TTL).
-    pub(crate) fn index_query_ready(&self) -> bool {
+    pub(crate) fn index_query_ready(&self, collection: &str) -> bool {
         self.indexes_ready.load(std::sync::atomic::Ordering::Acquire)
             && self.backfill_inflight.load(std::sync::atomic::Ordering::Acquire) == 0
             // Pending IndexOps (hakodb#71 BUG-2, report from box fkip-234):
             // a write returns Ok after enqueueing its index update; a query
             // that lets the planner trust a composite/secondary tree before
-            // the worker applied the ops loses read-your-writes. Pending
-            // ops => full-scan lane (correct, incremental cost only until
-            // the queue drains).
-            && self.index_inflight.load(std::sync::atomic::Ordering::Acquire) == 0
+            // the worker applied the ops loses read-your-writes. Scope the
+            // fallback to the written collection: a pending write in `hot`
+            // must not force `cold` onto FullCollection.
+            && self
+                .index_inflight_by_collection
+                .read()
+                .map(|m| {
+                    m.get(collection)
+                        .map_or(true, |p| p.load(Ordering::Acquire) == 0)
+                })
+                .unwrap_or(false)
+    }
+
+    /// Queue one index update and account it globally (quiescence) and per
+    /// collection (planner gate). The op carries the per-collection counter
+    /// so the worker never needs a map lock; a failed send refunds both.
+    pub(crate) fn enqueue_index_update(
+        &self,
+        collection: String,
+        puts: Arc<Vec<(String, Arc<HakoDoc>)>>,
+        deletes: Vec<(String, HakoDoc)>,
+    ) -> bool {
+        if puts.is_empty() && deletes.is_empty() {
+            return true;
+        }
+        let pending = {
+            let mut map = self.index_inflight_by_collection.write().unwrap();
+            Arc::clone(
+                map.entry(collection.clone())
+                    .or_insert_with(|| Arc::new(AtomicUsize::new(0))),
+            )
+        };
+        pending.fetch_add(1, Ordering::AcqRel);
+        self.index_inflight.fetch_add(1, Ordering::AcqRel);
+        if self
+            .index_tx
+            .send(IndexOp::Update {
+                collection,
+                puts,
+                deletes,
+                pending: Arc::clone(&pending),
+            })
+            .is_err()
+        {
+            pending.fetch_sub(1, Ordering::AcqRel);
+            self.index_inflight.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+        true
     }
 
     /// Vector planning keeps the backfill gate but drops the pending IndexOps
@@ -6343,6 +6390,48 @@ mod profile_tests {
         let back = db.get("archive", "a2").expect("get").expect("reloaded");
         assert_eq!(back.get("kind"), Some(&Value::String("memo".into())));
         std::fs::remove_dir_all(&bdir).ok();
+        drop(db);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pending index op is scoped to its collection: `cold` must stay on
+    /// its index while `hot` waits for the worker. The write lock blocks the
+    /// worker before it applies, making the window deterministic.
+    #[test]
+    fn index_readiness_is_collection_scoped() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("fl-idxscope-{nanos}"));
+        let mut cfg = HakoConfig::default();
+        cfg.durability_mode = DurabilityMode::Manual;
+        let db = Hako::open(&dir, cfg).expect("open");
+        assert!(
+            db.await_quiescent(std::time::Duration::from_secs(30)),
+            "initial quiescence"
+        );
+
+        let mut doc = HakoDoc::default();
+        doc.insert("v", Value::Int(1));
+        let indexes_guard = db.indexes.write().unwrap();
+        assert!(db.enqueue_index_update(
+            "hot".into(),
+            Arc::new(vec![("d1".into(), Arc::new(doc))]),
+            vec![],
+        ));
+        assert!(
+            db.index_query_ready("cold"),
+            "cold inherited hot's pending index op"
+        );
+        assert!(
+            !db.index_query_ready("hot"),
+            "hot planned before its index op applied"
+        );
+        drop(indexes_guard);
+
+        assert!(db.await_quiescent(std::time::Duration::from_secs(30)));
+        assert!(db.index_query_ready("hot"));
         drop(db);
         std::fs::remove_dir_all(&dir).ok();
     }
