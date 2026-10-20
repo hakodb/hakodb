@@ -652,6 +652,13 @@ pub struct Hako {
     /// window, so writes consult this instead. Derived/rebuildable from
     /// storage (trees + recovery fold); WAL stays the durability source.
     pub(crate) unique_ledger: std::sync::Arc<crate::index::composite::ledger::UniqueLedger>,
+    /// Cached unique-index defs per collection (hakodb#71). The gate used
+    /// to take `indexes.read()` once per batch, which starves behind the
+    /// indexer's writer lock (std RwLock is write-preferring): ~35us per
+    /// 10-doc batch on the bench box. This cache is written only when
+    /// composite defs change (create / drop_collection / restore), so the
+    /// per-batch read stays uncontended.
+    gate_cache: RwLock<HashMap<String, Arc<Vec<GateDef>>>>,
     /// Optional per-collection schemas (hakodb#71/F8). Empty by default;
     /// `schema_enabled` is the lock-free gate so schemaless deployments pay
     /// no RwLock on the write path. Persisted to `_indices/schemas.json`
@@ -1170,6 +1177,7 @@ impl Hako {
             local_only_cols: RwLock::new(HashSet::new()),
             local_only_keys: RwLock::new(HashSet::new()),
             unique_ledger: std::sync::Arc::new(crate::index::composite::ledger::UniqueLedger::default()),
+            gate_cache: RwLock::new(HashMap::new()),
             schemas: RwLock::new(HashMap::new()),
             schema_enabled: std::sync::atomic::AtomicBool::new(false),
         };
@@ -2258,15 +2266,31 @@ impl Hako {
             return cached.clone();
         }
         let defs: Vec<GateDef> = {
-            let mgr = self.indexes.read().unwrap();
-            mgr.composite
-                .indexes_for_collection(col)
-                .filter(|i| i.definition.unique)
-                .map(|i| GateDef {
-                    index_id: i.definition.id,
-                    def: i.definition.clone(),
-                })
-                .collect()
+            let cache = self.gate_cache.read().unwrap();
+            match cache.get(col) {
+                // Clone of Arc, then of the (usually empty) Vec: an empty
+                // defs list is the common case, no lock on `indexes`.
+                Some(cached) => (**cached).clone(),
+                None => {
+                    drop(cache);
+                    let defs: Vec<GateDef> = {
+                        let mgr = self.indexes.read().unwrap();
+                        mgr.composite
+                            .indexes_for_collection(col)
+                            .filter(|i| i.definition.unique)
+                            .map(|i| GateDef {
+                                index_id: i.definition.id,
+                                def: i.definition.clone(),
+                            })
+                            .collect()
+                    };
+                    self.gate_cache
+                        .write()
+                        .unwrap()
+                        .insert(col.to_string(), Arc::new(defs.clone()));
+                    defs
+                }
+            }
         };
         memo.insert(col.to_string(), defs.clone());
         defs
@@ -2818,6 +2842,7 @@ impl Hako {
                 self.unique_ledger.reset(id);
             }
         }
+        self.gate_cache.write().unwrap().clear();
         self.persist_index_defs()?;
         // F8: a dropped collection's schema goes with its defs.
         {
@@ -3970,6 +3995,9 @@ impl Hako {
             }
         }
         
+        drop(mgr);
+        self.gate_cache.write().unwrap().clear();
+
         // NO persist_index_defs() call here. We just loaded what was already on disk.
         Ok(())
     }
@@ -4941,6 +4969,10 @@ impl Hako {
             .with_fields(fields)
             .with_constraints(unique, sparse, filter);
         let index_id = self.indexes.write().unwrap().create_index(def);
+        // Publish the new def to the admission gate before backfill: a
+        // batch landing mid-backfill must see `!ledger.is_ready` and
+        // reject instead of writing past a unique constraint.
+        self.gate_cache.write().unwrap().clear();
 
         let shard_arc = self.get_shard(col)?;
         if !unique {
@@ -4960,6 +4992,7 @@ impl Hako {
                 // Roll the not-ready def back: tree registration gone,
                 // ledger never went live, defs re-persisted without it.
                 self.indexes.write().unwrap().composite.drop_index(index_id);
+                self.gate_cache.write().unwrap().clear();
                 self.unique_ledger.reset(index_id);
                 let _ = self.persist_index_defs();
                 self.plan_cache.invalidate();
