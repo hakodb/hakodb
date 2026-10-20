@@ -45,6 +45,7 @@ operator-driven.
 Writer pod:
 
 ```toml
+server_id = "hako-writer-0"
 rooms_dir = "./wrooms"
 admin_bind = "0.0.0.0:8301"
 
@@ -59,6 +60,7 @@ mesh_bind = "0.0.0.0:9101"   # replicas dial this
 Replica pod:
 
 ```toml
+server_id = "hako-replica-0"
 rooms_dir = "./rrooms"
 admin_bind = "0.0.0.0:8302"
 
@@ -73,6 +75,9 @@ read_only = true
 
 Validation is fail-closed:
 
+- Every pod needs a distinct `server_id`. The mesh node id is
+  `<server_id>-<room>-<role>`; duplicate ids collide in the writer's peer
+  map, so two replicas evict each other's connection and reconnect-loop.
 - `read_only = true` without `mesh_peers` refuses to boot (a replica with
   no writer would stay silently empty).
 - A read-only room may not declare `mesh_bind` (replicas dial; they are
@@ -98,12 +103,16 @@ zero behavior change).
   `/api/health` lists rooms; readiness may additionally check
   `NetSyncer::status()` (peer_count / status) via a future admin exposing
   mesh state — deliverable listed in #74.
-- **Failover (manual)**: pick a replica, flip its config into writer
-  form (`read_only = false`, `mesh_bind = ...`), flip the old writer into
-  replica form pointing at the new writer's mesh address, restart both.
-  Clients reconnect to whatever Service route they have; catch-ups just
-  re-sync from the new state — the engine's epoch/last-write-timestamp
-  semantics (handshake + VersionPing) keep ordering consistent.
+- **Failover (manual)**: stop the old writer, flip one replica into
+  writer form (`read_only = false`, `mesh_bind = ...`), restart it, then
+  restart the old writer as a read-only replica pointed at the new
+  writer's mesh address. The demoted writer keeps its WAL; on connect it
+  bootstraps from the new writer, applies newer writes and tombstones
+  (a doc deleted on the new writer stays deleted), and converges. Give
+  every pod a distinct `server_id` (see Config). Clients reconnect to
+  whatever Service route they have; catch-ups just re-sync from the new
+  state — the engine's epoch/last-write-timestamp semantics (handshake +
+  VersionPing) keep ordering consistent.
 
 ## Ops notes
 
@@ -114,6 +123,20 @@ zero behavior change).
   by a lagging replica gives slightly older data. Eventual-gather clients
   converge on the next VersionPing cycle; this is the tradeoff for
   `write once → read everywhere`.
+- Read-only replicas only ingest. They never serve a bootstrap snapshot or
+  fan out their own WAL; a demoted writer still holds a full snapshot, and
+  two simultaneous full sends fill both socket buffers and deadlock the
+  handshake. `sync_checkpoint` is a local write and is therefore blocked
+  on a read-only replica, so promotion starts at offset 0 and re-reads the
+  WAL; the #80 tail clamp covers a stale checkpoint past the current WAL.
+- `/api/compact` is a no-op below `auto_compaction_threshold_bytes`
+  (8 MiB default). A 5k-doc / ~1.6 MB WAL stays put, so compare doc counts
+  and query results, not WAL byte sizes.
+- `docker stop` on 0.16.5 still exits 137 after the timeout (no graceful
+  SIGTERM path was observed). The WAL replayed cleanly after the restart,
+  but treat shutdown as a crash: promote only after the new writer is
+  healthy, and keep the old writer stopped until you start it as a
+  read-only replica.
 - Multicast (`mDNS`/broadcast discovery) is OFF for mesh-wired rooms:
   container networks don't carry it and turning it off removes an entire
   failure class. Desktop LAN groups keep normal discovery — this mode is
