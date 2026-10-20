@@ -312,6 +312,9 @@ impl Wal {
             // Write to OS buffer but skip the expensive physical disk flip (fsync)
             self.file.write_all(&self.write_buffer)?;
             self.write_buffer.clear();
+            // data_len is the "real records" watermark tail() clamps against,
+            // so it must track remote writes too even though we skipped fsync.
+            self.data_len = self.file.stream_position()?;
             return Ok(());
         }
 
@@ -599,15 +602,26 @@ impl Wal {
         let file = File::open(&self.path)?;
         let file_len = file.metadata()?.len();
 
-        if start_offset >= file_len {
+        // A reset/rewrite truncates the records but may leave preallocated
+        // file_len; a tailer holding an offset from the old WAL would sit on
+        // zero padding forever (callers only advance on non-empty ops).
+        // Re-read the rebuilt WAL once instead. LWW + echo dedupe make the
+        // replay safe; `>` keeps the normal caught-up case off the slow path.
+        let start = if start_offset > self.data_len {
+            0
+        } else {
+            start_offset
+        };
+
+        if start >= file_len {
             return Ok((vec![], file_len));
         }
 
         let mut reader = BufReader::new(file);
         let mut ops = Vec::new();
-        let mut current_pos = start_offset;
-        // Skip to start_offset on the fresh handle (its cursor is ours alone).
-        reader.seek(SeekFrom::Start(start_offset))?;
+        let mut current_pos = start;
+        // Skip to start on the fresh handle (its cursor is ours alone).
+        reader.seek(SeekFrom::Start(start))?;
 
         loop {
             let mut header = [0u8; 8];
@@ -1086,6 +1100,95 @@ mod tests {
 
         drop(wal);
         drop(wal2);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    /// #80: rewrite/reset leaves tailers with offsets from the old WAL. If
+    /// preallocation keeps file_len large, seeking to that offset lands on
+    /// zero padding and tail() returned empty forever.
+    #[test]
+    fn tail_resyncs_after_reset() {
+        let path = std::env::temp_dir().join(format!(
+            "hako-wal-tail-reset-{}.log",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+
+        let reserve = 64 * 1024;
+        let mut wal = Wal::open(&path, DurabilityMode::Always, 100, None, reserve).expect("open");
+        wal.append(
+            &WalOp::PutInlined {
+                key: "before".into(),
+                value: vec![1u8; 1024],
+            },
+            false,
+        )
+        .expect("before");
+        let stale_offset = wal.data_len();
+        assert!(wal.file_len() > stale_offset, "preallocation keeps EOF ahead");
+
+        wal.reset().expect("reset");
+        wal.append(
+            &WalOp::PutInlined {
+                key: "after".into(),
+                value: vec![2u8; 8],
+            },
+            false,
+        )
+        .expect("after");
+        let new_len = wal.data_len();
+        assert!(
+            stale_offset > new_len,
+            "test must cross the rebuilt boundary ({stale_offset} vs {new_len})"
+        );
+
+        let (ops, new_pos) = wal.tail(stale_offset).expect("tail");
+        assert_eq!(ops.len(), 1, "must replay the rebuilt WAL, got {ops:?}");
+        assert!(
+            matches!(&ops[0], WalOp::PutInlined { key, .. } if key == "after"),
+            "got {:?}",
+            ops[0]
+        );
+        assert_eq!(new_pos, new_len);
+
+        drop(wal);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    /// #80: remote ingest skips fsync but still advances the real-byte
+    /// watermark used by tail()'s stale-offset clamp and snapshot staleness.
+    #[test]
+    fn remote_append_advances_data_len() {
+        let path = std::env::temp_dir().join(format!(
+            "hako-wal-remote-dlen-{}.log",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+
+        let mut wal = Wal::open(&path, DurabilityMode::Manual, 100, None, 0).expect("open");
+        assert_eq!(wal.data_len(), 0);
+        wal.append_batch_fast(
+            1,
+            &[WalOp::PutInlined {
+                key: "remote".into(),
+                value: vec![7u8; 16],
+            }],
+            true,
+        )
+        .expect("remote batch");
+
+        assert!(wal.data_len() > 0, "remote writes count as real bytes");
+        assert_eq!(
+            wal.data_len(),
+            fs::metadata(&path).expect("meta").len(),
+            "no reservation here, so data_len is the file length"
+        );
+
+        drop(wal);
         fs::remove_file(path).expect("cleanup");
     }
 }
