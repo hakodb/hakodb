@@ -19,7 +19,12 @@ use crate::document::value::Value;
 use crate::error::{HakoError, Result};
 
 /// Declared type of a schema field.
+///
+/// Wire/storage names are lower-case (`"string"`, `"int"`, ...) because the
+/// C ABI accepts this JSON verbatim; F8 had not shipped when the spelling
+/// was fixed, so there is no legacy on-disk format to preserve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum FieldKind {
     String,
     Int,
@@ -71,6 +76,7 @@ impl FieldKind {
 pub struct FieldRule {
     pub name: String,
     pub kind: FieldKind,
+    #[serde(default)]
     pub required: bool,
     #[serde(default)]
     pub default: Option<Value>,
@@ -95,6 +101,7 @@ impl FieldRule {
 /// Declaration for one collection. Empty `fields` = no constraints.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CollectionSchema {
+    #[serde(default)]
     pub fields: Vec<FieldRule>,
 }
 

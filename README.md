@@ -90,7 +90,7 @@ guarantee. If the invariant matters, re-check the affected docs with
 
 ## C ABI (multi-language)
 
-Flat C API over opaque handles (`HK_Engine`, `HK_Doc`, `HK_Query`, `HK_Pipeline`, `HK_Batch`, `HK_Transaction`, `HK_Watch`, `HK_ResultSet`, sync handles): CRUD, batches, transactions (typed retry codes), queries (dotted paths, `elemMatch`, `explain`), aggregation pipelines, watch, result sets, sync. Build outputs: `target/release/libhakodb.so` (Linux), `.dylib` (macOS), `hakodb.dll` (Windows) + per-target `hakodb.h`.
+Flat C API over opaque handles (`HK_Engine`, `HK_Doc`, `HK_Query`, `HK_Pipeline`, `HK_Batch`, `HK_Transaction`, `HK_Watch`, `HK_ResultSet`, sync handles): CRUD, batches, transactions (typed retry codes), queries (dotted paths, `elemMatch`, `explain`), aggregation pipelines, optional per-collection schemas, watch, result sets, sync. Build outputs: `target/release/libhakodb.so` (Linux), `.dylib` (macOS), `hakodb.dll` (Windows) + per-target `hakodb.h`.
 
 ```bash
 cargo build --release                                   # full (sync + compression)

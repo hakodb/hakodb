@@ -3875,6 +3875,144 @@ pub extern "C" fn hk_engine_list_indexes(
     })
 }
 
+// --- PER-COLLECTION SCHEMAS (F8) ---
+//
+// JSON shape mirrors `crate::schema::CollectionSchema`:
+//   {"fields":[{"name":"status","kind":"string","required":true,
+//               "default":"paid"}]}
+// `kind` is one of string/int/float/bool/null/array/map/bytes/timestamp/any.
+// Declared fields are top-level only; undeclared fields stay free. The write
+// gate returns ErrorKind 4 (ConstraintMismatch) on a violation.
+
+/// Declare or replace a collection schema. `schema_json` is parsed by serde;
+/// an empty `{"fields":[]}` clears the schema (same as `clear`). Returns 0 on
+/// success, -1 on error (typed error available via `hk_error_last_kind`).
+#[no_mangle]
+pub extern "C" fn hk_engine_set_schema(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    schema_json: *const c_char,
+) -> i32 {
+    safety_shield!(-1, {
+        if engine.is_null() {
+            return set_last_error_err("null engine handle");
+        }
+        let collection = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => return set_last_error_err(e),
+        };
+        let raw = match cstr_to_string(schema_json) {
+            Ok(v) => v,
+            Err(e) => return set_last_error_err(e),
+        };
+        let schema: crate::schema::CollectionSchema = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => return set_last_error_err(format!("invalid schema JSON: {e}")),
+        };
+        let engine = unsafe { &*engine };
+        match engine.db.set_schema(&collection, schema) {
+            Ok(()) => {
+                clear_last_error();
+                0
+            }
+            Err(e) => set_last_error_err(e),
+        }
+    })
+}
+
+/// Return the collection's schema as JSON, or NULL when the collection has no
+/// schema. NULL is not an error in that case (`hk_last_error` stays clear).
+/// Free the returned string with `hk_string_free`.
+#[no_mangle]
+pub extern "C" fn hk_engine_get_schema(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+) -> *mut c_char {
+    safety_shield!(ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error_err("null engine handle");
+            return ptr::null_mut();
+        }
+        let collection = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let engine = unsafe { &*engine };
+        let Some(schema) = engine.db.schema(&collection) else {
+            clear_last_error();
+            return ptr::null_mut();
+        };
+        match serde_json::to_string(&schema)
+            .ok()
+            .and_then(|s| CString::new(s).ok())
+        {
+            Some(json) => {
+                clear_last_error();
+                json.into_raw()
+            }
+            None => {
+                set_last_error_err("failed to encode schema");
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Remove a collection's schema. Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn hk_engine_clear_schema(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+) -> i32 {
+    safety_shield!(-1, {
+        if engine.is_null() {
+            return set_last_error_err("null engine handle");
+        }
+        let collection = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => return set_last_error_err(e),
+        };
+        let engine = unsafe { &*engine };
+        match engine.db.clear_schema(&collection) {
+            Ok(()) => {
+                clear_last_error();
+                0
+            }
+            Err(e) => set_last_error_err(e),
+        }
+    })
+}
+
+/// Return every declared schema as a JSON object keyed by collection name.
+/// Free the returned string with `hk_string_free`.
+#[no_mangle]
+pub extern "C" fn hk_engine_list_schemas(engine: *mut HK_Engine) -> *mut c_char {
+    safety_shield!(ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error_err("null engine handle");
+            return ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let schemas = engine.db.list_schemas();
+        match serde_json::to_string(&schemas)
+            .ok()
+            .and_then(|s| CString::new(s).ok())
+        {
+            Some(json) => {
+                clear_last_error();
+                json.into_raw()
+            }
+            None => {
+                set_last_error_err("failed to encode schemas");
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
 // --- AGGREGATION PIPELINES (F4) ---
 
 #[no_mangle]
