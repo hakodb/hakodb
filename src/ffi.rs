@@ -214,12 +214,26 @@ fn value_to_json(v: &Value) -> serde_json::Value {
 
 fn doc_to_json(doc: &HakoDoc) -> Result<String, String> {
     safety_shield!(Err("Internal Panic".into()), {
-        // Adaptive emit (0.9.4): byte-identical to write_json either way
-        // (same shape WITH `_time`, same contract as below) — serde's SIMD
-        // scan wins past ~512 B single-string runs, the byte-loop wins
-        // below. Duel bench `json_emit` pins both sides of the crossover.
-        let out = doc.to_json_bytes_auto();
+        // Single-pass emit, byte-identical to serde's output (pinned by
+        // tests/json_bytes_parity) with no intermediate serde_json DOM.
+        // Long runs are bulk-copied, so there is no size-crossover arm.
+        let out = doc.to_json_bytes();
         String::from_utf8(out).map_err(|e| e.to_string())
+    })
+}
+
+/// Hot FFI variant of [`doc_to_json`]: same bytes, handed to the caller as a
+/// C string without the UTF-8 validation pass, the interior-NUL scan, and
+/// the extra copy `String` + `CString::new` cost.
+fn doc_to_cstring(doc: &HakoDoc) -> Result<CString, String> {
+    safety_shield!(Err("Internal Panic".into()), {
+        let mut out = doc.to_json_bytes();
+        out.push(0);
+        // SAFETY: `write_json` emits only valid UTF-8 (string values are
+        // `&str`, keys are `&str`, everything else is ASCII) and escapes
+        // every U+0000 as `\u0000`, so the buffer has no interior NUL and
+        // the byte we just appended is the only terminator.
+        Ok(unsafe { CString::from_vec_unchecked(out) })
     })
 }
 
@@ -2595,7 +2609,7 @@ pub extern "C" fn hk_doc_to_json(doc: *const HK_Doc) -> *mut c_char {
     }
 
     let doc = unsafe { &*doc };
-    match doc_to_json(&doc.doc).and_then(|s| CString::new(s).map_err(|e| e.to_string())) {
+    match doc_to_cstring(&doc.doc) {
         Ok(s) => {
             clear_last_error();
             s.into_raw()
