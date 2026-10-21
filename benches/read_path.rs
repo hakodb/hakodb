@@ -9,10 +9,11 @@
 //! - equality query via secondary index                   [query_eq_*]
 //! - composite range query + cursor pagination            [query_composite_*]
 //! - offset pagination (the 5k qps floor from bench)      [query_offset_*]
+//! - covering vs decode projection                        [query_projection_*]
 //!
 //! Run with `cargo bench --bench read_path`.
 //!
-//! Ponytail: 6 benches. No fixture framework, no async, no thread-pool juggling.
+//! Ponytail: 8 benches. No fixture framework, no async, no thread-pool juggling.
 //! Each bench is sub-second on a single core.
 
 use std::time::Duration;
@@ -216,7 +217,6 @@ fn bench_query_offset(c: &mut Criterion) {
 // 5. Cursor pagination — same shape as offset but using start_at. Expected to
 //    be much faster, validates that the BTree-seek path is doing its job.
 // ---------------------------------------------------------------------------
-
 fn bench_query_cursor(c: &mut Criterion) {
     let db = build_engine("qcur");
     let mut group = c.benchmark_group("query_cursor");
@@ -243,7 +243,57 @@ fn bench_query_cursor(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Large offset on 10k docs — the realistic "skip-ahead" case. N=10k means
+// 6. Projection: secondary covering vs decode.
+// ---------------------------------------------------------------------------
+
+fn bench_query_projection(c: &mut Criterion) {
+    let db = build_engine("qproj");
+    let mut q = Query::new("bench");
+    q.filters.push(hakodb::query::filter::Filter {
+        field: "active".into(),
+        op: Operator::Eq,
+        value: Value::Bool(true),
+    });
+    q.limit = Some(50);
+
+    let rep = db
+        .explain_report(q.clone().select_fields(vec!["active".to_string()]))
+        .unwrap();
+    assert!(rep.covering, "bench shape must stay covering: {rep}");
+
+    let mut group = c.benchmark_group("query_projection");
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("secondary_cover", |b| {
+        b.iter(|| {
+            let _ = db
+                .query_projected_zero_copy(q.clone(), &["active".to_string()])
+                .expect("q");
+        });
+    });
+    group.bench_function("secondary_decode", |b| {
+        b.iter(|| {
+            let _ = db
+                .query_projected_zero_copy(
+                    q.clone(),
+                    &["active".to_string(), "description".to_string()],
+                )
+                .expect("q");
+        });
+    });
+    group.bench_function("id_only", |b| {
+        b.iter(|| {
+            let _ = db
+                .query_projected_zero_copy(q.clone(), &["id".to_string()])
+                .expect("q");
+        });
+    });
+    group.finish();
+    drop(db);
+    cleanup("qproj");
+}
+
+// ---------------------------------------------------------------------------
+// 7. Large offset on 10k docs — the realistic "skip-ahead" case. N=10k means
 //    the storage index exceeds page cache and forces the linear-scan path to
 //    actually do work per offset doc.
 // ---------------------------------------------------------------------------
@@ -302,7 +352,7 @@ fn bench_query_offset_big(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. JSON emit duel: write_json (single-pass, no DOM) vs to_json + serde
+// 8. JSON emit duel: write_json (single-pass, no DOM) vs to_json + serde
 //    to_vec (DOM + serde emit). Both arms stay as a tripwire: the writer
 //    now wins every shape (bulk-copied clean runs + SWAR 8-byte skip), so
 //    a serde win here means the writer regressed.
@@ -432,6 +482,7 @@ criterion_group!(
         bench_query_composite,
         bench_query_offset,
         bench_query_cursor,
+        bench_query_projection,
         bench_query_offset_big,
         bench_json_emit,
 );

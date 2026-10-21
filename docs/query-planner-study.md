@@ -1,9 +1,10 @@
 # Query planner and index execution study (issue #22)
 
-Status: study, no implementation. Scope: how plans are chosen and executed on
-the query side. This does not change query semantics or add SQL/joins.
+Status: P0 landed (#104); P1 audit open; P2 items 1-2 landed (secondary
+equality field + `id`-only covering). Scope: how plans are chosen and executed
+on the query side. This does not change query semantics or add SQL/joins.
 
-Current tree: `hakodb` main `ea08078` (0.16.5 plus #98/#99/#100).
+Current tree: `hakodb` main `d4a0e31` (0.16.6 plus #103 P0/P1).
 
 ## 1. What already exists
 
@@ -17,19 +18,22 @@ place:
   early-termination path for unordered/order-satisfied pages. Deep offset with
   a small limit already uses the cheap skip path.
 - `id` order uses the storage `SortedKeys` slice, not an index walk.
-- Covering (`index-only`) reads exist for one shape only: a composite point
-  lookup whose prefix covers every filter, the order, and the whole top-level
-  projection. `QueryPlan::covering_projection` returns `None` for anything
-  else (nested paths, cursor bounds, raw, elemMatch).
+- Covering (`index-only`) reads now cover three proven shapes: a composite
+  point lookup whose prefix covers every filter, the order, and the whole
+  top-level projection; a secondary equality scan whose projection is the
+  indexed field; and `id` alone on an index-backed scan. Everything else
+  returns `None` from `QueryPlan::covering_projection` (nested paths, cursor
+  bounds, raw, elemMatch, unknown fields).
 - Filtered composite indexes exist (`CompositeIndexDefinition::filter`). The
   planner may use one only when the query pins the predicate exactly with
   `Eq` or a single-value `In`; `Or` and ranges fall back to a sweep.
 - There are no per-field cardinality/NDV statistics. Planning uses
   `collection_rows`, a `rows / workers > 50` heuristic, posting sizes for
   secondary equality, and fixed scan priorities.
-- `index_query_ready()` is gated by a **global** `index_inflight` counter, not
-  per collection. One pending write anywhere sends all collections to
-  `FullCollection` until the index worker drains (see section 3).
+- `index_query_ready(collection)` is per collection (P0, #104). The global
+  counter remains only for `QuiescenceStatus.pending_index_ops`; a pending
+  write in one collection no longer forces other collections to
+  `FullCollection`.
 - The plan cache has a 1 s TTL and is keyed by query shape, including the
   collection. A stats-driven plan would need an epoch or invalidation rule.
 
@@ -57,10 +61,10 @@ existing scan.
 
 ## 3. Ranked work packages
 
-### P0 - collection-scoped index readiness
+### P0 - collection-scoped index readiness (landed in #104)
 
-Problem: `index_query_ready()` is global. A write to collection A makes a
-query on collection B use `FullCollection` until A's index op is applied.
+Problem: `index_query_ready()` was global. A write to collection A made a
+query on collection B use `FullCollection` until A's index op was applied.
 
 Approach: keep the existing global counter for `quiescence_status`, but add a
 per-collection pending count (or a per-collection epoch) and pass the queried
@@ -83,6 +87,10 @@ Risk: moderate. This touches the write enqueue, worker completion, all query
 entry points, and watch planning. It is independent of stats and should ship
 alone before query tuning.
 
+Status: landed in #104 (merge `efa3ade`). The deterministic two-collection
+test is `index_readiness_is_collection_scoped`; all enqueue paths, including
+replicated/cloud ingest, now share `enqueue_index_update`.
+
 ### P1 - EXPLAIN and benchmark audit
 
 No new planner behavior. Turn the slow shapes into repeatable evidence:
@@ -102,17 +110,34 @@ Acceptance: each shape has a before/after number and an `explain_report` line
 showing the expected scan. This is the gate for deciding whether P3 is worth
 doing at all.
 
+Status: partial. The projection shape now has a dedicated criterion group
+(`benches/read_path.rs`, `query_projection`) on the 1k-doc fixture:
+
+| Arm | Time | Relative |
+|---|---:|---:|
+| secondary equality, covered field | 48-58 µs | 1.0x |
+| same scan, decode extra field | 184-191 µs | 3.2-4.0x |
+| secondary equality, `id` only | 32-35 µs | 0.6x |
+
+Ranges are two runs on the same box; the relative gap is stable even though
+the absolute numbers move with machine load. The bench asserts
+`explain_report.covering` for the covered arm, so it fails if the planner
+silently drops the fast path. Cold/pending, top-N vs indexed order,
+filtered-index implication, and aggregate shapes are still open.
+
 ### P2 - expand covering / index-only reads
 
 Safe incremental targets, in order:
 
-1. Secondary equality where the projection is exactly the indexed field: the
-   plan already knows the value, so return `(id, {field: value})` without a
-   document read. This is a natural analogue of the composite point path.
-2. `id`-only projection on a scan whose filters are satisfied by the index:
-   the id is already in the scan row. No decode.
+1. **Done.** Secondary equality where the projection is exactly the indexed
+   field: return `(id, {field: value})` without a document read.
+2. **Done.** `id`-only projection on an index-backed scan whose filters are
+   satisfied: the id is already in the scan row, so the field list is empty.
 3. Composite range/prefix scans where every projected field is inside the
    known prefix. Values beyond the prefix are not in the plan, so fail closed.
+
+Items 1-2 live behind `QueryPlan::covering_projection` and are pinned by
+`tests/issue22_covering.rs`. Item 3 is still open.
 
 Do not start with dotted projection rebuilding or nested index-only
 reconstruction. `covering_projection` intentionally returns `None` for dotted
@@ -171,9 +196,11 @@ gap on the standard profiles.
 
 ## 4. Recommended order
 
-1. P0 collection-scoped readiness (separate PR; highest measured impact).
-2. P1 audit/benchmark shapes (evidence before design).
-3. P2 covering expansion, starting with secondary equality and `id`-only.
+1. P0 collection-scoped readiness (landed in #104; highest measured impact).
+2. P1 audit/benchmark shapes (partial: projection lane captured; evidence
+   before design for the remaining shapes).
+3. P2 covering expansion, starting with secondary equality and `id`-only
+   (items 1-2 landed; item 3 remains).
 4. P4 partial-range implication only on demand.
 5. P3 statistics only if P1 finds a shape that the current rules lose.
 6. P5/P6: no code until a concrete API or measured regression exists.

@@ -3,7 +3,7 @@ use crate::index::vector::Metric;
 use smallvec::SmallVec;
 use std::ops::Bound;
 
-use super::filter::Filter;
+use super::filter::{Filter, Operator};
 use super::order::OrderBy;
 use super::query::ElemMatch;
 
@@ -162,11 +162,14 @@ impl ScanType {
 }
 
 impl QueryPlan {
-    /// hakodb#71 F6 — index-only (covering) projection. When the scan is a
-    /// composite point lookup whose prefix already covers every filter, the
-    /// requested order, and the whole projection (top-level fields only),
-    /// the projected values are known from the plan itself and the executor
-    /// can answer without reading a single document.
+    /// hakodb#71 F6 / hakodb#22 - index-only (covering) projection. The
+    /// projected values must be known from the plan itself; the executor
+    /// can then answer without reading a single document.
+    ///
+    /// Supported shapes:
+    /// - composite point lookup whose prefix covers the projection;
+    /// - secondary equality where the projection is the indexed field;
+    /// - `id` alone on an index-backed scan (the row id is the output key).
     ///
     /// Fail-closed by construction: anything not provably covered returns
     /// None and the normal decode path runs.
@@ -180,19 +183,45 @@ impl QueryPlan {
         {
             return None;
         }
-        let (fields, values) = match &self.scan {
-            ScanType::CompositeIndex { fields, values, .. } => (fields, values),
-            _ => return None,
-        };
         let mut out = Vec::with_capacity(self.projection.len());
         for path in &self.projection {
+            if path == "id" {
+                // The executor already carries the row id; projection APIs
+                // return it outside the field list.
+                if self.scan.index_label().is_none() {
+                    return None;
+                }
+                continue;
+            }
             if path.contains('.') {
                 // Nested rebuild from an index prefix is a later step; the
                 // decode path handles it correctly today.
                 return None;
             }
-            let pos = fields.iter().position(|f| f == path)?;
-            out.push((path.clone(), values.get(pos)?.clone()));
+            let value = match &self.scan {
+                ScanType::CompositeIndex { fields, values, .. } => {
+                    let pos = fields.iter().position(|f| f == path)?;
+                    values.get(pos)?.clone()
+                }
+                ScanType::SecondaryIndex { field, .. } => {
+                    // The planner only marks a secondary scan satisfied for
+                    // a single equality filter on this field.
+                    if field != path {
+                        return None;
+                    }
+                    let mut filters = self
+                        .filters
+                        .iter()
+                        .filter(|f| f.field == *field && f.op == Operator::Eq);
+                    let filter = filters.next()?;
+                    if filters.next().is_some() {
+                        return None;
+                    }
+                    filter.value.clone()
+                }
+                _ => return None,
+            };
+            out.push((path.clone(), value));
         }
         Some(out)
     }
