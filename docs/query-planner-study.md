@@ -1,10 +1,11 @@
 # Query planner and index execution study (issue #22)
 
-Status: P0 landed (#104); P1 audit open; P2 items 1-2 landed (secondary
+Status: P0 landed (#104); P1 audit partial; P2 items 1-2 landed (secondary
 equality field + `id`-only covering). Scope: how plans are chosen and executed
 on the query side. This does not change query semantics or add SQL/joins.
 
-Current tree: `hakodb` main `d4a0e31` (0.16.6 plus #103 P0/P1).
+Current tree: `hakodb` main `7c152f0` (0.16.6 plus #103 P0/P1 and #22 P2
+items 1-2).
 
 ## 1. What already exists
 
@@ -122,8 +123,22 @@ Status: partial. The projection shape now has a dedicated criterion group
 Ranges are two runs on the same box; the relative gap is stable even though
 the absolute numbers move with machine load. The bench asserts
 `explain_report.covering` for the covered arm, so it fails if the planner
-silently drops the fast path. Cold/pending, top-N vs indexed order,
-filtered-index implication, and aggregate shapes are still open.
+silently drops the fast path.
+
+Remote `hakobench` on `fkip-234` at `7c152f0` (1k docs, Manual,
+`--index-groups=std,f2f6`) measured `cover` 26,188 QPS vs `proj` 9,207 QPS
+(2.84x); `Qry` 14,174, `Cmp` 11,893, `Json` 8,354. Median of three gate runs:
+`Qry` 13,864, `Cmp` 11,820, `Off` 15,379, `Cur` 13,500, `Json` 8,187;
+`GATE RESULT: PASS`.
+
+The FFI JSON path was checked on the same box: covered
+`[{"active":true,"tenant":"tenant-1"}, ...]` vs decode
+`[{"active":true,"extra":"decoded-only","tenant":"tenant-1"}, ...]`. A Python
+check over five rows confirmed the shared fields match and only the projected
+extra field differs; keys are sorted, so the raw bytes are stable.
+
+Cold/pending, top-N vs indexed order, filtered-index implication, and
+aggregate shapes are still open.
 
 ### P2 - expand covering / index-only reads
 
