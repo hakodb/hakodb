@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "hakodb"
-version = "0.16.6"
+version = "0.16.7"
 dependencies = [
  "bincode",
  "cbindgen",

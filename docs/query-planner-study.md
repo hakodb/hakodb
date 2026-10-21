@@ -6,8 +6,7 @@ fixed. P2 item 3 (covering a range/prefix projection) is still open. Scope: how
 plans are chosen and executed on the query side. This does not change query
 semantics or add SQL/joins.
 
-Current tree: 0.16.6 plus #103/#104 and #111 (the composite-range planner fix
-and this audit).
+Current tree: 0.16.7 (the composite-range planner fix and this audit).
 
 ## 1. What already exists
 
