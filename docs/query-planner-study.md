@@ -152,8 +152,13 @@ matches `3fe814e` (bulk-copy writer). The `proj` decode lane is ~15% lower in
 0.16.6 on both harnesses; that is a real residual, not a harness artifact.
 The old harness also carries a 5 KB `body` on every 8th doc (1.8-1.9 MB store
 vs 1.3-1.4 MB), so cross-harness absolute numbers are not interchangeable.
-The `hako-backend` v0.16.4+13 run (`Qry` 16.7k, `Json` 10.4k) is a different
-CPU and is not a valid baseline for this box.
+
+A repeat on `hako-backend` (i3-5005U, 2C/4T, two Manual runs per cell) shows
+the same shape: `Qry`/`Cmp` flat (~16.2k/14.1k), `Json` 6.6k on v0.16.4 ->
+10.4k on v0.16.6, `cover` 24.4k -> 36.6k, `proj` 13.0k -> 11.8k. The original
+`hako-backend` baseline used `/home/riza/hakodb` at `v0.16.4-13-ga7964ae`;
+that tree already measured `Json` 10.5k, so the original 10.4k was not a
+v0.16.4 number.
 
 Cold/pending, top-N vs indexed order, filtered-index implication, and
 aggregate shapes are still open.
