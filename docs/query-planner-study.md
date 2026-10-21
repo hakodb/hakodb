@@ -137,6 +137,24 @@ The FFI JSON path was checked on the same box: covered
 check over five rows confirmed the shared fields match and only the projected
 extra field differs; keys are sorted, so the raw bytes are stable.
 
+A version/harness A/B on the same box (`fkip-234`, Manual, 1k docs,
+`--no-maintenance`) separates the library from the benchmark:
+
+| Benchmark | Library | Qry | Cmp | Json | cover | proj |
+|---|---|---:|---:|---:|---:|---:|
+| old `8d50319` | v0.16.4 | 14,167 | 11,939 | 4,912 | 20,794 | 10,642 |
+| old `8d50319` | v0.16.6 | 13,944 | 11,756 | 8,263 | 26,127 | 9,081 |
+| new `a228960` | v0.16.4 | 14,278 | 11,892 | 4,913 | 19,633 | 10,626 |
+| new `a228960` | v0.16.6 | 14,417 | 11,939 | 8,272 | 27,026 | 9,044 |
+
+`Qry`/`Cmp` are flat (within ~1%). `Json` improves ~1.68x in 0.16.6, which
+matches `3fe814e` (bulk-copy writer). The `proj` decode lane is ~15% lower in
+0.16.6 on both harnesses; that is a real residual, not a harness artifact.
+The old harness also carries a 5 KB `body` on every 8th doc (1.8-1.9 MB store
+vs 1.3-1.4 MB), so cross-harness absolute numbers are not interchangeable.
+The `hako-backend` v0.16.4+13 run (`Qry` 16.7k, `Json` 10.4k) is a different
+CPU and is not a valid baseline for this box.
+
 Cold/pending, top-N vs indexed order, filtered-index implication, and
 aggregate shapes are still open.
 
