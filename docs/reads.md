@@ -12,8 +12,9 @@ that answers the question.**
 | `walk` | Borrowed bytes, zero allocs (~0.4µs) | Full scans: count, filter, copy out |
 | `get_view` / `walk_view` | Borrow + pull only touched fields (~0.2µs + ~0.2µs/pull) | Sparse reads: 2 fields out of 20 |
 
-Numbers: in-process release, 20k docs (see `docs/benchmarking.md` for
-methodology). All four agree field-for-field — see `tests/codec_integrity.rs`.
+Numbers: in-process release, 20k docs (see the
+[`hakobench`](https://github.com/hakodb/hakobench) harness for methodology).
+All four agree field-for-field — see `tests/codec_integrity.rs`.
 
 ## Point reads
 
@@ -64,9 +65,10 @@ versions. FFI: `hk_query_execute_raw` + result-set fns,
 
 ## Pagination
 
-Keyset only — no `OFFSET` scans. Order by `id`, take a page, bind the
-last row as the next anchor (`start_after`); descending is symmetric
-(same fast path both directions, ~1.1x apart):
+Prefer keyset paging. `offset` exists, but it is a skip scan: the rows are
+still produced and discarded. Order by `id`, take a page, bind the last row
+as the next anchor (`start_after`); descending is symmetric (same fast path
+both directions, ~1.1x apart):
 
 ```rust
 let mut q = Query::new("bench").order_by("id", false);
@@ -76,14 +78,15 @@ q.limit = Some(1000);
 
 `limit`/`offset` truncate downstream; deep pages cost the same as shallow
 ones (O(log N) anchor seek). Contrast: offset-based paging degrades
-linearly with depth — see the deep-pagination duel in
-`docs/benchmarking.md`.
+linearly with depth — see the `query_offset`/`query_cursor` groups in
+`benches/read_path.rs`.
 
 ## Before you measure or paginate: readiness
 
 `Hako::open` returns while index recovery still runs in the
 background. Queries issued first silently plan full scans (cursor bounds
-ignored, pages repeat). Poll before scanning:
+ignored, pages repeat). Pending writes gate only their own collection
+(#104); open-time recovery still gates all of them. Poll before scanning:
 
 ```rust
 while !db.is_indexes_ready() { /* sleep briefly, bounded */ }

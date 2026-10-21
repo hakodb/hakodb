@@ -1,11 +1,13 @@
 # Query planner and index execution study (issue #22)
 
-Status: P0 landed (#104); P1 audit partial; P2 items 1-2 landed (secondary
-equality field + `id`-only covering). Scope: how plans are chosen and executed
-on the query side. This does not change query semantics or add SQL/joins.
+Status: P0 landed (#104); P1 audit complete; P2 items 1-2 landed (secondary
+equality field + `id`-only covering) and the composite-range planner gate is
+fixed. P2 item 3 (covering a range/prefix projection) is still open. Scope: how
+plans are chosen and executed on the query side. This does not change query
+semantics or add SQL/joins.
 
-Current tree: `hakodb` main `7c152f0` (0.16.6 plus #103 P0/P1 and #22 P2
-items 1-2).
+Current tree: `hakodb` main `ee523de` (0.16.6 plus #103 and #22 P2 items 1-2)
+plus this change.
 
 ## 1. What already exists
 
@@ -111,8 +113,8 @@ Acceptance: each shape has a before/after number and an `explain_report` line
 showing the expected scan. This is the gate for deciding whether P3 is worth
 doing at all.
 
-Status: partial. The projection shape now has a dedicated criterion group
-(`benches/read_path.rs`, `query_projection`) on the 1k-doc fixture:
+Status: complete (P1 audit). The projection shape has a dedicated criterion
+group (`benches/read_path.rs`, `query_projection`) on the 1k-doc fixture:
 
 | Arm | Time | Relative |
 |---|---:|---:|
@@ -168,8 +170,51 @@ the nested `profile`/`slug` fields from `a228960` restores 22,532 / 19,946 on
 v0.16.6. The 16k figures are therefore a dataset effect, not an engine
 regression.
 
-Cold/pending, top-N vs indexed order, filtered-index implication, and
-aggregate shapes are still open.
+Remaining shapes were measured on a local release build (Windows, 1k and 10k
+docs, Manual). Each number is the temporary audit harness's 100-iteration
+average; the 1k composite-range row uses the criterion arm after the planner
+fix:
+
+| Shape | 1k | 10k | `explain_report` scan |
+|---|---:|---:|---|
+| top-N, unindexed `score`, limit 20 | 1.18 ms | 13.8 ms | `full_collection`, order false |
+| tenant equality + score order, limit 20 | 0.078 ms | 0.075 ms | `composite_index(tenant)`, order true |
+| tenant equality + score range, before | 0.136 ms | 0.90 ms | `secondary_index(tenant)`, order false |
+| tenant equality + score range, after | 0.061-0.078 ms | ~0.05-0.10 ms | `composite_index_range`, order false |
+| filtered index, exact predicate | 0.167 ms | 1.30 ms | `composite_index_range` on the filtered tree |
+| filtered index, implied range | 0.170 ms | 1.41 ms | plain prefix/full scan, not the filtered tree |
+| filtered index, `Or` | 0.153 ms | 1.15 ms | plain prefix; filtered gate still rejects |
+| `count(active=true)`, indexed | 0.118 ms | 1.09 ms | `secondary_index(active)` |
+| same, no index | 2.68 ms | 15.3 ms | `full_collection` |
+| `sum(age)` where `active=true`, indexed | 0.228 ms | 2.89 ms | `secondary_index(active)` |
+| same, no index | 1.72 ms | 15.7 ms | `full_collection` |
+
+Findings:
+
+- **Cold/pending** is covered by the deterministic
+  `index_readiness_is_collection_scoped` test (#104). It is a correctness
+  routing fix, not a costing shape; no separate throughput number is useful.
+- **Top-N** scales linearly when the order field has no index. The remedy is
+  an index on the order field; the indexed arm stays flat across 1k/10k. This
+  is expected work, not a planner regression.
+- **Composite range** was the real losing shape. `try_plan_composite_range`
+  rejected every non-point filter, so `tenant = t2 AND score >= 50` used
+  `secondary_index(tenant)` plus TopN. Allowing one range filter after the
+  equality prefix moves it to `composite_index_range`; the 1k criterion arm
+  drops from 171 µs to 61-78 µs (2.2-2.8x) and the 10k shape from ~0.90 ms to
+  ~0.05-0.10 ms.
+- **Filtered implication** is not yet a measured win. An exact predicate
+  rides the filtered tree; a range that logically implies it still does not,
+  and `Or` is rejected by the gate. Leave P4 demand-driven.
+- **Aggregates** are not losing: indexed `count`/`sum` beat the no-index full
+  scan by 5-23x on these fixtures. Comparing them with the unfiltered O(1)
+  count is apples-to-oranges. Sum still intersects postings; a composite
+  `(active, age)` aggregate would be a separate optimization, not a fix.
+
+The composite-range plan is pinned by `tests/issue22_audit.rs` (parity vs the
+unindexed engine, both orders, extra filters, first-field range, and the
+filtered-index gate) and by the `tenant_eq_score_range_desc` arm in
+`benches/read_path.rs`.
 
 ### P2 - expand covering / index-only reads
 
@@ -183,7 +228,19 @@ Safe incremental targets, in order:
    known prefix. Values beyond the prefix are not in the plan, so fail closed.
 
 Items 1-2 live behind `QueryPlan::covering_projection` and are pinned by
-`tests/issue22_covering.rs`. Item 3 is still open.
+`tests/issue22_covering.rs`. The P1 audit found a prerequisite bug in item 3's
+planner path: `try_plan_composite_range` required every filter to be a point
+lookup, so a range on the next composite field never produced a
+`CompositeIndexRange`. That gate now accepts one range filter (plus equality
+prefixes and post-scan extras); the plan is pinned by
+`tests/issue22_audit.rs`.
+
+Item 3 itself is still open. The range plan deliberately reports
+`filters_satisfied_by_index=false` and `order_by_satisfied=false`, and
+`CompositeIndexRange` does not carry the equality-prefix values, so
+`covering_projection` fails closed. Extending it needs the prefix values in
+the plan, a proof that the requested order matches the prefix/range walk, and
+the same parity tests used for the point/covering paths.
 
 Do not start with dotted projection rebuilding or nested index-only
 reconstruction. `covering_projection` intentionally returns `None` for dotted
@@ -243,12 +300,14 @@ gap on the standard profiles.
 ## 4. Recommended order
 
 1. P0 collection-scoped readiness (landed in #104; highest measured impact).
-2. P1 audit/benchmark shapes (partial: projection lane captured; evidence
-   before design for the remaining shapes).
+2. P1 audit/benchmark shapes (complete; composite-range plan fixed).
 3. P2 covering expansion, starting with secondary equality and `id`-only
    (items 1-2 landed; item 3 remains).
 4. P4 partial-range implication only on demand.
-5. P3 statistics only if P1 finds a shape that the current rules lose.
+5. P3 statistics only if a future audit finds a shape that the current rules
+   lose. P1 found none that needs statistics: top-N is an index-coverage
+   issue, aggregates already benefit from indexes, and the composite-range
+   loss was a plan-gate bug, not a cardinality estimate.
 6. P5/P6: no code until a concrete API or measured regression exists.
 
 This order deliberately avoids a statistics subsystem first. The measured

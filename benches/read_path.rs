@@ -178,6 +178,35 @@ fn bench_query_composite(c: &mut Criterion) {
         });
     });
 
+    // #22 P1: equality prefix + a range on the next composite field. This
+    // used to fall through to secondary_index(tenant) + TopN.
+    let mut range_q = Query::new("bench");
+    range_q.filters.push(hakodb::query::filter::Filter {
+        field: "tenant".into(),
+        op: Operator::Eq,
+        value: Value::String("tenant-2".into()),
+    });
+    range_q.filters.push(hakodb::query::filter::Filter {
+        field: "score".into(),
+        op: Operator::Gte,
+        value: Value::Float(50.0),
+    });
+    range_q.order_by.push(OrderBy {
+        field: "score".into(),
+        ascending: false,
+    });
+    range_q.limit = Some(20);
+    let rep = db.explain_report(range_q.clone()).expect("explain");
+    assert!(
+        rep.scan.starts_with("composite_index_range"),
+        "range shape must ride the composite index: {rep}"
+    );
+    group.bench_function("tenant_eq_score_range_desc", |b| {
+        b.iter(|| {
+            let _ = db.query(range_q.clone()).expect("q");
+        });
+    });
+
     group.finish();
     drop(db);
     cleanup("qcomp");
