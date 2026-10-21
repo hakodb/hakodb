@@ -81,22 +81,31 @@ will execute: usually the `FullCollection` fallback, with the id-order
 
 ## Covering (index-only) projections
 
-A covering read builds each projected value from the composite plan and
-reads no document. `covering` is true only when all of these hold:
+A covering read builds each projected value from the plan and reads no
+document. `covering` is true only when all of these hold:
 
-- The scan is a composite **point lookup** (`ScanType::CompositeIndex`);
-  ranges, unions, secondary, FTS, vector, and traverse scans are not
-  covering.
 - `filters_satisfied_by_index` and `order_by_satisfied` are both true.
 - There are no cursor bounds, no `elemMatch` clauses, and `raw` is false.
 - The projection is non-empty.
-- Every projected path is top-level (no dots) and is present in the
-  composite index prefix.
+- The projection is one of these proven shapes:
+  - a composite **point lookup** (`ScanType::CompositeIndex`) whose
+    top-level fields cover the projection;
+  - a secondary **equality** scan whose projection contains only the
+    indexed field (and optionally `id`);
+  - `id` alone on an index-backed scan (the row id is already the output
+    key, so the field list is empty).
 
-Anything else falls back to decoding. Covering applies to projected
-reads such as `query_projected_zero_copy` (and the projected FFI path);
-plain `query()` returns whole documents and therefore is not a covering
-read. The optimizer records this in `QueryPlan::covering_projection` in
+Ranges, unions, FTS, and vector scans are not covering for field
+projections; `id` alone can cover when the scan is index-backed and its
+filters/order are satisfied. Traverse is excluded. Every projected path
+must be top-level (no dots); nested rebuild from an index prefix is still
+unsupported and falls back to decode. The same fallback applies when the
+projection includes any field the plan does not know.
+
+Covering applies to projected reads such as
+`query_projected_zero_copy` (and the projected FFI path); plain `query()`
+returns whole documents and therefore is not a covering read. The
+optimizer records this in `QueryPlan::covering_projection` in
 `src/query/plan.rs`.
 
 ## See also

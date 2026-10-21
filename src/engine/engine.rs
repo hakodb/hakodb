@@ -788,8 +788,8 @@ pub struct ExplainReport {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub projection: Vec<String>,
-    /// F6: true when the projected fields are served straight from the
-    /// composite index (no document read) — the query is covering.
+    /// F6 / #22: true when the projected fields are served straight from
+    /// the index (no document read) - the query is covering.
     pub covering: bool,
     /// Index definitions that exist on the collection (candidates the
     /// planner could have used — "why didn't my index run?").
