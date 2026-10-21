@@ -728,8 +728,14 @@ impl QueryPlanner {
             matches!(f.op, Operator::Eq) ||
             (matches!(f.op, Operator::In) && matches!(&f.value, Value::Array(a) if a.len() == 1))
         };
+        let is_range = |f: &crate::query::filter::Filter| {
+            matches!(f.op, Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte | Operator::Ne)
+        };
 
-        if query.filters.is_empty() || !query.filters.iter().all(is_point_lookup) {
+        if query.filters.is_empty()
+            || query.filters.iter().filter(|f| is_range(f)).count() > 1
+            || !query.filters.iter().all(|f| is_point_lookup(f) || is_range(f))
+        {
             return None;
         }
 
