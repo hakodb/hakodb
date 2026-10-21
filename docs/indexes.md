@@ -9,11 +9,12 @@ or memory use; the planner study lives in `docs/query-planner-study.md`.
 Opening a database starts index recovery in the background. Separately,
 creating a secondary, full-text, vector, or **non-unique** composite index
 registers the definition and then backfills it on a background thread.
-While any backfill is in flight the planner treats index-backed plans as
-not ready and falls back to `FullCollection`. Two lanes have their own
-rules: the id-order `SortedKeys` slice stays available because it is
-index-independent, and vector lanes ignore pending writes (the executor
-live-filters deleted ids) but still wait for backfills to finish.
+While a collection's backfill is in flight, the planner treats that
+collection's index-backed plans as not ready and falls back to
+`FullCollection`. Two lanes have their own rules: the id-order `SortedKeys`
+slice stays available because it is index-independent, and vector lanes
+ignore pending writes (the executor live-filters deleted ids) but still wait
+for backfills to finish.
 
 - `is_indexes_ready()` covers open-time recovery only.
 - `quiescence_status()` reports `index_backfills`, `pending_index_ops`,
@@ -85,6 +86,15 @@ The gate is deliberately narrow (`composite_def_usable` in
 Extra query filters are allowed. A filtered unique index applies the
 filter before admission, so documents outside the predicate do not hold
 claims.
+
+## Composite ranges
+
+A composite index can serve one range operator (`gt/gte/lt/lte/ne`) after
+an equality prefix, for example index `(tenant, score)` with
+`tenant = "t2" AND score >= 50`. Extra filters are re-checked after the
+scan, and the lane does not claim filter or order satisfaction; `limit`
+still rides the executor's TopN. The planner study records the before/after
+numbers and `tests/issue22_audit.rs` pins result parity.
 
 ## Unique indexes and tombstones
 

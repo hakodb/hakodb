@@ -97,7 +97,9 @@ document. `covering` is true only when all of these hold:
 
 Ranges, unions, FTS, and vector scans are not covering for field
 projections; `id` alone can cover when the scan is index-backed and its
-filters/order are satisfied. Traverse is excluded. Every projected path
+filters/order are satisfied. A composite range can narrow candidates, but
+its plan reports the filter/order flags false, so it stays on the decode
+path. Traverse is excluded. Every projected path
 must be top-level (no dots); nested rebuild from an index prefix is still
 unsupported and falls back to decode. The same fallback applies when the
 projection includes any field the plan does not know.

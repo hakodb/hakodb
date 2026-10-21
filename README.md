@@ -30,9 +30,9 @@ Your app *is* the database host: ideal for local-first/offline-first products, d
 ## Key features
 
 - **Engine** — `open/put/get/delete/query`, atomic `write_batch`, serializable transactions, `watch_collection` streams, subcollections.
-- **Queries** — `eq/ne/gt/gte/lt/lte/in/notIn/arrayContains/match/contains/startsWith`, ordering, limit/offset, cursor bounds, `count/sum/avg`, cost-aware parallel planner with projection pushdown.
-- **Indexes** — secondary B-Tree, composite, full-text, HNSW vector (KNN), graph backlinks (BFS) + `_from`/`_to` edge collections (weighted Dijkstra); built asynchronously in the background.
-- **Storage** — tiered compaction, group-commit WAL, blob offloading, optional zstd compression (`compression` feature, default-on).
+- **Queries** — `eq/ne/gt/gte/lt/lte/in/notIn/arrayContains/match/contains/startsWith`, ordering, limit/offset, cursor bounds, `count/sum/avg`, cost-aware parallel planner with projection pushdown, `explain` (scan/index/order/covering), and covering index-only projections.
+- **Indexes** — secondary B-Tree, composite (including dotted paths, filtered/partial, and unique constraints), full-text, HNSW vector (KNN), graph backlinks (BFS) + `_from`/`_to` edge collections (weighted Dijkstra); built asynchronously in the background with collection-scoped readiness.
+- **Storage** — tiered compaction, group-commit WAL, blob offloading, optional zstd compression (`compression` feature, default-on), bulk JSON ingest.
 - **Operations** — collection-prefix allow/deny rules, audit logging, `flush/compact/backup`.
 
 ## Quick start (Rust)
@@ -103,11 +103,11 @@ Two optional, independent replication layers:
 
 ```toml
 [dependencies]
-hakodb = { version = "0.15", features = ["net-sync"] }    # LAN mesh: mDNS discovery, room-key isolation, delta replication
-hakodb = { version = "0.15", features = ["cloud-sync"] }  # central hub: offline-first clients over ws(s), room isolation, auth tokens
+hakodb = { version = "0.16", features = ["net-sync"] }    # LAN mesh: mDNS discovery, room-key isolation, delta replication
+hakodb = { version = "0.16", features = ["cloud-sync"] }  # central hub: offline-first clients over ws(s), room isolation, auth tokens
 ```
 
-Rooms isolate data (`room_name` + `room_key`); the cloud server is room-agnostic and hosts any room. Index definitions replicate; derived state (HNSW graphs) rebuilds locally.
+Rooms isolate data (`room_name` + `room_key`); a cloud server is bound to exactly one room and rejects clients that present another. Run one server per room (the scaling docs show writer/replica pods for the same room). Index definitions replicate; derived state (HNSW graphs) rebuilds locally.
 
 ### Encryption posture (read before encrypting)
 
@@ -120,7 +120,16 @@ At-rest encryption and sync-time plaintext are **independent**: an encrypted col
 | Old (pre-capability) peer | Encrypted rooms pause for it; plaintext rooms keep syncing. Upgrade to resume. |
 | Server operator / passive LAN observer | **Not protected** — use E2E rooms or `wss://`/mTLS segments. |
 
-Rule: one room needs the **same** `encryption_key` on every sharing node (`encrypted_cols`, server uses `<prefix>_<collection>` storage names). There is intentionally **no override flag**.
+Rule: one room needs the **same** `encryption_key` on every sharing node (`encrypted_cols` lists the collections). Collection names stay plain in 0.16; there is intentionally **no override flag**.
+
+## Documentation
+
+- [Queries, explain, and pagination](docs/query.md)
+- [Index semantics and readiness](docs/indexes.md)
+- [Choosing a read path](docs/reads.md)
+- [Pipeline stages and limits](docs/pipeline.md)
+- [Query planner study (issue #22)](docs/query-planner-study.md)
+- [Scaling writers and mesh replicas](docs/scaling.md) and [LAN relay](docs/lan-relay.md)
 
 ## License
 
