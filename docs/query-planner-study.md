@@ -150,8 +150,9 @@ A version/harness A/B on the same box (`fkip-234`, Manual, 1k docs,
 `Qry`/`Cmp` are flat (within ~1%). `Json` improves ~1.68x in 0.16.6, which
 matches `3fe814e` (bulk-copy writer). The `proj` decode lane is ~15% lower in
 0.16.6 on both harnesses; that is a real residual, not a harness artifact.
-The old harness also carries a 5 KB `body` on every 8th doc (1.8-1.9 MB store
-vs 1.3-1.4 MB), so cross-harness absolute numbers are not interchangeable.
+The `8d50319` harness adds a 5 KB `body` on every 8th doc; `a228960` removes
+it but adds a nested `profile` object and `slug` to every doc. Both change the
+decode cost, so cross-harness absolute numbers are not interchangeable.
 
 A repeat on `hako-backend` (i3-5005U, 2C/4T, two Manual runs per cell) shows
 the same shape: `Qry`/`Cmp` flat (~16.2k/14.1k), `Json` 6.6k on v0.16.4 ->
@@ -159,6 +160,13 @@ the same shape: `Qry`/`Cmp` flat (~16.2k/14.1k), `Json` 6.6k on v0.16.4 ->
 `hako-backend` baseline used `/home/riza/hakodb` at `v0.16.4-13-ga7964ae`;
 that tree already measured `Json` 10.5k, so the original 10.4k was not a
 v0.16.4 number.
+
+The pre-#71 harness (`2b0ce1a`) is the true no-extra-field control: with
+v0.16.1 it measures `Qry` 23,005 / `Cmp` 20,521, and with v0.16.6 it measures
+22,662 / 20,122. New `a228960` with v0.16.1 measures 16,571 / 13,920. Removing
+the nested `profile`/`slug` fields from `a228960` restores 22,532 / 19,946 on
+v0.16.6. The 16k figures are therefore a dataset effect, not an engine
+regression.
 
 Cold/pending, top-N vs indexed order, filtered-index implication, and
 aggregate shapes are still open.
