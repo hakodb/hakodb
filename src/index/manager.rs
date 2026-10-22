@@ -252,6 +252,60 @@ impl IndexManager {
             .insert(field.to_string(), SecondaryIndex::default());
     }
 
+    pub fn drop_secondary_index(&mut self, collection: &str, field: &str) -> bool {
+        let removed = self
+            .secondary
+            .get_mut(collection)
+            .is_some_and(|fields| fields.remove(field).is_some());
+        if self
+            .secondary
+            .get(collection)
+            .is_some_and(|fields| fields.is_empty())
+        {
+            self.secondary.remove(collection);
+        }
+        removed
+    }
+
+    pub fn drop_fts_index(&mut self, collection: &str, field: &str) -> bool {
+        let removed = self
+            .fts
+            .get_mut(collection)
+            .is_some_and(|fields| fields.remove(field).is_some());
+        if self.fts.get(collection).is_some_and(|fields| fields.is_empty()) {
+            self.fts.remove(collection);
+        }
+        removed
+    }
+
+    /// Remove a vector definition AND its derived HNSW graph. An in-flight
+    /// backfill becomes a no-op on its next chunk (the def is gone).
+    pub fn drop_vector_index(&mut self, collection: &str, field: &str) -> bool {
+        let removed = self
+            .vector
+            .get_mut(collection)
+            .is_some_and(|fields| fields.remove(field).is_some());
+        if self
+            .vector
+            .get(collection)
+            .is_some_and(|fields| fields.is_empty())
+        {
+            self.vector.remove(collection);
+        }
+        let dropped_graph = self
+            .hnsw
+            .get_mut(collection)
+            .is_some_and(|graphs| graphs.remove(field).is_some());
+        if self.hnsw.get(collection).is_some_and(|graphs| graphs.is_empty()) {
+            self.hnsw.remove(collection);
+        }
+        removed || dropped_graph
+    }
+
+    pub fn drop_traverse_index(&mut self, collection: &str) -> bool {
+        self.traverse.untrack(collection)
+    }
+
     /// Optimized lookup: Check secondary indexes if no composite exists
     pub fn lookup_secondary(
         &self,
@@ -330,7 +384,7 @@ impl IndexManager {
         self.fts.remove(collection);
         self.vector.remove(collection);
         self.hnsw.remove(collection);
-        self.traverse.clear_collection(collection);
+        self.traverse.untrack(collection);
         self.composite.drop_collection(collection);
     }
 
@@ -402,7 +456,11 @@ impl IndexManager {
             if skip.contains(&col) {
                 continue;
             }
-            let col_map = into.entry(col).or_default();
+            // Only overwrite live definitions. A stale snapshot must not
+            // recreate an empty collection entry for a dropped index.
+            let Some(col_map) = into.get_mut(&col) else {
+                continue;
+            };
             for (field, index) in fields {
                 if let Some(existing_index) = col_map.get_mut(&field) {
                     *existing_index = index;
@@ -499,6 +557,19 @@ mod tests {
     }
 
     #[test]
+    fn stale_snapshot_does_not_recreate_dropped_entries() {
+        let m = manager_with_entries();
+        let legacy: Vec<u8> =
+            bincode::serialize(&(&m.secondary, &m.fts)).expect("legacy export");
+        let mut m2 = IndexManager::default();
+        m2.import_state(&legacy, &std::collections::HashSet::new())
+            .expect("legacy import");
+        assert!(m2.secondary.is_empty());
+        assert!(m2.fts.is_empty());
+        assert!(!m2.has_collection("students"));
+    }
+
+    #[test]
     fn import_skips_definition_mismatch() {
         let m = manager_with_entries();
         let bytes = m.export_state().expect("export");
@@ -527,6 +598,9 @@ mod tests {
         tails.insert("students".to_string(), (1234, 5678));
         let bytes = m.export_state_with_tails(&tails).expect("export");
         let mut m2 = IndexManager::default();
+        // Definitions are restored before the snapshot on open; mirror
+        // that here so import has a live registration to fill.
+        m2.create_secondary_index("students", "nim");
         let (restored, got) = m2.import_state(&bytes, &std::collections::HashSet::new()).expect("import");
         assert!(restored);
         assert_eq!(got.expect("tails").get("students"), Some(&(1234, 5678)));

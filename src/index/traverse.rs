@@ -131,6 +131,13 @@ impl BacklinkIndex {
         self.edges.get(tgt_col).and_then(|m| m.get(tgt_id))
     }
 
+    /// Stop tracking `collection` and drop every edge touching it.
+    /// Mirrors `clear_collection`, but the registration goes too.
+    pub fn untrack(&mut self, collection: &str) -> bool {
+        self.clear_collection(collection);
+        self.tracked.remove(collection)
+    }
+
     /// Drop derived state touching `collection` (registrations stay —
     /// rescan refills, same rule as every other family).
     pub fn clear_collection(&mut self, collection: &str) {
