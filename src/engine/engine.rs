@@ -3763,8 +3763,24 @@ impl Hako {
     }
 
     pub fn compact(&self) -> Result<()> {
+        self.compact_impl(None)
+    }
+
+    /// [`Self::compact`] with cooperative cancellation.
+    ///
+    /// Shards merged before cancellation stay merged; the remaining shards
+    /// are left untouched. Compaction is idempotent, so a cancelled pass
+    /// loses no data and can simply be retried.
+    pub fn compact_with_cancel(&self, cancel: &CancelToken) -> Result<()> {
+        self.compact_impl(Some(cancel))
+    }
+
+    fn compact_impl(&self, cancel: Option<&CancelToken>) -> Result<()> {
         for s in self.shards.read().unwrap().values() {
-            s.write().unwrap().compact()?;
+            if let Some(token) = cancel {
+                token.check()?;
+            }
+            s.write().unwrap().compact_with_cancel(cancel)?;
         }
         Ok(())
     }
@@ -5482,26 +5498,6 @@ impl Hako {
         self.resolve_doc(doc, collection)
     }
 
-    // Helper for projected resolution
-    fn resolve_single_value_blob(&self, collection: &str, offset: u64, len: u32) -> Result<Value> {
-        let shard_arc = self.get_shard(collection)?;
-        let blob_manager = {
-            let shard = shard_arc.read().unwrap();
-            shard
-                .blob_manager
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| HakoError::StorageError("Blob manager missing".into()))?
-        };
-        let data = blob_manager.read_at(offset, len)?;
-
-        if let Ok(s) = String::from_utf8(data.clone()) {
-            Ok(Value::String(s))
-        } else {
-            Ok(Value::Binary(data))
-        }
-    }
-
     fn resolve_doc(&self, doc: &mut HakoDoc, collection: &str) -> Result<()> {
         // Single acquisition: snapshot queue + manager under one read
         // guard, then resolve without holding any lock. Re-acquiring
@@ -5571,6 +5567,21 @@ impl Hako {
     }
 
     pub fn vacuum(&self, collection: &str) -> Result<()> {
+        self.vacuum_impl(collection, None)
+    }
+
+    /// [`Self::vacuum`] with cooperative cancellation.
+    ///
+    /// Cancellation before the final rename removes the temp blob file and
+    /// leaves the existing `blobs.dat` and every document untouched.
+    pub fn vacuum_with_cancel(&self, collection: &str, cancel: &CancelToken) -> Result<()> {
+        self.vacuum_impl(collection, Some(cancel))
+    }
+
+    fn vacuum_impl(&self, collection: &str, cancel: Option<&CancelToken>) -> Result<()> {
+        if let Some(token) = cancel {
+            token.check()?;
+        }
         let shard_arc = self.get_shard(collection)?;
         let mut shard = shard_arc.write().unwrap();
         
@@ -5587,23 +5598,35 @@ impl Hako {
 
         // 1. Scan the index for all documents in this shard
         for (key, pointer) in &shard.index {
+            if let Some(token) = cancel {
+                if token.is_cancelled() {
+                    drop(new_blob_file);
+                    let _ = std::fs::remove_file(&temp_path);
+                    return Err(HakoError::Cancelled);
+                }
+            }
             // We need to read the document to find BlobLinks inside it
             if let Some(bytes) = shard.read_pointer(pointer)? {
                 if let Some(mut doc) = HakoDoc::decode(&bytes) {
-                    let doc_changed = false;
+                    let mut doc_changed = false;
                     
                     for (_, value) in &mut doc.fields {
                         if let Value::BlobLink { offset, len } = *value {
-                            let data = self.resolve_single_value_blob(collection, offset, len)?;
-                            let raw_bytes = match data {
-                                Value::String(s) => s.into_bytes(),
-                                Value::Binary(b) => b,
-                                _ => continue,
-                            };
+                            // Read through the guard we already hold: going
+                            // back through `resolve_single_value_blob` would
+                            // re-acquire the shard write lock and deadlock.
+                            let raw_bytes = shard
+                                .blob_manager
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    HakoError::StorageError("Blob manager missing".into())
+                                })?
+                                .read_at(offset, len)?;
 
                             new_blob_file.write_all(&raw_bytes)?;
                             *value = Value::BlobLink { offset: new_offset, len: raw_bytes.len() as u32 };
                             new_offset += raw_bytes.len() as u64;
+                            doc_changed = true;
                         }
                     }
 
@@ -5615,6 +5638,13 @@ impl Hako {
         }
 
         // 2. Commit the new blob file
+        if let Some(token) = cancel {
+            if token.is_cancelled() {
+                drop(new_blob_file);
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(HakoError::Cancelled);
+            }
+        }
         drop(new_blob_file);
         std::fs::rename(&temp_path, &blob_path)?;
         
