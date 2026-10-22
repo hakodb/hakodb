@@ -19,6 +19,9 @@ pub enum ErrorKind {
     /// Constraint target is not comparable against its declared constraint
     /// (schema drift) — repair by aligning the write.
     ConstraintMismatch = 4,
+    /// The caller's [`crate::CancelToken`] stopped the operation. Safe to
+    /// retry with a fresh token if the work is still wanted.
+    Cancelled = 5,
 }
 
 #[derive(Debug, Error)]
@@ -70,6 +73,9 @@ pub enum HakoError {
         field: String,
         expected: String,
     },
+    /// A cooperative [`crate::CancelToken`] stopped the operation.
+    #[error("operation cancelled")]
+    Cancelled,
 }
 
 impl HakoError {
@@ -82,6 +88,7 @@ impl HakoError {
             }
             HakoError::UniqueViolation { .. } => ErrorKind::UniqueViolation,
             HakoError::SchemaViolation { .. } => ErrorKind::ConstraintMismatch,
+            HakoError::Cancelled => ErrorKind::Cancelled,
             _ => ErrorKind::Generic,
         }
     }
