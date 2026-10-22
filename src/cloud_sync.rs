@@ -146,7 +146,23 @@ pub struct CloudStatus {
     pub mode: CloudSyncMode,
     pub connected: bool,
     pub room_name: String,
+    /// Secret. Kept for trusted in-process callers, but never serialized:
+    /// use [`CloudStatusRedacted`] / [`CloudSync::status_redacted`] at
+    /// logging, admin, or FFI boundaries.
+    #[serde(skip_serializing)]
     pub room_key: String,
+    pub active_clients: usize,
+    pub queued_writes: usize,
+}
+
+/// Admin/log-safe cloud status: same shape as [`CloudStatus`] minus the
+/// room key. This is what `hk_cloud_sync_status` returns.
+#[cfg(feature = "cloud-sync")]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CloudStatusRedacted {
+    pub mode: CloudSyncMode,
+    pub connected: bool,
+    pub room_name: String,
     pub active_clients: usize,
     pub queued_writes: usize,
 }
@@ -513,17 +529,29 @@ impl CloudSync {
     }
 
     pub fn status(&self) -> CloudStatus {
+        let redacted = self.status_redacted();
+        CloudStatus {
+            mode: redacted.mode,
+            connected: redacted.connected,
+            room_name: redacted.room_name,
+            room_key: self.room_key.clone(),
+            active_clients: redacted.active_clients,
+            queued_writes: redacted.queued_writes,
+        }
+    }
+
+    /// Status safe for logs, admin endpoints, and FFI: no room key.
+    pub fn status_redacted(&self) -> CloudStatusRedacted {
         let active_clients = if let Ok(guard) = self.active_peers.try_read() {
             guard.len()
         } else {
             0
         };
 
-        CloudStatus {
+        CloudStatusRedacted {
             mode: self.mode,
             connected: self.running.load(Ordering::Relaxed),
             room_name: self.room_name.clone(),
-            room_key: self.room_key.clone(),
             active_clients,
             queued_writes: 0,
         }
@@ -1961,6 +1989,26 @@ mod tests {
         assert_eq!(s.mode, CloudSyncMode::Server);
         let st = s.status();
         assert_eq!(st.room_name, "game");
+    }
+
+    #[test]
+    fn status_serialization_never_leaks_room_key() {
+        let (db, _dir) = temp_db("statusredact");
+        let s = CloudSync::server(db, "hub-1", "tok", "game", "s3cret");
+        let full = s.status();
+        assert_eq!(full.room_key, "s3cret");
+
+        // Direct serialization of the full status is already safe.
+        let full_json = serde_json::to_string(&full).expect("full status json");
+        assert!(!full_json.contains("room_key"));
+        assert!(!full_json.contains("s3cret"));
+
+        let redacted = s.status_redacted();
+        let redacted_json = serde_json::to_string(&redacted).expect("redacted status json");
+        assert!(!redacted_json.contains("room_key"));
+        assert!(!redacted_json.contains("s3cret"));
+        assert_eq!(redacted.room_name, "game");
+        assert_eq!(redacted.mode, CloudSyncMode::Server);
     }
 
     #[test]

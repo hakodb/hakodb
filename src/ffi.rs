@@ -5412,6 +5412,8 @@ pub extern "C" fn hk_cloud_sync_start(cloud_sync: *mut HK_CloudSync, address: *c
     })
 }
 
+/// Redacted status JSON: mode, connected, room_name, active_clients, and
+/// queued_writes. The room key is never included.
 #[cfg(feature = "cloud-sync")]
 #[no_mangle]
 pub extern "C" fn hk_cloud_sync_status(cloud_sync: *mut HK_CloudSync) -> *mut c_char {
@@ -5421,8 +5423,8 @@ pub extern "C" fn hk_cloud_sync_status(cloud_sync: *mut HK_CloudSync) -> *mut c_
             return ptr::null_mut();
         }
         let cs_ref = unsafe { &*cloud_sync };
-        // Returns JSON string representation of current CloudStatus
-        let status = cs_ref.inner.status();
+        // Admin/log boundary: never expose the room key.
+        let status = cs_ref.inner.status_redacted();
         match serde_json::to_string(&status) {
             Ok(json) => match CString::new(json) {
                 Ok(c_str) => {
