@@ -2,6 +2,30 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.17.0 — index drops and cooperative cancellation
+- **Index drop APIs (#115 P0).** `drop_index`, `drop_fts_index`,
+  `drop_vector_index`, `drop_composite_index`, `drop_traverse_index`, and
+  `drop_edge_index` remove an index from RAM and disk. The matching C ABI
+  functions ship in the same release. A drop of an absent index is a no-op;
+  a composite id that belongs to another collection is rejected.
+- **Cooperative cancellation (#115 P1).** New `CancelToken` (cheap clone,
+  thread-safe) plus `HakoError::Cancelled` / `ErrorKind::Cancelled = 5`.
+  `delete_where_with_cancel`, `patch_where_with_cancel`,
+  `compact_with_cancel`, and `vacuum_with_cancel` stop at safe checkpoints.
+  Bulk ops check before their single atomic batch, so cancelling leaves zero
+  partial writes. Compaction removes a cancelled target segment and keeps the
+  originals; vacuum removes `blobs.tmp` and keeps `blobs.dat` intact. Existing
+  non-cancellable methods are unchanged wrappers. Rust API only for now.
+- **Vacuum correctness.** Vacuum no longer re-acquires its own shard lock
+  (self-deadlock) and now persists rewritten blob offsets to the document
+  skeletons instead of leaving stale pointers.
+- **Cloud status redaction (breaking for JSON consumers).**
+  `hk_cloud_sync_status` no longer exposes `room_key`; use
+  `CloudSync::status_redacted` / `CloudStatusRedacted` for the safe shape. The
+  full `CloudStatus` Rust struct still carries the key for server-side callers.
+- **Warning-free build.** Removed 77 redundant `unsafe` blocks from FFI tests
+  and cleared compiler/clippy warnings across the workspace.
+
 ### v0.16.0 — cloud single-room (breaking)
 - **Room as channel (net_sync parity).** `CloudSync::server` takes
   `room_name` + `room_key` and serves exactly that room; wrong-room
