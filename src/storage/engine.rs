@@ -1,6 +1,7 @@
 use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::cancel::CancelToken;
 use crate::config::{HakoConfig, DurabilityMode};
 use crate::error::{HakoError, Result};
 use std::sync::{Arc, Mutex, RwLock};
@@ -1104,6 +1105,16 @@ impl StorageEngine {
     }
 
     pub fn compact(&mut self) -> Result<()> {
+        self.compact_with_cancel(None)
+    }
+
+    pub(crate) fn compact_with_cancel(
+        &mut self,
+        cancel: Option<&CancelToken>,
+    ) -> Result<()> {
+        if let Some(token) = cancel {
+            token.check()?;
+        }
         // 1. FORCED ROTATION: Ensure current data is eligible for compaction
         if self.segments.get(&self.active_segment_id)
             .is_some_and(|m| m.segment.size_bytes().unwrap_or(0) > 0)
@@ -1130,6 +1141,10 @@ impl StorageEngine {
             self.active_segment_id = new_id;
         }
 
+        if let Some(token) = cancel {
+            token.check()?;
+        }
+
         let immutable_ids: Vec<u64> = self.segments.keys()
             .filter(|&&id| id != self.active_segment_id)
             .cloned().collect();
@@ -1147,6 +1162,9 @@ impl StorageEngine {
         // 2. GLOBAL MERGE: Collect ALL data from ALL immutable segments
         let mut entries = Vec::new();
         for (key, pointer) in &self.index {
+            if let Some(token) = cancel {
+                token.check()?;
+            }
             if let Pointer::Segment { segment_id, .. } = pointer {
                 if immutable_ids.contains(segment_id) {
                     if let Some(value) = self.read_pointer(pointer)? {
@@ -1157,6 +1175,9 @@ impl StorageEngine {
         }
 
         // 3. Write to ONE highly-optimized, compressed segment
+        if let Some(token) = cancel {
+            token.check()?;
+        }
         let target_id = self.next_segment_id;
         self.next_segment_id += 1;
         let target_path = segment_path(&self.base_dir, 1, target_id);
@@ -1172,6 +1193,17 @@ impl StorageEngine {
         let mut rebuilt_index_subset = HashMap::new();
 
         compact_segment(&mut target, &entries, &mut rebuilt_index_subset, target_id, self.use_compression)?;
+
+        // Cancelled before the swap: drop the half-built target and keep
+        // every original segment exactly as it was.
+        if let Some(token) = cancel {
+            if token.is_cancelled() {
+                let path = target.path().to_path_buf();
+                target.close();
+                let _ = std::fs::remove_file(path);
+                return Err(HakoError::Cancelled);
+            }
+        }
 
         // 4. Atomic Swap
         for id in &immutable_ids {
