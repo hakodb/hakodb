@@ -25,7 +25,7 @@ pub mod cloud_sync;
 pub mod socket_sync;
 
 #[cfg(feature = "cloud-sync")]
-pub use cloud_sync::{CloudPacket, CloudStatus, CloudSync, CloudSyncMode};
+pub use cloud_sync::{CloudPacket, CloudStatus, CloudStatusRedacted, CloudSync, CloudSyncMode};
 
 pub use engine::Hako;
 pub use engine::QuiescenceStatus;
