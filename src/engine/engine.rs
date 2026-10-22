@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH, Instant};
 
 use hashbrown::{HashMap, HashSet};
 
+use crate::cancel::CancelToken;
 use crate::config::{DurabilityMode, HakoConfig};
 use crate::document::hako_doc::HakoDoc;
 use crate::document::value::Value;
@@ -3064,6 +3065,17 @@ impl Hako {
     }
 
     pub fn query(&self, query: Query) -> Result<Vec<(String, HakoDoc)>> {
+        self.query_with_cancel(query, None)
+    }
+
+    fn query_with_cancel(
+        &self,
+        query: Query,
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<(String, HakoDoc)>> {
+        if let Some(token) = cancel {
+            token.check()?;
+        }
         if !self.allowed(&query.collection, AccessOp::Query) {
             return Err(self.deny(AccessOp::Query, &query.collection, None));
         }
@@ -3085,7 +3097,7 @@ impl Hako {
         // the single-shard executor â€” dedicated path below. Normal scans
         // are untouched (perf: zero hot-path change).
         if matches!(plan.scan, crate::query::plan::ScanType::Traverse { .. }) {
-            let results = self.execute_traverse_query(&plan)?;
+            let results = self.execute_traverse_query(&plan, cancel)?;
             self.record_audit(AuditEntry {
                 op: AccessOp::Query,
                 collection: query.collection.clone(),
@@ -3096,7 +3108,9 @@ impl Hako {
         }
 
         // SIMPLE CALL: No blob_file or encryption passed here!
-        let results = self.executor.execute(shard_arc, &indexes, (*plan).clone())?;
+        let results = self
+            .executor
+            .execute_with_cancel(shard_arc, &indexes, (*plan).clone(), cancel)?;
 
         // AUDIT RESULT
         self.record_audit(AuditEntry {
@@ -3196,6 +3210,7 @@ impl Hako {
     fn execute_traverse_query(
         &self,
         plan: &crate::query::plan::QueryPlan,
+        cancel: Option<&CancelToken>,
     ) -> Result<Vec<(String, HakoDoc)>> {
         use crate::query::filter::compare_values;
         use crate::query::plan::ScanType;
@@ -3215,6 +3230,9 @@ impl Hako {
         }
         let mut results: Vec<(String, HakoDoc)> = Vec::new();
         for hit in self.find_paths(&start_col, &start_id, &spec)? {
+            if let Some(token) = cancel {
+                token.check()?;
+            }
             if hit.collection != plan.collection {
                 continue;
             }
@@ -3427,8 +3445,33 @@ impl Hako {
     }
 
     pub fn delete_where(&self, query: crate::query::query::Query) -> Result<usize> {
-        // 1. Find the matches
-        let results = self.query(query.clone())?;
+        self.delete_where_impl(query, None)
+    }
+
+    /// [`Self::delete_where`] with cooperative cancellation.
+    ///
+    /// The token is checked during the matching scan and once more before
+    /// the delete batch commits. Cancelling before that final batch means
+    /// no document is deleted; the whole batch is atomic, so there is no
+    /// partially deleted match set.
+    pub fn delete_where_with_cancel(
+        &self,
+        query: crate::query::query::Query,
+        cancel: &CancelToken,
+    ) -> Result<usize> {
+        self.delete_where_impl(query, Some(cancel))
+    }
+
+    fn delete_where_impl(
+        &self,
+        query: crate::query::query::Query,
+        cancel: Option<&CancelToken>,
+    ) -> Result<usize> {
+        // 1. Find the matches (cancel checks ride the scan).
+        let results = self.query_with_cancel(query.clone(), cancel)?;
+        if let Some(token) = cancel {
+            token.check()?;
+        }
         if results.is_empty() { return Ok(0); }
 
         // 2. Map to delete mutations
@@ -3440,13 +3483,42 @@ impl Hako {
             })
             .collect();
 
-        // 3. Execute batch
+        // 3. Execute batch; cancelled before commit means zero writes.
+        if let Some(token) = cancel {
+            token.check()?;
+        }
         self.write_batch(mutations)?;
         Ok(count)
     }
 
     pub fn patch_where(&self, query: crate::query::query::Query, updates: Vec<(String, Value)>) -> Result<usize> {
-        let results = self.query(query.clone())?;
+        self.patch_where_impl(query, updates, None)
+    }
+
+    /// [`Self::patch_where`] with cooperative cancellation.
+    ///
+    /// The token is checked during the matching scan and once more before
+    /// the patch batch commits. Cancelling before that final batch means
+    /// no document is modified; the batch itself is atomic.
+    pub fn patch_where_with_cancel(
+        &self,
+        query: crate::query::query::Query,
+        updates: Vec<(String, Value)>,
+        cancel: &CancelToken,
+    ) -> Result<usize> {
+        self.patch_where_impl(query, updates, Some(cancel))
+    }
+
+    fn patch_where_impl(
+        &self,
+        query: crate::query::query::Query,
+        updates: Vec<(String, Value)>,
+        cancel: Option<&CancelToken>,
+    ) -> Result<usize> {
+        let results = self.query_with_cancel(query.clone(), cancel)?;
+        if let Some(token) = cancel {
+            token.check()?;
+        }
         if results.is_empty() { return Ok(0); }
 
         let count = results.len();
@@ -3458,6 +3530,9 @@ impl Hako {
             })
             .collect();
 
+        if let Some(token) = cancel {
+            token.check()?;
+        }
         self.write_batch(mutations)?;
         Ok(count)
     }

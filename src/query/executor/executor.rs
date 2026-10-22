@@ -4,6 +4,7 @@ use std::collections::BinaryHeap;
 use std::sync::{Arc, RwLock};
 use std::thread;
 
+use crate::cancel::CancelToken;
 use crate::document::hako_doc::{BorrowedValue, DocView, HakoDoc, HakoDocView};
 use crate::document::value::Value;
 use crate::error::Result;
@@ -211,13 +212,34 @@ impl ParallelQueryExecutor {
         }
     }
 
+    fn check_cancel(cancel: Option<&CancelToken>) -> Result<()> {
+        match cancel {
+            Some(token) => token.check(),
+            None => Ok(()),
+        }
+    }
+
     pub fn execute(
         &self,
         storage_arc: Arc<RwLock<StorageEngine>>,
         indexes: &IndexManager,
+        plan: QueryPlan,
+    ) -> Result<Vec<(String, HakoDoc)>> {
+        self.execute_with_cancel(storage_arc, indexes, plan, None)
+    }
+
+    /// [`Self::execute`] with cooperative cancellation. The optional token
+    /// is checked at scan-row and fetch checkpoints; a cancelled scan
+    /// returns `HakoError::Cancelled` without running the write side.
+    pub(crate) fn execute_with_cancel(
+        &self,
+        storage_arc: Arc<RwLock<StorageEngine>>,
+        indexes: &IndexManager,
         mut plan: QueryPlan,
+        cancel: Option<&CancelToken>,
     ) -> Result<Vec<(String, HakoDoc)>> {
         let _inflight = InflightGuard::take();
+        Self::check_cancel(cancel)?;
         // 1. PHASE 1: INDEX SCAN
         // Fetch physical pointers from the RAM Index
         let mut keys_from_index = {
@@ -261,6 +283,8 @@ impl ParallelQueryExecutor {
             plan.filters_satisfied_by_index = false;
         }
 
+        Self::check_cancel(cancel)?;
+
         if keys_from_index.is_empty() {
             return Ok(Vec::new());
         }
@@ -292,7 +316,7 @@ impl ParallelQueryExecutor {
             && !plan.has_cursor_bounds
             && matches!(plan.limit, Some(l) if l < keys_from_index.len());
         if topn {
-            return self.execute_topn(storage_arc, &plan, keys_from_index);
+            return self.execute_topn(storage_arc, &plan, keys_from_index, cancel);
         }
 
         // --- EARLY TERMINATION (issue #22): unordered (or order-satisfied)
@@ -343,6 +367,7 @@ impl ParallelQueryExecutor {
             };
 
             for (id, ptr) in keys_from_index {
+                Self::check_cancel(cancel)?;
                 // ponytail: Inlined bytes are Arc-shared — decode borrows the
                 // shared buffer instead of cloning ~1KB per row. The owned Arc
                 // keeps the buffer alive, so no guard lifetime is involved.
@@ -364,6 +389,7 @@ impl ParallelQueryExecutor {
                 }
             }
 
+            Self::check_cancel(cancel)?;
             // ponytail: parallel blob inflation. Skeletons are all decoded
             // above; resolve every BlobLink concurrently (positional preads
             // are thread-safe, no shared state). Sequential 20x50KB disk
@@ -384,6 +410,7 @@ impl ParallelQueryExecutor {
             }
 
             // 6. PHASE 6: FINAL SORTING & SLICING
+            Self::check_cancel(cancel)?;
             if !plan.order_by_satisfied && !plan.order_by.is_empty() {
                 results.sort_by(|(id_a, doc_a), (id_b, doc_b)| {
                     for order in &plan.order_by {
@@ -417,7 +444,13 @@ impl ParallelQueryExecutor {
         // satisfied scans would fall into phases 3-6 and regress vs the
         // old rayon path they used to take.
         if plan.order_by_satisfied && plan.filters_satisfied_by_index {
-            return self.execute_satisfied_parallel(storage_arc, indexes, plan, keys_from_index);
+            return self.execute_satisfied_parallel(
+                storage_arc,
+                indexes,
+                plan,
+                keys_from_index,
+                cancel,
+            );
         }
 
         // 3. PHASE 3: PHYSICAL SORT (The "Sweep" optimization)
@@ -449,6 +482,7 @@ impl ParallelQueryExecutor {
         // way (scan-order prefix); bounded regret when sparse (one
         // sequential probe window, then full parallelism as today).
         const PROBE_ROWS: usize = 2000;
+        Self::check_cancel(cancel)?;
         let mut probe_results: Vec<(String, HakoDoc)> = Vec::new();
         if let Some(need) = early_need {
             if need < docs_to_fetch.len() {
@@ -464,6 +498,7 @@ impl ParallelQueryExecutor {
         }
 
         // 4. PHASE 4: ADAPTIVE WORKER DISPATCH
+        Self::check_cancel(cancel)?;
         // Probe already full: drop the remainder, the page is complete.
         if let Some(need) = early_need {
             if probe_results.len() >= need {
@@ -492,13 +527,20 @@ impl ParallelQueryExecutor {
         let processed_docs: Vec<(String, HakoDoc)> = if target_workers == 1 {
             // SHORT-CIRCUIT: Avoid Rayon task-scheduling overhead for small results.
             // This ensures a query for 50 docs is as fast as 50 individual Get calls.
-            tasks.into_iter().flat_map(run_task).collect()
+            let mut out = Vec::new();
+            for task in tasks {
+                Self::check_cancel(cancel)?;
+                out.extend(run_task(task));
+            }
+            out
         } else {
             // PARALLEL PATH: Use full CPU power for heavy workloads
-            tasks
+            let out = tasks
                 .into_par_iter()
                 .flat_map(run_task)
-                .collect()
+                .collect();
+            Self::check_cancel(cancel)?;
+            out
         };
 
         // 5. PHASE 5: LOGICAL ORDER RESTORATION
@@ -535,6 +577,7 @@ impl ParallelQueryExecutor {
         }
 
         // 6. PHASE 6: FINAL SORTING & SLICING
+        Self::check_cancel(cancel)?;
         // Manual sort if the Index couldn't satisfy the order_by clause
         if !plan.order_by_satisfied && !plan.order_by.is_empty() {
             results.sort_by(|(id_a, doc_a), (id_b, doc_b)| {
@@ -588,6 +631,7 @@ impl ParallelQueryExecutor {
         storage_arc: Arc<RwLock<StorageEngine>>,
         plan: &QueryPlan,
         keys: Vec<(String, Pointer)>,
+        cancel: Option<&CancelToken>,
     ) -> Result<Vec<(String, HakoDoc)>> {
         let limit = plan.limit.unwrap_or(usize::MAX);
         let offset = plan.offset.unwrap_or(0);
@@ -605,6 +649,7 @@ impl ParallelQueryExecutor {
         // freeze the heap on the first K scanned.)
         let mut heap: BinaryHeap<TopItem> = BinaryHeap::new();
         for (seq, (id, ptr)) in keys.iter().enumerate() {
+            Self::check_cancel(cancel)?;
             let Some(shared) = storage.read_pointer_shared(ptr)? else {
                 continue;
             };
@@ -637,6 +682,7 @@ impl ParallelQueryExecutor {
             heap.into_iter().map(|item| item.entry).collect();
         entries.sort_by(|a, b| cmp_top(a, b, orders));
         let blob_manager = storage.blob_manager.as_ref();
+        Self::check_cancel(cancel)?;
         let mut out = Vec::new();
         let mut skipped = 0usize;
         for e in entries {
@@ -948,12 +994,14 @@ impl ParallelQueryExecutor {
         _indexes: &IndexManager,
         plan: QueryPlan,
         keys_from_index: Vec<(String, Pointer)>,
+        cancel: Option<&CancelToken>,
     ) -> Result<Vec<(String, HakoDoc)>> {
         use crate::query::executor::worker::{doc_has_links, inflate_blobs};
         let (staged, blob_manager) = {
             let storage = storage_arc.read().unwrap();
             let mut v = Vec::with_capacity(keys_from_index.len());
             for (id, ptr) in keys_from_index {
+                Self::check_cancel(cancel)?;
                 if let Some(bytes) = storage.read_pointer_shared(&ptr)? {
                     v.push((id, bytes));
                 }
@@ -975,10 +1023,12 @@ impl ParallelQueryExecutor {
                 }
             }
         }
+        Self::check_cancel(cancel)?;
         let mut results: Vec<(String, HakoDoc)> = staged
             .into_par_iter()
             .filter_map(|(id, bytes)| HakoDoc::decode(&bytes).map(|doc| (id, doc)))
             .collect();
+        Self::check_cancel(cancel)?;
         if !plan.defer_blobs {
             if let Some(bm) = blob_manager.as_ref() {
                 if results.iter().any(|(_, doc)| doc_has_links(doc)) {
