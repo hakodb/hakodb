@@ -1,3 +1,4 @@
+pub mod cancel;
 pub mod config;
 pub mod document;
 pub mod engine;
@@ -27,6 +28,7 @@ pub mod socket_sync;
 #[cfg(feature = "cloud-sync")]
 pub use cloud_sync::{CloudPacket, CloudStatus, CloudStatusRedacted, CloudSync, CloudSyncMode};
 
+pub use cancel::CancelToken;
 pub use engine::Hako;
 pub use engine::QuiescenceStatus;
 pub mod schema;
