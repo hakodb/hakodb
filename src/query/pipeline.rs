@@ -41,6 +41,7 @@ pub struct AccumSpec {
 
 /// Pipeline stage. `Match` carries a full `Query` (its own limit/offset
 /// apply as written; prefer the pipeline `Limit`/`Offset` stages).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Stage {
     Match(Query),
@@ -148,12 +149,12 @@ impl AccState {
                 _ => {}
             },
             Accum::Min(_) => {
-                if self.min.as_ref().map_or(true, |m| v < m) {
+                if self.min.as_ref().is_none_or(|m| v < m) {
                     self.min = Some(v.clone());
                 }
             }
             Accum::Max(_) => {
-                if self.max.as_ref().map_or(true, |m| v > m) {
+                if self.max.as_ref().is_none_or(|m| v > m) {
                     self.max = Some(v.clone());
                 }
             }
@@ -206,14 +207,10 @@ pub fn validate(p: &Pipeline) -> Result<(), HakoError> {
                     )));
                 }
             }
-            Stage::Group { key, .. } => {
-                if let Some(k) = key {
-                    if k.split('.').any(|s| s.is_empty()) {
-                        return Err(HakoError::InvalidInput(format!(
-                            "pipeline group: invalid key path ({k})"
-                        )));
-                    }
-                }
+            Stage::Group { key: Some(k), .. } if k.split('.').any(|s| s.is_empty()) => {
+                return Err(HakoError::InvalidInput(format!(
+                    "pipeline group: invalid key path ({k})"
+                )));
             }
             _ => {}
         }
@@ -239,11 +236,12 @@ pub fn run_stages(
                 rows = rows
                     .into_iter()
                     .map(|(id, doc)| {
-                        let mut next = HakoDoc::default();
-                        next._time = doc._time;
                         // F6: dotted paths prune subtrees, same semantics as
                         // query projection.
-                        next.fields = doc.project_fields(fields);
+                        let next = HakoDoc {
+                            _time: doc._time,
+                            fields: doc.project_fields(fields),
+                        };
                         (id, next)
                     })
                     .collect();
@@ -308,7 +306,7 @@ pub fn run_stages(
     Ok(rows)
 }
 
-fn sort_key<'a>(row: &'a (String, HakoDoc), field: &str) -> Option<Value> {
+fn sort_key(row: &(String, HakoDoc), field: &str) -> Option<Value> {
     match field {
         "id" => Some(Value::String(row.0.clone())),
         "_time" => Some(Value::Int(row.1._time)),

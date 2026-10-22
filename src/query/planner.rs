@@ -82,7 +82,7 @@ impl QueryPlanner {
         for filter in &query.filters {
             if matches!(filter.op, Operator::Match | Operator::MatchPrefix) && filter.field != "_time" {
                 if let Value::String(q_text) = &filter.value {
-                    if indexes.fts.get(&query.collection).map_or(false, |m| m.contains_key(&filter.field)) {
+                    if indexes.fts.get(&query.collection).is_some_and(|m| m.contains_key(&filter.field)) {
                         return Self::make_plan(
                             query,
                             ScanType::InvertedIndex {
@@ -203,7 +203,7 @@ impl QueryPlanner {
             && use_index_heuristic
             && matches!(query.filters[0].op, Operator::Eq)
             && indexes.secondary.get(&query.collection)
-                .map_or(false, |m| m.contains_key(&query.filters[0].field))
+                .is_some_and(|m| m.contains_key(&query.filters[0].field))
             && !matches!(&query.filters[0].value, Value::String(s) if s.parse::<i64>().is_ok());
         if !yield_to_secondary {
         if let Some((eq_scan, satisfied, filters_done)) = Self::try_plan_composite_eq(query, indexes) {
@@ -411,7 +411,7 @@ impl QueryPlanner {
                             }
                             let val_bytes = crate::index::index_key::encode_scalar(&filter.value);
                             let len = sec.get_map().get(&val_bytes).map(|s| s.len()).unwrap_or(0);
-                            if best.as_ref().map_or(true, |(l, _, _)| len < *l) {
+                            if best.as_ref().is_none_or(|(l, _, _)| len < *l) {
                                 best = Some((len, fi, val_bytes));
                             }
                         }
@@ -572,22 +572,22 @@ impl QueryPlanner {
         Some(ScanType::SortedKeys { start_key, start_exclusive, reverse: !first_order.ascending })
     }
 
-    fn try_plan_union(query: &Query, indexes: &IndexManager) -> Option<ScanType> {        let mut scans = Vec::new();
+    fn try_plan_union(query: &Query, indexes: &IndexManager) -> Option<ScanType> {
+        let mut scans = Vec::new();
         for filter in &query.filters {
             if matches!(filter.op, Operator::In) {
                 if let Value::Array(vals) = &filter.value {
-                    let mut scans = Vec::new();
                     for v in vals {
-                        // This ensures each item in the IN array checks for 
+                        // This ensures each item in the IN array checks for
                         // Composite Indexes first, then Secondary Indexes.
-                        if let Some(scan) = Self::get_single_filter_scan(
-                            &query.collection, &filter.field, v, indexes, query
-                        ) {
-                            scans.push(scan);
-                        } else {
-                            // If one item can't hit an index, the whole IN might as well full scan
-                            return None; 
-                        }
+                        let scan = Self::get_single_filter_scan(
+                            &query.collection,
+                            &filter.field,
+                            v,
+                            indexes,
+                            query,
+                        )?;
+                        scans.push(scan);
                     }
                     return Some(ScanType::UnionIndex { scans });
                 }
@@ -685,7 +685,7 @@ impl QueryPlanner {
                 if !Self::composite_def_usable(&idx.definition, _query) {
                     continue;
                 }
-                if idx.definition.fields.first().map_or(false, |f| f.field == field) {
+                if idx.definition.fields.first().is_some_and(|f| f.field == field) {
                     sub_scans.push(ScanType::CompositeIndex {
                         index_id: idx.definition.id,
                         fields: vec![field.to_string()],

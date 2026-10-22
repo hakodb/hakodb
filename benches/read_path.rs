@@ -42,7 +42,7 @@ fn make_doc(i: usize) -> HakoDoc {
     let mut doc = HakoDoc::default();
     doc.insert("tenant", Value::String(format!("tenant-{}", i % 32)));
     doc.insert("age", Value::Int(18 + (i % 70) as i64));
-    doc.insert("active", Value::Bool(i % 3 != 0));
+    doc.insert("active", Value::Bool(!i.is_multiple_of(3)));
     doc.insert("score", Value::Float(((i % 10000) as f64) / 7.0 + 0.5));
     doc.insert(
         "description",

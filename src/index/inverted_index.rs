@@ -37,16 +37,12 @@ impl InvertedIndex {
         let mut results: Option<BTreeSet<String>> = None;
 
         for word in words {
-            if let Some(ids) = self.map.get(&word) {
-                if let Some(ref mut current_set) = results {
-                    // Intersection: Must contain ALL words in the query
-                    *current_set = current_set.intersection(ids).cloned().collect();
-                } else {
-                    results = Some(ids.clone());
-                }
+            let ids = self.map.get(&word)?;
+            if let Some(ref mut current_set) = results {
+                // Intersection: Must contain ALL words in the query
+                *current_set = current_set.intersection(ids).cloned().collect();
             } else {
-                // One word not found = no matches for the whole phrase
-                return None;
+                results = Some(ids.clone());
             }
         }
         results

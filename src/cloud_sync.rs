@@ -287,7 +287,6 @@ fn value_to_string(v: &Value) -> Option<String> {
 }
 
 /// Client-facing collections are stored server-side as "<prefix>_<collection>".
-
 /// Uniform key used by the outbound tailers and the ingest flusher to suppress
 /// echoes (writes that originated locally and were only re-applied on arrival).
 /// Connection-scoped like the room itself: collection + key are enough,
@@ -561,9 +560,7 @@ impl CloudSync {
     /// client: normally just the uplink, if tracked). Best-effort read.
     pub fn peer_list(&self) -> Vec<PeerView> {
         match self.active_peers.try_read() {
-            Ok(guard) => guard
-                .iter()
-                .map(|(k, _)| PeerView {
+            Ok(guard) => guard.keys().map(|k| PeerView {
                     peer_key: k.clone(),
                 })
                 .collect(),
@@ -741,7 +738,7 @@ impl CloudSync {
                         // LWW check (mirrors the put arm): a stale tombstone —
                         // e.g. replayed by handshake catch-up — must not beat
                         // a newer local put.
-                        if Self::is_stale_remote_delete(&db, &collection, key, *timestamp) {
+                        if Self::is_stale_remote_delete(db, &collection, key, *timestamp) {
                             continue;
                         }
                         {
@@ -923,7 +920,7 @@ kind,
     async fn start_server_mode(&self, bind_addr: &str) -> FLResult<()> {
         let listener = tokio::net::TcpListener::bind(bind_addr)
             .await
-            .map_err(|e| HakoError::Io(e))?;
+            .map_err(HakoError::Io)?;
 
         let ingest_tx = self.ingest_tx.clone();
         let db = self.db.clone();
@@ -993,6 +990,7 @@ kind,
     }
 
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_server_client<S>(
         ws_stream: tokio_tungstenite::WebSocketStream<S>,
         ingest_tx: mpsc::Sender<IngestItem>,
@@ -1348,6 +1346,7 @@ kind,
         pages
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_catchup_deltas(
         db: &Arc<Hako>,
         collection: &str,
@@ -1505,7 +1504,7 @@ kind,
                                     let wal_ts = crate::sync_core::op_logical_time(&op);
 
                                     // Skip writes originating from client WebSockets (already handled)
-                                    let ek = echo_key(&collection, &key);
+                                    let ek = echo_key(&collection, key);
                                     let is_echo = crate::sync_core::echo_take(&echo_cache, &ek, wal_ts);
 
                                     if !is_echo {
@@ -1653,7 +1652,7 @@ kind,
                     true,
                 )
                 .await;
-                if matches!(ws_result, Ok(_)) {
+                if ws_result.is_ok() {
                     let (mut ws_tx, mut ws_rx) = ws_result.map(|(s, _)| s.split()).unwrap();
 
                     let auth_packet = CloudPacket::Authenticate {
@@ -1891,7 +1890,7 @@ kind,
                                     // (sync_core: shared decode + echo take, all tailers).
                                     let wal_ts = crate::sync_core::op_logical_time(&op);
 
-                                    let is_echo = crate::sync_core::echo_take(&echo_cache, &echo_key(&col, &key), wal_ts);
+                                    let is_echo = crate::sync_core::echo_take(&echo_cache, &echo_key(&col, key), wal_ts);
 
                                     if !is_echo {
                                         // Local-only signal: client never pushes marked ops upstream.

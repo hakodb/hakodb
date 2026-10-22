@@ -128,7 +128,7 @@ impl CompositeIndexDefinition {
         };
         let matches = |f: &crate::query::filter::Filter| {
             value_of(&f.field)
-                .map_or(false, |v| compare_values(&v, &f.op, &f.value))
+                .is_some_and(|v| compare_values(&v, &f.op, &f.value))
         };
         match group.logic {
             FilterLogic::And => group.filters.iter().all(matches),

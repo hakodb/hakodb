@@ -48,7 +48,7 @@ fn order(items: Vec<(&str, i64)>, tags: Option<Vec<&str>>) -> HakoDoc {
 
 #[test]
 fn elem_match_requires_one_element_with_all_subfilters() {
-    let db = Hako::open(&tmp_dir("basic"), HakoConfig::default()).unwrap();
+    let db = Hako::open(tmp_dir("basic"), HakoConfig::default()).unwrap();
     db.put("o", "o1", &order(vec![("A1", 1), ("B2", 5)], None)).unwrap();
     // Same sku but qty too low, plus a high-qty item of another sku: no
     // single element satisfies BOTH sub-filters.
@@ -65,7 +65,7 @@ fn elem_match_requires_one_element_with_all_subfilters() {
 
 #[test]
 fn elem_match_fail_closed_edges() {
-    let db = Hako::open(&tmp_dir("edges"), HakoConfig::default()).unwrap();
+    let db = Hako::open(tmp_dir("edges"), HakoConfig::default()).unwrap();
     db.put("o", "empty", &order(vec![], None)).unwrap();
     db.put("o", "missing", &HakoDoc::default()).unwrap();
     db.put("o", "nonarray", &{
@@ -107,7 +107,7 @@ fn elem_match_fail_closed_edges() {
 
 #[test]
 fn array_all_eq_is_whole_value_membership() {
-    let db = Hako::open(&tmp_dir("all-eq"), HakoConfig::default()).unwrap();
+    let db = Hako::open(tmp_dir("all-eq"), HakoConfig::default()).unwrap();
     db.put("d", "all", &order(vec![], Some(vec!["a", "a"]))).unwrap();
     db.put("d", "mixed", &order(vec![], Some(vec!["a", "b"]))).unwrap();
     db.put("d", "empty", &order(vec![], Some(vec![]))).unwrap();
@@ -124,7 +124,7 @@ fn array_all_eq_is_whole_value_membership() {
 
 #[test]
 fn elem_match_combines_with_indexed_filters() {
-    let db = Hako::open(&tmp_dir("combo"), HakoConfig::default()).unwrap();
+    let db = Hako::open(tmp_dir("combo"), HakoConfig::default()).unwrap();
     db.create_index("o", "status").unwrap();
     let mut a = order(vec![("A1", 5)], None);
     a.insert("status", Value::String("open".into()));
@@ -145,7 +145,7 @@ fn elem_match_combines_with_indexed_filters() {
 
 #[test]
 fn raw_and_walk_refuse_elem_match() {
-    let db = Hako::open(&tmp_dir("guard"), HakoConfig::default()).unwrap();
+    let db = Hako::open(tmp_dir("guard"), HakoConfig::default()).unwrap();
     db.put("o", "o1", &order(vec![("A1", 5)], None)).unwrap();
     let mut q = Query::new("o").elem_match("items", vec![
         f("sku", Operator::Eq, Value::String("A1".into())),

@@ -60,7 +60,7 @@ fn ids(db: &Hako, q: Query) -> Vec<String> {
 
 #[test]
 fn composite_range_uses_prefix_and_matches_full_scan() {
-    let indexed = Hako::open(&tmp_dir("range"), HakoConfig::default()).unwrap();
+    let indexed = Hako::open(tmp_dir("range"), HakoConfig::default()).unwrap();
     indexed
         .create_composite_index(
             "docs",
@@ -72,7 +72,7 @@ fn composite_range_uses_prefix_and_matches_full_scan() {
         .unwrap();
     seed(&indexed);
 
-    let plain = Hako::open(&tmp_dir("range-plain"), HakoConfig::default()).unwrap();
+    let plain = Hako::open(tmp_dir("range-plain"), HakoConfig::default()).unwrap();
     seed(&plain);
 
     let q = range_query();
@@ -87,7 +87,7 @@ fn composite_range_uses_prefix_and_matches_full_scan() {
 
 #[test]
 fn composite_range_supports_ascending_order_and_extra_filters() {
-    let indexed = Hako::open(&tmp_dir("range-order"), HakoConfig::default()).unwrap();
+    let indexed = Hako::open(tmp_dir("range-order"), HakoConfig::default()).unwrap();
     indexed
         .create_composite_index(
             "docs",
@@ -99,7 +99,7 @@ fn composite_range_supports_ascending_order_and_extra_filters() {
         .unwrap();
     seed(&indexed);
 
-    let plain = Hako::open(&tmp_dir("range-order-plain"), HakoConfig::default()).unwrap();
+    let plain = Hako::open(tmp_dir("range-order-plain"), HakoConfig::default()).unwrap();
     seed(&plain);
 
     let mut asc = range_query();
@@ -122,13 +122,13 @@ fn composite_range_supports_ascending_order_and_extra_filters() {
 
 #[test]
 fn composite_range_on_first_field() {
-    let indexed = Hako::open(&tmp_dir("range-first"), HakoConfig::default()).unwrap();
+    let indexed = Hako::open(tmp_dir("range-first"), HakoConfig::default()).unwrap();
     indexed
         .create_composite_index("docs", vec![("score".into(), SortDirection::Asc)])
         .unwrap();
     seed(&indexed);
 
-    let plain = Hako::open(&tmp_dir("range-first-plain"), HakoConfig::default()).unwrap();
+    let plain = Hako::open(tmp_dir("range-first-plain"), HakoConfig::default()).unwrap();
     seed(&plain);
 
     let mut q = Query::new("docs").where_filter("score", Operator::Gte, Value::Int(25));
@@ -146,7 +146,7 @@ fn composite_range_on_first_field() {
 
 #[test]
 fn filtered_index_is_only_used_when_the_query_implies_its_predicate() {
-    let db = Hako::open(&tmp_dir("filtered"), HakoConfig::default()).unwrap();
+    let db = Hako::open(tmp_dir("filtered"), HakoConfig::default()).unwrap();
     seed(&db);
     db.create_composite_index_ex(
         "docs",

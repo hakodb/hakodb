@@ -457,7 +457,7 @@ impl Transaction {
         });
     }
     pub fn commit(self, db: &Hako) -> Result<Vec<String>> {
-        Ok(db.write_batch(self.mutations)?)
+        db.write_batch(self.mutations)
     }
 }
 
@@ -568,7 +568,7 @@ impl SerializableTransaction {
             .collect()
     }
     pub fn commit(&self, db: &Hako) -> Result<Vec<String>> {
-        Ok(db.commit_serializable(self.reads.clone(), self.mutations.clone())?)
+        db.commit_serializable(self.reads.clone(), self.mutations.clone())
     }
 }
 
@@ -840,7 +840,7 @@ pub struct DropReport {
 impl Hako {
     pub fn open(path: impl AsRef<Path>, config: HakoConfig) -> Result<Self> {
 
-        let query_threads = config.query_workers.max(1).min(8);
+        let query_threads = config.query_workers.clamp(1, 8);
         RAYON_INIT.call_once(|| {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(query_threads)
@@ -879,7 +879,7 @@ impl Hako {
         let index_log_path = index_dir.join("index.log").to_string_lossy().to_string();
         let snapshot_dir = index_dir.join("snapshots").to_string_lossy().to_string();
         let index_storage = Arc::new(Mutex::new(
-            IndexStorage::open(&index_log_path, &snapshot_dir).map_err(|e| HakoError::Io(e))?,
+            IndexStorage::open(&index_log_path, &snapshot_dir).map_err(HakoError::Io)?,
         ));
 
         // --- WORKER 1: PERSISTENT INDEX WORKER ---
@@ -977,8 +977,8 @@ impl Hako {
                                 if !idx.definition.filter_passes(id, doc_ref) {
                                     continue;
                                 }
-                                if let Some(vals) = idx.document_values(&id, doc_ref) {
-                                    let key_bytes = crate::index::composite::key_encoder::encode_composite_key(&idx.definition, &vals, &id);
+                                if let Some(vals) = idx.document_values(id, doc_ref) {
+                                    let key_bytes = crate::index::composite::key_encoder::encode_composite_key(&idx.definition, &vals, id);
                                     let _ = persist.insert(idx.definition.id, key_bytes.to_vec(), id.clone());
                                 }
                             }
@@ -1080,7 +1080,7 @@ impl Hako {
                     }
                     if !shedding {
                         if let Ok(mut persist) = index_sys_ptr.try_lock() {
-                            if let Ok(_) = persist.snapshot(1) { let _ = persist.reset_log(); }
+                            if persist.snapshot(1).is_ok() { let _ = persist.reset_log(); }
                         }
 
                         // Periodically snapshot RAM indexes (prevent loss on crash)
@@ -1112,6 +1112,7 @@ impl Hako {
             // retried next tick (entries stay BlobPending, served from
             // their Arc â€” reads stay correct meanwhile). Bounded: each
             // item is carried at most until its shard frees.
+            #[allow(clippy::type_complexity)]
             let mut carry: Vec<(Arc<RwLock<StorageEngine>>, String, Vec<u8>, i64, usize)> = Vec::new();
             loop {
                 stop_latched = stop_latched || stop_rx.try_recv().is_ok();
@@ -1228,7 +1229,7 @@ impl Hako {
             // stepped BACKWARD past the last run reopens the hole â€”
             // ETag users with strict needs should add a boot epoch.
             global_version: AtomicU64::new(crate::util::clock::now_micros().max(1) as u64),
-            last_ts_watermark: std::sync::atomic::AtomicI64::new(crate::util::clock::now_micros() as i64),
+            last_ts_watermark: std::sync::atomic::AtomicI64::new(crate::util::clock::now_micros()),
             security_rules: RwLock::new(Vec::new()),
             security_enabled: std::sync::atomic::AtomicBool::new(false),
             read_only: std::sync::atomic::AtomicBool::new(false),
@@ -1454,12 +1455,12 @@ impl Hako {
                         .vector
                         .keys()
                         .filter(|col| {
-                            mgr.hnsw.get(*col).map_or(true, |graphs| {
+                            mgr.hnsw.get(*col).is_none_or(|graphs| {
                                 mgr.vector
                                     .get(*col)
-                                    .map_or(false, |defs| {
+                                    .is_some_and(|defs| {
                                         defs.keys().any(|f| {
-                                            graphs.get(f).map_or(true, |g| !g.complete())
+                                            graphs.get(f).is_none_or(|g| !g.complete())
                                         })
                                     })
                             })
@@ -2044,6 +2045,7 @@ impl Hako {
         // ponytail: last-collection cache â€” consecutive mutations usually hit
         // the same shard, so reuse its handle + blob manager instead of a map
         // lookup and two lock acquisitions per mutation.
+        #[allow(clippy::type_complexity)]
         let mut last_shard: Option<(String, Arc<RwLock<StorageEngine>>, Option<Arc<BlobManager>>)> = None;
         for m in mutations {
             // 1. Resolve basic info immediately
@@ -2066,7 +2068,7 @@ impl Hako {
                 }
             };
 
-            if doc_id.is_empty() || doc_id == "" {
+            if doc_id.is_empty() {
                 doc_id = self.generate_sortable_id(now_nanos);
             }
 
@@ -3366,6 +3368,7 @@ impl Hako {
         Ok(visited)
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn query_projected_zero_copy(
         &self,
         query: Query,
@@ -3413,7 +3416,7 @@ impl Hako {
         }]);
 
         // AUDIT RESULT
-        let _ = self.record_audit(AuditEntry {
+        self.record_audit(AuditEntry {
             op: AccessOp::Put,
             collection: col.into(),
             doc_id: Some(id.into()),
@@ -3513,8 +3516,7 @@ impl Hako {
         }
         rules
             .iter()
-            .filter(|r| op == r.op && col.starts_with(&r.collection_prefix))
-            .last()
+            .rfind(|r| op == r.op && col.starts_with(&r.collection_prefix))
             .map(|r| r.allow)
             .unwrap_or(true)
     }
@@ -3863,7 +3865,7 @@ impl Hako {
     /// tombstone comparison into permanent drops.
     pub(crate) fn observe_remote_ts(&self, ts: i64) {
         const SKEW_CEILING_MICROS: i64 = 100 * 365 * 24 * 60 * 60 * 1_000_000; // 100y
-        let ceiling = crate::util::clock::now_micros() as i64 + SKEW_CEILING_MICROS;
+        let ceiling = crate::util::clock::now_micros() + SKEW_CEILING_MICROS;
         let effective = ts.min(ceiling);
         let mut cur = self.last_ts_watermark.load(std::sync::atomic::Ordering::Relaxed);
         while effective > cur {
@@ -4222,7 +4224,7 @@ impl Hako {
         let mut composite = Vec::new();
         for idx in mgr.composite.all_indexes() {
             if let Some(target) = collection {
-                if target != &idx.definition.collection { continue; }
+                if target != idx.definition.collection { continue; }
             }
             composite.push(CompositeIndexInfo {
                 id: idx.definition.id,
@@ -4399,7 +4401,7 @@ impl Hako {
             if mgr
                 .secondary
                 .get(collection)
-                .map_or(false, |m| m.contains_key(field))
+                .is_some_and(|m| m.contains_key(field))
             {
                 return Ok(());
             }
@@ -4686,7 +4688,7 @@ impl Hako {
     /// Tests poll this (with quiescence) to distinguish the ANN path from
     /// the exact fallback; operators can gate dashboards on it.
     pub fn vector_index_complete(&self, collection: &str, field: &str) -> bool {
-        self.indexes.read().map_or(false, |mgr| {
+        self.indexes.read().is_ok_and(|mgr| {
             mgr.hnsw
                 .get(collection)
                 .and_then(|m| m.get(field))
@@ -4990,6 +4992,7 @@ impl Hako {
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
         let mut dist: HashMap<(String, String), f64> = HashMap::new();
+        #[allow(clippy::type_complexity)]
         let mut heap: BinaryHeap<(Reverse<(u64, String, String)>, usize)> = BinaryHeap::new();
         dist.insert((collection.to_string(), id.to_string()), 0.0);
         heap.push((Reverse((0, collection.to_string(), id.to_string())), 0));
@@ -5318,6 +5321,7 @@ impl Hako {
         Self::write_index_snapshot(&self.root_path, &self.shards, &self.indexes)
     }
 
+    #[allow(clippy::type_complexity)]
     fn write_index_snapshot(
         root_path: &std::path::Path,
         shards: &Arc<RwLock<HashMap<String, Arc<RwLock<StorageEngine>>>>>,
@@ -5359,7 +5363,7 @@ impl Hako {
     pub fn save_index_snapshots(&self) -> Result<()> {
         let persist = self.index_storage.lock().unwrap();
         // Snapshot the primary composite index (ID 1)
-        persist.snapshot(1).map_err(|e| HakoError::Io(e))?;
+        persist.snapshot(1).map_err(HakoError::Io)?;
         Ok(())
     }
 
@@ -5439,6 +5443,7 @@ impl Hako {
     /// Snapshot the blob state needed for resolve: manager handle plus
     /// not-yet-flushed queue bytes by offset. Call under a read guard;
     /// the returned Arcs outlive it.
+    #[allow(clippy::type_complexity)]
     fn snapshot_blob_state(
         shard: &StorageEngine,
     ) -> (Option<Arc<BlobManager>>, HashMap<u64, Arc<Vec<u8>>>) {
@@ -5589,7 +5594,7 @@ impl Hako {
                 .read()
                 .map(|m| {
                     m.get(collection)
-                        .map_or(true, |p| p.load(Ordering::Acquire) == 0)
+                        .is_none_or(|p| p.load(Ordering::Acquire) == 0)
                 })
                 .unwrap_or(false)
     }
@@ -5882,7 +5887,7 @@ mod profile_tests {
         let mut d = HakoDoc::default();
         d.insert("tenant", Value::String(format!("tenant-{}", i % 32)));
         d.insert("age", Value::Int(18 + (i % 70) as i64));
-        d.insert("active", Value::Bool(i % 3 != 0));
+        d.insert("active", Value::Bool(!i.is_multiple_of(3)));
         d.insert("score", Value::Float((i % 10000) as f64 / 7.0 + 0.5));
         d.insert("description", Value::String(format!("payload {i}")));
         d.insert("extra", Value::String("X".repeat(1024)));

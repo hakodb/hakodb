@@ -33,6 +33,7 @@ pub enum ScanType {
         values: Vec<Value>,
         reverse: bool,
     },
+    #[allow(clippy::type_complexity)]
     CompositeIndexRange {
         index_id: u32,
         ranges: Vec<(Bound<SmallVec<[u8; 32]>>, Bound<SmallVec<[u8; 32]>>)>,
@@ -188,9 +189,7 @@ impl QueryPlan {
             if path == "id" {
                 // The executor already carries the row id; projection APIs
                 // return it outside the field list.
-                if self.scan.index_label().is_none() {
-                    return None;
-                }
+                self.scan.index_label()?;
                 continue;
             }
             if path.contains('.') {

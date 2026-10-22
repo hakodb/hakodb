@@ -17,7 +17,7 @@ static CALLBACK: AtomicPtr<()> = AtomicPtr::new(null_mut());
 
 fn from_sink(s: Sink) -> *mut () { s as *const () as *mut () }
 fn as_sink(p: *mut ()) -> Option<Sink> {
-    if p.is_null() { None } else { Some(unsafe { std::mem::transmute(p) }) }
+    if p.is_null() { None } else { Some(unsafe { std::mem::transmute::<*mut (), Sink>(p) }) }
 }
 
 pub fn info(msg: &str) {

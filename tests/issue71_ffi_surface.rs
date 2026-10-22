@@ -76,14 +76,14 @@ fn seed(dir: &Path) {
 
 fn open(dir: &Path) -> *mut HK_Engine {
     let path = cstr(dir.to_str().unwrap());
-    let eng = unsafe { hk_engine_open(path.as_ptr()) };
+    let eng = { hk_engine_open(path.as_ptr()) };
     assert!(!eng.is_null(), "open failed: {}", last_error());
-    assert!(unsafe { hk_engine_await_quiescent(eng, 60_000) }, "never quiescent");
+    assert!({ hk_engine_await_quiescent(eng, 60_000) }, "never quiescent");
     eng
 }
 
 fn last_error() -> String {
-    let p = unsafe { hk_last_error() };
+    let p = { hk_last_error() };
     if p.is_null() {
         return String::new();
     }
@@ -93,7 +93,7 @@ fn last_error() -> String {
 fn take_json(p: *mut std::ffi::c_char) -> serde_json::Value {
     assert!(!p.is_null(), "null result: {}", last_error());
     let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_string();
-    unsafe { hk_string_free(p) };
+    hk_string_free(p);
     serde_json::from_str(&s).expect("valid JSON")
 }
 
@@ -103,29 +103,29 @@ fn elem_match_and_all_eq_through_ffi() {
     seed(&dir);
     let eng = open(&dir);
 
-    let q = unsafe { hk_query_new(cstr("orders").as_ptr()) };
+    let q = { hk_query_new(cstr("orders").as_ptr()) };
     assert!(!q.is_null());
     let filters = cstr(r#"[{"field":"sku","op":"eq","value":"B"},{"field":"qty","op":"gt","value":2}]"#);
-    let rc = unsafe { hk_query_where_elem_match(q, cstr("items").as_ptr(), filters.as_ptr()) };
+    let rc = { hk_query_where_elem_match(q, cstr("items").as_ptr(), filters.as_ptr()) };
     assert_eq!(rc, 0, "elem_match: {}", last_error());
-    let rows = take_json(unsafe { hk_query_execute(eng, q) });
+    let rows = take_json(hk_query_execute(eng, q));
     assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
     assert_eq!(rows[0]["name"], "o1");
 
     // Empty sub-filter list is refused instead of matching everything.
     let empty = cstr("[]");
-    let rc = unsafe { hk_query_where_elem_match(q, cstr("items").as_ptr(), empty.as_ptr()) };
+    let rc = { hk_query_where_elem_match(q, cstr("items").as_ptr(), empty.as_ptr()) };
     assert_eq!(rc, -1);
     assert!(!last_error().is_empty());
 
-    let all = unsafe { hk_query_new(cstr("orders").as_ptr()) };
-    let rc = unsafe { hk_query_where_array_all_eq(all, cstr("tags").as_ptr(), cstr("\"x\"").as_ptr()) };
+    let all = { hk_query_new(cstr("orders").as_ptr()) };
+    let rc = { hk_query_where_array_all_eq(all, cstr("tags").as_ptr(), cstr("\"x\"").as_ptr()) };
     assert_eq!(rc, 0, "all_eq: {}", last_error());
-    let rows = take_json(unsafe { hk_query_execute(eng, all) });
+    let rows = take_json(hk_query_execute(eng, all));
     assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
     assert_eq!(rows[0]["name"], "o1", "empty tags fail closed, x+y excluded");
 
-    unsafe {
+    {
         hk_query_free(q);
         hk_query_free(all);
         hk_engine_free(eng);
@@ -138,20 +138,20 @@ fn pipeline_through_ffi_matches_rust_semantics() {
     seed(&dir);
     let eng = open(&dir);
 
-    let p = unsafe { hk_pipeline_new(cstr("orders").as_ptr()) };
+    let p = { hk_pipeline_new(cstr("orders").as_ptr()) };
     assert!(!p.is_null(), "{}", last_error());
-    assert_eq!(unsafe { hk_pipeline_unwind(p, cstr("items").as_ptr()) }, 0);
+    assert_eq!({ hk_pipeline_unwind(p, cstr("items").as_ptr()) }, 0);
     let accums = cstr(r#"[{"out":"total","op":"sum","field":"items.qty"},{"out":"orders","op":"count"}]"#);
     assert_eq!(
-        unsafe { hk_pipeline_group(p, cstr("items.sku").as_ptr(), accums.as_ptr()) },
+        { hk_pipeline_group(p, cstr("items.sku").as_ptr(), accums.as_ptr()) },
         0,
         "{}",
         last_error()
     );
-    assert_eq!(unsafe { hk_pipeline_sort(p, cstr("total").as_ptr(), false) }, 0);
-    assert_eq!(unsafe { hk_pipeline_limit(p, 2) }, 0);
+    assert_eq!({ hk_pipeline_sort(p, cstr("total").as_ptr(), false) }, 0);
+    assert_eq!({ hk_pipeline_limit(p, 2) }, 0);
 
-    let rows = take_json(unsafe { hk_pipeline_execute(eng, p) });
+    let rows = take_json(hk_pipeline_execute(eng, p));
     assert_eq!(rows.as_array().unwrap().len(), 2, "{rows}");
     assert_eq!(rows[0]["sku"], "C");
     assert_eq!(rows[0]["total"], 9);
@@ -160,10 +160,10 @@ fn pipeline_through_ffi_matches_rust_semantics() {
     assert_eq!(rows[1]["total"], 6);
     assert_eq!(rows[1]["orders"], 2);
 
-    let rs = unsafe { hk_pipeline_execute_to_handles(eng, p) };
+    let rs = { hk_pipeline_execute_to_handles(eng, p) };
     assert!(!rs.is_null(), "{}", last_error());
-    assert_eq!(unsafe { hk_result_set_count(rs) }, 2);
-    unsafe {
+    assert_eq!({ hk_result_set_count(rs) }, 2);
+    {
         hk_result_set_free(rs);
         hk_pipeline_free(p);
         hk_engine_free(eng);
@@ -176,17 +176,17 @@ fn pipeline_match_stage_accepts_a_query_handle() {
     seed(&dir);
     let eng = open(&dir);
 
-    let q = unsafe { hk_query_new(cstr("orders").as_ptr()) };
-    let rc = unsafe { hk_query_where_elem_match(q, cstr("items").as_ptr(), cstr(r#"[{"field":"sku","op":"eq","value":"C"}]"#).as_ptr()) };
+    let q = { hk_query_new(cstr("orders").as_ptr()) };
+    let rc = { hk_query_where_elem_match(q, cstr("items").as_ptr(), cstr(r#"[{"field":"sku","op":"eq","value":"C"}]"#).as_ptr()) };
     assert_eq!(rc, 0);
 
-    let p = unsafe { hk_pipeline_new(cstr("orders").as_ptr()) };
-    assert_eq!(unsafe { hk_pipeline_match(p, q) }, 0);
-    let rows = take_json(unsafe { hk_pipeline_execute(eng, p) });
+    let p = { hk_pipeline_new(cstr("orders").as_ptr()) };
+    assert_eq!({ hk_pipeline_match(p, q) }, 0);
+    let rows = take_json(hk_pipeline_execute(eng, p));
     assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
     assert_eq!(rows[0]["name"], "o3");
 
-    unsafe {
+    {
         hk_pipeline_free(p);
         hk_query_free(q);
         hk_engine_free(eng);
@@ -200,79 +200,79 @@ fn versioned_get_and_transaction_surface() {
     std::fs::create_dir_all(&dir).unwrap();
     let eng = open(&dir);
 
-    let doc = unsafe { hk_doc_new() };
-    unsafe { hk_doc_insert_int(doc, cstr("n").as_ptr(), 1) };
+    let doc = { hk_doc_new() };
+    hk_doc_insert_int(doc, cstr("n").as_ptr(), 1);
     assert_eq!(
-        unsafe { hk_engine_insert(eng, cstr("c").as_ptr(), cstr("a").as_ptr(), doc) },
+        { hk_engine_insert(eng, cstr("c").as_ptr(), cstr("a").as_ptr(), doc) },
         0,
         "{}",
         last_error()
     );
-    unsafe { hk_doc_free(doc) };
+    hk_doc_free(doc);
 
     let mut v1 = 0u64;
-    let got = unsafe { hk_engine_get_versioned(eng, cstr("c").as_ptr(), cstr("a").as_ptr(), &mut v1) };
+    let got = { hk_engine_get_versioned(eng, cstr("c").as_ptr(), cstr("a").as_ptr(), &mut v1) };
     assert!(!got.is_null(), "{}", last_error());
     assert!(v1 > 0, "version captured atomically");
-    unsafe { hk_doc_free(got) };
+    hk_doc_free(got);
 
     let mut missing_version = 7u64;
-    let absent = unsafe {
+    let absent = {
         hk_engine_get_versioned(eng, cstr("c").as_ptr(), cstr("nope").as_ptr(), &mut missing_version)
     };
     assert!(absent.is_null());
     assert_eq!(missing_version, 0, "absent doc zeroes the out version");
 
-    let doc = unsafe { hk_doc_new() };
-    unsafe { hk_doc_insert_int(doc, cstr("n").as_ptr(), 2) };
-    assert_eq!(unsafe { hk_engine_insert(eng, cstr("c").as_ptr(), cstr("a").as_ptr(), doc) }, 0);
-    unsafe { hk_doc_free(doc) };
+    let doc = { hk_doc_new() };
+    hk_doc_insert_int(doc, cstr("n").as_ptr(), 2);
+    assert_eq!({ hk_engine_insert(eng, cstr("c").as_ptr(), cstr("a").as_ptr(), doc) }, 0);
+    hk_doc_free(doc);
     let mut v2 = 0u64;
-    let got = unsafe { hk_engine_get_versioned(eng, cstr("c").as_ptr(), cstr("a").as_ptr(), &mut v2) };
+    let got = { hk_engine_get_versioned(eng, cstr("c").as_ptr(), cstr("a").as_ptr(), &mut v2) };
     assert!(!got.is_null());
     assert!(v2 > v1, "a rewrite bumps the version ({v1} -> {v2})");
-    unsafe { hk_doc_free(got) };
+    hk_doc_free(got);
 
-    let tx = unsafe { hk_transaction_begin(eng) };
+    let tx = { hk_transaction_begin(eng) };
     assert!(!tx.is_null());
-    let many = take_json(unsafe {
+    let many = take_json({
         hk_transaction_get_many(eng, tx, cstr("c").as_ptr(), cstr(r#"["a","missing"]"#).as_ptr())
     });
     assert_eq!(many[0]["n"], 2);
     assert!(many[1].is_null(), "absent id is null in the same order: {many}");
     assert_eq!(
-        unsafe { hk_transaction_patch(eng, tx, cstr("c").as_ptr(), cstr("a").as_ptr(), cstr(r#"{"n":42}"#).as_ptr()) },
+        { hk_transaction_patch(eng, tx, cstr("c").as_ptr(), cstr("a").as_ptr(), cstr(r#"{"n":42}"#).as_ptr()) },
         0,
         "{}",
         last_error()
     );
-    assert_eq!(unsafe { hk_transaction_commit(eng, tx) }, 0, "{}", last_error());
-    unsafe { hk_transaction_free(tx) };
+    assert_eq!({ hk_transaction_commit(eng, tx) }, 0, "{}", last_error());
+    hk_transaction_free(tx);
 
     let mut v3 = 0u64;
-    let got = unsafe { hk_engine_get_versioned(eng, cstr("c").as_ptr(), cstr("a").as_ptr(), &mut v3) };
+    let got = { hk_engine_get_versioned(eng, cstr("c").as_ptr(), cstr("a").as_ptr(), &mut v3) };
     assert!(!got.is_null());
-    let json = take_json(unsafe { hk_doc_to_json(got) });
+    let json = take_json(hk_doc_to_json(got));
     assert_eq!(json["n"], 42, "patch applied at commit: {json}");
-    unsafe { hk_doc_free(got) };
+    hk_doc_free(got);
 
     // Conflict: read in tx1, external write, then commit.
-    let tx1 = unsafe { hk_transaction_begin(eng) };
-    let seen = unsafe { hk_transaction_get(eng, tx1, cstr("c").as_ptr(), cstr("a").as_ptr()) };
+    let tx1 = { hk_transaction_begin(eng) };
+    let seen = { hk_transaction_get(eng, tx1, cstr("c").as_ptr(), cstr("a").as_ptr()) };
     assert!(!seen.is_null());
-    unsafe { hk_doc_free(seen) };
-    let doc = unsafe { hk_doc_new() };
-    unsafe { hk_doc_insert_int(doc, cstr("n").as_ptr(), 3) };
-    assert_eq!(unsafe { hk_engine_insert(eng, cstr("c").as_ptr(), cstr("a").as_ptr(), doc) }, 0);
-    unsafe { hk_doc_free(doc) };
+    hk_doc_free(seen);
+    let doc = { hk_doc_new() };
+    hk_doc_insert_int(doc, cstr("n").as_ptr(), 3);
+    assert_eq!({ hk_engine_insert(eng, cstr("c").as_ptr(), cstr("a").as_ptr(), doc) }, 0);
+    hk_doc_free(doc);
     assert_eq!(
-        unsafe { hk_transaction_patch(eng, tx1, cstr("c").as_ptr(), cstr("a").as_ptr(), cstr(r#"{"n":99}"#).as_ptr()) },
+        { hk_transaction_patch(eng, tx1, cstr("c").as_ptr(), cstr("a").as_ptr(), cstr(r#"{"n":99}"#).as_ptr()) },
         0
     );
-    assert_eq!(unsafe { hk_transaction_commit(eng, tx1) }, -1, "stale read-set must conflict");
-    assert!(unsafe { hk_error_is_retryable() }, "kind {}", unsafe { hk_error_last_kind() });
-    assert_eq!(unsafe { hk_error_last_kind() }, 2);
-    unsafe {
+    assert_eq!({ hk_transaction_commit(eng, tx1) }, -1, "stale read-set must conflict");
+    assert!({ hk_error_is_retryable() }, "kind {}", { hk_error_last_kind() });
+    assert_eq!({ hk_error_last_kind() }, 2);
+    {
         hk_transaction_free(tx1);
         hk_engine_free(eng);
     }
@@ -318,15 +318,15 @@ fn explain_returns_plan_json() {
     seed(&dir);
     let eng = open(&dir);
 
-    let q = unsafe { hk_query_new(cstr("orders").as_ptr()) };
-    let report = take_json(unsafe { hk_query_explain(eng, q) });
+    let q = { hk_query_new(cstr("orders").as_ptr()) };
+    let report = take_json(hk_query_explain(eng, q));
     assert_eq!(report["collection"], "orders");
     assert_eq!(report["collection_rows"], 3);
     assert!(report["scan"].is_string(), "{report}");
     assert!(report["available_indexes"].is_array(), "{report}");
     assert_eq!(report["filter_count"], 0);
 
-    unsafe {
+    {
         hk_query_free(q);
         hk_engine_free(eng);
     }

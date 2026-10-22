@@ -42,7 +42,7 @@ fn query_for(col: &str, field: &str, op: Operator, v: Value) -> hakodb::query::q
 
 #[test]
 fn dotted_eq_range_and_ne_absent_semantics() {
-    let db = Hako::open(&tmp_dir("dotted-eq"), HakoConfig::default()).unwrap();
+    let db = Hako::open(tmp_dir("dotted-eq"), HakoConfig::default()).unwrap();
     db.put("docs", "d1", &nested(Some("Rome"), Some("00100"))).unwrap();
     db.put("docs", "d2", &nested(Some("Oslo"), Some("0150"))).unwrap();
     // null vs absent: d3 carries explicit null city, d4 lacks the
@@ -120,13 +120,13 @@ fn dotted_or_groups_and_order_paths() {
     assert_eq!(hits.len(), 2);
 
     // ORDER BY dotted â€” legacy sort lane.
-    let mut q = Query::new("docs").order_by("profile.address.city", true);
+    let q = Query::new("docs").order_by("profile.address.city", true);
     let hits = db.query(q).unwrap();
     let order: Vec<String> = hits.iter().map(|(i, _)| i.clone()).collect();
     assert_eq!(order, ["b", "c", "a"]);
 
     // TopN lane (limit below row count) must match the legacy lane.
-    let mut q = Query::new("docs").order_by("profile.address.city", true).limit(2);
+    let q = Query::new("docs").order_by("profile.address.city", true).limit(2);
     let hits = db.query(q).unwrap();
     assert_eq!(hits.iter().map(|(i, _)| i.as_str()).collect::<Vec<_>>(), ["b", "c"]);
 }

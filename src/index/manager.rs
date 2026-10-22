@@ -133,12 +133,11 @@ impl IndexManager {
                     return false;
                 }
 
-                for i in 0..fields.len() {
-                    if idx.definition.fields[i].field != fields[i] {
-                        return false;
-                    }
-                }
-                true
+                idx.definition
+                    .fields
+                    .iter()
+                    .zip(fields)
+                    .all(|(def, field)| def.field == field.as_str())
             })
     }
 
@@ -434,6 +433,7 @@ impl IndexManager {
             self.composite.import_snapshot_filtered(trees, next_id, skip);
             return Ok((true, None));
         }
+        #[allow(clippy::type_complexity)]
         let (sec, fts): (
             HashMap<String, HashMap<String, crate::index::secondary_index::SecondaryIndex>>,
             HashMap<String, HashMap<String, crate::index::inverted_index::InvertedIndex>>,
@@ -553,7 +553,7 @@ mod tests {
                 &["passw".to_string(), "nim".to_string()],
                 &[Value::String("28021988".into()), Value::String("F1".into())],
             )
-            .map_or(true, |v| v.is_empty()));
+            .is_none_or(|v| v.is_empty()));
     }
 
     #[test]
@@ -588,7 +588,7 @@ mod tests {
                 &["passw".to_string()],
                 &[Value::String("28021988".into())],
             )
-            .map_or(true, |v| v.is_empty()));
+            .is_none_or(|v| v.is_empty()));
     }
 
     #[test]

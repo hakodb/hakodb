@@ -163,6 +163,7 @@ impl StorageEngine {
 
         let blob_file_raw = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             // .append(true)
             .write(true)
@@ -259,11 +260,10 @@ impl StorageEngine {
         // collection (file zeros + data only in RAM, indefinitely on a
         // quiet server). One write_all+fdatasync per bloated open: off the
         // write hot path by construction.
-        if engine.wal_snapshot_worthwhile() {
-            if engine.rewrite_wal_snapshot().is_ok() {
+        if engine.wal_snapshot_worthwhile()
+            && engine.rewrite_wal_snapshot().is_ok() {
                 let _ = engine.wal.flush();
             }
-        }
         Ok(engine)
     }
 
@@ -1106,7 +1106,7 @@ impl StorageEngine {
     pub fn compact(&mut self) -> Result<()> {
         // 1. FORCED ROTATION: Ensure current data is eligible for compaction
         if self.segments.get(&self.active_segment_id)
-            .map_or(false, |m| m.segment.size_bytes().unwrap_or(0) > 0) 
+            .is_some_and(|m| m.segment.size_bytes().unwrap_or(0) > 0)
         {
             let new_id = self.next_segment_id;
             self.next_segment_id += 1;
@@ -1516,10 +1516,7 @@ mod tests {
                 "doc must be reachable after spill"
             );
             assert!(eng.wal.data_len() > 0, "WAL still carries the ops");
-            assert!(matches!(
-                eng.wal.append_batch_fast(9, &[WalOp::CommitTx { tx_id: 9 }], false),
-                Ok(_)
-            ), "WAL stays writable after spill");
+            assert!(eng.wal.append_batch_fast(9, &[WalOp::CommitTx { tx_id: 9 }], false).is_ok(), "WAL stays writable after spill");
         }
         let eng2 = StorageEngine::open(&dir, &cfg_for(DurabilityMode::Always), "c".into(), None).unwrap();
         assert!(

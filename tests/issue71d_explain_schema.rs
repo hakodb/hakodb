@@ -29,7 +29,7 @@ fn doc(status: &str) -> HakoDoc {
 
 #[test]
 fn explain_reports_chosen_index_and_candidates() {
-    let db = Hako::open(&tmp_dir("explain"), HakoConfig::default()).unwrap();
+    let db = Hako::open(tmp_dir("explain"), HakoConfig::default()).unwrap();
     db.create_index("orders", "status").unwrap();
     // Above the small-collection heuristic (planner scans small tables on
     // purpose) so the index actually routes.
@@ -64,7 +64,7 @@ fn explain_reports_chosen_index_and_candidates() {
 
 #[test]
 fn counters_cover_unique_violations_and_tx_conflicts() {
-    let db = Hako::open(&tmp_dir("counters"), HakoConfig::default()).unwrap();
+    let db = Hako::open(tmp_dir("counters"), HakoConfig::default()).unwrap();
     write_stats_report();
 
     db.create_composite_index_ex(
@@ -119,7 +119,7 @@ fn schema() -> CollectionSchema {
 
 #[test]
 fn schema_required_type_and_defaults() {
-    let db = Hako::open(&tmp_dir("schema"), HakoConfig::default()).unwrap();
+    let db = Hako::open(tmp_dir("schema"), HakoConfig::default()).unwrap();
     db.set_schema("orders", schema()).unwrap();
 
     assert_eq!(
@@ -148,7 +148,7 @@ fn schema_required_type_and_defaults() {
 
 #[test]
 fn schema_rejects_bad_declarations_and_batch_atomically() {
-    let db = Hako::open(&tmp_dir("schema-batch"), HakoConfig::default()).unwrap();
+    let db = Hako::open(tmp_dir("schema-batch"), HakoConfig::default()).unwrap();
     assert!(db
         .set_schema(
             "orders",
