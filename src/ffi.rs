@@ -1,3 +1,5 @@
+#![allow(clippy::not_unsafe_ptr_arg_deref)] // outer C ABI: callers guarantee pointer validity
+
 use std::cell::RefCell;
 use std::ffi::{c_char, c_int, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -3370,6 +3372,31 @@ pub extern "C" fn hk_engine_create_index(
     }
 }
 
+/// Drops a composite index by id (idempotent). Returns 0 on success,
+/// -1 when the id belongs to another collection or the drop fails.
+#[no_mangle]
+pub extern "C" fn hk_engine_drop_composite_index(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    id: u32,
+) -> i32 {
+    if engine.is_null() {
+        return set_last_error_err("null engine handle");
+    }
+    let engine = unsafe { &*engine };
+    let col = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    match engine.db.drop_composite_index(&col, id) {
+        Ok(_) => {
+            clear_last_error();
+            0
+        }
+        Err(e) => set_last_error_err(e),
+    }
+}
+
 /// Simplified indexer: Create an index for a single field.
 #[no_mangle]
 pub extern "C" fn hk_engine_create_simple_index(
@@ -3397,6 +3424,33 @@ pub extern "C" fn hk_engine_create_simple_index(
 }
 
 #[no_mangle]
+pub extern "C" fn hk_engine_drop_simple_index(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    field: *const c_char,
+) -> i32 {
+    if engine.is_null() {
+        return set_last_error_err("null engine handle");
+    }
+    let engine = unsafe { &*engine };
+    let col = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    let fld = match cstr_to_string(field) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    match engine.db.drop_index(&col, &fld) {
+        Ok(_) => {
+            clear_last_error();
+            0
+        }
+        Err(e) => set_last_error_err(e),
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn hk_engine_create_fts_index(
     engine: *mut HK_Engine,
     collection: *const c_char,
@@ -3418,6 +3472,33 @@ pub extern "C" fn hk_engine_create_fts_index(
     match engine.db.create_fts_index(&col, &fld) {
         Ok(_) => 0,
         Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn hk_engine_drop_fts_index(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    field: *const c_char,
+) -> i32 {
+    if engine.is_null() {
+        return set_last_error_err("null engine handle");
+    }
+    let engine = unsafe { &*engine };
+    let col = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    let fld = match cstr_to_string(field) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    match engine.db.drop_fts_index(&col, &fld) {
+        Ok(_) => {
+            clear_last_error();
+            0
+        }
+        Err(e) => set_last_error_err(e),
     }
 }
 
@@ -3451,6 +3532,33 @@ pub extern "C" fn hk_engine_create_vector_index(
             0
         }
         Err(e) => set_last_error_err(e.to_string()),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn hk_engine_drop_vector_index(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    field: *const c_char,
+) -> i32 {
+    if engine.is_null() {
+        return set_last_error_err("null engine handle");
+    }
+    let engine = unsafe { &*engine };
+    let col = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    let fld = match cstr_to_string(field) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    match engine.db.drop_vector_index(&col, &fld) {
+        Ok(_) => {
+            clear_last_error();
+            0
+        }
+        Err(e) => set_last_error_err(e),
     }
 }
 
@@ -3589,6 +3697,28 @@ pub extern "C" fn hk_engine_create_traverse_index(
             0
         }
         Err(e) => set_last_error_err(e.to_string()),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn hk_engine_drop_traverse_index(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+) -> i32 {
+    if engine.is_null() {
+        return set_last_error_err("null engine handle");
+    }
+    let engine = unsafe { &*engine };
+    let col = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    match engine.db.drop_traverse_index(&col) {
+        Ok(_) => {
+            clear_last_error();
+            0
+        }
+        Err(e) => set_last_error_err(e),
     }
 }
 
@@ -3744,6 +3874,28 @@ pub extern "C" fn hk_engine_create_edge_index(
             0
         }
         Err(e) => set_last_error_err(e.to_string()),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn hk_engine_drop_edge_index(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+) -> i32 {
+    if engine.is_null() {
+        return set_last_error_err("null engine handle");
+    }
+    let engine = unsafe { &*engine };
+    let col = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    match engine.db.drop_edge_index(&col) {
+        Ok(_) => {
+            clear_last_error();
+            0
+        }
+        Err(e) => set_last_error_err(e),
     }
 }
 

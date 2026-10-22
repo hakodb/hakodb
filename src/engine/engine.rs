@@ -4276,6 +4276,122 @@ impl Hako {
         }
     }
 
+    /// Drop one index definition. Idempotent: an absent target is a no-op.
+    ///
+    /// Definitions are local metadata. On a synced deployment, dropping on
+    /// one peer is not enough: another peer's additive def sync can
+    /// recreate it, so drop on every member (def tombstones are a separate
+    /// follow-up, hakodb#115).
+    pub fn drop_index(&self, collection: &str, field: &str) -> Result<()> {
+        self.ensure_index_mutation_allowed()?;
+        let removed = self
+            .indexes
+            .write()
+            .unwrap()
+            .drop_secondary_index(collection, field);
+        if removed {
+            self.finish_index_drop()?;
+        }
+        Ok(())
+    }
+
+    pub fn drop_fts_index(&self, collection: &str, field: &str) -> Result<()> {
+        self.ensure_index_mutation_allowed()?;
+        let removed = self
+            .indexes
+            .write()
+            .unwrap()
+            .drop_fts_index(collection, field);
+        if removed {
+            self.finish_index_drop()?;
+        }
+        Ok(())
+    }
+
+    pub fn drop_vector_index(&self, collection: &str, field: &str) -> Result<()> {
+        self.ensure_index_mutation_allowed()?;
+        let removed = self
+            .indexes
+            .write()
+            .unwrap()
+            .drop_vector_index(collection, field);
+        if removed {
+            self.finish_index_drop()?;
+        }
+        Ok(())
+    }
+
+    /// Drop a composite index by id. The collection must match the index's
+    /// owning collection; a mismatched id returns `InvalidInput` instead of
+    /// silently deleting another collection's index. An absent id is a
+    /// no-op (idempotent), matching every other drop.
+    pub fn drop_composite_index(&self, collection: &str, id: u32) -> Result<()> {
+        self.ensure_index_mutation_allowed()?;
+        let unique = {
+            let mgr = self.indexes.read().unwrap();
+            match mgr.composite.get(id) {
+                Some(idx) if idx.definition.collection == collection => Some(idx.definition.unique),
+                Some(_) => {
+                    return Err(HakoError::InvalidInput(format!(
+                        "composite index {id} does not belong to `{collection}`"
+                    )))
+                }
+                None => None,
+            }
+        };
+        if let Some(unique) = unique {
+            self.indexes.write().unwrap().composite.drop_index(id);
+            if unique {
+                self.unique_ledger.reset(id);
+            }
+            self.finish_index_drop()?;
+        }
+        Ok(())
+    }
+
+    pub fn drop_traverse_index(&self, collection: &str) -> Result<()> {
+        self.ensure_index_mutation_allowed()?;
+        let removed = self
+            .indexes
+            .write()
+            .unwrap()
+            .drop_traverse_index(collection);
+        if removed {
+            self.finish_index_drop()?;
+        }
+        Ok(())
+    }
+
+    /// Drop an edge index: its traverse tracking plus the `_from`/`_to`
+    /// secondary indexes that `create_edge_index` owns.
+    pub fn drop_edge_index(&self, collection: &str) -> Result<()> {
+        self.ensure_index_mutation_allowed()?;
+        let removed = {
+            let mut mgr = self.indexes.write().unwrap();
+            let from = mgr.drop_secondary_index(collection, "_from");
+            let to = mgr.drop_secondary_index(collection, "_to");
+            let tracked = mgr.drop_traverse_index(collection);
+            from || to || tracked
+        };
+        if removed {
+            self.finish_index_drop()?;
+        }
+        Ok(())
+    }
+
+    fn ensure_index_mutation_allowed(&self) -> Result<()> {
+        if self.read_only.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(HakoError::Corrupt("ReadOnly".into()));
+        }
+        Ok(())
+    }
+
+    fn finish_index_drop(&self) -> Result<()> {
+        self.gate_cache.write().unwrap().clear();
+        self.plan_cache.invalidate();
+        self.persist_index_defs()
+    }
+
     pub fn create_index(&self, collection: &str, field: &str) -> Result<()> {
         // 1. Check if it exists
         {
