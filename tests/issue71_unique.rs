@@ -364,7 +364,7 @@ fn query_right_after_put_sees_the_put() {
         let r = format!("r{i}");
         db.put("ryw", &format!("d{i}"), &doc("p", &r)).unwrap();
         // Immediately: planner must NOT ride the not-yet-updated tree.
-        let hits = db.query(Query::new("ryw").where_eq("region", Value::String(r.into()))).unwrap();
+        let hits = db.query(Query::new("ryw").where_eq("region", Value::String(r))).unwrap();
         assert_eq!(hits.len(), 1, "iteration {i}: read-your-writes window");
     }
 }

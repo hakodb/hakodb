@@ -66,7 +66,7 @@ fn numerics_match_serde() {
             ("neg", Value::Int(-1)),
             ("min", Value::Int(i64::MIN)),
             ("max", Value::Int(i64::MAX)),
-            ("pi", Value::Float(3.14159)),
+            ("ratio", Value::Float(3.5)),
             ("big", Value::Float(1e100)),
             ("negzero", Value::Float(-0.0)),
             ("nan", Value::Float(f64::NAN)),

@@ -55,7 +55,7 @@ fn get(doc: &HakoDoc, field: &str) -> Value {
 
 #[test]
 fn match_project_sort_limit_offset() {
-    let db = Hako::open(&tmp_dir("basic"), HakoConfig::default()).unwrap();
+    let db = Hako::open(tmp_dir("basic"), HakoConfig::default()).unwrap();
     seed(&db);
 
     let p = Pipeline::new("orders")
@@ -72,7 +72,7 @@ fn match_project_sort_limit_offset() {
 
 #[test]
 fn unwind_and_group_by_element_path() {
-    let db = Hako::open(&tmp_dir("unwind"), HakoConfig::default()).unwrap();
+    let db = Hako::open(tmp_dir("unwind"), HakoConfig::default()).unwrap();
     seed(&db);
 
     let p = Pipeline::new("orders")
@@ -106,7 +106,7 @@ fn unwind_and_group_by_element_path() {
 
 #[test]
 fn group_without_key_is_one_global_group() {
-    let db = Hako::open(&tmp_dir("global"), HakoConfig::default()).unwrap();
+    let db = Hako::open(tmp_dir("global"), HakoConfig::default()).unwrap();
     seed(&db);
 
     let p = Pipeline::new("orders")
@@ -130,7 +130,7 @@ fn group_without_key_is_one_global_group() {
 
 #[test]
 fn unwind_skips_missing_and_non_array_fields() {
-    let db = Hako::open(&tmp_dir("skip"), HakoConfig::default()).unwrap();
+    let db = Hako::open(tmp_dir("skip"), HakoConfig::default()).unwrap();
     seed(&db);
     let mut flat = HakoDoc::default();
     flat.insert("status", Value::String("paid".into()));
@@ -151,7 +151,7 @@ fn unwind_skips_missing_and_non_array_fields() {
 
 #[test]
 fn elem_match_inside_pipeline_match() {
-    let db = Hako::open(&tmp_dir("elem"), HakoConfig::default()).unwrap();
+    let db = Hako::open(tmp_dir("elem"), HakoConfig::default()).unwrap();
     seed(&db);
 
     let q = Query::new("orders").elem_match("items", vec![
@@ -166,7 +166,7 @@ fn elem_match_inside_pipeline_match() {
 
 #[test]
 fn nested_unwind_is_refused_but_nested_project_prunes() {
-    let db = Hako::open(&tmp_dir("refuse"), HakoConfig::default()).unwrap();
+    let db = Hako::open(tmp_dir("refuse"), HakoConfig::default()).unwrap();
     seed(&db);
 
     let p = Pipeline::new("orders").unwind("meta.items");

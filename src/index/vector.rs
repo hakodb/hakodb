@@ -56,7 +56,7 @@ pub fn validate_dim(dim: u32) -> Result<()> {
 /// Decode LE f32s from a `Value::Binary` payload. Length (not dim) is
 /// checked here; dim agreement with the index is the caller's job.
 pub fn decode_f32s(bytes: &[u8]) -> Result<Vec<f32>> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(HakoError::Corrupt(format!(
             "vector bytes {} not a multiple of 4",
             bytes.len()
@@ -325,8 +325,8 @@ impl HnswIndex {
     fn q_dist(&self, q: &[f32], qn: f64, idx: usize) -> f64 {
         let n = &self.nodes[idx];
         let mut dot = 0.0f64;
-        for i in 0..q.len() {
-            dot += q[i] as f64 * n.ivec[i] as f64;
+        for (i, q) in q.iter().enumerate() {
+            dot += *q as f64 * n.ivec[i] as f64;
         }
         match self.metric {
             Metric::Cosine => {
@@ -665,7 +665,7 @@ mod tests {
         for (i, &x) in v.iter().enumerate() {
             assert!((iv[i] as f32 * s - x).abs() <= s / 2.0 + 1e-6, "i={i} x={x}");
         }
-        let (z, s0) = quantize(&vec![0.0; 8]);
+        let (z, s0) = quantize(&[0.0; 8]);
         assert!(z.iter().all(|&x| x == 0));
         assert_eq!(s0, 1.0);
     }

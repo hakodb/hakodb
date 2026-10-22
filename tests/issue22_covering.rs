@@ -17,7 +17,7 @@ fn tmp_dir(tag: &str) -> std::path::PathBuf {
 }
 
 fn setup(tag: &str) -> Hako {
-    let db = Hako::open(&tmp_dir(tag), HakoConfig::default()).unwrap();
+    let db = Hako::open(tmp_dir(tag), HakoConfig::default()).unwrap();
     db.create_index("docs", "status").unwrap();
     let mut batch = Vec::new();
     for i in 0..400 {

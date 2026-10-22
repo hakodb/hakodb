@@ -68,10 +68,10 @@ impl CompositeIndex {
         let new_entries = docs
             .into_iter()
             .filter_map(|(doc_id, doc)| {
-                if !self.filter_passes(&doc_id, doc) {
+                if !self.filter_passes(doc_id, doc) {
                     return None;
                 }
-                self.document_values(&doc_id, doc).map(|values| {
+                self.document_values(doc_id, doc).map(|values| {
                     let key = encode_composite_key(&self.definition, &values, doc_id);
                     (key, Arc::from(doc_id))
                 })
@@ -85,7 +85,7 @@ impl CompositeIndex {
         if !self.filter_passes(doc_id, doc) {
             return;
         }
-        if let Some(values) = self.document_values(&doc_id, doc) {
+        if let Some(values) = self.document_values(doc_id, doc) {
             self.tree
                 .remove(&encode_composite_key(&self.definition, &values, doc_id));
         }
@@ -96,10 +96,10 @@ impl CompositeIndex {
         I: IntoIterator<Item = (&'a str, &'a HakoDoc)>,
     {
         for (doc_id, doc) in docs {
-            if !self.filter_passes(&doc_id, doc) {
+            if !self.filter_passes(doc_id, doc) {
                 continue;
             }
-            if let Some(values) = self.document_values(&doc_id, doc) {
+            if let Some(values) = self.document_values(doc_id, doc) {
                 let key = encode_composite_key(&self.definition, &values, doc_id);
                 self.tree.remove(&key);
             }

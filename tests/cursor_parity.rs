@@ -203,7 +203,7 @@ fn point_get_floor() {
     let fdir_c = std::ffi::CString::new(fdir.to_str().unwrap()).unwrap();
     let col = std::ffi::CString::new("bench").unwrap();
     let field = std::ffi::CString::new("v").unwrap();
-    let payload = vec![0xABu8; 100];
+    let payload = [0xABu8; 100];
     let engine_ptr =  {
         let cfg = hakodb::ffi::hk_config_new();
         hakodb::ffi::hk_config_set_durability(cfg, 2);
@@ -236,9 +236,9 @@ fn point_get_floor() {
         if !doc.is_null() {
             let js =  { hakodb::ffi::hk_doc_to_json(doc) };
             if !js.is_null() {
-                 { hakodb::ffi::hk_string_free(js) };
+                 hakodb::ffi::hk_string_free(js);
             }
-             { hakodb::ffi::hk_doc_free(doc) };
+             hakodb::ffi::hk_doc_free(doc);
             found += 1;
         }
     }
@@ -248,7 +248,7 @@ fn point_get_floor() {
         "point-get FFI+JSON (harness-equivalent): {N} gets in {ffi_dt:?} = {} ops/s",
         N as u128 * 1_000_000_000 / ffi_dt.as_nanos().max(1),
     );
-     { hakodb::ffi::hk_engine_free(engine_ptr) };
+     hakodb::ffi::hk_engine_free(engine_ptr);
     std::fs::remove_dir_all(&fdir).ok();
 
     // Control: same FFI get loop, but seeded via BATCHES (like fillrandbatch)
@@ -302,9 +302,9 @@ fn point_get_floor() {
         if !doc.is_null() {
             let js =  { hakodb::ffi::hk_doc_to_json(doc) };
             if !js.is_null() {
-                 { hakodb::ffi::hk_string_free(js) };
+                 hakodb::ffi::hk_string_free(js);
             }
-             { hakodb::ffi::hk_doc_free(doc) };
+             hakodb::ffi::hk_doc_free(doc);
             found += 1;
         }
     }
@@ -325,7 +325,7 @@ fn point_get_floor() {
             hakodb::ffi::hk_engine_get(bengine, col.as_ptr(), k.as_ptr())
         };
         if !doc.is_null() {
-             { hakodb::ffi::hk_doc_free(doc) };
+             hakodb::ffi::hk_doc_free(doc);
             found += 1;
         }
     }
@@ -342,14 +342,14 @@ fn point_get_floor() {
     for _ in 0..N {
         let js =  { hakodb::ffi::hk_doc_to_json(one) };
         assert!(!js.is_null());
-         { hakodb::ffi::hk_string_free(js) };
+         hakodb::ffi::hk_string_free(js);
     }
     let jsononly_dt = t0.elapsed();
     eprintln!(
         "hk_doc_to_json alone x{N}: {jsononly_dt:?} = {} ops/s",
         N as u128 * 1_000_000_000 / jsononly_dt.as_nanos().max(1),
     );
-     { hakodb::ffi::hk_doc_free(one) };
+     hakodb::ffi::hk_doc_free(one);
     // Control: same serialize loop over a STRING-valued doc (no byte array).
     // If this is multiples faster, the Binary-array arm is the confirmed hog.
     let sdoc =  { hakodb::ffi::hk_doc_new() };
@@ -361,15 +361,15 @@ fn point_get_floor() {
     for _ in 0..N {
         let js =  { hakodb::ffi::hk_doc_to_json(sdoc) };
         assert!(!js.is_null());
-         { hakodb::ffi::hk_string_free(js) };
+         hakodb::ffi::hk_string_free(js);
     }
     let sjson_dt = t0.elapsed();
     eprintln!(
         "hk_doc_to_json string-doc x{N}: {sjson_dt:?} = {} ops/s",
         N as u128 * 1_000_000_000 / sjson_dt.as_nanos().max(1),
     );
-     { hakodb::ffi::hk_doc_free(sdoc) };
-     { hakodb::ffi::hk_engine_free(bengine) };
+     hakodb::ffi::hk_doc_free(sdoc);
+     hakodb::ffi::hk_engine_free(bengine);
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(&bdir).ok();
 }
@@ -455,7 +455,7 @@ fn raw_ffi_roundtrip() {
     let col = std::ffi::CString::new("bench").unwrap();
     let field = std::ffi::CString::new("v").unwrap();
     let idf = std::ffi::CString::new("id").unwrap();
-    let payload = vec![0xABu8; 100];
+    let payload = [0xABu8; 100];
 
     let engine =  {
         let cfg = ffi::hk_config_new();
@@ -503,8 +503,8 @@ fn raw_ffi_roundtrip() {
         assert!(!rs.is_null());
         let n =  { ffi::hk_rawresult_count(rs) };
         if n == 0 {
-             { ffi::hk_rawresult_free(rs) };
-             { ffi::hk_query_free(q) };
+             ffi::hk_rawresult_free(rs);
+             ffi::hk_query_free(q);
             break;
         }
         let mut last_raw: *mut ffi::HK_RawDoc = std::ptr::null_mut();
@@ -531,12 +531,12 @@ fn raw_ffi_roundtrip() {
             let js =  { ffi::hk_doc_to_json(d) };
             assert!(!js.is_null());
             resolved_json = unsafe { std::ffi::CStr::from_ptr(js) }.to_str().unwrap().to_string();
-             { ffi::hk_string_free(js) };
-             { ffi::hk_doc_free(d) };
+             ffi::hk_string_free(js);
+             ffi::hk_doc_free(d);
         }
         prev_rs = rs;
         prev_last = last_raw;
-         { ffi::hk_query_free(q) };
+         ffi::hk_query_free(q);
     }
     let dt = t0.elapsed();
     assert_eq!(ids.len(), N, "raw FFI scan missed docs");
@@ -546,7 +546,7 @@ fn raw_ffi_roundtrip() {
         "raw FFI scan: {N} docs / {total_bytes} bytes in {dt:?} = {} docs/s",
         N as u128 * 1_000_000_000 / dt.as_nanos().max(1),
     );
-     { ffi::hk_engine_free(engine) };
+     ffi::hk_engine_free(engine);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -844,7 +844,7 @@ fn walk_ffi() {
     let col = std::ffi::CString::new("bench").unwrap();
     let field = std::ffi::CString::new("v").unwrap();
     let idf = std::ffi::CString::new("id").unwrap();
-    let payload = vec![0xABu8; 100];
+    let payload = [0xABu8; 100];
 
     let engine =  {
         let cfg = ffi::hk_config_new();
@@ -890,7 +890,7 @@ fn walk_ffi() {
         st.bytes,
         N as u128 * 1_000_000_000 / dt.as_nanos().max(1),
     );
-     { ffi::hk_query_free(q) };
+     ffi::hk_query_free(q);
 
     // Early-stop + null callback.
     let q2 =  { ffi::hk_query_new(col.as_ptr()) };
@@ -910,8 +910,8 @@ fn walk_ffi() {
     assert_eq!(cnt, 100);
     let n =  { ffi::hk_cursor_walk(engine, q2, None, std::ptr::null_mut()) };
     assert_eq!(n, -1, "null callback errors");
-     { ffi::hk_query_free(q2) };
+     ffi::hk_query_free(q2);
 
-     { ffi::hk_engine_free(engine) };
+     ffi::hk_engine_free(engine);
     std::fs::remove_dir_all(&dir).ok();
 }

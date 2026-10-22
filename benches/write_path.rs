@@ -48,7 +48,7 @@ fn make_small_doc(i: usize) -> HakoDoc {
     let mut doc = HakoDoc::default();
     doc.insert("tenant", Value::String(format!("tenant-{}", i % 32)));
     doc.insert("age", Value::Int(18 + (i % 70) as i64));
-    doc.insert("active", Value::Bool(i % 3 != 0));
+    doc.insert("active", Value::Bool(!i.is_multiple_of(3)));
     doc.insert("score", Value::Float(((i % 10000) as f64) / 7.0 + 0.5));
     doc.insert("description", Value::String(format!("payload {i}")));
     doc
@@ -75,7 +75,7 @@ fn cfg_for(mode: DurabilityMode, threshold: usize) -> HakoConfig {
 }
 
 fn open_engine(label: &str, mode: DurabilityMode) -> Hako {
-    Hako::open(&temp_dir(label), cfg_for(mode, 16 * 1024)).expect("open")
+    Hako::open(temp_dir(label), cfg_for(mode, 16 * 1024)).expect("open")
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +171,7 @@ fn bench_write_blob(c: &mut Criterion) {
     cfg.page_cache_capacity = 4096;
     cfg.mmap_size = 64 * 1024 * 1024;
     cfg.value_blob_threshold_bytes = 16 * 1024;
-    let db = Hako::open(&temp_dir("blob"), cfg).expect("open");
+    let db = Hako::open(temp_dir("blob"), cfg).expect("open");
 
     let mut group = c.benchmark_group("write_blob");
     group.throughput(Throughput::Elements(1));
@@ -207,7 +207,7 @@ fn bench_tx(c: &mut Criterion) {
     cfg.page_cache_capacity = 4096;
     cfg.mmap_size = 64 * 1024 * 1024;
     cfg.value_blob_threshold_bytes = 16 * 1024;
-    let db = Hako::open(&temp_dir("tx"), cfg).expect("open");
+    let db = Hako::open(temp_dir("tx"), cfg).expect("open");
     db.write_batch(vec![BatchMutation::Put {
         collection: "bench".into(),
         doc_id: "tx_target".into(),
@@ -293,7 +293,7 @@ fn bench_query_composite_vs_eq(c: &mut Criterion) {
     cfg.page_cache_capacity = 4096;
     cfg.mmap_size = 64 * 1024 * 1024;
     cfg.value_blob_threshold_bytes = 16 * 1024;
-    let db = Hako::open(&temp_dir("cmp"), cfg).expect("open");
+    let db = Hako::open(temp_dir("cmp"), cfg).expect("open");
     db.write_batch({
         let mut m = Vec::with_capacity(SMALL_N);
         for i in 0..SMALL_N {

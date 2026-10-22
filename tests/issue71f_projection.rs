@@ -37,7 +37,7 @@ fn map_get<'a>(fields: &'a [(String, Value)], key: &str) -> Option<&'a Value> {
 
 #[test]
 fn nested_projection_prunes_subtrees() {
-    let db = Hako::open(&tmp_dir("nested"), HakoConfig::default()).unwrap();
+    let db = Hako::open(tmp_dir("nested"), HakoConfig::default()).unwrap();
     db.put("users", "u1", &nested_doc("ana", "bandung", 40115)).unwrap();
 
     let rows = db
@@ -75,7 +75,7 @@ fn nested_projection_prunes_subtrees() {
 }
 
 fn covering_setup(tag: &str) -> Hako {
-    let db = Hako::open(&tmp_dir(tag), HakoConfig::default()).unwrap();
+    let db = Hako::open(tmp_dir(tag), HakoConfig::default()).unwrap();
     db.create_composite_index_ex(
         "events",
         vec![

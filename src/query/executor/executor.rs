@@ -93,7 +93,7 @@ impl<'a> PartialEq for TopItem<'a> {
 impl<'a> Eq for TopItem<'a> {}
 impl<'a> PartialOrd for TopItem<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(cmp_top(&self.entry, &other.entry, self.orders))
+        Some(self.cmp(other))
     }
 }
 impl<'a> Ord for TopItem<'a> {
@@ -492,12 +492,12 @@ impl ParallelQueryExecutor {
         let processed_docs: Vec<(String, HakoDoc)> = if target_workers == 1 {
             // SHORT-CIRCUIT: Avoid Rayon task-scheduling overhead for small results.
             // This ensures a query for 50 docs is as fast as 50 individual Get calls.
-            tasks.into_iter().flat_map(|task| run_task(task)).collect()
+            tasks.into_iter().flat_map(run_task).collect()
         } else {
             // PARALLEL PATH: Use full CPU power for heavy workloads
             tasks
                 .into_par_iter()
-                .flat_map(|task| run_task(task))
+                .flat_map(run_task)
                 .collect()
         };
 
@@ -612,7 +612,7 @@ impl ParallelQueryExecutor {
             let Some(view) = HakoDocView::new(bytes) else {
                 continue;
             };
-            if need_match && !trust_scan && !matches_filters_view(&id, bytes, plan) {
+            if need_match && !trust_scan && !matches_filters_view(id, bytes, plan) {
                 continue;
             }
             let entry = TopEntry {
@@ -720,7 +720,6 @@ impl ParallelQueryExecutor {
             ScanType::SortedKeys { .. } => 0,
             _ => plan.offset.unwrap_or(0),
         };
-        let mut out = out;
         if skip > 0 {
             out = out.into_iter().skip(skip).collect();
         }
@@ -1200,8 +1199,7 @@ impl ParallelQueryExecutor {
         // [4. Final Processing for Averages]
         let keys: Vec<String> = final_results.keys().cloned().collect();
         for k in keys {
-            if k.starts_with("avg_tmp_") {
-                let field = &k[8..];
+            if let Some(field) = k.strip_prefix("avg_tmp_") {
                 let sum = final_results.remove(&k).unwrap_or(0.0);
                 let count = final_results
                     .remove(&format!("avg_cnt_{}", field))
@@ -1231,6 +1229,7 @@ impl ParallelQueryExecutor {
         Ok(final_results)
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn execute_projected(
         &self,
         storage_arc: Arc<RwLock<StorageEngine>>,

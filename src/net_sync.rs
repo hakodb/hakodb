@@ -1015,7 +1015,7 @@ fn peer_may_send(
     local_fp: [u8; 32],
 ) -> bool {
     let enc = db.is_collection_encrypted(col);
-    if sync_guard::caps_allow(enc, local_fp, caps.get(&peer_id).as_ref()) {
+    if sync_guard::caps_allow(enc, local_fp, caps.get(peer_id).as_ref()) {
         return true;
     }
     caps.warn(
@@ -1026,6 +1026,7 @@ fn peer_may_send(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_peer(
     stream: TcpStream, 
     db: Arc<Hako>, 

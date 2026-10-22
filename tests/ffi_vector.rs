@@ -63,21 +63,21 @@ fn seed(dir: &std::path::Path) {
 /// fail-closes to zero rows).
 fn call_near(dir: &std::path::Path, field: &str, q: &[f32], k: usize) -> *mut std::ffi::c_char {
     let path = CString::new(dir.to_str().expect("path")).expect("cstr");
-    let eng = unsafe { hk_engine_open(path.as_ptr()) };
+    let eng = { hk_engine_open(path.as_ptr()) };
     assert!(!eng.is_null(), "hk_engine_open failed");
     assert!(
-        unsafe { hk_engine_await_quiescent(eng, 60_000) },
+        { hk_engine_await_quiescent(eng, 60_000) },
         "engine never quiescent"
     );
     let col = CString::new("pts").unwrap();
     let fld = CString::new(field).unwrap();
-    unsafe { hk_engine_find_near(eng, col.as_ptr(), fld.as_ptr(), q.as_ptr(), q.len(), k) }
+    hk_engine_find_near(eng, col.as_ptr(), fld.as_ptr(), q.as_ptr(), q.len(), k)
 }
 
 fn to_json(ptr: *mut std::ffi::c_char) -> serde_json::Value {
     assert!(!ptr.is_null(), "null return");
     let s = unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() };
-    unsafe { hk_string_free(ptr) };
+    hk_string_free(ptr);
     serde_json::from_str(&s).expect("json")
 }
 

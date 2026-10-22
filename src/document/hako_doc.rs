@@ -116,9 +116,10 @@ impl HakoDoc {
         // ponytail: size the vec from the header count — the old push-grown
         // vec always paid one backing alloc (+ regrow for wide docs) per
         // decode. The count is right there in the view.
-        let mut doc = HakoDoc::default();
-        doc._time = view._time;
-        doc.fields = Vec::with_capacity(view.fields_count as usize);
+        let mut doc = HakoDoc {
+            _time: view._time,
+            fields: Vec::with_capacity(view.fields_count as usize),
+        };
         let mut it = view.iter();
         for (key, tag, data) in it.by_ref() {
             doc.fields.push((intern_field(key), decode_value(tag, data)?));
@@ -135,15 +136,16 @@ impl HakoDoc {
 
     pub fn decode_projected(bytes: &[u8], projection: &[String]) -> Option<Self> {
         let view = HakoDocView::new(bytes)?;
-        let mut doc = HakoDoc::default();
-        doc._time = view._time;
-        doc.fields = Vec::with_capacity(view.fields_count as usize);
+        let mut doc = HakoDoc {
+            _time: view._time,
+            fields: Vec::with_capacity(view.fields_count as usize),
+        };
         let mut it = view.iter();
         let prefixes = crate::document::value::projection_prefixes(projection);
         for (key, tag, data) in it.by_ref() {
             // hakodb#71 F6: a dotted projection only needs its top-level
             // prefix decoded; the subtree is pruned in memory afterwards.
-            let wanted = projection.is_empty() || prefixes.iter().any(|p| *p == key);
+            let wanted = projection.is_empty() || prefixes.contains(&key);
             if wanted {
                 let val = decode_value(tag, data)?;
                 if projection.is_empty() {
@@ -855,7 +857,7 @@ impl<'a> Iterator for HakoDocRawIter<'a> {
 }
 
 pub(crate) fn skip_value(tag: u8, bytes: &[u8], pos: &mut usize) -> Option<()> {
-    if tag >= 0xC0 && tag <= 0xC3 { return Some(()); }
+    if (0xC0..=0xC3).contains(&tag) { return Some(()); }
     if (tag & 0xF0) == 0x10 { return Some(()); }
     if (tag & 0xF8) == 0x40 {
         *pos += (tag & 0x07) as usize;
@@ -868,7 +870,7 @@ pub(crate) fn skip_value(tag: u8, bytes: &[u8], pos: &mut usize) -> Option<()> {
     }
 
     match tag {
-        3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 => {
+        3..=11 => {
             // let v_len = u32::from_le_bytes(bytes.get(*pos..*pos + 4)?.try_into().ok()?) as usize;
             // *pos += 4 + v_len;
             // Some(())

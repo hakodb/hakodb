@@ -12,7 +12,7 @@ thread_local! {
     /// allocates nothing after warmup (~2 small Vecs per row otherwise,
     /// i.e. ~20k allocs per 10k-row scan).
     static MATCH_SCRATCH: RefCell<(Vec<bool>, Vec<bool>)> =
-        RefCell::new((Vec::new(), Vec::new()));
+        const { RefCell::new((Vec::new(), Vec::new())) };
 }
 
 /// Per-row match buffers borrowed from [`MATCH_SCRATCH`]. Parked back on
@@ -317,7 +317,7 @@ pub(crate) fn unified_match_projected(doc_id: &str, bytes: &[u8], plan: &crate::
         // `projection.contains(&key.to_string())` allocated one String per
         // field per row just to compare.
         // hakodb#71 F6: a dotted projection matches by top-level prefix.
-        let is_needed_for_proj = proj_prefixes.iter().any(|p| *p == key);
+        let is_needed_for_proj = proj_prefixes.contains(&key);
 
         if is_needed_for_filter || is_needed_for_proj {
             let val = crate::document::hako_doc::decode_value(tag, data)?;
@@ -361,8 +361,12 @@ fn check_metadata_filters(
     // Check ORs
     for (gi, group) in plan.or_groups.iter().enumerate() {
         for f in group {
-            if f.field == "id" && matches_id_flexible(doc_id, &f.op, &f.value) { or_group_results[gi] = true; }
-            else if f.field == "_time" && crate::query::filter::compare_values(&Value::Int(doc_time), &f.op, &f.value) { or_group_results[gi] = true; }
+            let matched = match f.field.as_str() {
+                "id" => matches_id_flexible(doc_id, &f.op, &f.value),
+                "_time" => crate::query::filter::compare_values(&Value::Int(doc_time), &f.op, &f.value),
+                _ => false,
+            };
+            if matched { or_group_results[gi] = true; }
         }
     }
     true
@@ -406,9 +410,8 @@ fn check_metadata_filters(
 #[inline]
 fn apply_filter_logic(key: &str, val: &Value, plan: &crate::query::plan::QueryPlan, and_matches: &mut [bool], or_group_results: &mut [bool]) {
     for (i, f) in plan.filters.iter().enumerate() {
-        if !and_matches[i] && key == f.field {
-            if crate::query::filter::compare_values(val, &f.op, &f.value) { and_matches[i] = true; }
-        }
+        if !and_matches[i] && key == f.field
+            && crate::query::filter::compare_values(val, &f.op, &f.value) { and_matches[i] = true; }
     }
     for (gi, group) in plan.or_groups.iter().enumerate() {
         if or_group_results[gi] { continue; }
@@ -438,15 +441,15 @@ fn matches_id_flexible(doc_id: &str, op: &Operator, filter_val: &Value) -> bool 
         Value::Array(items) => {
             // Handing "IN" logic: where id in ["6", "9"]
             if matches!(op, Operator::In) {
-                return items.iter().any(|v| {
+                items.iter().any(|v| {
                     if let Value::String(s) = v { s == doc_id } else { false }
-                });
+                })
             } else if matches!(op, Operator::NotIn) {
-                return !items.iter().any(|v| {
+                !items.iter().any(|v| {
                     if let Value::String(s) = v { s == doc_id } else { false }
-                });
+                })
             } else {
-                return compare_default_filter(doc_id, op, filter_val)
+                compare_default_filter(doc_id, op, filter_val)
             }
         },
         _ => compare_default_filter(doc_id, op, filter_val)
@@ -458,8 +461,7 @@ fn compare_default_filter (doc_id: &str, op: &Operator, filter_val: &Value) -> b
     crate::query::filter::compare_values(&id_val, op, filter_val)
 }
 
-/// Remaining logic (inflate_blobs, matches_filters_view, etc.) kept for internal use...
-
+/// Remaining logic (inflate_blobs, matches_filters_view, etc.) kept for internal use.
 pub(crate) fn inflate_blobs(doc: &mut HakoDoc, blob_manager: &crate::storage::blob::BlobManager) -> Result<(), crate::error::HakoError> {
     let links: Vec<&mut Value> = doc.fields.iter_mut()
         .map(|(_, v)| v)
@@ -578,9 +580,8 @@ pub(crate) fn matches_filters_view(doc_id: &str, bytes: &[u8], plan: &crate::que
     let Some(view) = HakoDocView::new(bytes) else { return false; };
     for (key, tag, data) in view.iter() {
         for (i, f) in plan.filters.iter().enumerate() {
-            if !and_matches[i] && key == f.field {
-                if compare_raw_bytes(tag, data, &f.op, &f.value) { and_matches[i] = true; }
-            }
+            if !and_matches[i] && key == f.field
+                && compare_raw_bytes(tag, data, &f.op, &f.value) { and_matches[i] = true; }
         }
         for (gi, group) in plan.or_groups.iter().enumerate() {
             if or_group_results[gi] { continue; }

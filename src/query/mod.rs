@@ -6,6 +6,7 @@ pub mod order;
 pub mod plan;
 pub mod plan_cache;
 pub mod planner;
+#[allow(clippy::module_inception)]
 pub mod query;
 pub mod builder;
 pub mod pipeline;

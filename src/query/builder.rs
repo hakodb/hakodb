@@ -166,6 +166,7 @@ impl<'a> QueryBuilder<'a> {
 
     /// Weighted variant (Phase B): `via_edge` names the edge collection,
     /// `weight` its numeric prop — Dijkstra ordering instead of BFS.
+    #[allow(clippy::too_many_arguments)]
     pub fn where_traverse_weighted(
         self,
         start_col: &str,

@@ -38,6 +38,7 @@ impl Segment {
         // 1. Open File handle for WRITES (Durability)
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path_buf)?;

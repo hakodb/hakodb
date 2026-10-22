@@ -24,6 +24,7 @@ use crate::error::HakoError;
 /// Encoded tuple prefix (index id + field encodings, no doc-id tail).
 pub type ClaimPrefix = SmallVec<[u8; 32]>;
 
+#[derive(Default)]
 struct ClaimMap {
     /// prefix -> owning doc id
     fwd: HashMap<ClaimPrefix, Arc<str>>,
@@ -42,15 +43,6 @@ struct ClaimMap {
     freed: HashSet<Arc<str>>,
 }
 
-impl Default for ClaimMap {
-    fn default() -> Self {
-        Self {
-            fwd: HashMap::default(),
-            by_doc: HashMap::default(),
-            freed: HashSet::default(),
-        }
-    }
-}
 
 /// One mutation the write path made to the ledger during batch
 /// preparation. Rollback replays in reverse order, which restores the
@@ -125,7 +117,7 @@ impl UniqueLedger {
             let idl = doc_id.len();
             if n < idl + 4
                 || &key[n - idl..] != doc_id.as_bytes()
-                || &key[(n - idl - 2)..(n - idl)]
+                || key[(n - idl - 2)..(n - idl)]
                     != (idl as u16).to_be_bytes()
             {
                 continue;

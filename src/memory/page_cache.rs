@@ -35,7 +35,7 @@ impl PageCache {
     }
 
     pub fn get(&mut self, key: &BlockKey) -> Option<Arc<Vec<u8>>> {
-        let Some(block) = self.blocks.get(key) else { return None; };
+        let block = self.blocks.get(key)?;
         let data = Arc::clone(&block.data);
 
         // O(1) MRU bump: if the key is already at the back, do nothing.

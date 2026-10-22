@@ -99,6 +99,7 @@ impl Wal {
         let path_buf = path.as_ref().to_path_buf();
         let mut file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(path)?;

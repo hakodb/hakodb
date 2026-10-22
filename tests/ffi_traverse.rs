@@ -54,16 +54,16 @@ fn seed(dir: &std::path::Path) {
 
 fn open(dir: &std::path::Path) -> *mut hakodb::ffi::HK_Engine {
     let path = CString::new(dir.to_str().expect("path")).expect("cstr");
-    let eng = unsafe { hk_engine_open(path.as_ptr()) };
+    let eng = { hk_engine_open(path.as_ptr()) };
     assert!(!eng.is_null(), "hk_engine_open failed");
-    assert!(unsafe { hk_engine_await_quiescent(eng, 60_000) }, "never quiescent");
+    assert!({ hk_engine_await_quiescent(eng, 60_000) }, "never quiescent");
     eng
 }
 
 fn to_json(ptr: *mut std::ffi::c_char) -> serde_json::Value {
     assert!(!ptr.is_null(), "null return");
     let s = unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() };
-    unsafe { hk_string_free(ptr) };
+    hk_string_free(ptr);
     serde_json::from_str(&s).expect("json")
 }
 
@@ -82,7 +82,7 @@ fn find_paths_returns_bfs_hits_with_depth() {
     let eng = open(&dir);
     let col = CString::new("pts").unwrap();
     let id = CString::new("a").unwrap();
-    let out = unsafe {
+    let out = {
         hk_engine_find_paths(eng, col.as_ptr(), id.as_ptr(), 0, std::ptr::null(), 10, 10)
     };
     let v = to_json(out);
@@ -103,7 +103,7 @@ fn find_paths_missing_anchor_returns_empty() {
     let eng = open(&dir);
     let col = CString::new("pts").unwrap();
     let id = CString::new("ghost").unwrap();
-    let out = unsafe {
+    let out = {
         hk_engine_find_paths(eng, col.as_ptr(), id.as_ptr(), 0, std::ptr::null(), 10, 10)
     };
     assert_eq!(to_json(out), serde_json::json!([]));
@@ -117,14 +117,14 @@ fn find_paths_untracked_incoming_is_hard_error() {
     // No traverse index on "other": incoming must null + last_error.
     let col = CString::new("other").unwrap();
     let id = CString::new("x").unwrap();
-    let out = unsafe {
+    let out = {
         hk_engine_find_paths(eng, col.as_ptr(), id.as_ptr(), 1, std::ptr::null(), 10, 10)
     };
     assert!(out.is_null(), "untracked incoming must return null");
     assert!(last_err().contains("create_traverse_index"), "got: {}", last_err());
     // create_traverse_index via FFI works (idempotent: pts already has it).
     let col2 = CString::new("pts").unwrap();
-    let rc = unsafe { hk_engine_create_traverse_index(eng, col2.as_ptr()) };
+    let rc = { hk_engine_create_traverse_index(eng, col2.as_ptr()) };
     assert_eq!(rc, 0);
 }
 
@@ -139,7 +139,7 @@ fn shortest_paths_weighted_over_ffi() {
     let id = CString::new("a").unwrap();
     let via = CString::new("rel").unwrap();
     let w = CString::new("w").unwrap();
-    let out = unsafe {
+    let out = {
         hk_engine_shortest_paths(
             eng,
             col.as_ptr(),
@@ -161,7 +161,7 @@ fn shortest_paths_weighted_over_ffi() {
     assert!((arr[1]["cost"].as_f64().unwrap() - 2.0).abs() < 1e-9);
     // create_edge_index via FFI works (idempotent here).
     let rel = CString::new("rel").unwrap();
-    let rc = unsafe { hk_engine_create_edge_index(eng, rel.as_ptr()) };
+    let rc = { hk_engine_create_edge_index(eng, rel.as_ptr()) };
     assert_eq!(rc, 0);
 }
 
