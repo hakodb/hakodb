@@ -245,6 +245,13 @@ fn doc_to_cstring(doc: &HakoDoc) -> Result<CString, String> {
     })
 }
 
+/// NUL-terminate a JSON byte buffer produced by a `write_json` path. Those
+/// writers escape U+0000, so the appended byte is the only terminator.
+fn json_to_cstring(mut out: Vec<u8>) -> CString {
+    out.push(0);
+    unsafe { CString::from_vec_unchecked(out) }
+}
+
 fn projection_to_json(fields: Vec<(String, Value)>) -> Result<serde_json::Value, String> {
     let mut map = serde_json::Map::new();
     for (k, v) in fields {
@@ -985,6 +992,45 @@ pub extern "C" fn hk_engine_get(
             // already a freshly-allocated String and we don't reuse it.
             Ok(Some(doc)) => Box::into_raw(Box::new(HK_Doc { id: doc_id_owned, doc })),
             _ => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Point-read JSON straight from the pinned bytes; blob links are resolved
+/// so the output matches `hk_engine_get` + `hk_doc_to_json`. Caller frees
+/// with `hk_string_free`.
+#[no_mangle]
+pub extern "C" fn hk_engine_get_json(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    doc_id: *const c_char,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() || collection.is_null() || doc_id.is_null() {
+            set_last_error_err("null engine/collection/doc_id handle");
+            return std::ptr::null_mut();
+        }
+        let (collection, doc_id) = match (
+            unsafe { CStr::from_ptr(collection) }.to_str(),
+            unsafe { CStr::from_ptr(doc_id) }.to_str(),
+        ) {
+            (Ok(c), Ok(d)) => (c, d),
+            _ => {
+                set_last_error_err("invalid utf8");
+                return std::ptr::null_mut();
+            }
+        };
+        let engine = unsafe { &*engine };
+        match engine.db.get_json(collection, doc_id) {
+            Ok(Some((_version, json))) => {
+                clear_last_error();
+                json_to_cstring(json).into_raw()
+            }
+            Ok(None) => std::ptr::null_mut(),
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                std::ptr::null_mut()
+            }
         }
     })
 }
@@ -2067,6 +2113,47 @@ pub extern "C" fn hk_query_execute(engine: *mut HK_Engine, query: *const HK_Quer
     })
 }
 
+/// Query rows as one JSON array string, emitted from pinned bytes (no owned
+/// `HakoDoc`). Output matches `hk_query_execute`; projections reuse that
+/// path because the projected executor has its own field shape. Caller
+/// frees with `hk_string_free`.
+#[no_mangle]
+pub extern "C" fn hk_query_execute_json(
+    engine: *mut HK_Engine,
+    query: *const HK_Query,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() || query.is_null() {
+            set_last_error_err("null engine/query handle");
+            return std::ptr::null_mut();
+        }
+        let query_obj = unsafe { &*query };
+        if !query_obj.query.projection.is_empty() {
+            return hk_query_execute(engine, query);
+        }
+        let engine = unsafe { &*engine };
+        match engine.db.query_json(query_obj.query.clone()) {
+            Ok(rows) => {
+                let mut out = Vec::new();
+                out.push(b'[');
+                for (i, (_, json)) in rows.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    out.extend_from_slice(&json);
+                }
+                out.push(b']');
+                clear_last_error();
+                json_to_cstring(out).into_raw()
+            }
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
 /// F7: plan explanation without executing the query. Returns JSON
 /// (`ExplainReport`: scan/index, counts, covering, available indexes).
 /// Caller frees with `hk_string_free`.
@@ -2429,6 +2516,51 @@ pub extern "C" fn hk_cursor_walk(
     })
 }
 
+/// JSON row callback: same signature as `hk_cursor_walk`, but `bytes` is
+/// UTF-8 JSON rather than storage framing. Rows are materialized by
+/// `walk_json`; `false` stops early. Returns rows visited, -1 on error.
+#[no_mangle]
+pub extern "C" fn hk_cursor_walk_json(
+    engine: *mut HK_Engine,
+    query: *const HK_Query,
+    callback: HkWalkCallback,
+    userdata: *mut std::ffi::c_void,
+) -> i64 {
+    safety_shield!(-1, {
+        if engine.is_null() || query.is_null() {
+            set_last_error_err("null engine/query handle");
+            return -1;
+        }
+        let cb = match callback {
+            Some(f) => f,
+            None => {
+                set_last_error_err("null walk callback");
+                return -1;
+            }
+        };
+        let engine = unsafe { &*engine };
+        let query_obj = unsafe { &*query };
+        let res = engine
+            .db
+            .walk_json(query_obj.query.clone(), &mut |id: &str, json: &[u8]| unsafe {
+                cb(
+                    id.as_ptr() as *const c_char,
+                    id.len(),
+                    json.as_ptr(),
+                    json.len(),
+                    userdata,
+                )
+            });
+        match res {
+            Ok(n) => n as i64,
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                -1
+            }
+        }
+    })
+}
+
 // --- Borrowed views (ponytail, v0.8.11+) ---
 // The sqlite3_column_* analog: an owned HK_ViewDoc handle pins storage
 // bytes; typed getters pull single fields with zero owned construction.
@@ -2574,14 +2706,14 @@ pub extern "C" fn hk_view_get_str(
     }
     unsafe {
         match (view.as_ref(), CStr::from_ptr(key).to_str()) {
-            (Some(v), Ok(k)) => match v.view.get(k) {
-                Some(Value::String(s)) => {
+            (Some(v), Ok(k)) => match v.view.get_str(k) {
+                Some(s) => {
                     if !len_out.is_null() {
                         *len_out = s.len();
                     }
                     s.as_ptr() as *const c_char
                 }
-                _ => std::ptr::null(),
+                None => std::ptr::null(),
             },
             _ => std::ptr::null(),
         }
@@ -2600,14 +2732,136 @@ pub extern "C" fn hk_view_get_bytes(
     }
     unsafe {
         match (view.as_ref(), CStr::from_ptr(key).to_str()) {
-            (Some(v), Ok(k)) => match v.view.get(k) {
-                Some(Value::Binary(b)) => {
+            (Some(v), Ok(k)) => match v.view.get_bytes(k) {
+                Some(b) => {
                     if !len_out.is_null() {
                         *len_out = b.len();
                     }
                     b.as_ptr()
                 }
-                _ => std::ptr::null(),
+                None => std::ptr::null(),
+            },
+            _ => std::ptr::null(),
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn hk_view_get_path_int(
+    view: *const HK_ViewDoc,
+    path: *const c_char,
+    out: *mut i64,
+) -> bool {
+    if view.is_null() || path.is_null() || out.is_null() {
+        return false;
+    }
+    unsafe {
+        match (view.as_ref(), CStr::from_ptr(path).to_str()) {
+            (Some(v), Ok(p)) => match v.view.get_path(p) {
+                Some(Value::Int(i)) => {
+                    *out = i;
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn hk_view_get_path_float(
+    view: *const HK_ViewDoc,
+    path: *const c_char,
+    out: *mut f64,
+) -> bool {
+    if view.is_null() || path.is_null() || out.is_null() {
+        return false;
+    }
+    unsafe {
+        match (view.as_ref(), CStr::from_ptr(path).to_str()) {
+            (Some(v), Ok(p)) => match v.view.get_path(p) {
+                Some(Value::Float(f)) => {
+                    *out = f;
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn hk_view_get_path_bool(view: *const HK_ViewDoc, path: *const c_char) -> i32 {
+    if view.is_null() || path.is_null() {
+        return -1;
+    }
+    unsafe {
+        match (view.as_ref(), CStr::from_ptr(path).to_str()) {
+            (Some(v), Ok(p)) => match v.view.get_path(p) {
+                Some(Value::Bool(b)) => {
+                    if b {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                _ => -1,
+            },
+            _ => -1,
+        }
+    }
+}
+
+/// Borrowed UTF-8 at a dotted path. Same lifetime contract as
+/// `hk_view_get_str`.
+#[no_mangle]
+pub extern "C" fn hk_view_get_path_str(
+    view: *const HK_ViewDoc,
+    path: *const c_char,
+    len_out: *mut usize,
+) -> *const c_char {
+    if view.is_null() || path.is_null() {
+        return std::ptr::null();
+    }
+    unsafe {
+        match (view.as_ref(), CStr::from_ptr(path).to_str()) {
+            (Some(v), Ok(p)) => match v.view.get_path_str(p) {
+                Some(s) => {
+                    if !len_out.is_null() {
+                        *len_out = s.len();
+                    }
+                    s.as_ptr() as *const c_char
+                }
+                None => std::ptr::null(),
+            },
+            _ => std::ptr::null(),
+        }
+    }
+}
+
+/// Borrowed Binary at a dotted path. Same lifetime contract as
+/// `hk_view_get_bytes`.
+#[no_mangle]
+pub extern "C" fn hk_view_get_path_bytes(
+    view: *const HK_ViewDoc,
+    path: *const c_char,
+    len_out: *mut usize,
+) -> *const u8 {
+    if view.is_null() || path.is_null() {
+        return std::ptr::null();
+    }
+    unsafe {
+        match (view.as_ref(), CStr::from_ptr(path).to_str()) {
+            (Some(v), Ok(p)) => match v.view.get_path_bytes(p) {
+                Some(b) => {
+                    if !len_out.is_null() {
+                        *len_out = b.len();
+                    }
+                    b.as_ptr()
+                }
+                None => std::ptr::null(),
             },
             _ => std::ptr::null(),
         }
@@ -2634,6 +2888,31 @@ pub extern "C" fn hk_view_to_doc(view: *const HK_ViewDoc, doc_id: *const c_char)
         let view = unsafe { &*view };
         match view.view.to_owned_doc() {
             Some(doc) => Box::into_raw(Box::new(HK_Doc { id, doc })),
+            None => {
+                set_last_error_err("view bytes do not decode");
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Full JSON from the pinned view bytes, no owned decode. Blob links stay
+/// as `{"__blob__":...}` (a view cannot inflate); use `hk_engine_get_json`
+/// when resolved blob values are required. Caller frees with
+/// `hk_string_free`.
+#[no_mangle]
+pub extern "C" fn hk_view_to_json(view: *const HK_ViewDoc) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if view.is_null() {
+            set_last_error_err("null view handle");
+            return std::ptr::null_mut();
+        }
+        let view = unsafe { &*view };
+        match view.view.to_json_bytes() {
+            Some(out) => {
+                clear_last_error();
+                json_to_cstring(out).into_raw()
+            }
             None => {
                 set_last_error_err("view bytes do not decode");
                 std::ptr::null_mut()

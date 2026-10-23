@@ -804,6 +804,25 @@ pub struct BorrowedValue<'a> {
 }
 impl<'a> BorrowedValue<'a> {
     pub fn to_owned_value(&self) -> Option<Value> { decode_value(self.tag, self.data) }
+    /// Borrowed UTF-8 for String values (inline or tag 5), no decode.
+    pub fn as_str(&self) -> Option<&'a str> {
+        if (self.tag & 0xF8) == 0x40 {
+            return std::str::from_utf8(self.data.get(..(self.tag & 0x07) as usize)?).ok();
+        }
+        if self.tag == 5 {
+            let len = u32::from_le_bytes(self.data.get(..4)?.try_into().ok()?) as usize;
+            return std::str::from_utf8(self.data.get(4..4usize.checked_add(len)?)?).ok();
+        }
+        None
+    }
+    /// Borrowed bytes for Binary values (tag 6), no decode.
+    pub fn as_bytes(&self) -> Option<&'a [u8]> {
+        if self.tag != 6 {
+            return None;
+        }
+        let len = u32::from_le_bytes(self.data.get(..4)?.try_into().ok()?) as usize;
+        self.data.get(4..4usize.checked_add(len)?)
+    }
     pub fn as_f64(&self) -> Option<f64> {
         if (self.tag & 0xF0) == 0x10 { return Some((self.tag & 0x0F) as f64); }
         match self.tag {
@@ -898,6 +917,36 @@ impl DocView {
     /// None on any miss, on descent into a non-Map value, on empty
     /// segments, or on corrupt framing.
     pub fn get_path(&self, path: &str) -> Option<Value> {
+        self.get_path_span(path)?.to_owned_value()
+    }
+
+    /// Borrowed String for `key` (literal top-level field, no dotted path).
+    pub fn get_str(&self, key: &str) -> Option<&str> {
+        self.iter()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v.as_str())
+    }
+
+    /// Borrowed bytes for `key` (literal top-level Binary field).
+    pub fn get_bytes(&self, key: &str) -> Option<&[u8]> {
+        self.iter()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v.as_bytes())
+    }
+
+    /// Borrowed String at a dotted path (`a.b.c`), no terminal decode.
+    pub fn get_path_str(&self, path: &str) -> Option<&str> {
+        self.get_path_span(path)?.as_str()
+    }
+
+    /// Borrowed Binary at a dotted path, no terminal decode.
+    pub fn get_path_bytes(&self, path: &str) -> Option<&[u8]> {
+        self.get_path_span(path)?.as_bytes()
+    }
+
+    /// Raw terminal span for a dotted path; `get_path` decodes it, the
+    /// borrowed getters read it in place.
+    fn get_path_span(&self, path: &str) -> Option<BorrowedValue<'_>> {
         let mut segs = path.split('.');
         let first = segs.next()?;
         if first.is_empty() {
@@ -953,7 +1002,7 @@ impl DocView {
             }
             (tag, span) = hit?;
         }
-        decode_value(tag, span)
+        Some(BorrowedValue { tag, data: span })
     }
 
     /// True when a top-level field points at blob storage that `get` would
