@@ -2,7 +2,7 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
-### Unreleased — FFI JSON read paths (P2)
+### v0.18.0 — FFI JSON read paths (P2)
 - **New FFI JSON surface.** `hk_engine_get_json`, `hk_view_to_json`,
   `hk_query_execute_json`, and `hk_cursor_walk_json` emit JSON straight from
   pinned bytes; caller frees with `hk_string_free`. `hk_query_execute_json`
