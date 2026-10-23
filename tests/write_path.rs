@@ -95,6 +95,14 @@ fn blob_write_path() {
         Some(Value::String(s)) => assert_eq!(s.len(), 4096, "blob string round-trip length"),
         other => panic!("expected resolved String after worker flush, got {:?}", other),
     }
+
+    // get_json must resolve blobs too: same bytes as get().to_json_bytes(),
+    // including the logical-time fallback for the ETag.
+    let (json_time, json) = db.get_json("bench", "blob_doc").expect("get_json").expect("blob json");
+    assert_eq!(json_time, blob._time);
+    assert_eq!(json, blob.to_json_bytes());
+    let (_, small_json) = db.get_json("bench", "small_doc").expect("get_json").expect("small json");
+    assert_eq!(small_json, small.to_json_bytes());
     std::fs::remove_dir_all(&dir).ok();
 }
 

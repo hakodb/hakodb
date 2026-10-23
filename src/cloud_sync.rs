@@ -1272,7 +1272,32 @@ kind,
                         crate::storage::engine::Pointer::BlobPending(doc) => {
                             doc.get_logical_time()
                         }
-                        _ => 0,
+                        crate::storage::engine::Pointer::BlobPendingData { skeleton, .. } => {
+                            i64::from_le_bytes(skeleton[2..10].try_into().unwrap_or([0; 8]))
+                        }
+                        // Segment/blob pointers have no timestamp field; read
+                        // the framed doc only when an incremental catch-up
+                        // actually needs to compare times. A fresh joiner
+                        // (`since_ts <= 0`) takes everything.
+                        crate::storage::engine::Pointer::Segment { .. }
+                        | crate::storage::engine::Pointer::Blob { .. } => {
+                            if since_ts <= 0 {
+                                1
+                            } else {
+                                guard
+                                    .read_pointer_internal(ptr, false)
+                                    .ok()
+                                    .flatten()
+                                    .map(|b| {
+                                        i64::from_le_bytes(
+                                            b.get(2..10)
+                                                .and_then(|s| s.try_into().ok())
+                                                .unwrap_or([0; 8]),
+                                        )
+                                    })
+                                    .unwrap_or(0)
+                            }
+                        }
                     };
                     if ts > since_ts {
                         Some((k.clone(), ptr.clone()))
@@ -1282,24 +1307,51 @@ kind,
                 })
                 .collect()
         };
-        let mut ops = Vec::new();
+        let mut raw_ops = Vec::new();
         {
-            let guard = shard_arc.read().unwrap();
+            let _guard = shard_arc.read().unwrap();
             for (key, ptr) in changed {
                 if db.is_local_only(collection, &key) {
                     continue;
                 }
-                if let crate::storage::engine::Pointer::Deleted { timestamp } = ptr {
-                    ops.push(WalOp::Delete { key, timestamp });
-                    continue;
+                match ptr {
+                    crate::storage::engine::Pointer::Deleted { timestamp } => {
+                        raw_ops.push(WalOp::Delete { key, timestamp });
+                    }
+                    crate::storage::engine::Pointer::Inlined(bytes) => {
+                        raw_ops.push(WalOp::PutInlined { key, value: (*bytes).clone() });
+                    }
+                    crate::storage::engine::Pointer::BlobPending(doc) => {
+                        raw_ops.push(WalOp::PutInlined { key, value: doc.encode_buffered() });
+                    }
+                    crate::storage::engine::Pointer::BlobPendingData { skeleton, .. } => {
+                        raw_ops.push(WalOp::PutInlined { key, value: skeleton });
+                    }
+                    crate::storage::engine::Pointer::Segment { segment_id, offset, len } => {
+                        raw_ops.push(WalOp::Put { key, segment_id, segment_offset: offset, len });
+                    }
+                    crate::storage::engine::Pointer::Blob { offset, len } => {
+                        raw_ops.push(WalOp::PutBlob { key, offset, len });
+                    }
                 }
-                if let crate::storage::engine::Pointer::BlobPending(doc) = ptr {
-                    ops.push(WalOp::PutInlined { key, value: doc.encode_buffered() });
-                    continue;
-                }
-                if let Ok(Some(bytes)) = guard.read_pointer_internal(&ptr, false) {
-                    ops.push(WalOp::PutInlined { key, value: bytes });
-                }
+            }
+        }
+        // Catch-up is a full-doc replay: inflate BlobLinks before they hit
+        // the wire. Receivers cannot use the sender's blob offsets.
+        let mut ops = Vec::with_capacity(raw_ops.len());
+        for op in raw_ops {
+            if matches!(op, WalOp::Delete { .. }) {
+                ops.push(op);
+                continue;
+            }
+            let key = match &op {
+                WalOp::PutInlined { key, .. }
+                | WalOp::Put { key, .. }
+                | WalOp::PutBlob { key, .. } => key.clone(),
+                _ => continue,
+            };
+            if let Some(value) = crate::sync_core::resolve_send_bytes(&shard_arc, db, &op) {
+                ops.push(WalOp::PutInlined { key, value });
             }
         }
         ops
@@ -1518,11 +1570,10 @@ kind,
                                                     let has_blobs = doc.fields.iter().any(|(_, v)| matches!(v, Value::BlobLink { .. }));
                                                     if has_blobs {
                                                         let enc_key = db.config.encryption_key.as_deref();
-                                                        if crate::engine::engine::resolve_doc_static(&mut doc, &shard_arc, enc_key).is_ok() {
-                                                            WalOp::PutInlined { key: key.clone(), value: doc.encode_buffered() }
-                                                        } else {
-                                                            op
+                                                        if crate::engine::engine::resolve_doc_static(&mut doc, &shard_arc, enc_key).is_err() {
+                                                            continue;
                                                         }
+                                                        WalOp::PutInlined { key: key.clone(), value: doc.encode_buffered() }
                                                     } else {
                                                         op
                                                     }
@@ -1903,11 +1954,10 @@ kind,
                                                     let has_blobs = doc.fields.iter().any(|(_, v)| matches!(v, Value::BlobLink { .. }));
                                                     if has_blobs {
                                                         let enc_key = db.config.encryption_key.as_deref();
-                                                        if crate::engine::engine::resolve_doc_static(&mut doc, &shard_arc, enc_key).is_ok() {
-                                                            WalOp::PutInlined { key: key.clone(), value: doc.encode_buffered() }
-                                                        } else {
-                                                            op
+                                                        if crate::engine::engine::resolve_doc_static(&mut doc, &shard_arc, enc_key).is_err() {
+                                                            continue;
                                                         }
+                                                        WalOp::PutInlined { key: key.clone(), value: doc.encode_buffered() }
                                                     } else {
                                                         op
                                                     }
@@ -2044,6 +2094,43 @@ mod tests {
         }
         assert_eq!(puts, 1, "expected only the live doc, got {ops:?}");
         assert_eq!(dels, vec!["gone".to_string()]);
+    }
+
+    #[test]
+    fn catchup_inflates_blobs() {
+        let (db, dir) = temp_db("catchup-blob");
+        let payload = "x".repeat(32 * 1024);
+        let mut doc = HakoDoc::default();
+        doc.insert("payload", Value::String(payload.clone()));
+        db.put("c", "blob", &doc).unwrap();
+        db.flush().expect("flush blob");
+
+        let ops = CloudSync::collect_catchup_ops(&db, "c", 0);
+        assert_eq!(ops.len(), 1, "expected one doc, got {ops:?}");
+        let WalOp::PutInlined { value, .. } = &ops[0] else {
+            panic!("expected PutInlined, got {:?}", ops[0]);
+        };
+        let sent = HakoDoc::decode(value).expect("wire doc decodes");
+        assert_eq!(sent.get("payload"), Some(&Value::String(payload)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn catchup_includes_segment_docs() {
+        let (db, dir) = temp_db("catchup-segment");
+        let mut doc = HakoDoc::default();
+        // 4 KiB..blob threshold goes to the active segment, not inline.
+        doc.insert("payload", Value::String("x".repeat(5 * 1024)));
+        db.put("c", "seg", &doc).unwrap();
+        db.flush().expect("flush segment");
+
+        let ts = db.get("c", "seg").unwrap().unwrap()._time;
+        assert_eq!(CloudSync::collect_catchup_ops(&db, "c", 0).len(), 1);
+        assert_eq!(CloudSync::collect_catchup_ops(&db, "c", ts - 1).len(), 1);
+        assert!(CloudSync::collect_catchup_ops(&db, "c", ts).is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

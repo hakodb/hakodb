@@ -2596,6 +2596,14 @@ impl Hako {
     }
 
     pub fn get(&self, collection: &str, doc_id: &str) -> Result<Option<HakoDoc>> {
+        Ok(self.get_arc(collection, doc_id)?.map(|doc| (*doc).clone()))
+    }
+
+    /// Shared-cache point read: same admission, version check, decode and
+    /// blob resolution as [`Self::get`], but a cache hit returns the resident
+    /// `Arc` instead of deep-cloning the document. Read-only callers that
+    /// only inspect or serialize the doc should prefer this.
+    pub fn get_arc(&self, collection: &str, doc_id: &str) -> Result<Option<Arc<HakoDoc>>> {
         if !self.allowed(collection, AccessOp::Get) {
             return Err(self.deny(AccessOp::Get, collection, Some(doc_id)));
         }
@@ -2615,7 +2623,7 @@ impl Hako {
         if let (Some(ver), Some(cache_key)) = (ver, &cache_key) {
             if let Some((v, cached)) = self.doc_cache.read().unwrap().get(cache_key) {
                 if *v == ver {
-                    return Ok(Some((**cached).clone()));
+                    return Ok(Some(Arc::clone(cached)));
                 }
             }
         }
@@ -2647,6 +2655,7 @@ impl Hako {
         
         if let Some(mut doc) = res {
             self.resolve_doc(&mut doc, collection)?;
+            let doc = Arc::new(doc);
             // ponytail: populate post-resolve. Bounded at 8192 with single
             // arbitrary eviction when full.
             // ponytail: try_write â€” a contended cache must not serialize
@@ -2657,7 +2666,7 @@ impl Hako {
                     if cache.len() >= 8192 {
                         if let Some(k) = cache.keys().next().cloned() { cache.remove(&k); }
                     }
-                    cache.insert(cache_key, (ver, Arc::new(doc.clone())));
+                    cache.insert(cache_key, (ver, Arc::clone(&doc)));
                 }
             }
             return Ok(Some(doc));
@@ -2696,6 +2705,45 @@ impl Hako {
         }
 
         Ok(res)
+    }
+
+    /// Point read that emits JSON straight from the pinned bytes: no owned
+    /// `HakoDoc`, no per-field String/Map allocs. Returns `(logical_time,
+    /// json)` so response paths can keep the same ETag fallback as `get`.
+    ///
+    /// Blob-backed fields are the one exception: `DocView` cannot inflate
+    /// them, so those documents fall back to decode + resolve to keep the
+    /// output byte-identical to `get`. Blob-free reads stay zero-decode.
+    pub fn get_json(&self, collection: &str, doc_id: &str) -> Result<Option<(i64, Vec<u8>)>> {
+        let Some(view) = self.get_view(collection, doc_id)? else {
+            return Ok(None);
+        };
+        let time = view.time();
+        Ok(self.json_from_view(&view, collection)?.map(|json| (time, json)))
+    }
+
+    /// Serialize one pinned row, falling back to owned decode only when the
+    /// row has blob links. Shared by point and query JSON paths so both keep
+    /// `get`'s resolved-blob byte contract.
+    fn json_from_view(
+        &self,
+        view: &crate::document::hako_doc::DocView,
+        collection: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        if view.has_blob_links() {
+            // shortcut: blob docs pay one decode; upgrade to a blob-aware
+            // view writer if large-blob JSON reads become hot.
+            let Some(mut doc) = view.to_owned_doc() else {
+                return Ok(None);
+            };
+            self.resolve_document_blobs(&mut doc, collection)?;
+            return Ok(Some(doc.to_json_bytes()));
+        }
+        let mut out = Vec::with_capacity(view.as_bytes().len() + 16);
+        if view.write_json(&mut out).is_none() {
+            return Ok(None);
+        }
+        Ok(Some(out))
     }
 
     pub fn put(&self, col: &str, id: &str, doc: &HakoDoc) -> Result<String> {
@@ -3316,6 +3364,61 @@ impl Hako {
         });
 
         Ok(results)
+    }
+
+    /// JSON rows from the raw fast path when the query allows it, else from
+    /// the decoded query. Raw rows are serialized from pinned bytes; rows
+    /// with blob links fall back to decode + resolve so bytes match
+    /// `query` + `to_json_bytes`. Projections/aggregations and queries the
+    /// raw executor cannot satisfy take the decoded path (same semantics).
+    pub fn query_json(&self, query: Query) -> Result<Vec<(String, Vec<u8>)>> {
+        if query.projection.is_empty() && query.aggregations.is_empty() {
+            match self.query_raw(query.clone()) {
+                Ok(rows) => {
+                    let mut out = Vec::with_capacity(rows.len());
+                    for (id, bytes) in rows {
+                        let Some(view) = crate::document::hako_doc::DocView::new(bytes) else {
+                            continue;
+                        };
+                        let json = if query.defer_blobs {
+                            view.to_json_bytes()
+                        } else {
+                            self.json_from_view(&view, &query.collection)?
+                        };
+                        if let Some(json) = json {
+                            out.push((id, json));
+                        }
+                    }
+                    return Ok(out);
+                }
+                Err(HakoError::QueryError(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let mut q = query;
+        q.raw = false;
+        Ok(self
+            .query(q)?
+            .into_iter()
+            .map(|(id, doc)| (id, doc.to_json_bytes()))
+            .collect())
+    }
+
+    /// Callback over [`Self::query_json`] rows. The rows are materialized
+    /// first (this is not the zero-copy `walk_view`); `false` stops early.
+    pub fn walk_json<F>(&self, query: Query, callback: &mut F) -> Result<usize>
+    where
+        F: FnMut(&str, &[u8]) -> bool,
+    {
+        let rows = self.query_json(query)?;
+        let mut visited = 0;
+        for (id, json) in rows {
+            visited += 1;
+            if !callback(&id, &json) {
+                break;
+            }
+        }
+        Ok(visited)
     }
 
     /// Zero-alloc scan walk: lends each matching row (`&str` id, `&[u8]`

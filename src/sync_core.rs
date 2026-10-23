@@ -518,4 +518,76 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// Blob regression for the shared send/receive primitives: the sender
+    /// inflates its BlobLink, the receiver re-extracts it (never trusting
+    /// the sender's file offsets), and both point reads and get_json resolve
+    /// the same bytes after a restart.
+    #[tokio::test]
+    async fn replicated_blob_round_trips_and_resolves() {
+        use crate::config::{DurabilityMode, HakoConfig};
+        use crate::document::value::Value;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let src_dir = std::env::temp_dir().join(format!("hako-sync-blob-src-{nanos}"));
+        let dst_dir = std::env::temp_dir().join(format!("hako-sync-blob-dst-{nanos}"));
+        let cfg = HakoConfig {
+            durability_mode: DurabilityMode::Manual,
+            value_blob_threshold_bytes: 1024,
+            ..Default::default()
+        };
+        let src = Arc::new(Hako::open(&src_dir, cfg.clone()).expect("open src"));
+        let dst = Arc::new(Hako::open(&dst_dir, cfg.clone()).expect("open dst"));
+
+        let payload = "x".repeat(4096);
+        let mut doc = HakoDoc::default();
+        doc.insert("small", Value::String("ok".into()));
+        doc.insert("payload", Value::String(payload.clone()));
+        src.put_owned("c", "k", doc).expect("put");
+
+        // Source stores a skeleton + blob; the wire copy must carry bytes.
+        let view = src.get_view("c", "k").expect("view").expect("doc");
+        assert!(view.has_blob_links(), "source must store a BlobLink");
+        let expected = src.get("c", "k").expect("get").expect("doc");
+        assert_eq!(expected.get("payload"), Some(&Value::String(payload.clone())));
+
+        let shard = src.get_shard("c").expect("shard");
+        let op = WalOp::PutInlined { key: "k".into(), value: view.as_bytes().to_vec() };
+        let wire = resolve_send_bytes(&shard, &src, &op).expect("inflate source blob");
+        let wire_doc = HakoDoc::decode(&wire).expect("wire decodes");
+        assert_eq!(wire_doc.get("payload"), Some(&Value::String(payload)));
+
+        apply_replicated_batch(
+            dst.clone(),
+            "c".into(),
+            vec![WalOp::PutInlined { key: "k".into(), value: wire }],
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+        .await;
+
+        // Receiver must re-extract locally, not keep the sender's link.
+        let dst_view = dst.get_view("c", "k").expect("dst view").expect("dst doc");
+        assert!(dst_view.has_blob_links(), "receiver must re-extract the blob");
+
+        let expected_json = expected.to_json_bytes();
+        let (time, json) = dst.get_json("c", "k").expect("dst get_json").expect("dst json");
+        assert_eq!(time, expected._time);
+        assert_eq!(json, expected_json);
+
+        // Graceful close drains the queue; reopen proves the WAL skeleton and
+        // blob file survived together.
+        drop(dst);
+        let dst = Arc::new(Hako::open(&dst_dir, cfg).expect("reopen dst"));
+        let reopened = dst.get("c", "k").expect("reopened get").expect("reopened doc");
+        assert_eq!(reopened.to_json_bytes(), expected_json);
+        let (time, json) = dst.get_json("c", "k").expect("reopened get_json").expect("reopened json");
+        assert_eq!(time, expected._time);
+        assert_eq!(json, expected_json);
+
+        std::fs::remove_dir_all(&src_dir).ok();
+        std::fs::remove_dir_all(&dst_dir).ok();
+    }
 }
