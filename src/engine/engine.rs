@@ -392,6 +392,9 @@ pub struct Transaction {
 struct ShardWork {
     ops: Vec<WalOp>,
     keys: Vec<Arc<str>>,
+    /// Keys whose final op in this batch is a delete. Their version entry is
+    /// removed after the write so an absent read (None) stays comparable.
+    deleted: HashSet<Arc<str>>,
     events: Vec<(String, ChangeEvent)>,
     index_puts: Vec<(String, Arc<HakoDoc>)>, 
     index_deletes: Vec<(String, HakoDoc)>,
@@ -2089,9 +2092,9 @@ impl Hako {
             let work = match shard_map.get_mut(&col) {
                 Some(w) => w,
                 None => shard_map.entry(col.clone()).or_insert_with(|| ShardWork {
-                    ops: Vec::new(), keys: Vec::new(), events: Vec::new(),
-                    index_puts: Vec::new(), blob_queue_items: Vec::new(),
-                    index_deletes: Vec::new()
+                    ops: Vec::new(), keys: Vec::new(), deleted: HashSet::new(),
+                    events: Vec::new(), index_puts: Vec::new(),
+                    blob_queue_items: Vec::new(), index_deletes: Vec::new()
                 }),
             };
 
@@ -2111,6 +2114,7 @@ impl Hako {
                 // keys/events share the Arc (bumps, no String allocs).
                 work.ops.push(WalOp::Delete { key: doc_id, timestamp: now_micros });
                 work.keys.push(key_arc.clone());
+                work.deleted.insert(key_arc.clone());
                 work.events.push((col, ChangeEvent { path: key_arc, kind: ChangeKind::Delete }));
                 continue;
             }
@@ -2153,6 +2157,7 @@ impl Hako {
             work.ops.push(WalOp::PutInlined { key: key_arc.to_string(), value: skeleton_bytes });
             work.index_puts.push((doc_id, Arc::clone(&doc_arc))); 
             work.keys.push(key_arc.clone());
+            work.deleted.remove(&key_arc);
             // ponytail: event path bumps the same Arc instead of a fresh
             // String allocation per mutation.
             work.events.push((col, ChangeEvent {
@@ -2163,6 +2168,19 @@ impl Hako {
             for b in blob_work { work.blob_queue_items.push(b); }
         }
         WRITE_STATS.encode_ns.fetch_add(t_encode.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        // Versions are keyed by bare doc id, so a delete in one collection
+        // must not erase a version for the same id that stays live in
+        // another collection in this batch (relocate is the common case).
+        let live_keys: HashSet<Arc<str>> = shard_map
+            .values()
+            .flat_map(|w| {
+                w.keys
+                    .iter()
+                    .filter(|k| !w.deleted.contains(*k))
+                    .cloned()
+            })
+            .collect();
 
         // --- APPLY SHARD CHANGES ---
         for (col_name, mut work) in shard_map {
@@ -2261,6 +2279,7 @@ impl Hako {
                 // version paired with the old document (silent lost update).
                 let t_ver = Instant::now();
                 self.bump_versions_by_keys(work.keys.clone());
+                self.clear_versions_by_keys(&work.deleted, &live_keys);
                 WRITE_STATS.versions_ns.fetch_add(t_ver.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
             // apply wall time includes the WAL call above; report net below.
@@ -2577,6 +2596,9 @@ impl Hako {
             // Src tombstone with FRESH timestamp via the normal delete
             // path (WAL + index + versions + cache + watchers + audit).
             self.delete(src, id)?;
+            // The delete drops the bare-key version; the doc is still live
+            // at dst, so restore a version for the moved identity.
+            self.bump_versions_by_keys(vec![key_arc.clone()]);
             self.trigger_blob_flush.store(true, Ordering::Release);
             report.moved.push(id.clone());
         }
@@ -3766,6 +3788,25 @@ impl Hako {
             let bucket = (fxhash::hash64(&key) % 32) as usize;
             let mut shard = self.doc_versions[bucket].write().unwrap();
             shard.insert(key, self.global_version.fetch_add(1, Ordering::Relaxed));
+        }
+    }
+
+    /// Drop version entries for keys whose final op was a delete. A
+    /// tombstoned doc is absent again, so `get_versioned` reports None; the
+    /// commit check must compare against None too, not a historical version.
+    fn clear_versions_by_keys(
+        &self,
+        keys: &HashSet<Arc<str>>,
+        keep: &HashSet<Arc<str>>,
+    ) {
+        for key in keys {
+            if keep.contains(key) {
+                continue;
+            }
+            let bucket = (fxhash::hash64(&key) % 32) as usize;
+            if let Ok(mut shard) = self.doc_versions[bucket].write() {
+                shard.remove(key.as_ref());
+            }
         }
     }
 

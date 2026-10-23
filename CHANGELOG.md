@@ -2,6 +2,15 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.17.1 — tombstone version fix
+- **Delete-then-recreate no longer false-conflicts.** A delete now drops the
+  bare-key version entry instead of leaving a historical version behind, so a
+  serializable transaction that read the doc as absent (`None`) can commit its
+  re-create. This broke unique shadow registries (delete a user, re-create the
+  same email → permanent `transaction conflict`). Keys that stay live in
+  another collection in the same batch (relocate) keep their version, and
+  `relocate_docs` re-bumps the moved identity after the source tombstone.
+
 ### v0.17.0 — index drops and cooperative cancellation
 - **Point-read JSON fast path (#123 P0).** `DocView::write_json` /
   `to_json_bytes` emit the same bytes as `HakoDoc::write_json` straight from
