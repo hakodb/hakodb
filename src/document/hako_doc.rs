@@ -387,22 +387,7 @@ fn write_json_value(out: &mut Vec<u8>, v: &Value) {
             out.extend_from_slice(itoa::Buffer::new().format(*offset).as_bytes());
             out.extend_from_slice(b"}}");
         }
-        Map(fields) => {
-            // to_json rebuilds a BTreeMap: sort borrowed keys, no allocs.
-            let mut items: Vec<(&str, &Value)> =
-                fields.iter().map(|(k, v)| (k.as_ref(), v)).collect();
-            items.sort_by(|a, b| a.0.cmp(b.0));
-            out.push(b'{');
-            for (i, (k, v)) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
-                }
-                Self::write_json_str(out, k);
-                out.push(b':');
-                Self::write_json_value(out, v);
-            }
-            out.push(b'}');
-        }
+        Map(fields) => Self::write_json_map(out, fields),
         Array(values) => {
             out.push(b'[');
             for (i, v) in values.iter().enumerate() {
@@ -415,6 +400,212 @@ fn write_json_value(out: &mut Vec<u8>, v: &Value) {
         }
     }
 }
+
+    /// Write a map in BTreeMap key order. Most maps are small, so sorting
+    /// borrowed refs in a stack array avoids a Vec per nested map.
+    fn write_json_map(out: &mut Vec<u8>, fields: &[(Arc<str>, Value)]) {
+        const STACK: usize = 32;
+        if fields.len() <= STACK {
+            let mut items: [Option<(&str, &Value)>; STACK] = [None; STACK];
+            for (slot, (k, v)) in items.iter_mut().zip(fields) {
+                *slot = Some((k.as_ref(), v));
+            }
+            let items = &mut items[..fields.len()];
+            items.sort_unstable_by(|a, b| a.unwrap().0.cmp(b.unwrap().0));
+            Self::write_json_map_items(out, items.iter().map(|i| i.unwrap()));
+        } else {
+            let mut items: Vec<(&str, &Value)> =
+                fields.iter().map(|(k, v)| (k.as_ref(), v)).collect();
+            items.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            Self::write_json_map_items(out, items);
+        }
+    }
+
+    fn write_json_map_items<'a, I>(out: &mut Vec<u8>, items: I)
+    where
+        I: IntoIterator<Item = (&'a str, &'a Value)>,
+    {
+        out.push(b'{');
+        let mut first = true;
+        for (k, v) in items {
+            if !first {
+                out.push(b',');
+            }
+            first = false;
+            Self::write_json_str(out, k);
+            out.push(b':');
+            Self::write_json_value(out, v);
+        }
+        out.push(b'}');
+    }
+
+    /// Raw-span JSON writer: same output as [`Self::write_json_value`], but
+    /// reads the encoded span directly (no `Value` tree, no String allocs).
+    /// `None` means the span is not valid framing; callers treat it as a
+    /// missing/corrupt document, matching `HakoDoc::decode`.
+    fn write_view_value(out: &mut Vec<u8>, v: &BorrowedValue<'_>) -> Option<()> {
+        let tag = v.tag;
+        let data = v.data;
+        if tag == 0xC0 || tag == 0xC1 {
+            out.extend_from_slice(b"null");
+            return Some(());
+        }
+        if tag == 0xC2 {
+            out.extend_from_slice(b"true");
+            return Some(());
+        }
+        if tag == 0xC3 {
+            out.extend_from_slice(b"false");
+            return Some(());
+        }
+        if (tag & 0xF0) == 0x10 {
+            Self::push_int(out, (tag & 0x0F) as i64);
+            return Some(());
+        }
+        if (tag & 0xF8) == 0x40 {
+            let len = (tag & 0x07) as usize;
+            let s = std::str::from_utf8(data.get(..len)?).ok()?;
+            Self::write_json_str(out, s);
+            return Some(());
+        }
+        match tag {
+            3 | 7 => {
+                let mut p = 4;
+                let val = decode_varint(data, &mut p)?;
+                Self::push_int(out, zigzag_decode(val));
+            }
+            4 => {
+                let f = f64::from_le_bytes(data.get(4..12)?.try_into().ok()?);
+                match serde_json::Number::from_f64(f) {
+                    Some(n) => out.extend_from_slice(n.to_string().as_bytes()),
+                    None => out.extend_from_slice(b"null"),
+                }
+            }
+            5 => {
+                let len = u32::from_le_bytes(data.get(..4)?.try_into().ok()?) as usize;
+                let s = std::str::from_utf8(data.get(4..4 + len)?).ok()?;
+                Self::write_json_str(out, s);
+            }
+            6 => {
+                let len = u32::from_le_bytes(data.get(..4)?.try_into().ok()?) as usize;
+                let bytes = data.get(4..4 + len)?;
+                out.push(b'[');
+                for (i, b) in bytes.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    Self::push_int(out, *b as i64);
+                }
+                out.push(b']');
+            }
+            8 => Self::write_view_map(out, data)?,
+            9 => {
+                let count = u32::from_le_bytes(data.get(4..8)?.try_into().ok()?) as usize;
+                let mut p = 8usize;
+                out.push(b'[');
+                for i in 0..count {
+                    let t = *data.get(p)?;
+                    p += 1;
+                    let start = p;
+                    skip_value(t, data, &mut p)?;
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    Self::write_view_value(out, &BorrowedValue { tag: t, data: &data[start..p] })?;
+                }
+                if p != data.len() {
+                    return None;
+                }
+                out.push(b']');
+            }
+            10 => {
+                let c_len = *data.get(4)? as usize;
+                let c = std::str::from_utf8(data.get(5..5 + c_len)?).ok()?;
+                let d_len = *data.get(5 + c_len)? as usize;
+                let d = std::str::from_utf8(data.get(6 + c_len..6 + c_len + d_len)?).ok()?;
+                out.extend_from_slice(b"{\"__ref__\":\"");
+                Self::write_json_raw(out, c);
+                out.push(b'/');
+                Self::write_json_raw(out, d);
+                out.extend_from_slice(b"\"}");
+            }
+            11 => {
+                let offset = u64::from_le_bytes(data.get(4..12)?.try_into().ok()?);
+                let len = u32::from_le_bytes(data.get(12..16)?.try_into().ok()?);
+                out.extend_from_slice(b"{\"__blob__\":{\"len\":");
+                out.extend_from_slice(itoa::Buffer::new().format(len).as_bytes());
+                out.extend_from_slice(b",\"offset\":");
+                out.extend_from_slice(itoa::Buffer::new().format(offset).as_bytes());
+                out.extend_from_slice(b"}}");
+            }
+            _ => out.extend_from_slice(b"null"),
+        }
+        Some(())
+    }
+
+    fn write_view_map(out: &mut Vec<u8>, data: &[u8]) -> Option<()> {
+        const STACK: usize = 32;
+        let count = u16::from_le_bytes(data.get(4..6)?.try_into().ok()?) as usize;
+        let mut p = 6usize;
+        if count <= STACK {
+            let mut items: [Option<(&[u8], u8, &[u8])>; STACK] = [None; STACK];
+            for slot in items.iter_mut().take(count) {
+                let k_len = *data.get(p)? as usize;
+                p += 1;
+                let key = data.get(p..p + k_len)?;
+                p += k_len;
+                let tag = *data.get(p)?;
+                p += 1;
+                let start = p;
+                skip_value(tag, data, &mut p)?;
+                *slot = Some((key, tag, &data[start..p]));
+            }
+            if p != data.len() {
+                return None;
+            }
+            let items = &mut items[..count];
+            items.sort_unstable_by(|a, b| a.unwrap().0.cmp(b.unwrap().0));
+            Self::write_view_map_items(out, items.iter().map(|i| i.unwrap()))
+        } else {
+            let mut items: Vec<(&[u8], u8, &[u8])> = Vec::with_capacity(count);
+            for _ in 0..count {
+                let k_len = *data.get(p)? as usize;
+                p += 1;
+                let key = data.get(p..p + k_len)?;
+                p += k_len;
+                let tag = *data.get(p)?;
+                p += 1;
+                let start = p;
+                skip_value(tag, data, &mut p)?;
+                items.push((key, tag, &data[start..p]));
+            }
+            if p != data.len() {
+                return None;
+            }
+            items.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            Self::write_view_map_items(out, items)
+        }
+    }
+
+    fn write_view_map_items<'a, I>(out: &mut Vec<u8>, items: I) -> Option<()>
+    where
+        I: IntoIterator<Item = (&'a [u8], u8, &'a [u8])>,
+    {
+        out.push(b'{');
+        let mut first = true;
+        for (key, tag, span) in items {
+            if !first {
+                out.push(b',');
+            }
+            first = false;
+            let k = std::str::from_utf8(key).ok()?;
+            Self::write_json_str(out, k);
+            out.push(b':');
+            Self::write_view_value(out, &BorrowedValue { tag, data: span })?;
+        }
+        out.push(b'}');
+        Some(())
+    }
 
     pub fn to_json_with_id(&self, id: &str) -> serde_json::Value {
         let mut json = self.to_json();
@@ -763,6 +954,61 @@ impl DocView {
             (tag, span) = hit?;
         }
         decode_value(tag, span)
+    }
+
+    /// True when a top-level field points at blob storage that `get` would
+    /// inflate. `offset == u64::MAX` is the deferred placeholder and needs
+    /// no read, so it stays on the zero-decode path.
+    pub fn has_blob_links(&self) -> bool {
+        self.iter().any(|(_, v)| {
+            v.tag == 11
+                && v.data
+                    .get(4..12)
+                    .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                    .map(|b| u64::from_le_bytes(b) != u64::MAX)
+                    .unwrap_or(true)
+        })
+    }
+
+    /// Single-pass JSON serialization from the pinned bytes: same byte
+    /// contract as [`HakoDoc::write_json`], no owned decode. `None` means
+    /// corrupt framing, matching `HakoDoc::decode`'s missing-document result.
+    pub fn write_json(&self, out: &mut Vec<u8>) -> Option<()> {
+        let view = HakoDocView::new(&self.bytes)?;
+        out.push(b'{');
+        let mut first = true;
+        let mut time_written = false;
+        let mut it = view.iter();
+        for (k, tag, data) in it.by_ref() {
+            if !time_written && k > "_time" {
+                HakoDoc::write_time(out, &mut first, self.time);
+                time_written = true;
+            }
+            if !time_written && k == "_time" {
+                time_written = true;
+            }
+            if !first {
+                out.push(b',');
+            }
+            first = false;
+            HakoDoc::write_json_str(out, k);
+            out.push(b':');
+            HakoDoc::write_view_value(out, &BorrowedValue { tag, data })?;
+        }
+        if it.remaining() != 0 || it.position() != self.bytes.len() {
+            return None;
+        }
+        if !time_written {
+            HakoDoc::write_time(out, &mut first, self.time);
+        }
+        out.push(b'}');
+        Some(())
+    }
+
+    /// Owned convenience for response paths.
+    pub fn to_json_bytes(&self) -> Option<Vec<u8>> {
+        let mut out = Vec::with_capacity(self.bytes.len() + 16);
+        self.write_json(&mut out).map(|_| out)
     }
 
     /// Iterate `(key, borrowed value)` pairs without materializing.

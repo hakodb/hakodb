@@ -1,7 +1,7 @@
-//! Byte-parity: `HakoDoc::write_json` must emit exactly what `to_json()` +
-//! `serde_json::to_vec` produce, across shapes that stress ordering,
-//! escaping, nesting, and numeric edges. Any divergence fails loudly.
-use hakodb::document::hako_doc::HakoDoc;
+//! Byte-parity: `HakoDoc::write_json` and `DocView::write_json` must emit
+//! exactly what `to_json()` + `serde_json::to_vec` produce, across shapes
+//! that stress ordering, escaping, nesting, and numeric edges.
+use hakodb::document::hako_doc::{DocView, HakoDoc};
 use hakodb::document::value::Value;
 use std::sync::Arc;
 
@@ -11,6 +11,12 @@ fn check(doc: &HakoDoc) {
     doc.write_json(&mut got);
     assert_eq!(got, expected, "mismatch for doc ts={}", doc._time);
     assert_eq!(doc.to_json_bytes(), expected);
+
+    let view = DocView::new(Arc::new(doc.encode())).expect("encoded doc must frame");
+    let mut view_json = Vec::new();
+    view.write_json(&mut view_json).expect("view writer");
+    assert_eq!(view_json, expected, "view mismatch for doc ts={}", doc._time);
+    assert_eq!(view.to_json_bytes().as_deref(), Some(expected.as_slice()));
 }
 
 fn doc_with_time(fields: Vec<(&str, Value)>, ts: i64) -> HakoDoc {
@@ -102,6 +108,16 @@ fn shapes_match_serde() {
         ],
         42,
     ));
+}
+
+#[test]
+fn wide_maps_use_vec_fallback() {
+    // >32 entries exercises the heap fallback in both map writers.
+    let wide: Vec<(Arc<str>, Value)> = (0..40)
+        .rev()
+        .map(|i| (Arc::from(format!("k{i:02}")), Value::Int(i)))
+        .collect();
+    check(&doc_with_time(vec![("wide", Value::Map(wide))], 5));
 }
 
 #[test]

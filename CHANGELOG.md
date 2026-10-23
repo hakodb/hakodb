@@ -2,7 +2,35 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.17.1 — tombstone version fix
+- **Delete-then-recreate no longer false-conflicts.** A delete now drops the
+  bare-key version entry instead of leaving a historical version behind, so a
+  serializable transaction that read the doc as absent (`None`) can commit its
+  re-create. This broke unique shadow registries (delete a user, re-create the
+  same email → permanent `transaction conflict`). Keys that stay live in
+  another collection in the same batch (relocate) keep their version, and
+  `relocate_docs` re-bumps the moved identity after the source tombstone.
+
 ### v0.17.0 — index drops and cooperative cancellation
+- **Point-read JSON fast path (#123 P0).** `DocView::write_json` /
+  `to_json_bytes` emit the same bytes as `HakoDoc::write_json` straight from
+  the pinned document bytes (no owned decode, no per-field `String`/map
+  allocs). `Hako::get_json` returns `(logical_time, json)` and falls back to
+  the existing decode + blob-resolve path only for blob-backed docs.
+  `HakoDoc::write_json` now sorts maps in a stack buffer instead of allocating
+  a `Vec` per nested map.
+- **Query JSON and shared-cache reads (#123 P1).** `Hako::query_json` returns
+  `(id, json)` rows from the raw scan when the query allows it, falling back
+  to the decoded query for projections/aggregations and non-index-satisfied
+  filters. Blob-backed rows are resolved per row, so bytes match
+  `query` + `to_json_bytes`. `Hako::walk_json` exposes the same rows through
+  a callback. `Hako::get_arc` returns the resident `Arc<HakoDoc>` on a hot
+  cache hit instead of deep-cloning; `get` keeps its owned-doc signature.
+- **Cloud catch-up blob/segment fix.** `CloudSync::collect_catchup_ops` now inflates
+  `BlobLink` values before they reach the wire. Pending and landed blob
+  skeletons previously shipped sender-local offsets, which the receiver
+  could not resolve. Segment/blob pointers are also included (their
+  timestamp is read from the framed doc) instead of being silently skipped.
 - **Index drop APIs (#115 P0).** `drop_index`, `drop_fts_index`,
   `drop_vector_index`, `drop_composite_index`, `drop_traverse_index`, and
   `drop_edge_index` remove an index from RAM and disk. The matching C ABI

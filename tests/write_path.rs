@@ -95,6 +95,14 @@ fn blob_write_path() {
         Some(Value::String(s)) => assert_eq!(s.len(), 4096, "blob string round-trip length"),
         other => panic!("expected resolved String after worker flush, got {:?}", other),
     }
+
+    // get_json must resolve blobs too: same bytes as get().to_json_bytes(),
+    // including the logical-time fallback for the ETag.
+    let (json_time, json) = db.get_json("bench", "blob_doc").expect("get_json").expect("blob json");
+    assert_eq!(json_time, blob._time);
+    assert_eq!(json, blob.to_json_bytes());
+    let (_, small_json) = db.get_json("bench", "small_doc").expect("get_json").expect("small json");
+    assert_eq!(small_json, small.to_json_bytes());
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -216,5 +224,33 @@ fn wal_reserve_skipped_for_internal_collections() {
         "system shard carries phantom reserve: {} bytes",
         wal_len("__hako_system")
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn delete_clears_version_for_absent_tx_reads() {
+    let dir = std::env::temp_dir().join(format!(
+        "fl-test-tx-recreate-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut cfg = HakoConfig::default();
+    cfg.durability_mode = DurabilityMode::Manual;
+    let db = Hako::open(&dir, cfg).expect("open");
+
+    let mut doc = HakoDoc::default();
+    doc.insert("v", Value::Int(1));
+    db.put("c", "k", &doc).expect("put");
+    db.delete("c", "k").expect("delete");
+    assert!(db.current_version("k").is_none(), "tombstone must read as absent");
+
+    let mut tx = db.begin_serializable_transaction();
+    assert!(tx.get(&db, "c", "k").expect("tx get").is_none());
+    tx.put("c", "k", doc);
+    tx.commit(&db).expect("recreate after delete");
+    assert!(db.get("c", "k").expect("get").is_some());
+
     std::fs::remove_dir_all(&dir).ok();
 }
