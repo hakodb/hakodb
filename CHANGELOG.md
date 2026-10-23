@@ -2,6 +2,18 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### Unreleased — FFI JSON read paths (P2)
+- **New FFI JSON surface.** `hk_engine_get_json`, `hk_view_to_json`,
+  `hk_query_execute_json`, and `hk_cursor_walk_json` emit JSON straight from
+  pinned bytes; caller frees with `hk_string_free`. `hk_query_execute_json`
+  matches `hk_query_execute` byte-for-byte (projection queries reuse the
+  projected executor).
+- **Dotted-path view getters.** `hk_view_get_path_{int,float,bool,str,bytes}`
+  expose `DocView::get_path` without allocating an owned document.
+- **Borrowed getters fixed.** `hk_view_get_str` / `hk_view_get_bytes` now
+  return spans borrowed from the pinned view bytes instead of pointers into a
+  temporary decoded `Value` (dangling/UB).
+
 ### v0.17.1 — tombstone version fix
 - **Delete-then-recreate no longer false-conflicts.** A delete now drops the
   bare-key version entry instead of leaving a historical version behind, so a
