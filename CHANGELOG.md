@@ -2,6 +2,15 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.18.1 — P3 ergonomics: serializable reports, exists, per-collection compact
+- **Serializable reports.** `CollectionStats`, `DropReport`, and `RelocateReport`
+  derive `Serialize`; consumers no longer hand-build their JSON.
+- **`Hako::exists`.** Pins the row and validates framing without an owned
+  decode or hot-cache touch. Missing collections are not materialized.
+- **Per-collection compaction.** `Hako::compact_collection` (and
+  `compact_collection_with_cancel`) compacts one resident shard; absent or
+  unloaded collections are a no-op.
+
 ### v0.18.0 — FFI JSON read paths (P2)
 - **New FFI JSON surface.** `hk_engine_get_json`, `hk_view_to_json`,
   `hk_query_execute_json`, and `hk_cursor_walk_json` emit JSON straight from

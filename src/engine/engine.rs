@@ -745,7 +745,7 @@ pub struct Hako {
 }
 
 /// Relocate report: moved ids + ids missing at source.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RelocateReport {
     pub moved: Vec<String>,
     pub missing: Vec<String>,
@@ -757,7 +757,7 @@ pub struct RelocateReport {
 /// between reads, so fields may disagree by a few writes. For sizing,
 /// disk-pressure alerting and ordering decisions only â€” never diff them
 /// for correctness.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CollectionStats {
     pub collection: String,
     /// Live (non-tombstoned) documents currently in the RAM index.
@@ -829,7 +829,7 @@ impl std::fmt::Display for ExplainReport {
 }
 
 /// Result of [`Hako::drop_collection`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DropReport {
     /// Live docs that existed at drop time (each now tombstoned on the
     /// WAL, so sync peers converge to empty via the normal tail).
@@ -2729,6 +2729,39 @@ impl Hako {
         Ok(res)
     }
 
+    /// Cheap existence check: pins the stored row and validates its framing,
+    /// with no owned decode and no hot-cache interaction. Returns false for a
+    /// missing document or a collection that does not exist; unlike
+    /// [`Self::get_view`], it never materializes a collection.
+    pub fn exists(&self, collection: &str, doc_id: &str) -> Result<bool> {
+        if !self.allowed(collection, AccessOp::Get) {
+            return Err(self.deny(AccessOp::Get, collection, Some(doc_id)));
+        }
+
+        let Some(shard) = self.try_get_shard_on_disk(collection)? else {
+            return Ok(false);
+        };
+        // ponytail: same read-lock sample as get(); no decode, no cache.
+        let t_lock = Instant::now();
+        let storage = shard.safe_read()?;
+        LOCK_STATS.read_wait_ns.fetch_add(t_lock.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        LOCK_STATS.read_acqs.fetch_add(1, Ordering::Relaxed);
+        let found = storage
+            .get_shared(doc_id)?
+            .is_some_and(|b| crate::document::hako_doc::DocView::new(b).is_some());
+
+        if self.config.enable_audit_log {
+            self.record_audit(AuditEntry {
+                op: AccessOp::Get,
+                collection: collection.into(),
+                doc_id: Some(doc_id.into()),
+                ok: true,
+            });
+        }
+
+        Ok(found)
+    }
+
     /// Point read that emits JSON straight from the pinned bytes: no owned
     /// `HakoDoc`, no per-field String/Map allocs. Returns `(logical_time,
     /// json)` so response paths can keep the same ETag fallback as `get`.
@@ -3926,6 +3959,43 @@ impl Hako {
             }
             s.write().unwrap().compact_with_cancel(cancel)?;
         }
+        Ok(())
+    }
+
+    /// [`Self::compact`] restricted to one collection.
+    ///
+    /// A no-op when the collection is absent or not currently loaded (a lazy
+    /// collection that was never touched): whole-database compaction has the
+    /// same resident-shard scope. Compaction is idempotent, so repeating it
+    /// is safe.
+    pub fn compact_collection(&self, collection: &str) -> Result<()> {
+        self.compact_collection_impl(collection, None)
+    }
+
+    /// [`Self::compact_collection`] with cooperative cancellation.
+    ///
+    /// A cancelled pass leaves the collection merged up to the last completed
+    /// rewrite and loses no data, same as [`Self::compact_with_cancel`].
+    pub fn compact_collection_with_cancel(
+        &self,
+        collection: &str,
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        self.compact_collection_impl(collection, Some(cancel))
+    }
+
+    fn compact_collection_impl(
+        &self,
+        collection: &str,
+        cancel: Option<&CancelToken>,
+    ) -> Result<()> {
+        let Some(shard) = self.try_get_shard(collection) else {
+            return Ok(());
+        };
+        if let Some(token) = cancel {
+            token.check()?;
+        }
+        shard.write().unwrap().compact_with_cancel(cancel)?;
         Ok(())
     }
 
