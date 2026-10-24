@@ -89,8 +89,8 @@ Two optional, independent replication layers:
 
 ```toml
 [dependencies]
-hakodb = { version = "0.18", features = ["net-sync"] }    # LAN mesh: mDNS discovery, room-key isolation, delta replication
-hakodb = { version = "0.18", features = ["cloud-sync"] }  # central hub: offline-first clients over ws(s), room isolation, auth tokens
+hakodb = { version = "0.19", features = ["net-sync"] }    # LAN mesh: mDNS discovery, room-key isolation, delta replication
+hakodb = { version = "0.19", features = ["cloud-sync"] }  # central hub: offline-first clients over ws(s), room isolation, auth tokens
 ```
 
 Rooms isolate data (`room_name` + `room_key`); the cloud server is room-agnostic and hosts any room. Index definitions replicate; derived state (HNSW graphs) rebuilds locally.

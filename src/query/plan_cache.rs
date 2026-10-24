@@ -216,6 +216,8 @@ fn hash_agg(a: &crate::query::query::AggregateOp, h: &mut DefaultHasher) {
         crate::query::query::AggregateOp::Count => 0u8.hash(h),
         crate::query::query::AggregateOp::Sum(f) => { 1u8.hash(h); f.hash(h); }
         crate::query::query::AggregateOp::Avg(f) => { 2u8.hash(h); f.hash(h); }
+        crate::query::query::AggregateOp::Min(f) => { 3u8.hash(h); f.hash(h); }
+        crate::query::query::AggregateOp::Max(f) => { 4u8.hash(h); f.hash(h); }
     }
 }
 

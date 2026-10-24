@@ -243,6 +243,20 @@ impl<'a> QueryBuilder<'a> {
         Ok(*res.get(&format!("avg_{}", field)).unwrap_or(&0.0))
     }
 
+    /// `None` when no matching document has a numeric `field`.
+    pub fn min(mut self, field: &str) -> Result<Option<f64>> {
+        self.query.aggregations = vec![AggregateOp::Min(field.to_string())];
+        let res = self.db.execute_aggregation(self.query)?;
+        Ok(res.get(&format!("min_{}", field)).copied())
+    }
+
+    /// `None` when no matching document has a numeric `field`.
+    pub fn max(mut self, field: &str) -> Result<Option<f64>> {
+        self.query.aggregations = vec![AggregateOp::Max(field.to_string())];
+        let res = self.db.execute_aggregation(self.query)?;
+        Ok(res.get(&format!("max_{}", field)).copied())
+    }
+
     // --- Terminal Execution Methods (Chained Mutations) ---
 
     /// Delete all documents matching this query

@@ -54,6 +54,10 @@ pub enum AggregateOp {
     Count,
     Sum(String), 
     Avg(String),
+    /// Smallest numeric value of `field`; absent key when no doc has one.
+    Min(String),
+    /// Largest numeric value of `field`; absent key when no doc has one.
+    Max(String),
 }
 
 impl Query {

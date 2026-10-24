@@ -1151,6 +1151,44 @@ impl ParallelQueryExecutor {
                             }
                         }
                     }
+
+                    // CASE 3: MIN / MAX
+                    AggregateOp::Min(target_field) | AggregateOp::Max(target_field) => {
+                        if let Some(sec_map) = indexes.secondary.get(&plan.collection) {
+                            if let Some(index) = sec_map.get(target_field) {
+                                let is_min = matches!(op, AggregateOp::Min(_));
+                                let mut best: Option<f64> = None;
+
+                                for (val_bytes, doc_ids) in index.get_map() {
+                                    let match_count = if let Some(ref allowed_ids) = filter_ids {
+                                        doc_ids
+                                            .iter()
+                                            .filter(|id| allowed_ids.contains(*id))
+                                            .count()
+                                    } else {
+                                        doc_ids.len()
+                                    };
+                                    if match_count == 0 {
+                                        continue;
+                                    }
+                                    if let Some(val) = decode_scalar_as_f64(val_bytes) {
+                                        best = Some(match best {
+                                            Some(b) if is_min => b.min(val),
+                                            Some(b) => b.max(val),
+                                            None => val,
+                                        });
+                                    }
+                                }
+
+                                let mut res = HashMap::new();
+                                if let Some(v) = best {
+                                    let key = if is_min { "min" } else { "max" };
+                                    res.insert(format!("{}_{}", key, target_field), v);
+                                }
+                                return Ok(res);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1205,6 +1243,25 @@ impl ParallelQueryExecutor {
                                             }
                                         }
                                     }
+                                    AggregateOp::Min(field) | AggregateOp::Max(field) => {
+                                        if let Some((_, tag, data)) = view.iter().find(|(k, _, _)| k == field) {
+                                            let borrowed = BorrowedValue { tag, data };
+                                            if let Some(num) = borrowed.as_f64() {
+                                                let is_min = matches!(op, AggregateOp::Min(_));
+                                                let key = if is_min {
+                                                    format!("min_{}", field)
+                                                } else {
+                                                    format!("max_{}", field)
+                                                };
+                                                let entry = partial_results.entry(key).or_insert(num);
+                                                if is_min {
+                                                    *entry = entry.min(num);
+                                                } else {
+                                                    *entry = entry.max(num);
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1241,7 +1298,16 @@ impl ParallelQueryExecutor {
             drop(tx);
             while let Ok(partial) = rx.recv() {
                 for (k, v) in partial {
-                    *final_results.entry(k).or_insert(0.0) += v;
+                    // min/max are foldable idempotent, not additive.
+                    if k.starts_with("min_") {
+                        let e = final_results.entry(k).or_insert(v);
+                        *e = e.min(v);
+                    } else if k.starts_with("max_") {
+                        let e = final_results.entry(k).or_insert(v);
+                        *e = e.max(v);
+                    } else {
+                        *final_results.entry(k).or_insert(0.0) += v;
+                    }
                 }
             }
         }
@@ -1273,6 +1339,8 @@ impl ParallelQueryExecutor {
                 AggregateOp::Avg(field) => {
                     final_results.entry(format!("avg_{}", field)).or_insert(0.0);
                 }
+                // min/max over an empty set has no value: the key stays absent.
+                AggregateOp::Min(_) | AggregateOp::Max(_) => {}
             }
         }
 
