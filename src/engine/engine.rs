@@ -3055,6 +3055,199 @@ impl Hako {
         })
     }
 
+    /// Rename a collection (issue #132): replay its live docs onto `to`
+    /// through the normal write path, delete them from `from`, then drop
+    /// the old directory. Index definitions, the schema, and local-only
+    /// marks move with it.
+    ///
+    /// Sync semantics: this is NOT a metadata rename. Peers receive Put
+    /// ops for `to` and Delete ops for `from`, so they converge without a
+    /// full re-sync. The cost is a full rewrite of the collection (bytes,
+    /// versions, index rebuilds) â€” treat rename as writer-side
+    /// maintenance, not a hot path.
+    ///
+    /// Gates: read-only engine, empty/path-like/reserved names, missing
+    /// `from`, existing `to`, sync-excluded plane, unloaded lazy
+    /// collection. Refusals leave both names untouched.
+    ///
+    /// Not atomic: a crash mid-way leaves a partial `to` with `from`
+    /// intact (or half-deleted). Drop the leftover name and retry.
+    /// Returns the number of docs moved.
+    pub fn rename_collection(&self, from: &str, to: &str) -> Result<u64> {
+        if self.read_only.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(HakoError::Corrupt("ReadOnly".into()));
+        }
+        let bad_name = |name: &str| {
+            name.is_empty()
+                || name.starts_with('_')
+                || name == "snapshots"
+                || name.contains(['/', '\\', '\0'])
+                || name == "."
+                || name == ".."
+        };
+        if from == to {
+            return Err(HakoError::InvalidInput(
+                "rename: `from` and `to` are the same collection".into(),
+            ));
+        }
+        if bad_name(from) || bad_name(to) {
+            return Err(HakoError::InvalidInput(format!(
+                "rename: invalid collection name (`{from}` -> `{to}`)"
+            )));
+        }
+        if self.is_sync_excluded_effective(from) || self.is_sync_excluded_effective(to) {
+            return Err(HakoError::Corrupt(
+                "rename: sync-excluded collections cannot be renamed".into(),
+            ));
+        }
+        if self.is_lazy_unloaded(from) || self.is_lazy_unloaded(to) {
+            return Err(HakoError::Corrupt(format!(
+                "rename: `{}` is an unloaded lazy collection â€” load it first",
+                if self.is_lazy_unloaded(from) { from } else { to }
+            )));
+        }
+        let from_dir = self.root_path.join(from);
+        let to_dir = self.root_path.join(to);
+        if !from_dir.is_dir() {
+            return Err(HakoError::InvalidInput(format!(
+                "rename: `{from}` does not exist"
+            )));
+        }
+        if to_dir.exists()
+            || self
+                .shards
+                .read()
+                .map(|m| m.contains_key(to))
+                .unwrap_or(false)
+        {
+            return Err(HakoError::InvalidInput(format!(
+                "rename: `{to}` already exists"
+            )));
+        }
+
+        // Snapshot the metadata that must follow the data.
+        let (secondary, fts, vector, composite, traverse) = {
+            let mgr = self.indexes.read().unwrap();
+            let secondary: Vec<String> = mgr
+                .secondary
+                .get(from)
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            let fts: Vec<String> = mgr
+                .fts
+                .get(from)
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            let vector: Vec<(String, u32, crate::index::vector::Metric)> = mgr
+                .vector
+                .get(from)
+                .map(|m| {
+                    m.iter()
+                        .map(|(f, d)| (f.clone(), d.dim, d.metric))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let composite = mgr
+                .indexes_for_collection(from)
+                .map(|i| i.definition.clone())
+                .collect::<Vec<_>>();
+            let traverse = mgr.traverse.is_tracked(from);
+            (secondary, fts, vector, composite, traverse)
+        };
+        let schema = self.schema(from);
+        let was_local = self.is_collection_local(from);
+
+        let ids: Vec<String> = {
+            let shard = self.get_shard(from)?;
+            let storage = shard.read().unwrap();
+            storage.index.keys().cloned().collect()
+        };
+
+        // Local-only signal first, mirrored onto `to` and kept on `from`
+        // until the deletes land: neither the copied docs nor the old
+        // tombstones may replicate.
+        {
+            let mut keys = self.local_only_keys.write().unwrap();
+            let prefix = format!("{from}\0");
+            let moved: Vec<String> = keys
+                .iter()
+                .filter(|k| k.starts_with(&prefix))
+                .map(|k| format!("{to}\0{}", &k[prefix.len()..]))
+                .collect();
+            keys.extend(moved);
+        }
+        if was_local {
+            self.set_collection_local(to, true);
+        }
+        self.persist_local_only();
+
+        for chunk in ids.chunks(1000) {
+            let mut mutations = Vec::with_capacity(chunk.len());
+            for id in chunk {
+                if let Some(doc) = self.get(from, id)? {
+                    mutations.push(BatchMutation::Put {
+                        collection: to.to_string(),
+                        doc_id: id.clone(),
+                        doc,
+                    });
+                }
+            }
+            if !mutations.is_empty() {
+                self.write_batch(mutations)?;
+            }
+        }
+
+        for chunk in ids.chunks(1000) {
+            let mutations: Vec<BatchMutation> = chunk
+                .iter()
+                .map(|id| BatchMutation::Delete {
+                    collection: from.to_string(),
+                    doc_id: id.clone(),
+                })
+                .collect();
+            self.write_batch(mutations)?;
+        }
+
+        // Index defs rebuild on the new name (derived RAM graphs follow).
+        for field in secondary {
+            self.create_index(to, &field)?;
+        }
+        for field in fts {
+            self.create_fts_index(to, &field)?;
+        }
+        for (field, dim, metric) in vector {
+            self.create_vector_index(to, &field, dim, metric)?;
+        }
+        for def in composite {
+            let fields = def
+                .fields
+                .iter()
+                .map(|f| (f.field.clone(), f.direction.clone()))
+                .collect();
+            self.create_composite_index_ex(to, fields, def.unique, def.sparse, def.filter.clone())?;
+        }
+        if traverse {
+            self.create_traverse_index(to)?;
+        }
+        if let Some(schema) = schema {
+            self.set_schema(to, schema)?;
+        }
+
+        // Old marks and the local flag go; `from` is empty by now, so the
+        // normal drop cleanup (dir + defs + schema) is safe.
+        {
+            let prefix = format!("{from}\0");
+            self.local_only_keys
+                .write()
+                .unwrap()
+                .retain(|k| !k.starts_with(&prefix));
+        }
+        self.set_collection_local(from, false);
+        self.drop_collection(from)?;
+
+        Ok(ids.len() as u64)
+    }
+
     /// Local-only mass delete ("reset this query scope, don't propagate"):
     /// marks every matched key first (single persist), then batch-deletes.
     pub fn delete_where_local(&self, query: crate::query::query::Query) -> Result<usize> {
