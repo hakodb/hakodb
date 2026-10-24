@@ -130,3 +130,39 @@ fn get_arc_shares_cached_doc_without_clone() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `get` probes the hot cache with a reused per-thread key buffer: the buffer
+/// must never mix two collections that share a doc id, and a write must still
+/// invalidate the cached version.
+#[test]
+fn get_reuses_the_cache_key_buffer_without_crosstalk() {
+    let (dir, db) = open("get-key-buffer", 1024);
+    for (col, n) in [("c1", 1i64), ("c2", 2)] {
+        let mut doc = HakoDoc::default();
+        doc.insert("n", Value::Int(n));
+        db.put(col, "k", &doc).expect("put");
+    }
+
+    // Warm both entries, then interleave: same id, different collection.
+    for _ in 0..3 {
+        for (col, want) in [("c1", 1i64), ("c2", 2)] {
+            let doc = db.get(col, "k").expect("get").expect("doc");
+            match doc.get("n") {
+                Some(Value::Int(got)) => assert_eq!(*got, want, "crosstalk on {col}"),
+                other => panic!("unexpected value in {col}: {other:?}"),
+            }
+        }
+    }
+
+    // Version bump + cache eviction on write: the next get must see the new doc.
+    let mut updated = HakoDoc::default();
+    updated.insert("n", Value::Int(3));
+    db.put("c1", "k", &updated).expect("update");
+    let doc = db.get("c1", "k").expect("get").expect("doc");
+    match doc.get("n") {
+        Some(Value::Int(got)) => assert_eq!(*got, 3, "stale hit after write"),
+        other => panic!("unexpected value after update: {other:?}"),
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}

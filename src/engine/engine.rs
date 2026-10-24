@@ -178,6 +178,15 @@ pub(crate) static LOCK_STATS: LockPhaseStats = LockPhaseStats {
     read_acqs: AtomicU64::new(0),
 };
 
+thread_local! {
+    /// Scratch buffer for the doc-cache key on point reads. Building
+    /// `"{collection}\0{doc_id}"` with `format!` allocated + freed a String
+    /// on every single get, hit or miss; a reused buffer removes that from
+    /// the hottest read path.
+    static CACHE_KEY_BUF: std::cell::RefCell<String> =
+        std::cell::RefCell::new(String::with_capacity(96));
+}
+
 /// Human-readable lock-wait table + reset. `avg` per acquisition â€”
 /// ~0 when free, >> 0 under contention.
 pub fn lock_stats_report() -> String {
@@ -2618,7 +2627,39 @@ impl Hako {
     }
 
     pub fn get(&self, collection: &str, doc_id: &str) -> Result<Option<HakoDoc>> {
+        // Hot-cache fast path: clone straight out of the resident Arc, without
+        // the Arc clone/drop and the extra frame that `get_arc` costs per hit
+        // (this is the pre-0.17 shape; the regression was the indirection).
+        // Miss delegates to `get_arc`, which repeats the admission check and
+        // the probe: keep this hit branch in sync with `get_arc`'s.
+        if !self.allowed(collection, AccessOp::Get) {
+            return Err(self.deny(AccessOp::Get, collection, Some(doc_id)));
+        }
+        if let Some(ver) = self.current_version(doc_id) {
+            if let Some(cached) = self.probe_doc_cache(collection, doc_id, ver) {
+                return Ok(Some((*cached).clone()));
+            }
+        }
         Ok(self.get_arc(collection, doc_id)?.map(|doc| (*doc).clone()))
+    }
+
+    /// Reusable-key cache probe: point reads must not pay a `format!` alloc
+    /// for the key on every hit.
+    #[inline]
+    fn probe_doc_cache(&self, collection: &str, doc_id: &str, ver: u64) -> Option<Arc<HakoDoc>> {
+        CACHE_KEY_BUF.with(|b| {
+            let mut b = b.borrow_mut();
+            b.clear();
+            b.push_str(collection);
+            b.push('\0');
+            b.push_str(doc_id);
+            self.doc_cache
+                .read()
+                .unwrap()
+                .get(b.as_str())
+                .filter(|(v, _)| *v == ver)
+                .map(|(_, d)| Arc::clone(d))
+        })
     }
 
     /// Shared-cache point read: same admission, version check, decode and
@@ -2638,17 +2679,13 @@ impl Hako {
         // ponytail: one version lookup serves both the probe and the
         // populate below (the old code paid fxhash + sharded lock twice).
         let ver = self.current_version(doc_id);
-        // ponytail: cache-key alloc only when a version exists to compare
-        // against â€” unversioned docs paid a format! for a probe that could
-        // never hit. Built once, shared by probe + populate below.
-        let cache_key = ver.map(|_| format!("{collection}\0{doc_id}"));
-        if let (Some(ver), Some(cache_key)) = (ver, &cache_key) {
-            if let Some((v, cached)) = self.doc_cache.read().unwrap().get(cache_key) {
-                if *v == ver {
-                    return Ok(Some(Arc::clone(cached)));
-                }
+        if let Some(ver) = ver {
+            if let Some(cached) = self.probe_doc_cache(collection, doc_id, ver) {
+                return Ok(Some(cached));
             }
         }
+        // Owned key only for the populate below: a cache hit never allocates.
+        let cache_key = ver.map(|_| format!("{collection}\0{doc_id}"));
 
         let Some(shard) = self.try_get_shard_on_disk(collection)? else { return Ok(None) };
         // ponytail: lock-wait sample â€” readers blocked here are queued
