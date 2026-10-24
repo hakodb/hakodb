@@ -37,10 +37,56 @@ pub struct HK_Engine {
     db: std::sync::Arc<Hako>,
 }
 
+pub enum DocRef {
+    /// Owned document (fresh handle, query row, materialized view).
+    Owned(HakoDoc),
+    /// Shared with the engine's doc cache. A point read returns the resident
+    /// `Arc` (zero-copy); the first mutation clones it (COW). This is the
+    /// difference between a ~900 ns and a ~250 ns `hk_engine_get`.
+    Shared(std::sync::Arc<HakoDoc>),
+}
+
+impl DocRef {
+    #[inline]
+    fn into_hako(self) -> HakoDoc {
+        match self {
+            DocRef::Owned(d) => d,
+            DocRef::Shared(a) => std::sync::Arc::try_unwrap(a).unwrap_or_else(|x| (*x).clone()),
+        }
+    }
+}
+
+impl Default for DocRef {
+    fn default() -> Self {
+        DocRef::Owned(HakoDoc::default())
+    }
+}
+
 #[allow(non_camel_case_types)]
 pub struct HK_Doc {
     pub id: String,
-    doc: HakoDoc,
+    doc: DocRef,
+}
+
+impl HK_Doc {
+    #[inline]
+    fn hako(&self) -> &HakoDoc {
+        match &self.doc {
+            DocRef::Owned(d) => d,
+            DocRef::Shared(a) => a,
+        }
+    }
+    #[inline]
+    fn hako_mut(&mut self) -> &mut HakoDoc {
+        match &mut self.doc {
+            DocRef::Owned(d) => d,
+            DocRef::Shared(a) => std::sync::Arc::make_mut(a),
+        }
+    }
+    #[inline]
+    fn into_hako(self) -> HakoDoc {
+        self.doc.into_hako()
+    }
 }
 
 #[allow(non_camel_case_types)]
@@ -763,7 +809,7 @@ pub extern "C" fn hk_engine_free(engine: *mut HK_Engine) {
 pub extern "C" fn hk_doc_new() -> *mut HK_Doc {
     Box::into_raw(Box::new(HK_Doc {
         id: String::new(),
-        doc: HakoDoc::default(),
+        doc: DocRef::Owned(HakoDoc::default()),
     }))
 }
 
@@ -792,7 +838,7 @@ pub extern "C" fn hk_doc_insert_str(
         Err(e) => return set_last_error_err(e),
     };
     let doc = unsafe { &mut *doc };
-    doc.doc.insert(key, Value::String(value));
+    doc.hako_mut().insert(key, Value::String(value));
     clear_last_error();
     0
 }
@@ -807,7 +853,7 @@ pub extern "C" fn hk_doc_insert_int(doc: *mut HK_Doc, key: *const c_char, value:
         Err(e) => return set_last_error_err(e),
     };
     let doc = unsafe { &mut *doc };
-    doc.doc.insert(key, Value::Int(value));
+    doc.hako_mut().insert(key, Value::Int(value));
     clear_last_error();
     0
 }
@@ -822,7 +868,7 @@ pub extern "C" fn hk_doc_insert_float(doc: *mut HK_Doc, key: *const c_char, valu
         Err(e) => return set_last_error_err(e),
     };
     let doc = unsafe { &mut *doc };
-    doc.doc.insert(key, Value::Float(value));
+    doc.hako_mut().insert(key, Value::Float(value));
     clear_last_error();
     0
 }
@@ -837,7 +883,7 @@ pub extern "C" fn hk_doc_insert_bool(doc: *mut HK_Doc, key: *const c_char, value
         Err(e) => return set_last_error_err(e),
     };
     let doc = unsafe { &mut *doc };
-    doc.doc.insert(key, Value::Bool(value));
+    doc.hako_mut().insert(key, Value::Bool(value));
     clear_last_error();
     0
 }
@@ -852,7 +898,7 @@ pub extern "C" fn hk_doc_insert_null(doc: *mut HK_Doc, key: *const c_char) -> i3
         Err(e) => return set_last_error_err(e),
     };
     let doc = unsafe { &mut *doc };
-    doc.doc.insert(key, Value::Null);
+    doc.hako_mut().insert(key, Value::Null);
     clear_last_error();
     0
 }
@@ -880,7 +926,7 @@ pub extern "C" fn hk_doc_insert_bin(
         unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
     };
     let doc = unsafe { &mut *doc };
-    doc.doc.insert(key, Value::Binary(bytes));
+    doc.hako_mut().insert(key, Value::Binary(bytes));
     clear_last_error();
     0
 }
@@ -908,7 +954,7 @@ pub extern "C" fn hk_engine_insert(
 
         let engine = unsafe { &mut *engine };
         let doc = unsafe { &*doc };
-        match engine.db.put(&collection, &doc_id, &doc.doc) {
+        match engine.db.put(&collection, &doc_id, doc.hako()) {
             Ok(_) => 0,
             Err(e) => set_last_error_err(e),
         }
@@ -941,7 +987,7 @@ pub extern "C" fn hk_engine_insert_take(
         let engine = unsafe { &mut *engine };
         // Move the document out of its Box without cloning every field.
         let owned = unsafe { *Box::from_raw(doc) };
-        match engine.db.put_owned(&collection, &doc_id, owned.doc) {
+        match engine.db.put_owned(&collection, &doc_id, owned.into_hako()) {
             Ok(_) => 0,
             Err(e) => set_last_error_err(e),
         }
@@ -987,10 +1033,9 @@ pub extern "C" fn hk_engine_get(
             }
         };
         let engine = unsafe { &*engine };
-        match engine.db.get(collection, &doc_id_owned) {
-            // PONYTAIL: move doc_id into HK_Doc instead of clone — doc_id is
-            // already a freshly-allocated String and we don't reuse it.
-            Ok(Some(doc)) => Box::into_raw(Box::new(HK_Doc { id: doc_id_owned, doc })),
+        match engine.db.get_arc(collection, &doc_id_owned) {
+            // Zero-copy: the returned handle shares the cached HakoDoc.
+            Ok(Some(doc)) => Box::into_raw(Box::new(HK_Doc { id: doc_id_owned, doc: DocRef::Shared(doc) })),
             _ => std::ptr::null_mut(),
         }
     })
@@ -1074,7 +1119,7 @@ pub extern "C" fn hk_engine_get_versioned(
                     unsafe { *out_version = version };
                 }
                 clear_last_error();
-                Box::into_raw(Box::new(HK_Doc { id: doc_id, doc }))
+                Box::into_raw(Box::new(HK_Doc { id: doc_id, doc: DocRef::Owned(doc) }))
             }
             Ok(None) => {
                 clear_last_error();
@@ -1410,7 +1455,7 @@ pub extern "C" fn hk_batch_set(
     let batch = unsafe { &mut *batch };
     let doc_ptr = unsafe { &mut *doc };
 
-    let internal_doc = std::mem::take(&mut doc_ptr.doc);
+    let internal_doc = std::mem::take(&mut doc_ptr.doc).into_hako();
 
     batch.ops.push(BatchMutation::Put {
         collection,
@@ -1610,7 +1655,7 @@ pub extern "C" fn hk_query_patch(
         let patch_ptr = unsafe { &*patch_doc };
 
         // Convert HK_Doc fields to the internal updates vector
-        let updates: Vec<(String, Value)> = patch_ptr.doc.fields.iter()
+        let updates: Vec<(String, Value)> = patch_ptr.hako().fields.iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect();
 
@@ -2011,7 +2056,7 @@ pub extern "C" fn hk_doc_resolve_blobs(
         };
         let engine = unsafe { &*engine };
         let doc = unsafe { &mut *doc };
-        match engine.db.resolve_document_blobs(&mut doc.doc, &collection) {
+        match engine.db.resolve_document_blobs(doc.hako_mut(), &collection) {
             Ok(_) => 0,
             Err(e) => set_last_error_err(format!("{}", e)),
         }
@@ -2234,7 +2279,7 @@ pub extern "C" fn hk_query_execute_to_handles(
         // the handles go out of scope.
         let docs: Vec<HK_Doc> = results
             .into_iter()
-            .map(|(id, doc)| HK_Doc { id, doc })
+            .map(|(id, doc)| HK_Doc { id, doc: DocRef::Owned(doc) })
             .collect();
         Box::into_raw(Box::new(HK_ResultSet { docs }))
     })
@@ -2448,7 +2493,7 @@ pub extern "C" fn hk_rawdoc_to_doc(
             set_last_error_err(e.to_string());
             return std::ptr::null_mut();
         }
-        Box::into_raw(Box::new(HK_Doc { id: raw.id.clone(), doc }))
+        Box::into_raw(Box::new(HK_Doc { id: raw.id.clone(), doc: DocRef::Owned(doc) }))
     })
 }
 
@@ -2887,7 +2932,7 @@ pub extern "C" fn hk_view_to_doc(view: *const HK_ViewDoc, doc_id: *const c_char)
         };
         let view = unsafe { &*view };
         match view.view.to_owned_doc() {
-            Some(doc) => Box::into_raw(Box::new(HK_Doc { id, doc })),
+            Some(doc) => Box::into_raw(Box::new(HK_Doc { id, doc: DocRef::Owned(doc) })),
             None => {
                 set_last_error_err("view bytes do not decode");
                 std::ptr::null_mut()
@@ -3093,7 +3138,7 @@ impl<'a> Serialize for SlabJson<'a> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let mut seq = s.serialize_seq(Some(self.0.len()))?;
         for row in self.0.iter() {
-            seq.serialize_element(&DocFields(&row.doc))?;
+            seq.serialize_element(&DocFields(row.hako()))?;
         }
         seq.end()
     }
@@ -3137,7 +3182,7 @@ pub extern "C" fn hk_doc_to_json(doc: *const HK_Doc) -> *mut c_char {
     }
 
     let doc = unsafe { &*doc };
-    match doc_to_cstring(&doc.doc) {
+    match doc_to_cstring(doc.hako()) {
         Ok(s) => {
             clear_last_error();
             s.into_raw()
@@ -3327,7 +3372,7 @@ pub extern "C" fn hk_doc_insert_timestamp(
         Err(e) => return set_last_error_err(e),
     };
     let doc = unsafe { &mut *doc };
-    doc.doc.insert(key, Value::Timestamp(micros));
+    doc.hako_mut().insert(key, Value::Timestamp(micros));
     0
 }
 
@@ -3341,7 +3386,7 @@ pub extern "C" fn hk_doc_insert_server_timestamp(doc: *mut HK_Doc, key: *const c
         Err(e) => return set_last_error_err(e),
     };
     let doc = unsafe { &mut *doc };
-    doc.doc.insert(key, Value::ServerTimestamp);
+    doc.hako_mut().insert(key, Value::ServerTimestamp);
     0
 }
 
@@ -3517,7 +3562,7 @@ pub extern "C" fn hk_array_append_doc(array: *mut HK_Array, doc: *const HK_Doc) 
         let doc_ptr = unsafe { &*doc };
 
         // Convert the document's fields into a Value::Map and push to the array
-        array_ptr.items.push(Value::Map(doc_ptr.doc.fields.clone()));
+        array_ptr.items.push(Value::Map(doc_ptr.hako().fields.clone()));
 
         clear_last_error();
         0
@@ -3543,8 +3588,8 @@ pub extern "C" fn hk_doc_insert_doc(
 
         // Convert the child document's fields into a Value::Map
         parent_doc
-            .doc
-            .insert(key, Value::Map(child_doc.doc.fields.clone()));
+            .hako_mut()
+            .insert(key, Value::Map(child_doc.hako().fields.clone()));
         0
     })
 }
@@ -3564,7 +3609,7 @@ pub extern "C" fn hk_doc_insert_array(
         let doc = unsafe { &mut *doc };
         let array_inner = unsafe { Box::from_raw(array) }; // Take ownership and free HK_Array
 
-        doc.doc.insert(key, Value::Array(array_inner.items));
+        doc.hako_mut().insert(key, Value::Array(array_inner.items));
         0
     })
 }
@@ -3592,7 +3637,7 @@ pub extern "C" fn hk_engine_patch(
         let update_doc = unsafe { &*updates };
 
         let mut updates_vec: Vec<(String, Value)> = Vec::new();
-        for (k, v) in &update_doc.doc.fields {
+        for (k, v) in &update_doc.hako().fields {
             updates_vec.push((k.to_string(), v.clone()));
         }
 
@@ -4738,7 +4783,7 @@ pub extern "C" fn hk_pipeline_execute_to_handles(
                 Box::into_raw(Box::new(HK_ResultSet {
                     docs: rows
                         .into_iter()
-                        .map(|(id, doc)| HK_Doc { id, doc })
+                        .map(|(id, doc)| HK_Doc { id, doc: DocRef::Owned(doc) })
                         .collect(),
                 }))
             }
@@ -4785,7 +4830,7 @@ pub extern "C" fn hk_transaction_get(
     };
 
     match tx.tx.get(&engine.db, &col, &id) {
-        Ok(Some(doc)) => Box::into_raw(Box::new(HK_Doc { doc, id: id.clone() })),
+        Ok(Some(doc)) => Box::into_raw(Box::new(HK_Doc { doc: DocRef::Owned(doc), id: id.clone() })),
         _ => ptr::null_mut(),
     }
     })
@@ -4811,7 +4856,7 @@ pub extern "C" fn hk_transaction_set(
     };
     let doc = unsafe { &*doc };
 
-    tx.tx.put(&col, &id, doc.doc.clone());
+    tx.tx.put(&col, &id, doc.hako().clone());
     0
     })
 }
@@ -4993,7 +5038,7 @@ pub extern "C" fn hk_engine_insert_subdoc(
     };
     let d = unsafe { &*doc };
 
-    match engine.db.put_subdocument(&c, &i, &sc, &si, &d.doc) {
+    match engine.db.put_subdocument(&c, &i, &sc, &si, d.hako()) {
         Ok(_) => 0,
         Err(e) => {
             set_last_error_err(e.to_string());
@@ -5056,7 +5101,7 @@ pub extern "C" fn hk_doc_insert_reference(
     };
 
     let doc_ptr = unsafe { &mut *doc };
-    doc_ptr.doc.insert(
+    doc_ptr.hako_mut().insert(
         key_str,
         Value::Reference {
             collection: col,
@@ -5090,14 +5135,14 @@ pub extern "C" fn hk_engine_get_by_ref(
         };
 
         // 1. Find the value in the provided document
-        let Some(val) = doc_ptr.doc.get(&key) else {
+        let Some(val) = doc_ptr.hako().get(&key) else {
             set_last_error_err("Field not found in document");
             return ptr::null_mut();
         };
 
         // 2. Resolve the reference using the engine
         match engine.db.get_by_reference(val) {
-            Ok(Some(target_doc)) => Box::into_raw(Box::new(HK_Doc { doc: target_doc, id: doc_ptr.id.clone() })),
+            Ok(Some(target_doc)) => Box::into_raw(Box::new(HK_Doc { doc: DocRef::Owned(target_doc), id: doc_ptr.id.clone() })),
             Ok(None) => ptr::null_mut(), // Document doesn't exist (Dangling reference)
             Err(e) => {
                 set_last_error_err(e.to_string());
@@ -5127,9 +5172,9 @@ fn get_anchor_values(q: &crate::query::query::Query, hk_doc: &HK_Doc) -> Option<
         if order.field == "id" {
             vals.push(Value::String(hk_doc.id.clone()));
         } else if order.field == "_time" {
-            vals.push(Value::Int(hk_doc.doc._time));
+            vals.push(Value::Int(hk_doc.hako()._time));
         } else {
-            vals.push(hk_doc.doc.get(&order.field)?.clone());
+            vals.push(hk_doc.hako().get(&order.field)?.clone());
         }
     }
     Some(vals)
