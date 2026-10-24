@@ -2,6 +2,25 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.19.1 — Get fast path and zero-copy FFI point reads
+- **`get` probes the hot cache directly.** The point read clones straight out
+  of the resident `Arc` again instead of routing through `get_arc`, which has
+  cost an `Arc` clone/drop pair and an extra frame per hit since v0.17.0. The
+  cache key is built in a thread-local scratch buffer, so an owned key is only
+  allocated on a miss. Restores v0.16.5 latency and improves on it.
+- **`hk_engine_get` is zero-copy.** The returned `HK_Doc` holds the cached
+  `Arc` instead of a deep copy; the first mutation clones it (copy-on-write),
+  so a handle is still a snapshot and the engine's document is never touched.
+  Every other handle source (query rows, versioned reads, raw/view
+  conversion, transactions, pipeline output) still owns its document, so the
+  non-Get paths pay nothing.
+- **Measured (11-rep paired A/B, `--docs=1000 --profile=Manual`).** `get`
+  +15.0% `std` / +12.0% `all`; `hk_engine_get` +120.3% / +179.3% versus
+  v0.19.0. Rust `Hako::get` still returns an owned `Option<HakoDoc>`;
+  `get_arc` remains the zero-copy Rust API.
+- **No API or C ABI change.** Same signatures, same ownership rules,
+  byte-identical results.
+
 ### v0.19.0 — P4 minimum and maximum aggregation
 - **`AggregateOp::Min` / `AggregateOp::Max`.** Simple aggregation now covers
   numeric min/max, matching the pipeline's `Accum::Min/Max`. New variants make
