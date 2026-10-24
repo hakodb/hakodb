@@ -151,6 +151,54 @@ fn get_and_put_round_trip() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A point read returns a snapshot, not a live view into the engine cache:
+/// two handles for the same key share storage until one is mutated, and a
+/// write through a handle must never reach the engine's document.
+#[test]
+fn point_read_handle_is_a_snapshot_with_copy_on_write() {
+    let dir = temp_dir("cow");
+    let path = cs(dir.to_str().unwrap());
+    let engine = unsafe { hk_engine_open(path.as_ptr()) };
+    assert!(!engine.is_null(), "engine open");
+
+    let coll = cs("bench");
+    let id = cs("d1");
+    let doc = unsafe { hk_doc_new() };
+    unsafe {
+        hk_doc_insert_int(doc, cs("n").as_ptr(), 42);
+        let batch = hk_batch_new();
+        hk_batch_set(batch, coll.as_ptr(), id.as_ptr(), doc);
+        assert_eq!(hk_batch_commit(engine, batch), 0, "batch_commit rc");
+    }
+
+    unsafe {
+        let a = hk_engine_get(engine, coll.as_ptr(), id.as_ptr());
+        let b = hk_engine_get(engine, coll.as_ptr(), id.as_ptr());
+        assert!(!a.is_null() && !b.is_null(), "get returned null");
+
+        // First write on a shared handle clones; the cache stays untouched.
+        assert_eq!(hk_doc_insert_int(a, cs("n").as_ptr(), 99), 0);
+        let json_a = read_cstr(hk_doc_to_json(a));
+        let json_b = read_cstr(hk_doc_to_json(b));
+        assert!(json_a.contains("99"), "mutated handle lost the write: {json_a}");
+        assert!(json_b.contains("42"), "handle aliased the write: {json_b}");
+
+        let fresh = hk_engine_get(engine, coll.as_ptr(), id.as_ptr());
+        assert!(!fresh.is_null(), "fresh get returned null");
+        let json_fresh = read_cstr(hk_doc_to_json(fresh));
+        assert!(
+            json_fresh.contains("42"),
+            "engine doc mutated through handle: {json_fresh}"
+        );
+
+        hk_doc_free(fresh);
+        hk_doc_free(b);
+        hk_doc_free(a);
+        hk_engine_free(engine);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn archive_relocate_load_unload_round_trip() {
     let dir = temp_dir("arch");
