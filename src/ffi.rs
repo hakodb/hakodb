@@ -3239,6 +3239,36 @@ pub extern "C" fn hk_query_aggregate_avg(query: *mut HK_Query, field: *const c_c
 }
 
 #[no_mangle]
+pub extern "C" fn hk_query_aggregate_min(query: *mut HK_Query, field: *const c_char) -> i32 {
+    if query.is_null() {
+        return set_last_error_err("null query handle");
+    }
+    let field = match cstr_to_string(field) {
+        Ok(s) => s,
+        Err(e) => return set_last_error_err(e),
+    };
+    let q = unsafe { &mut *query };
+    q.query.aggregations.push(AggregateOp::Min(field));
+    clear_last_error();
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn hk_query_aggregate_max(query: *mut HK_Query, field: *const c_char) -> i32 {
+    if query.is_null() {
+        return set_last_error_err("null query handle");
+    }
+    let field = match cstr_to_string(field) {
+        Ok(s) => s,
+        Err(e) => return set_last_error_err(e),
+    };
+    let q = unsafe { &mut *query };
+    q.query.aggregations.push(AggregateOp::Max(field));
+    clear_last_error();
+    0
+}
+
+#[no_mangle]
 pub extern "C" fn hk_query_execute_aggregation(
     engine: *mut HK_Engine,
     query: *const HK_Query,

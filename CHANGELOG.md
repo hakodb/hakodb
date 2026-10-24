@@ -2,6 +2,19 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.19.0 — P4 minimum and maximum aggregation
+- **`AggregateOp::Min` / `AggregateOp::Max`.** Simple aggregation now covers
+  numeric min/max, matching the pipeline's `Accum::Min/Max`. New variants make
+  this a minor release.
+- **Index fast path and scan slow path.** Single-op min/max fold the decoded
+  secondary-index values; multi-op and unindexed queries fold per document.
+  Non-numeric and missing fields are skipped.
+- **Absent key on an empty set.** No document with a numeric value means no
+  `min_<field>` / `max_<field>` key at all (not `0.0`), so an empty result is
+  unambiguous.
+- **Surfaces.** `QueryBuilder::min` / `max` return `Result<Option<f64>>`;
+  `hk_query_aggregate_min` / `hk_query_aggregate_max` join the C ABI.
+
 ### v0.18.1 — P3 ergonomics: serializable reports, exists, per-collection compact
 - **Serializable reports.** `CollectionStats`, `DropReport`, and `RelocateReport`
   derive `Serialize`; consumers no longer hand-build their JSON.
