@@ -1,5 +1,5 @@
 //! C-API round trip for graph traversal: `hk_engine_create_traverse_index`
-//! + `hk_engine_find_paths` return BFS-ordered
+//! and `hk_engine_find_paths` return BFS-ordered
 //! `[{"collection","id","depth","doc"}]`, hard-error on untracked
 //! incoming, fail-close to `"[]"` on missing anchors.
 use hakodb::config::{DurabilityMode, HakoConfig};

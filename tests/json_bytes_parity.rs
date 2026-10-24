@@ -87,9 +87,10 @@ fn numerics_match_serde() {
 #[test]
 fn shapes_match_serde() {
     // Nested maps inserted out of order (writer must sort like BTreeMap).
-    let mut inner = Vec::new();
-    inner.push((Arc::from("z"), Value::Int(1)));
-    inner.push((Arc::from("a"), Value::Int(2)));
+    let inner = vec![
+        (Arc::from("z"), Value::Int(1)),
+        (Arc::from("a"), Value::Int(2)),
+    ];
     check(&doc_with_time(
         vec![
             ("nul", Value::Null),

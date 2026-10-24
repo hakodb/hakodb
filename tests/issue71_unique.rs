@@ -75,22 +75,23 @@ fn batch_with_duplicate_is_atomic() {
     .unwrap();
 
     // Batch of three puts where the last collides with the first.
-    let mut tx = Vec::new();
-    tx.push(hakodb::engine::BatchMutation::Put {
-        collection: "items".into(),
-        doc_id: "b1".into(),
-        doc: doc("p", "r1"),
-    });
-    tx.push(hakodb::engine::BatchMutation::Put {
-        collection: "items".into(),
-        doc_id: "b2".into(),
-        doc: doc("p", "r2"),
-    });
-    tx.push(hakodb::engine::BatchMutation::Put {
-        collection: "items".into(),
-        doc_id: "b3".into(),
-        doc: doc("p", "r1"),
-    });
+    let tx = vec![
+        hakodb::engine::BatchMutation::Put {
+            collection: "items".into(),
+            doc_id: "b1".into(),
+            doc: doc("p", "r1"),
+        },
+        hakodb::engine::BatchMutation::Put {
+            collection: "items".into(),
+            doc_id: "b2".into(),
+            doc: doc("p", "r2"),
+        },
+        hakodb::engine::BatchMutation::Put {
+            collection: "items".into(),
+            doc_id: "b3".into(),
+            doc: doc("p", "r1"),
+        },
+    ];
     let err = db.write_batch(tx).unwrap_err();
     err_is_unique(err);
     // None of the batch landed (claims rolled back with the WAL ops).
@@ -99,17 +100,18 @@ fn batch_with_duplicate_is_atomic() {
     assert!(db.get("items", "b3").unwrap().is_none());
 
     // A clean re-run (fix the duplicate) succeeds and claims correctly.
-    let mut ok = Vec::new();
-    ok.push(hakodb::engine::BatchMutation::Put {
-        collection: "items".into(),
-        doc_id: "b1".into(),
-        doc: doc("p", "r1"),
-    });
-    ok.push(hakodb::engine::BatchMutation::Put {
-        collection: "items".into(),
-        doc_id: "b3".into(),
-        doc: doc("p", "r3"),
-    });
+    let ok = vec![
+        hakodb::engine::BatchMutation::Put {
+            collection: "items".into(),
+            doc_id: "b1".into(),
+            doc: doc("p", "r1"),
+        },
+        hakodb::engine::BatchMutation::Put {
+            collection: "items".into(),
+            doc_id: "b3".into(),
+            doc: doc("p", "r3"),
+        },
+    ];
     db.write_batch(ok).unwrap();
     assert!(db.get("items", "b3").unwrap().is_some());
 }

@@ -1,5 +1,5 @@
-//! Issue #71 FFI surface: F3 elemMatch/all_eq, F4 pipeline, F5 versioned get
-//! + transaction patch/get_many + retry classification, F7 explain JSON.
+//! Issue #71 FFI surface: F3 elemMatch/all_eq, F4 pipeline, F5 versioned get,
+//! transaction patch/get_many + retry classification, F7 explain JSON.
 //! Rust-level behavior is pinned in the issue71c/71d tests; these only prove
 //! the C ABI carries it faithfully.
 
