@@ -109,11 +109,10 @@ fn dotted_or_groups_and_order_paths() {
     db.put("docs", "c", &nested(Some("Mid"), None)).unwrap();
 
     // OR group over dotted paths.
-    let mut ors: Vec<Vec<Filter>> = Vec::new();
-    ors.push(vec![
+    let ors: Vec<Vec<Filter>> = vec![vec![
         Filter { field: "profile.address.city".into(), op: Operator::Eq, value: Value::String("Zeta".into()) },
         Filter { field: "profile.address.city".into(), op: Operator::Eq, value: Value::String("Alpha".into()) },
-    ]);
+    ]];
     let mut q = Query::new("docs");
     q.or_groups = ors;
     let hits = db.query(q).unwrap();

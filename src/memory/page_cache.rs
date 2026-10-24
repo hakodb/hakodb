@@ -85,6 +85,7 @@ impl PageCache {
 
     /// Test-only: number of cached blocks.
     #[cfg(test)]
+    #[allow(clippy::len_without_is_empty)] // test helper; no empty-check call site
     pub fn len(&self) -> usize {
         self.blocks.len()
     }

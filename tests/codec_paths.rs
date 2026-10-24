@@ -11,9 +11,10 @@ fn nested_fixture() -> (HakoDoc, Vec<u8>) {
     let mut profile = Vec::new();
     profile.push((Arc::from("name"), Value::String("alice".into())));
     profile.push((Arc::from("age"), Value::Int(30)));
-    let mut prefs = Vec::new();
-    prefs.push((Arc::from("theme"), Value::String("dark".into())));
-    prefs.push((Arc::from("lang"), Value::String("id".into())));
+    let prefs = vec![
+        (Arc::from("theme"), Value::String("dark".into())),
+        (Arc::from("lang"), Value::String("id".into())),
+    ];
     profile.push((Arc::from("prefs"), Value::Map(prefs)));
     d.insert("profile", Value::Map(profile));
     d.insert("score", Value::Int(7));

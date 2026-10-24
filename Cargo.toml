@@ -10,6 +10,11 @@ repository = "https://github.com/hakodb/hakodb"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[lints.clippy]
+# Test fixtures start from a Default config and override one or two fields;
+# the struct-literal rewrite is noisier than the assignment. Off by policy.
+field_reassign_with_default = "allow"
+
 [features]
 default = ["net-sync", "cloud-sync", "socket-sync", "compression"]
 net-sync = ["dep:tokio", "dep:mdns-sd", "dep:gethostname", "dep:local-ip-address", "dep:socket2" ]

@@ -41,6 +41,9 @@ pub struct HakoDoc {
     pub _time: i64,
 }
 
+/// One map entry as `(key, value tag, encoded value span)`.
+type MapEntry<'a> = (&'a [u8], u8, &'a [u8]);
+
 impl HakoDoc {
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.fields.binary_search_by(|(k, _)| k.as_ref().cmp(key))
@@ -548,7 +551,7 @@ fn write_json_value(out: &mut Vec<u8>, v: &Value) {
         let count = u16::from_le_bytes(data.get(4..6)?.try_into().ok()?) as usize;
         let mut p = 6usize;
         if count <= STACK {
-            let mut items: [Option<(&[u8], u8, &[u8])>; STACK] = [None; STACK];
+            let mut items: [Option<MapEntry>; STACK] = [None; STACK];
             for slot in items.iter_mut().take(count) {
                 let k_len = *data.get(p)? as usize;
                 p += 1;
@@ -567,7 +570,7 @@ fn write_json_value(out: &mut Vec<u8>, v: &Value) {
             items.sort_unstable_by(|a, b| a.unwrap().0.cmp(b.unwrap().0));
             Self::write_view_map_items(out, items.iter().map(|i| i.unwrap()))
         } else {
-            let mut items: Vec<(&[u8], u8, &[u8])> = Vec::with_capacity(count);
+            let mut items: Vec<MapEntry> = Vec::with_capacity(count);
             for _ in 0..count {
                 let k_len = *data.get(p)? as usize;
                 p += 1;
@@ -589,7 +592,7 @@ fn write_json_value(out: &mut Vec<u8>, v: &Value) {
 
     fn write_view_map_items<'a, I>(out: &mut Vec<u8>, items: I) -> Option<()>
     where
-        I: IntoIterator<Item = (&'a [u8], u8, &'a [u8])>,
+        I: IntoIterator<Item = MapEntry<'a>>,
     {
         out.push(b'{');
         let mut first = true;
