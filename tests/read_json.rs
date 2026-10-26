@@ -97,6 +97,52 @@ fn query_json_falls_back_for_filters_and_projection() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// `query_json_into` must emit the same rows, in the same order, as the
+/// per-row `query_json` path it replaces: plain pages, filter/projection
+/// fallbacks, and an empty result all end up as one JSON array.
+#[test]
+fn query_json_into_matches_query_json() {
+    let (dir, db) = open("json-into", usize::MAX);
+    seed(&db);
+
+    fn assembled(db: &Hako, q: &Query) -> (usize, Vec<u8>) {
+        let rows = db.query_json(q.clone()).expect("query_json");
+        let mut want = Vec::new();
+        want.push(b'[');
+        for (i, (_, json)) in rows.iter().enumerate() {
+            if i > 0 {
+                want.push(b',');
+            }
+            want.extend_from_slice(json);
+        }
+        want.push(b']');
+        (rows.len(), want)
+    }
+
+    for (label, q) in [
+        ("page", Query::new("c")),
+        (
+            "filtered",
+            Query::new("c").where_eq("tag", Value::String("a".into())),
+        ),
+        ("projected", Query::new("c").select_fields(vec!["n".into()])),
+    ] {
+        let mut out = Vec::new();
+        let n = db.query_json_into(q.clone(), &mut out).expect("into");
+        let (want_n, want) = assembled(&db, &q);
+        assert_eq!(n, want_n, "row count mismatch on {label}");
+        assert_eq!(out, want, "bytes mismatch on {label}");
+    }
+
+    // Empty result must still be a valid empty array.
+    let none = Query::new("c").where_eq("tag", Value::String("missing".into()));
+    let mut out = Vec::new();
+    let n = db.query_json_into(none, &mut out).expect("into empty");
+    assert_eq!((n, out.as_slice()), (0, b"[]".as_slice()));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn query_json_resolves_blobs() {
     let (dir, db) = open("blob", 1024);
