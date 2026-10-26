@@ -2336,14 +2336,29 @@ impl Hako {
             {
                 let mut cache = self.doc_cache.write().unwrap();
                 if !cache.is_empty() {
-                    for (doc_id, _) in &work.index_puts {
-                        cache.remove(&format!("{col_name}\0{doc_id}"));
-                    }
-                    for op in &work.ops {
-                        if let WalOp::Delete { key, .. } = op {
-                            cache.remove(&format!("{col_name}\0{key}"));
+                    // W1 (#143): one scratch-buffer prefix per batch — the old
+                    // format!-per-key paid an alloc + free for every written
+                    // id under the write lock (1.6 us/mut on the warm-delete
+                    // phase). No behavior change: same keys removed.
+                    CACHE_KEY_BUF.with(|b| {
+                        let mut b = b.borrow_mut();
+                        b.clear();
+                        b.push_str(&col_name);
+                        b.push('\0');
+                        let prefix = b.len();
+                        for (doc_id, _) in &work.index_puts {
+                            b.truncate(prefix);
+                            b.push_str(doc_id);
+                            cache.remove(b.as_str());
                         }
-                    }
+                        for op in &work.ops {
+                            if let WalOp::Delete { key, .. } = op {
+                                b.truncate(prefix);
+                                b.push_str(key);
+                                cache.remove(b.as_str());
+                            }
+                        }
+                    });
                 }
             }
             WRITE_STATS.cache_ns.fetch_add(t_cache.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -2617,17 +2632,29 @@ impl Hako {
                 vec![],
             );
             {
-                let mut cache = self.doc_cache.write().unwrap();
-                if !cache.is_empty() {
-                    cache.remove(&format!("{dst}\0{id}"));
-                }
-                let stale = format!("{dst}\0{id}");
-                let mut rcache = self.row_cache.write().unwrap();
-                if rcache.map.remove(&stale).is_some() {
-                    if let Some(pos) = rcache.order.iter().position(|k| *k == stale) {
-                        rcache.order.remove(pos);
+                // W1 (#143): one scratch-buffer key serves both cache removes
+                // (rename is cold, but the pattern is free and the two
+                // format!s here went away with it).
+                CACHE_KEY_BUF.with(|b| {
+                    let mut b = b.borrow_mut();
+                    b.clear();
+                    b.push_str(dst);
+                    b.push('\0');
+                    b.push_str(id);
+                    {
+                        let mut cache = self.doc_cache.write().unwrap();
+                        if !cache.is_empty() {
+                            cache.remove(b.as_str());
+                        }
                     }
-                }
+                    let mut rcache = self.row_cache.write().unwrap();
+                    if rcache.map.remove(b.as_str()).is_some() {
+                        let stale = b.as_str();
+                        if let Some(pos) = rcache.order.iter().position(|k| *k == stale) {
+                            rcache.order.remove(pos);
+                        }
+                    }
+                });
             }
             if self.config.enable_audit_log {
                 self.record_audit(AuditEntry {
