@@ -2,6 +2,23 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.19.3 — Batched sorted-keys maintenance: bulk-load O(n²) removed
+- **Bulk loads no longer pay O(n²) on the sorted key index.** The storage
+  engine's sorted-keys view was maintained with one binary-search + `Vec`
+  insert per written key — an O(n) tail memmove whenever a new id doesn't
+  sort after the current tail (unpadded counters, UUIDs, mixed prefixes).
+  Commits now resolve the view once per commit (#151): tail-ascending keys
+  append with zero memmove, large mid-inserting batches merge in one pass
+  through a reused scratch buffer (allocation-free in steady state), and
+  small batches keep the direct path byte-identical to the old behavior.
+  Measured on the bench box: a 2000-doc commit with chaotic ids went from
+  4.4→17.5 µs/op (growing with store size) to a flat 4.2→6.3 µs/op across
+  30k docs (~2.7× at 30k, growth eliminated); single-write cost unchanged
+  (the one-write mid-insert bound is documented in #151). The read contract
+  is untouched — the planner and executor still slice the same sorted Vec
+  under the read lock.
+- **No C ABI breaks, no on-disk format change.**
+
 ### v0.19.2 — Query egress, write-path wins, and single-call JSON insert FFI
 - **Query egress is 4–6× faster.** Query JSON serializes straight into one
   output buffer instead of building a string tree first (#144); index-satisfied
