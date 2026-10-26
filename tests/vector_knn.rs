@@ -4,7 +4,7 @@ use hakodb::config::{DurabilityMode, HakoConfig};
 use hakodb::document::hako_doc::HakoDoc;
 use hakodb::document::value::Value;
 use hakodb::engine::{BatchMutation, Hako};
-use hakodb::index::vector::{encode_f32s, Metric};
+use hakodb::index::vector::{cosine_distance, decode_f32s, encode_f32s, Metric};
 use hakodb::query::filter::Operator;
 use hakodb::query::plan::ScanType;
 use hakodb::query::query::Query;
@@ -122,6 +122,45 @@ fn exact_cosine_order_and_k() {
         .map(|(id, _)| id)
         .collect();
     assert_eq!(top2, vec!["c", "a"], "k truncates after ordering");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #141-3 / #141-11 (Phase A): `find_near_scored` returns the exact
+/// distance per hit (ascending) and honors the `max_distance` threshold.
+#[test]
+fn find_near_scored_distances_and_threshold() {
+    let dir = tmp("scored");
+    let db = open_db(&dir);
+    seed(&db);
+    wait_ready(&db);
+    let hits = db
+        .find_near_scored("pts", "emb", &[1.0, 0.5], 10, None)
+        .expect("scored knn");
+    let got: Vec<String> = hits.iter().map(|(id, _, _)| id.clone()).collect();
+    assert_eq!(got, vec!["c", "a", "d", "b"], "same order as find_near");
+    // Scores are exact distances, ascending, re-derivable from the stored
+    // vectors.
+    let mut prev = 0.0f64;
+    for (id, score, doc) in &hits {
+        assert!(*score >= prev - 1e-12, "scores ascending: {hits:?}");
+        prev = *score;
+        let stored = match doc.get("emb") {
+            Some(Value::Binary(b)) => decode_f32s(b).expect("stored vector"),
+            other => panic!("expected binary vector, got {other:?}"),
+        };
+        let expected = cosine_distance(&[1.0, 0.5], &stored);
+        assert!((score - expected).abs() < 1e-9, "exact rescore for {id}");
+    }
+    // Threshold: b (~0.55) drops out, c/a/d stay.
+    let kept: Vec<String> = db
+        .find_near_scored("pts", "emb", &[1.0, 0.5], 10, Some(0.2))
+        .expect("threshold")
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect();
+    assert_eq!(kept, vec!["c", "a", "d"], "b (~0.55) filtered out");
+    // Unindexed field: fail-closed empty (mirrors find_near).
+    assert!(db.find_near_scored("pts", "nope", &[1.0], 5, None).unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

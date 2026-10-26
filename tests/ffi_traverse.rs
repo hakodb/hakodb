@@ -94,6 +94,9 @@ fn find_paths_returns_bfs_hits_with_depth() {
     assert_eq!(arr[1]["id"], "c");
     assert_eq!(arr[1]["depth"], 2);
     assert!(arr[1]["doc"].is_object());
+    // Full discovery path as "col/id" strings, start-inclusive (#140-1).
+    assert_eq!(arr[0]["path"], serde_json::json!(["pts/a", "pts/b"]));
+    assert_eq!(arr[1]["path"], serde_json::json!(["pts/a", "pts/b", "pts/c"]));
 }
 
 #[test]
