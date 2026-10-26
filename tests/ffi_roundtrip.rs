@@ -44,6 +44,8 @@ extern "C" {
     fn hk_batch_new() -> *mut HK_Batch;
     fn hk_batch_set(batch: *mut HK_Batch, collection: *const c_char, doc_id: *const c_char, doc: *mut HK_Doc) -> c_int;
     fn hk_batch_commit(engine: *mut HK_Engine, batch: *mut HK_Batch) -> c_int;
+    fn hk_engine_insert_json(engine: *mut HK_Engine, collection: *const c_char, doc_id: *const c_char, json: *const c_char) -> c_int;
+    fn hk_batch_set_json(batch: *mut HK_Batch, collection: *const c_char, doc_id: *const c_char, json: *const c_char) -> c_int;
 
     fn hk_query_new(collection: *const c_char) -> *mut HK_Query;
     fn hk_query_free(query: *mut HK_Query);
@@ -240,14 +242,22 @@ fn query_row_handle_is_a_snapshot_with_copy_on_write() {
         assert_eq!(hk_doc_insert_int(h1, cs("n").as_ptr(), 99), 0, "COW write");
         let j1 = read_cstr(hk_doc_to_json(h1));
         let j2 = read_cstr(hk_doc_to_json(h2));
-        assert!(j1.contains("99"), "mutated handle lost the write: {j1}");
-        assert!(!j2.contains("99"), "handle aliased the write: {j2}");
+        // Parse, don't substring-match: the `_time` µs timestamp can
+        // legitimately contain the digits "99" (a bare contains() flaked
+        // exactly that way).
+        let v1: serde_json::Value = serde_json::from_str(&j1).unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&j2).unwrap();
+        assert_eq!(v1["n"], 99, "mutated handle lost the write: {j1}");
+        assert_ne!(v2["n"], 99, "handle aliased the write: {j2}");
 
         // Engine view stays pristine: a fresh page re-reads the original.
         let rs3 = hk_query_execute_to_handles(engine, q);
         let j30 = read_cstr(hk_doc_to_json(hk_result_set_get_doc(rs3, 0)));
         let j31 = read_cstr(hk_doc_to_json(hk_result_set_get_doc(rs3, 1)));
-        assert!(!j30.contains("99") && j31.contains("\"n\":2"), "engine rows: {j30} / {j31}");
+        let v30: serde_json::Value = serde_json::from_str(&j30).unwrap();
+        let v31: serde_json::Value = serde_json::from_str(&j31).unwrap();
+        assert_ne!(v30["n"], 99, "engine row 0 aliased the write: {j30}");
+        assert_eq!(v31["n"], 2, "engine rows: {j30} / {j31}");
 
         hk_result_set_free(rs3);
         hk_result_set_free(rs2);
@@ -861,5 +871,93 @@ fn result_set_free_is_idempotent_safe() {
         hk_query_free(q);
         hk_engine_free(engine);
     }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// W4 (#143): single-call JSON insert surface. Round-trips the new ABI:
+// JSON object string -> engine/batch -> get back as a doc.
+#[test]
+fn json_insert_roundtrip() {
+    let dir = temp_dir("ins-json");
+    let path = cs(dir.to_str().unwrap());
+    let engine = unsafe { hk_engine_open(path.as_ptr()) };
+    let coll = cs("bench");
+
+    let doc_json = cs(
+        r#"{"active":true,"age":42,"name":"ada","score":9.5,"tags":["a","b"],"nested":{"x":1},"nothing":null}"#,
+    );
+    unsafe {
+        assert_eq!(
+            hk_engine_insert_json(engine, coll.as_ptr(), cs("j1").as_ptr(), doc_json.as_ptr()),
+            0
+        );
+        // Error paths: invalid JSON, then non-object JSON. -1 with
+        // last_error set, and the engine stays usable.
+        assert_eq!(
+            hk_engine_insert_json(engine, coll.as_ptr(), cs("j2").as_ptr(), cs("{bad").as_ptr()),
+            -1
+        );
+        assert_eq!(
+            hk_engine_insert_json(engine, coll.as_ptr(), cs("j3").as_ptr(), cs("[1,2]").as_ptr()),
+            -1
+        );
+    }
+
+    let got = unsafe { hk_engine_get(engine, coll.as_ptr(), cs("j1").as_ptr()) };
+    assert!(!got.is_null(), "insert_json doc must be retrievable");
+    let json = read_cstr(unsafe { hk_doc_to_json(got) });
+    unsafe { hk_doc_free(got) };
+
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed["age"], 42);
+    assert_eq!(parsed["name"], "ada");
+    assert_eq!(parsed["score"], 9.5);
+    assert_eq!(parsed["active"], true);
+    assert_eq!(parsed["nested"]["x"], 1);
+    assert_eq!(parsed["tags"][1], "b");
+    assert_eq!(parsed["nothing"], serde_json::Value::Null);
+
+    unsafe { hk_engine_free(engine); }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn json_batch_set_roundtrip() {
+    let dir = temp_dir("batch-json");
+    let path = cs(dir.to_str().unwrap());
+    let engine = unsafe { hk_engine_open(path.as_ptr()) };
+    let coll = cs("bench");
+
+    unsafe {
+        let batch = hk_batch_new();
+        for i in 0..3 {
+            let j = cs(&format!(r#"{{"id":{},"name":"n{i}"}}"#, i));
+            assert_eq!(
+                hk_batch_set_json(batch, coll.as_ptr(), cs(&format!("b{i}")).as_ptr(), j.as_ptr()),
+                0
+            );
+        }
+        // Error path: bad JSON returns -1 and leaves the batch usable.
+        assert_eq!(
+            hk_batch_set_json(batch, coll.as_ptr(), cs("bad").as_ptr(), cs("{oops").as_ptr()),
+            -1
+        );
+        assert_eq!(
+            hk_batch_set_json(batch, coll.as_ptr(), cs("b3").as_ptr(), cs(r#"{"id":3}"#).as_ptr()),
+            0
+        );
+        assert_eq!(hk_batch_commit(engine, batch), 0);
+    }
+
+    for i in 0..4i64 {
+        let got = unsafe { hk_engine_get(engine, coll.as_ptr(), cs(&format!("b{i}")).as_ptr()) };
+        assert!(!got.is_null(), "b{i} must exist after batch commit");
+        let json = read_cstr(unsafe { hk_doc_to_json(got) });
+        unsafe { hk_doc_free(got) };
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["id"].as_i64(), Some(i));
+    }
+
+    unsafe { hk_engine_free(engine); }
     std::fs::remove_dir_all(&dir).ok();
 }
