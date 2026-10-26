@@ -2727,14 +2727,21 @@ impl Hako {
     /// the next query re-decodes.
     pub(crate) fn row_cache_insert(&self, collection: &str, doc_id: &str, ver: u64, doc: &HakoDoc) {
         if let Ok(mut cache) = self.row_cache.try_write() {
-            if cache.map.len() >= ROW_CACHE_CAP {
-                if let Some(oldest) = cache.order.pop_front() {
-                    cache.map.remove(&oldest);
+            let key = format!("{collection}\0{doc_id}");
+            match cache.map.get_mut(&key) {
+                // Refresh in place: the order slot is already queued, and a
+                // duplicate FIFO entry would evict the fresh value.
+                Some(slot) => *slot = (ver, Arc::new(doc.clone())),
+                None => {
+                    if cache.map.len() >= ROW_CACHE_CAP {
+                        if let Some(oldest) = cache.order.pop_front() {
+                            cache.map.remove(&oldest);
+                        }
+                    }
+                    cache.order.push_back(key.clone());
+                    cache.map.insert(key, (ver, Arc::new(doc.clone())));
                 }
             }
-            let key = format!("{collection}\0{doc_id}");
-            cache.order.push_back(key.clone());
-            cache.map.insert(key, (ver, Arc::new(doc.clone())));
         }
     }
 
@@ -3489,6 +3496,34 @@ impl Hako {
         query: Query,
         cancel: Option<&CancelToken>,
     ) -> Result<Vec<(String, HakoDoc)>> {
+        Ok(self
+            .query_rows(query, cancel)?
+            .into_iter()
+            .map(|(id, row)| (id, row.into_doc()))
+            .collect())
+    }
+
+    /// [`Self::query`] handing out shared `Arc`s instead of owned docs:
+    /// rows served from the query row cache are returned zero-copy (one
+    /// refcount bump, #142 Q3); freshly decoded rows are wrapped once.
+    /// Mutation goes through copy-on-write at the FFI boundary (`DocRef`),
+    /// so a cache entry is never mutated through a handle.
+    pub fn query_arc(&self, query: Query) -> Result<Vec<(String, std::sync::Arc<HakoDoc>)>> {
+        Ok(self
+            .query_rows(query, None)?
+            .into_iter()
+            .map(|(id, row)| (id, row.into_arc()))
+            .collect())
+    }
+
+    /// The single query funnel (plan cache, traverse branch, audit): returns
+    /// the executor's `RowRef` rows so the owned and arc wrappers above share
+    /// one implementation.
+    fn query_rows(
+        &self,
+        query: Query,
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<(String, crate::query::executor::executor::RowRef)>> {
         if let Some(token) = cancel {
             token.check()?;
         }
@@ -3520,7 +3555,10 @@ impl Hako {
                 doc_id: None,
                 ok: true,
             });
-            return Ok(results);
+            return Ok(results
+                .into_iter()
+                .map(|(id, doc)| (id, crate::query::executor::executor::RowRef::Owned(doc)))
+                .collect());
         }
 
         // SIMPLE CALL: No blob_file or encryption passed here!

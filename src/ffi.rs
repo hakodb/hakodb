@@ -2259,7 +2259,11 @@ pub extern "C" fn hk_query_execute_to_handles(
     safety_shield!(std::ptr::null_mut(), {
         let engine = unsafe { &*engine };
         let query_obj = unsafe { &*query };
-        let results = engine.db.query(query_obj.query.clone()).unwrap_or_default();
+        // Zero-copy rows (#142 Q3): rows served by the query row cache are
+        // shared with the engine (one refcount bump, no deep clone); fresh
+        // rows are wrapped once here. Handles mutate via COW in DocRef, so
+        // a cache entry is never aliased-mutated.
+        let results = engine.db.query_arc(query_obj.query.clone()).unwrap_or_default();
 
         // PONYTAIL: store HK_Doc values directly in the ResultSet slab
         // (one allocation) instead of N individual Box::new(HK_Doc) per
@@ -2271,7 +2275,7 @@ pub extern "C" fn hk_query_execute_to_handles(
         // the handles go out of scope.
         let docs: Vec<HK_Doc> = results
             .into_iter()
-            .map(|(id, doc)| HK_Doc { id, doc: DocRef::Owned(doc) })
+            .map(|(id, doc)| HK_Doc { id, doc: DocRef::Shared(doc) })
             .collect();
         Box::into_raw(Box::new(HK_ResultSet { docs }))
     })

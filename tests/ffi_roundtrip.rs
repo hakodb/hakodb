@@ -199,6 +199,65 @@ fn point_read_handle_is_a_snapshot_with_copy_on_write() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Query rows (zero-copy, #142 Q3): two result sets over the same page share
+/// the engine's cached row, and mutation through one handle is copy-on-write
+/// — neither the sibling result set nor the engine ever sees the write.
+#[test]
+fn query_row_handle_is_a_snapshot_with_copy_on_write() {
+    let dir = temp_dir("query-cow");
+    let path = cs(dir.to_str().unwrap());
+    let engine = unsafe { hk_engine_open(path.as_ptr()) };
+    assert!(!engine.is_null(), "engine open");
+
+    let coll = cs("bench");
+    unsafe {
+        let batch = hk_batch_new();
+        for (i, id) in ["d1", "d2"].iter().enumerate() {
+            let cid = cs(id);
+            let doc = hk_doc_new();
+            hk_doc_insert_int(doc, cs("n").as_ptr(), i as i64 + 1);
+            hk_batch_set(batch, coll.as_ptr(), cid.as_ptr(), doc);
+        }
+        assert_eq!(hk_batch_commit(engine, batch), 0, "seed batch");
+    }
+
+    unsafe {
+        let q = hk_query_new(coll.as_ptr());
+        // First page decodes + populates the row cache; later pages are
+        // served zero-copy from it.
+        let warm = hk_query_execute_to_handles(engine, q);
+        assert!(!warm.is_null(), "warm page");
+        hk_result_set_free(warm);
+
+        let rs1 = hk_query_execute_to_handles(engine, q);
+        let rs2 = hk_query_execute_to_handles(engine, q);
+        assert!(!rs1.is_null() && !rs2.is_null(), "result sets");
+        assert_eq!(hk_result_set_count(rs1), 2, "page count");
+
+        let h1 = hk_result_set_get_doc(rs1, 0);
+        let h2 = hk_result_set_get_doc(rs2, 0);
+        assert!(!h1.is_null() && !h2.is_null(), "handles");
+        assert_eq!(hk_doc_insert_int(h1, cs("n").as_ptr(), 99), 0, "COW write");
+        let j1 = read_cstr(hk_doc_to_json(h1));
+        let j2 = read_cstr(hk_doc_to_json(h2));
+        assert!(j1.contains("99"), "mutated handle lost the write: {j1}");
+        assert!(!j2.contains("99"), "handle aliased the write: {j2}");
+
+        // Engine view stays pristine: a fresh page re-reads the original.
+        let rs3 = hk_query_execute_to_handles(engine, q);
+        let j30 = read_cstr(hk_doc_to_json(hk_result_set_get_doc(rs3, 0)));
+        let j31 = read_cstr(hk_doc_to_json(hk_result_set_get_doc(rs3, 1)));
+        assert!(!j30.contains("99") && j31.contains("\"n\":2"), "engine rows: {j30} / {j31}");
+
+        hk_result_set_free(rs3);
+        hk_result_set_free(rs2);
+        hk_result_set_free(rs1);
+        hk_query_free(q);
+        hk_engine_free(engine);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn archive_relocate_load_unload_round_trip() {
     let dir = temp_dir("arch");

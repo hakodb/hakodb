@@ -1,4 +1,4 @@
-//! P1 read paths: JSON rows from raw bytes and shared-cache point reads.
+﻿//! P1 read paths: JSON rows from raw bytes and shared-cache point reads.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -214,12 +214,13 @@ fn get_reuses_the_cache_key_buffer_without_crosstalk() {
 }
 
 /// Query row cache (#142 Q1): a second identical query rides the cache, so
-/// an update or delete between two queries must be reflected immediately —
+/// an update or delete between two queries must be reflected immediately â€”
 /// the version check on probe, not luck, keeps the page fresh.
 #[test]
 fn row_cache_serves_fresh_rows_after_writes() {
     let (dir, db) = open("rowcache-writes", usize::MAX);
     seed(&db);
+    assert!(db.await_quiescent(std::time::Duration::from_secs(60)), "quiescent");
 
     fn ns(db: &Hako) -> Vec<i64> {
         let mut got: Vec<i64> = db
@@ -262,6 +263,9 @@ fn row_cache_never_serves_uninflated_blob_rows() {
     doc.insert("payload", Value::String("x".repeat(4096)));
     db.put("c", "blob", &doc).expect("put blob");
     db.flush().expect("flush blobs");
+    // best-effort settle: pending blob bytes keep the engine formally
+    // non-quiescent in Manual mode, so the verdict is not asserted here.
+    let _ = db.await_quiescent(std::time::Duration::from_secs(2));
 
     fn payload(db: &Hako, defer: bool) -> usize {
         let doc = &db
@@ -277,11 +281,52 @@ fn row_cache_never_serves_uninflated_blob_rows() {
     }
 
     // Same page three times: deferred rows are placeholders, resolved rows
-    // are full — the gate keeps the two shapes from ever mixing.
+    // are full â€” the gate keeps the two shapes from ever mixing.
     assert_eq!(payload(&db, false), 4096, "first query inflates");
     assert_eq!(payload(&db, false), 4096, "second query must be full too");
     assert_ne!(payload(&db, true), 4096, "deferred row is a placeholder");
     assert_eq!(payload(&db, false), 4096, "cache poisoned by deferred rows");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// query_arc (#142 Q3): warm rows come back as the same `Arc` (zero-copy
+/// sharing with the engine's cache); an update bumps the version, so the
+/// next call decodes fresh into a new `Arc` with the new value.
+#[test]
+fn query_arc_shares_cache_hit_rows() {
+    let (dir, db) = open("query-arc", usize::MAX);
+    seed(&db);
+
+    assert!(db.await_quiescent(std::time::Duration::from_secs(60)), "quiescent");
+
+    let q = Query::new("c");
+    db.query(q.clone()).expect("warm query");
+
+    let first = db.query_arc(q.clone()).expect("arc 1");
+    let second = db.query_arc(q.clone()).expect("arc 2");
+    assert_eq!(first.len(), second.len());
+    let pick = |rows: &[(String, Arc<HakoDoc>)], id: &str| {
+        rows.iter().find(|(i, _)| i == id).map(|(_, a)| a).expect("row").clone()
+    };
+    for id in ["a", "b", "c"] {
+        let (a, b) = (pick(&first, id), pick(&second, id));
+        assert!(Arc::ptr_eq(&a, &b), "cache-hit rows must share the Arc ({id})");
+    }
+
+    let mut updated = HakoDoc::default();
+    updated.insert("tag", Value::String("a".into()));
+    updated.insert("n", Value::Int(99));
+    db.put("c", "a", &updated).expect("update a");
+
+    let fresh = db.query_arc(q).expect("arc 3");
+    let (fa, da) = fresh.iter().find(|(id, _)| id == "a").expect("row a");
+    match da.get("n") {
+        Some(Value::Int(99)) => {}
+        other => panic!("stale arc row after update: {other:?}"),
+    }
+    let old = first.iter().find(|(id, _)| id == fa).expect("old a");
+    assert!(!Arc::ptr_eq(&old.1, da), "updated row must not reuse the old Arc");
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -294,6 +339,7 @@ fn row_cache_never_serves_uninflated_blob_rows() {
 fn row_cache_respects_projection_gate() {
     let (dir, db) = open("rowcache-projection", usize::MAX);
     seed(&db);
+    assert!(db.await_quiescent(std::time::Duration::from_secs(60)), "quiescent");
 
     let expected = vec![1, 2, 3];
     let q = Query::new("c").select_fields(vec!["n".into()]);
