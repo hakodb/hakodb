@@ -178,6 +178,20 @@ pub(crate) static LOCK_STATS: LockPhaseStats = LockPhaseStats {
     read_acqs: AtomicU64::new(0),
 };
 
+/// Budget of the query row cache (#142 Q1): 512 decoded link-free rows,
+/// FIFO eviction. Queries populate in page bursts (`<= limit + offset` per
+/// query, gated to pages of `<= 250` rows), so the resident set stays small
+/// even under wide query mixes.
+const ROW_CACHE_CAP: usize = 512;
+
+/// Storage for [`ROW_CACHE_CAP`]: map for O(1) probes, `order` for FIFO
+/// eviction (pop oldest, insert newest).
+#[derive(Default)]
+struct RowCache {
+    map: HashMap<String, (u64, Arc<HakoDoc>)>,
+    order: std::collections::VecDeque<String>,
+}
+
 thread_local! {
     /// Scratch buffer for the doc-cache key on point reads. Building
     /// `"{collection}\0{doc_id}"` with `format!` allocated + freed a String
@@ -723,6 +737,16 @@ pub struct Hako {
     /// every write bumps, so a version match is exact; writes also remove
     /// the key outright so stale entries can't linger.
     pub(crate) doc_cache: RwLock<HashMap<String, (u64, Arc<HakoDoc>)>>,
+    /// Query row cache (#142 Q1): decoded link-free rows the executor's
+    /// fast path serves, keyed `col\0id` with the version at decode time.
+    /// Separate from `doc_cache` (point reads own that) because queries
+    /// populate in page bursts: the budget is 512 with FIFO eviction.
+    /// Correctness rides the same contract as `doc_cache` — every write
+    /// bumps the version and the probe requires an exact match — so dead
+    /// entries (updated/deleted/dropped keys) are simply never matched
+    /// again; they leave by FIFO without the write path paying an eager
+    /// removal pass.
+    row_cache: RwLock<RowCache>,
     /// Local-only replication scope ("the signal"): collections and keys
     /// whose writes must never leave this device. Advancing clocks is
     /// untouched (tombstones keep fresh timestamps, so the deleter never
@@ -1265,6 +1289,7 @@ impl Hako {
             maintenance_running: maintenance_flag,
             plan_cache: PlanCache::default(),
             doc_cache: RwLock::new(HashMap::new()),
+            row_cache: RwLock::new(RowCache::default()),
             local_only_cols: RwLock::new(HashSet::new()),
             local_only_keys: RwLock::new(HashSet::new()),
             unique_ledger: std::sync::Arc::new(crate::index::composite::ledger::UniqueLedger::default()),
@@ -1944,6 +1969,13 @@ impl Hako {
                     cache.retain(|k, _| !k.starts_with(&prefix));
                 }
             }
+            if let Ok(mut cache) = self.row_cache.write() {
+                if !cache.map.is_empty() {
+                    let prefix = format!("{collection}\0");
+                    cache.map.retain(|k, _| !k.starts_with(&prefix));
+                    cache.order.retain(|k| !k.starts_with(&prefix));
+                }
+            }
             self.plan_cache.invalidate();
         }
         Ok(())
@@ -2589,6 +2621,13 @@ impl Hako {
                 if !cache.is_empty() {
                     cache.remove(&format!("{dst}\0{id}"));
                 }
+                let stale = format!("{dst}\0{id}");
+                let mut rcache = self.row_cache.write().unwrap();
+                if rcache.map.remove(&stale).is_some() {
+                    if let Some(pos) = rcache.order.iter().position(|k| *k == stale) {
+                        rcache.order.remove(pos);
+                    }
+                }
             }
             if self.config.enable_audit_log {
                 self.record_audit(AuditEntry {
@@ -2660,6 +2699,43 @@ impl Hako {
                 .filter(|(v, _)| *v == ver)
                 .map(|(_, d)| Arc::clone(d))
         })
+    }
+
+    /// Query row cache probe (#142 Q1): same key format and version
+    /// contract as [`Self::probe_doc_cache`], hit or miss both cheap.
+    #[inline]
+    pub(crate) fn probe_row_cache(&self, collection: &str, doc_id: &str, ver: u64) -> Option<Arc<HakoDoc>> {
+        CACHE_KEY_BUF.with(|b| {
+            let mut b = b.borrow_mut();
+            b.clear();
+            b.push_str(collection);
+            b.push('\0');
+            b.push_str(doc_id);
+            self.row_cache
+                .read()
+                .unwrap()
+                .map
+                .get(b.as_str())
+                .filter(|(v, _)| *v == ver)
+                .map(|(_, d)| Arc::clone(d))
+        })
+    }
+
+    /// Populate the query row cache. Clones `doc` once for the resident
+    /// copy; eviction is FIFO at the 512 cap. `try_write` so a contended
+    /// cache never serializes query readers — a skipped insert just means
+    /// the next query re-decodes.
+    pub(crate) fn row_cache_insert(&self, collection: &str, doc_id: &str, ver: u64, doc: &HakoDoc) {
+        if let Ok(mut cache) = self.row_cache.try_write() {
+            if cache.map.len() >= ROW_CACHE_CAP {
+                if let Some(oldest) = cache.order.pop_front() {
+                    cache.map.remove(&oldest);
+                }
+            }
+            let key = format!("{collection}\0{doc_id}");
+            cache.order.push_back(key.clone());
+            cache.map.insert(key, (ver, Arc::new(doc.clone())));
+        }
     }
 
     /// Shared-cache point read: same admission, version check, decode and
@@ -3069,6 +3145,13 @@ impl Hako {
                 cache.retain(|k, _| !k.starts_with(&prefix));
             }
         }
+        if let Ok(mut cache) = self.row_cache.write() {
+            if !cache.map.is_empty() {
+                let prefix = format!("{collection}\0");
+                cache.map.retain(|k, _| !k.starts_with(&prefix));
+                cache.order.retain(|k| !k.starts_with(&prefix));
+            }
+        }
         self.plan_cache.invalidate();
 
         // 4. Unlink last: the directory only disappears once nothing in
@@ -3443,7 +3526,7 @@ impl Hako {
         // SIMPLE CALL: No blob_file or encryption passed here!
         let results = self
             .executor
-            .execute_with_cancel(shard_arc, &indexes, (*plan).clone(), cancel)?;
+            .execute_with_cancel(shard_arc, &indexes, (*plan).clone(), cancel, Some(self))?;
 
         // AUDIT RESULT
         self.record_audit(AuditEntry {

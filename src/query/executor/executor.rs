@@ -225,18 +225,22 @@ impl ParallelQueryExecutor {
         indexes: &IndexManager,
         plan: QueryPlan,
     ) -> Result<Vec<(String, HakoDoc)>> {
-        self.execute_with_cancel(storage_arc, indexes, plan, None)
+        self.execute_with_cancel(storage_arc, indexes, plan, None, None)
     }
 
     /// [`Self::execute`] with cooperative cancellation. The optional token
     /// is checked at scan-row and fetch checkpoints; a cancelled scan
     /// returns `HakoError::Cancelled` without running the write side.
+    /// `row_cache` opts index-satisfied page queries into the engine's
+    /// query row cache (`Some(self)` from `Hako::query_with_cancel`); the
+    /// probe contract is the point read's — version read, then exact match.
     pub(crate) fn execute_with_cancel(
         &self,
         storage_arc: Arc<RwLock<StorageEngine>>,
         indexes: &IndexManager,
         mut plan: QueryPlan,
         cancel: Option<&CancelToken>,
+        row_cache: Option<&crate::engine::engine::Hako>,
     ) -> Result<Vec<(String, HakoDoc)>> {
         let _inflight = InflightGuard::take();
         Self::check_cancel(cancel)?;
@@ -356,27 +360,71 @@ impl ParallelQueryExecutor {
             // thread-safe). With plan.defer_blobs the placeholders are
             // returned as-is; resolve later per doc if needed.
             let defer = plan.defer_blobs;
-            let push_row = |id: String, bytes: &[u8], results: &mut Vec<(String, HakoDoc)>| {
-                if plan.filters_satisfied_by_index {
-                    if let Some(doc) = HakoDoc::decode(bytes) {
+            // Row cache (Q1, #142): small index-satisfied pages of full
+            // (non-projected, non-deferred) documents ride the point-read
+            // contract. Hit replaces the byte fetch + decode with one deep
+            // clone; a miss populates while the page budget lasts and only
+            // for link-free rows (the par-inflate pass below must see the
+            // same skeleton the cache would serve). Big scans keep the
+            // cache off — residency effects on Scan_fwd(all) measured in
+            // the study — and matcher/filtered rows never qualify.
+            let hako = row_cache.filter(|_| {
+                doc_count <= 250
+                    && plan.filters_satisfied_by_index
+                    && !defer
+                    && plan.projection.is_empty()
+            });
+            let collection = plan.collection.as_str();
+            // Populate budget: the page the query returns (limit+offset), at
+            // most 250. Unbounded small scans use the scan itself.
+            let cache_budget = std::cell::Cell::new(early_need.unwrap_or(250).min(250));
+            let push_row =
+                |id: String,
+                 bytes: &[u8],
+                 populate: Option<(&crate::engine::engine::Hako, u64)>,
+                 results: &mut Vec<(String, HakoDoc)>| {
+                    if plan.filters_satisfied_by_index {
+                        if let Some(doc) = HakoDoc::decode(bytes) {
+                            if let Some((hk, ver)) = populate {
+                                if !crate::query::executor::worker::doc_has_links(&doc) {
+                                    hk.row_cache_insert(collection, &id, ver, &doc);
+                                }
+                            }
+                            results.push((id, doc));
+                        }
+                    } else if let Some(doc) = crate::query::executor::worker::unified_match_decode(&id, bytes, &optimized_plan) {
                         results.push((id, doc));
                     }
-                } else if let Some(doc) = crate::query::executor::worker::unified_match_decode(&id, bytes, &optimized_plan) {
-                    results.push((id, doc));
-                }
-            };
+                };
 
             for (id, ptr) in keys_from_index {
                 Self::check_cancel(cancel)?;
+                // Row-cache probe first: a hit linearizes at the version
+                // check (same as get_arc) and skips the storage read and
+                // the decode entirely. A miss remembers the version so the
+                // decode below can populate under it.
+                let mut populate = None;
+                if let Some(hk) = hako {
+                    if let Some(ver) = hk.current_version(&id) {
+                        if let Some(cached) = hk.probe_row_cache(collection, &id, ver) {
+                            results.push((id, (*cached).clone()));
+                            continue;
+                        }
+                        if cache_budget.get() > 0 {
+                            cache_budget.set(cache_budget.get() - 1);
+                            populate = Some((hk, ver));
+                        }
+                    }
+                }
                 // ponytail: Inlined bytes are Arc-shared — decode borrows the
                 // shared buffer instead of cloning ~1KB per row. The owned Arc
                 // keeps the buffer alive, so no guard lifetime is involved.
                 match ptr {
-                    Pointer::Inlined(shared) => push_row(id, &shared, &mut results),
+                    Pointer::Inlined(shared) => push_row(id, &shared, populate, &mut results),
                     other => {
                         // ponytail: shared read (see Inlined arm above).
                         if let Ok(Some(bytes)) = storage_guard.read_pointer_shared(&other) {
-                            push_row(id, &bytes, &mut results);
+                            push_row(id, &bytes, populate, &mut results);
                         }
                     }
                 }
