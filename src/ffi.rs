@@ -4274,6 +4274,7 @@ pub extern "C" fn hk_engine_find_paths(
                 "id": hit.id,
                 "depth": hit.depth,
                 "cost": hit.cost,
+                "path": hit.path.iter().map(|(c, i)| format!("{c}/{i}")).collect::<Vec<_>>(),
                 "doc": doc_json,
             }));
         }
@@ -4417,6 +4418,7 @@ pub extern "C" fn hk_engine_shortest_paths(
                 "id": hit.id,
                 "depth": hit.depth,
                 "cost": hit.cost,
+                "path": hit.path.iter().map(|(c, i)| format!("{c}/{i}")).collect::<Vec<_>>(),
                 "doc": doc_json,
             }));
         }

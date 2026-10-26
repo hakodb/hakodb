@@ -366,6 +366,10 @@ pub struct TraverseHit {
     pub depth: usize,
     /// Accumulated path cost (BFS: hops as f64; Dijkstra: weight sum).
     pub cost: f64,
+    /// Full discovery path from the start node to this hit, inclusive on
+    /// both ends, as (collection, doc_id) pairs (#140-1). Single node =
+    /// the start document itself.
+    pub path: Vec<(String, String)>,
     pub doc: HakoDoc,
 }
 
@@ -5442,6 +5446,46 @@ impl Hako {
         self.query(q)
     }
 
+    /// Scored nearest-neighbor search (#141-3): the same candidates as
+    /// [`Self::find_near`], each rescored exactly against the stored vector
+    /// — the same `distance()` the FFI rescore uses, O(k·D) after the ANN
+    /// pass. Score = distance (cosine distance or squared L2), **lower is
+    /// closer**. `max_distance` keeps only hits at or under the bound
+    /// (#141-11); `None` returns everything the search found. Unindexed
+    /// field → empty vec (mirrors `find_near`'s fail-closed behavior).
+    pub fn find_near_scored(
+        &self,
+        collection: &str,
+        field: &str,
+        query: &[f32],
+        k: usize,
+        max_distance: Option<f64>,
+    ) -> Result<Vec<(String, f64, HakoDoc)>> {
+        let Some(metric) = self.vector_metric(collection, field) else {
+            return Ok(Vec::new());
+        };
+        let rows = self.find_near(collection, field, query, k)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, doc) in rows {
+            let score = match doc.get(field) {
+                Some(Value::Binary(b)) => crate::index::vector::decode_f32s(b)
+                    .ok()
+                    .filter(|stored| stored.len() == query.len())
+                    .map_or(f64::INFINITY, |stored| {
+                        crate::index::vector::distance(metric, query, &stored)
+                    }),
+                _ => f64::INFINITY,
+            };
+            if let Some(max) = max_distance {
+                if score > max {
+                    continue;
+                }
+            }
+            out.push((id, score, doc));
+        }
+        Ok(out)
+    }
+
     /// Operational visibility for ANN state: true once the HNSW graph for
     /// (collection, field) completed a full pass and may serve queries.
     /// Tests poll this (with quiescence) to distinguish the ANN path from
@@ -5702,10 +5746,14 @@ impl Hako {
         if spec.weight_field.is_some() {
             return self.find_paths_weighted(collection, id, spec);
         }
+        let start = (collection.to_string(), id.to_string());
         let mut visited: HashSet<(String, String)> = HashSet::new();
-        visited.insert((collection.to_string(), id.to_string()));
+        visited.insert(start.clone());
+        // First-visit parent map (#140-1): BFS discovery order IS the
+        // shortest-hop path, so walking parents back reconstructs it.
+        let mut parent: HashMap<(String, String), (String, String)> = HashMap::new();
         let mut queue: VecDeque<((String, String), usize)> = VecDeque::new();
-        queue.push_back(((collection.to_string(), id.to_string()), 0));
+        queue.push_back((start.clone(), 0));
         let mut out = Vec::new();
         'bfs: while let Some(((col, doc_id), depth)) = queue.pop_front() {
             if depth >= spec.max_depth {
@@ -5722,6 +5770,7 @@ impl Hako {
                 if !visited.insert((ncol.clone(), nid.clone())) {
                     continue;
                 }
+                parent.insert((ncol.clone(), nid.clone()), (col.clone(), doc_id.clone()));
                 let nd = depth + 1;
                 if nd < spec.max_depth {
                     queue.push_back(((ncol.clone(), nid.clone()), nd));
@@ -5730,11 +5779,35 @@ impl Hako {
                     break 'bfs;
                 }
                 if let Ok(Some(doc)) = self.get(&ncol, &nid) {
-                    out.push(TraverseHit { collection: ncol, id: nid, depth: nd, cost: nd as f64, doc });
+                    let path = Self::reconstruct_traverse_path(&parent, &start, (&ncol, &nid));
+                    out.push(TraverseHit { collection: ncol, id: nid, depth: nd, cost: nd as f64, path, doc });
                 }
             }
         }
         Ok(out)
+    }
+
+    /// Walk the first-visit parent chain back to the start (#140-1).
+    /// `parent` covers every node the walk discovered, so the chain always
+    /// reaches `start`; the `None` arm is defensive only.
+    fn reconstruct_traverse_path(
+        parent: &HashMap<(String, String), (String, String)>,
+        start: &(String, String),
+        node: (&str, &str),
+    ) -> Vec<(String, String)> {
+        let mut chain = vec![(node.0.to_string(), node.1.to_string())];
+        let mut cur = (node.0.to_string(), node.1.to_string());
+        while cur != *start {
+            match parent.get(&cur) {
+                Some(p) => {
+                    chain.push(p.clone());
+                    cur = p.clone();
+                }
+                None => break,
+            }
+        }
+        chain.reverse();
+        chain
     }
 
     /// Dijkstra over the same expansion as BFS (issue #53, Phase B):
@@ -5753,7 +5826,9 @@ impl Hako {
         let mut dist: HashMap<(String, String), f64> = HashMap::new();
         #[allow(clippy::type_complexity)]
         let mut heap: BinaryHeap<(Reverse<(u64, String, String)>, usize)> = BinaryHeap::new();
-        dist.insert((collection.to_string(), id.to_string()), 0.0);
+        let start = (collection.to_string(), id.to_string());
+        let mut parent: HashMap<(String, String), (String, String)> = HashMap::new();
+        dist.insert(start.clone(), 0.0);
         heap.push((Reverse((0, collection.to_string(), id.to_string())), 0));
         let mut out = Vec::new();
         while let Some((Reverse((cbits, col, doc_id)), depth)) = heap.pop() {
@@ -5766,11 +5841,13 @@ impl Hako {
                     break;
                 }
                 if let Ok(Some(doc)) = self.get(&col, &doc_id) {
+                    let path = Self::reconstruct_traverse_path(&parent, &start, (&col, &doc_id));
                     out.push(TraverseHit {
                         collection: col.clone(),
                         id: doc_id.clone(),
                         depth,
                         cost: f64::from_bits(cbits),
+                        path,
                         doc,
                     });
                 }
@@ -5782,6 +5859,9 @@ impl Hako {
                 let nc = f64::from_bits(cbits) + w;
                 let nkey = (ncol.clone(), nid.clone());
                 if nc < dist.get(&nkey).copied().unwrap_or(f64::INFINITY) {
+                    // Relaxation improved (#140-1): this node's best-known
+                    // path now comes through the current node.
+                    parent.insert(nkey.clone(), (col.clone(), doc_id.clone()));
                     dist.insert(nkey, nc);
                     heap.push((Reverse((nc.to_bits(), ncol, nid)), depth + 1));
                 }

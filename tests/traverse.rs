@@ -66,6 +66,19 @@ fn outgoing_walks_chain_and_stops_at_cycles() {
     assert!(hits.iter().all(|h| h.collection == "docs"));
     assert_eq!(hits[0].depth, 1);
     assert_eq!(hits[1].depth, 2);
+    // Full discovery paths (#140-1): start-inclusive, one link per hop.
+    assert_eq!(
+        hits[0].path,
+        vec![("docs".to_string(), "a".to_string()), ("docs".to_string(), "b".to_string())]
+    );
+    assert_eq!(
+        hits[1].path,
+        vec![
+            ("docs".to_string(), "a".to_string()),
+            ("docs".to_string(), "b".to_string()),
+            ("docs".to_string(), "c".to_string())
+        ]
+    );
     // Depth cap truncates.
     let hits = db.find_paths("docs", "a", &spec(TraverseDir::Outgoing, 1, 100)).unwrap();
     assert_eq!(hits.len(), 1);
@@ -288,6 +301,19 @@ fn dijkstra_prefers_cheap_over_short() {
         .unwrap();
     assert_eq!(one.len(), 1);
     assert_eq!(one[0].id, "b");
+    // Weighted paths follow the cheapest route (#140-1): c's path is the
+    // a-b-c chain, not the direct 10-weight edge.
+    let c_hit = dj.iter().find(|h| h.id == "c").unwrap();
+    assert_eq!(
+        c_hit.path,
+        vec![
+            ("n".to_string(), "a".to_string()),
+            ("n".to_string(), "b".to_string()),
+            ("n".to_string(), "c".to_string())
+        ]
+    );
+    let b_hit = dj.iter().find(|h| h.id == "b").unwrap();
+    assert_eq!(b_hit.path, vec![("n".to_string(), "a".to_string()), ("n".to_string(), "b".to_string())]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
