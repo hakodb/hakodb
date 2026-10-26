@@ -2253,7 +2253,18 @@ impl Hako {
                 if work.ops.iter().any(|op| matches!(op, WalOp::Delete { .. })) {
                     for op in &work.ops {
                         if let WalOp::Delete { key, .. } = op {
-                            if let Some(ptr) = shard.index.get(key) {
+                            // W2 (#143): a decoded copy of the pre-delete doc
+                            // may already be resident from a get/query. The
+                            // version bump happens below in this same commit,
+                            // so the point-read probe contract (exact version
+                            // match) holds: hit = clone the resident doc,
+                            // miss = the old storage read + decode.
+                            let cached = self
+                                .current_version(key)
+                                .and_then(|ver| self.probe_doc_cache(&col_name, key, ver));
+                            if let Some(cached) = cached {
+                                work.index_deletes.push((key.clone(), (*cached).clone()));
+                            } else if let Some(ptr) = shard.index.get(key) {
                                 if let Ok(Some(bytes)) = shard.read_pointer_internal(ptr, false) {
                                     if let Some(old_doc) = HakoDoc::decode(&bytes) {
                                         work.index_deletes.push((key.clone(), old_doc));
