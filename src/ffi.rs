@@ -1038,7 +1038,9 @@ pub extern "C" fn hk_engine_insert_json(
         };
 
         let engine = unsafe { &mut *engine };
-        match engine.db.put(&collection, &doc_id, &doc) {
+        // Owned put: the JSON-built doc is fresh — the &put would deep-clone
+        // it once more on the way in.
+        match engine.db.put_owned(&collection, &doc_id, doc) {
             Ok(_) => 0,
             Err(e) => set_last_error_err(e),
         }
