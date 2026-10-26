@@ -2301,21 +2301,25 @@ impl Hako {
                 // every key first (SipHash Ã—2/row on big batches) â€” gone.
                 // index_puts stays put for the indexer send below.
                 let mut put_idx = 0;
+                // ponytail (#151): batched sorted-view maintenance; flushed
+                // below, still inside the shard write lock.
+                let mut pending_sorted = Vec::new();
                 for op in &work.ops {
                     if let WalOp::PutInlined { value, .. } = op {
                         if let Some((doc_id, _)) = work.index_puts.get(put_idx) {
                             put_idx += 1;
                             let ptr = Pointer::Inlined(Arc::new(value.clone()));
-                            shard.update_index_entry(doc_id.clone(), Some(ptr));
+                            shard.update_index_entry_deferred(doc_id.clone(), Some(ptr), &mut pending_sorted);
                         }
                     }
                 }
                 debug_assert!(work.index_puts.get(put_idx).is_none(), "ops/index_puts lockstep broke");
                 for op in &work.ops {
                     if let WalOp::Delete { key, timestamp } = op {
-                        shard.update_index_entry(key.clone(), Some(Pointer::Deleted { timestamp: *timestamp }));
+                        shard.update_index_entry_deferred(key.clone(), Some(Pointer::Deleted { timestamp: *timestamp }), &mut pending_sorted);
                     }
                 }
+                shard.flush_pending_sorted(&mut pending_sorted);
                 
                 let mut b_bytes = 0;
                 for b in work.blob_queue_items {

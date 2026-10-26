@@ -874,17 +874,21 @@ impl CloudSync {
             if shard.wal.append_batch_fast(tx_id, &ops, true).is_err() {
                 return;
             }
+            // ponytail (#151): batched sorted-view maintenance, flushed
+            // before the shard write lock drops at the end of this block.
+            let mut pending_sorted = Vec::new();
             for op in &ops {
                 match op {
                     WalOp::PutInlined { key, value } => {
-                        shard.update_index_entry(key.clone(), Some(Pointer::Inlined(Arc::new(value.clone()))));
+                        shard.update_index_entry_deferred(key.clone(), Some(Pointer::Inlined(Arc::new(value.clone()))), &mut pending_sorted);
                     }
                     WalOp::Delete { key, timestamp } => {
-                        shard.update_index_entry(key.clone(), Some(Pointer::Deleted { timestamp: *timestamp }));
+                        shard.update_index_entry_deferred(key.clone(), Some(Pointer::Deleted { timestamp: *timestamp }), &mut pending_sorted);
                     }
                     _ => {}
                 }
             }
+            shard.flush_pending_sorted(&mut pending_sorted);
         }
 
         db.bump_versions_by_keys(keys);
