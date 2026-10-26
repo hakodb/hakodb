@@ -30,6 +30,42 @@ pub fn topn_runs() -> usize {
     TOPN_RUNS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Zero-copy rows (#142 Q3 + M1): only cache-hit rows from the executor's
+/// fast path are `Shared` (the entire source of the win — no deep clone per
+/// row); every freshly decoded row stays `Owned`, so the topN, parallel and
+/// worker lanes churn zero `Arc`s (the bisect showed Arc churn alone costs
+/// `Bulk_del(all)` −27%). `into_doc` restores the old owned semantics for
+/// `Hako::query`; `into_arc` hands FFI handles a shared `Arc` for free.
+pub(crate) enum RowRef {
+    Owned(HakoDoc),
+    Shared(std::sync::Arc<HakoDoc>),
+}
+
+impl RowRef {
+    fn doc(&self) -> &HakoDoc {
+        match self {
+            RowRef::Owned(d) => d,
+            RowRef::Shared(a) => a,
+        }
+    }
+
+    pub(crate) fn into_doc(self) -> HakoDoc {
+        match self {
+            RowRef::Owned(d) => d,
+            // ponytail: refcount 1 frees without a clone; more holders
+            // deep-clone (same cost the pre-Q3 hit path always paid).
+            RowRef::Shared(a) => std::sync::Arc::try_unwrap(a).unwrap_or_else(|x| (*x).clone()),
+        }
+    }
+
+    pub(crate) fn into_arc(self) -> std::sync::Arc<HakoDoc> {
+        match self {
+            RowRef::Owned(d) => std::sync::Arc::new(d),
+            RowRef::Shared(a) => a,
+        }
+    }
+}
+
 /// Queries currently executing (any execute_* entry point). The
 /// maintenance tick sheds non-durability work while this is non-zero —
 /// queries never queue behind compaction/snapshot I/O. Best-effort
@@ -225,7 +261,11 @@ impl ParallelQueryExecutor {
         indexes: &IndexManager,
         plan: QueryPlan,
     ) -> Result<Vec<(String, HakoDoc)>> {
-        self.execute_with_cancel(storage_arc, indexes, plan, None, None)
+        Ok(self
+            .execute_with_cancel(storage_arc, indexes, plan, None, None)?
+            .into_iter()
+            .map(|(id, row)| (id, row.into_doc()))
+            .collect())
     }
 
     /// [`Self::execute`] with cooperative cancellation. The optional token
@@ -241,7 +281,7 @@ impl ParallelQueryExecutor {
         mut plan: QueryPlan,
         cancel: Option<&CancelToken>,
         row_cache: Option<&crate::engine::engine::Hako>,
-    ) -> Result<Vec<(String, HakoDoc)>> {
+    ) -> Result<Vec<(String, RowRef)>> {
         let _inflight = InflightGuard::take();
         Self::check_cancel(cancel)?;
         // 1. PHASE 1: INDEX SCAN
@@ -320,7 +360,11 @@ impl ParallelQueryExecutor {
             && !plan.has_cursor_bounds
             && matches!(plan.limit, Some(l) if l < keys_from_index.len());
         if topn {
-            return self.execute_topn(storage_arc, &plan, keys_from_index, cancel);
+            return Ok(self
+                .execute_topn(storage_arc, &plan, keys_from_index, cancel)?
+                .into_iter()
+                .map(|(id, doc)| (id, RowRef::Owned(doc)))
+                .collect());
         }
 
         // --- EARLY TERMINATION (issue #22): unordered (or order-satisfied)
@@ -382,7 +426,7 @@ impl ParallelQueryExecutor {
                 |id: String,
                  bytes: &[u8],
                  populate: Option<(&crate::engine::engine::Hako, u64)>,
-                 results: &mut Vec<(String, HakoDoc)>| {
+                 results: &mut Vec<(String, RowRef)>| {
                     if plan.filters_satisfied_by_index {
                         if let Some(doc) = HakoDoc::decode(bytes) {
                             if let Some((hk, ver)) = populate {
@@ -390,10 +434,10 @@ impl ParallelQueryExecutor {
                                     hk.row_cache_insert(collection, &id, ver, &doc);
                                 }
                             }
-                            results.push((id, doc));
+                            results.push((id, RowRef::Owned(doc)));
                         }
                     } else if let Some(doc) = crate::query::executor::worker::unified_match_decode(&id, bytes, &optimized_plan) {
-                        results.push((id, doc));
+                        results.push((id, RowRef::Owned(doc)));
                     }
                 };
 
@@ -401,13 +445,14 @@ impl ParallelQueryExecutor {
                 Self::check_cancel(cancel)?;
                 // Row-cache probe first: a hit linearizes at the version
                 // check (same as get_arc) and skips the storage read and
-                // the decode entirely. A miss remembers the version so the
-                // decode below can populate under it.
+                // the decode entirely — the shared Arc leaves the cache
+                // untouched (zero-copy row, Q3). A miss remembers the
+                // version so the decode below can populate under it.
                 let mut populate = None;
                 if let Some(hk) = hako {
                     if let Some(ver) = hk.current_version(&id) {
                         if let Some(cached) = hk.probe_row_cache(collection, &id, ver) {
-                            results.push((id, (*cached).clone()));
+                            results.push((id, RowRef::Shared(cached)));
                             continue;
                         }
                         if cache_budget.get() > 0 {
@@ -448,10 +493,15 @@ impl ParallelQueryExecutor {
             if !defer {
                 if let Some(bm) = blob_manager {
                     use rayon::prelude::*;
-                    use crate::query::executor::worker::doc_has_links;
-                    if results.iter().any(|(_, doc)| doc_has_links(doc)) {
-                        results.par_iter_mut().for_each(|(_, doc)| {
-                            let _ = crate::query::executor::worker::inflate_blobs(doc, bm);
+                    use crate::query::executor::worker::{doc_has_links, inflate_blobs};
+                    // Shared rows are link-free by the populate gate; only
+                    // owned rows can carry links (and they mutate in place —
+                    // no Arc::make_mut, no COW copy).
+                    if results.iter().any(|(_, row)| matches!(row, RowRef::Owned(d) if doc_has_links(d))) {
+                        results.par_iter_mut().for_each(|(_, row)| {
+                            if let RowRef::Owned(doc) = row {
+                                let _ = inflate_blobs(doc, bm);
+                            }
                         });
                     }
                 }
@@ -460,7 +510,8 @@ impl ParallelQueryExecutor {
             // 6. PHASE 6: FINAL SORTING & SLICING
             Self::check_cancel(cancel)?;
             if !plan.order_by_satisfied && !plan.order_by.is_empty() {
-                results.sort_by(|(id_a, doc_a), (id_b, doc_b)| {
+                results.sort_by(|(id_a, row_a), (id_b, row_b)| {
+                    let (doc_a, doc_b) = (row_a.doc(), row_b.doc());
                     for order in &plan.order_by {
                         let cmp = match order.field.as_str() {
                             "id" => id_a.cmp(id_b),
@@ -492,13 +543,17 @@ impl ParallelQueryExecutor {
         // satisfied scans would fall into phases 3-6 and regress vs the
         // old rayon path they used to take.
         if plan.order_by_satisfied && plan.filters_satisfied_by_index {
-            return self.execute_satisfied_parallel(
-                storage_arc,
-                indexes,
-                plan,
-                keys_from_index,
-                cancel,
-            );
+            return Ok(self
+                .execute_satisfied_parallel(
+                    storage_arc,
+                    indexes,
+                    plan,
+                    keys_from_index,
+                    cancel,
+                )?
+                .into_iter()
+                .map(|(id, doc)| (id, RowRef::Owned(doc)))
+                .collect());
         }
 
         // 3. PHASE 3: PHYSICAL SORT (The "Sweep" optimization)
@@ -658,7 +713,10 @@ impl ParallelQueryExecutor {
             results.truncate(limit);
         }
 
-        Ok(results)
+        Ok(results
+            .into_iter()
+            .map(|(id, doc)| (id, RowRef::Owned(doc)))
+            .collect())
     }
 
     /// TopN heap for unsatisfied ORDER BY + LIMIT (see the hook in
