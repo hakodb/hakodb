@@ -117,6 +117,11 @@ pub struct StorageEngine {
     // when calling update_index_entry), so no extra synchronisation needed.
     // Read by the executor via `sorted_key_range` and direct slice.
     pub(crate) sorted_keys: Vec<String>,
+    /// Receiving buffer for [`Self::flush_pending_sorted`]'s merge pass. The
+    /// two buffers ping-pong so a large merge never allocates in steady
+    /// state — a fresh (n+m)-capacity Vec here once cost an mmap + page
+    /// faults on EVERY small commit (#151 measurement).
+    pub(crate) sorted_scratch: Vec<String>,
     pub blob_manager: Option<Arc<BlobManager>>,
     pub(crate) blob_tx: Option<CrossbeamSender<BlobWork>>,
     pub logical_name: String,
@@ -229,6 +234,7 @@ impl StorageEngine {
             cache,
             mmap_size: cfg.mmap_size,
             sorted_keys: Vec::new(),
+            sorted_scratch: Vec::new(),
             blob_manager: Some(Arc::new(BlobManager::new(
                 blob_file,
                 initial_size,
@@ -454,10 +460,14 @@ impl StorageEngine {
     }
 
     /// Resolve the keys collected by [`Self::update_index_entry_deferred`]
-    /// into the sorted view. Tail-ascending keys append with zero memmove;
-    /// anything else is one two-pointer merge per commit (O(n + m), not
-    /// O(n·m)). `self.index` is the liveness source of truth, so keys put
-    /// and deleted inside the same batch resolve correctly in one pass.
+    /// into the sorted view. Three strategies, cheapest first:
+    /// tail-ascending keys append with zero memmove; small batches take the
+    /// direct binary_search + insert path (one bounded memmove each, no
+    /// allocation — identical to the immediate API); large mid-inserting
+    /// batches get one two-pointer merge through a reused scratch buffer
+    /// (O(n + m) per commit, not O(n·m)). `self.index` is the liveness
+    /// source of truth, so keys put and deleted inside the same batch
+    /// resolve correctly in one pass.
     pub(crate) fn flush_pending_sorted(&mut self, pending: &mut Vec<String>) {
         if pending.is_empty() { return; }
         pending.sort_unstable();
@@ -473,13 +483,33 @@ impl StorageEngine {
             return;
         }
 
-        // General merge: old keys pass through; pending keys slot in if
-        // live, drop out if dead. mem::take avoids per-key clones on the
-        // hot side; the drained tail iterates by value.
-        let old = std::mem::take(&mut self.sorted_keys);
-        let mut merged = Vec::with_capacity(old.len() + pending.len());
+        // Small batches: the direct path per key. A full merge would
+        // allocate a fresh (n+m)-capacity buffer, and past the malloc mmap
+        // threshold that means page faults on every commit — far worse than
+        // a bounded memmove. 32 direct inserts ≈ the old per-key cost, so
+        // nothing regresses here.
+        if pending.len() <= 32 {
+            for k in pending.drain(..) {
+                if self.is_live(&k) {
+                    if let Err(pos) = self.sorted_keys.binary_search(&k) {
+                        self.sorted_keys.insert(pos, k);
+                    }
+                } else if let Ok(pos) = self.sorted_keys.binary_search(&k) {
+                    self.sorted_keys.remove(pos);
+                }
+            }
+            return;
+        }
+
+        // Large batch: one merge pass through the ping-pong scratch buffer.
+        // Old keys pass through; pending keys slot in if live, drop out if
+        // dead. The previous view's buffer becomes the next scratch, so a
+        // steady-state merge never allocates.
+        let mut old = std::mem::take(&mut self.sorted_keys);
+        let mut merged = std::mem::take(&mut self.sorted_scratch);
+        merged.clear();
         let mut pi = 0usize;
-        for k in old {
+        for k in old.drain(..) {
             while pi < pending.len() && pending[pi].as_str() < k.as_str() {
                 if self.is_live(&pending[pi]) { merged.push(std::mem::take(&mut pending[pi])); }
                 pi += 1;
@@ -495,6 +525,7 @@ impl StorageEngine {
             if self.is_live(&p) { merged.push(p); }
         }
         self.sorted_keys = merged;
+        self.sorted_scratch = old;
     }
 
     fn is_live(&self, key: &str) -> bool {
@@ -1545,6 +1576,20 @@ mod tests {
         let view2: Vec<&str> = eng.sorted_keys.iter().map(|k| k.as_str()).collect();
         assert_eq!(view2, vec!["n_1", "n_10", "n_100", "n_3", "n_99"], "mixed batch: update + tail + mid");
         assert_eq!(eng.get("n_1").unwrap().unwrap(), b"x", "updated bytes visible");
+
+        // Merge path (pending > 32): 40 out-of-order keys in one batch must
+        // land as one sorted, deduped view.
+        let mut ops3: Vec<WalOp> = (0..40)
+            .map(|i| WalOp::PutInlined { key: format!("m_{:03}", 39 - i), value: vec![b'v'] })
+            .collect();
+        // A duplicate within the same batch resolves to one entry.
+        ops3.push(WalOp::PutInlined { key: "m_007".into(), value: vec![b'u'] });
+        eng.apply_replicated_ops(&ops3).unwrap();
+        let mut expected3: Vec<String> = (0..40).map(|i| format!("m_{:03}", i)).collect();
+        expected3.sort();
+        let view3: Vec<String> = eng.sorted_keys.iter().filter(|k| k.starts_with("m_")).cloned().collect();
+        assert_eq!(view3, expected3, "large batch merges to one sorted deduped view");
+        assert_eq!(eng.get("m_007").unwrap().unwrap(), b"u", "duplicate resolves to last write");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
