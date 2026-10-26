@@ -355,6 +355,11 @@ pub struct VectorIndexInfo {
     pub field: String,
     pub dim: u32,
     pub metric: String,
+    /// HNSW params (#141-1); `None` = derived defaults. Serialized to FFI
+    /// consumers as null — additive keys, old consumers unaffected.
+    pub m: Option<usize>,
+    pub ef_construction: Option<usize>,
+    pub ef_search: Option<usize>,
 }
 
 /// One graph hit: collection + id (paths cross collections), BFS depth,
@@ -393,6 +398,13 @@ struct PersistedVectorIndex {
     field: String,
     dim: u32,
     metric: String,
+    /// HNSW params (#141-1). Absent on pre-0.19 files → derived defaults.
+    #[serde(default)]
+    m: Option<usize>,
+    #[serde(default)]
+    ef_construction: Option<usize>,
+    #[serde(default)]
+    ef_search: Option<usize>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -4774,6 +4786,9 @@ impl Hako {
                     field: f.clone(),
                     dim: d.dim,
                     metric: d.metric.name().to_string(),
+                    m: d.m,
+                    ef_construction: d.ef_construction,
+                    ef_search: d.ef_search,
                 })
                 .collect();
             list.sort_by(|a, b| a.field.cmp(&b.field));
@@ -4824,9 +4839,15 @@ impl Hako {
             for def in defs {
                 let metric = match def.metric.as_str() {
                     "l2" => crate::index::vector::Metric::L2,
+                    "inner_product" => crate::index::vector::Metric::InnerProduct,
                     _ => crate::index::vector::Metric::Cosine,
                 };
-                let _ = mgr.create_vector_index(&collection, &def.field, def.dim, metric);
+                let params = crate::index::vector::HnswParams {
+                    m: def.m,
+                    ef_construction: def.ef_construction,
+                    ef_search: def.ef_search,
+                };
+                let _ = mgr.create_vector_index(&collection, &def.field, def.dim, metric, params);
                 mgr.ensure_vector_graph(&collection, &def.field);
             }
         }
@@ -5017,6 +5038,9 @@ impl Hako {
                     field: f.clone(),
                     dim: d.dim,
                     metric: d.metric.name().to_string(),
+                    m: d.m,
+                    ef_construction: d.ef_construction,
+                    ef_search: d.ef_search,
                 })
                 .collect();
             infos.sort_by(|a, b| a.field.cmp(&b.field));
@@ -5319,10 +5343,24 @@ impl Hako {
         dim: u32,
         metric: crate::index::vector::Metric,
     ) -> Result<()> {
+        self.create_vector_index_with_params(collection, field, dim, metric, Default::default())
+    }
+
+    /// Vector index with explicit HNSW parameters (#141-1): `None` fields
+    /// ride the per-dim derived defaults. Parameters persist in the index
+    /// definitions (they sync like the rest of the def) and survive reopen.
+    pub fn create_vector_index_with_params(
+        &self,
+        collection: &str,
+        field: &str,
+        dim: u32,
+        metric: crate::index::vector::Metric,
+        params: crate::index::vector::HnswParams,
+    ) -> Result<()> {
         self.indexes
             .write()
             .unwrap()
-            .create_vector_index(collection, field, dim, metric)?;
+            .create_vector_index(collection, field, dim, metric, params)?;
         {
             if let Ok(mut mgr) = self.indexes.write() {
                 mgr.ensure_vector_graph(collection, field);
@@ -5484,6 +5522,21 @@ impl Hako {
             out.push((id, score, doc));
         }
         Ok(out)
+    }
+
+    /// Batched nearest-neighbor search (#141-5): one readiness/wait cycle
+    /// for many query vectors. Per-query results match `find_near` 1:1.
+    pub fn find_near_batch(
+        &self,
+        collection: &str,
+        field: &str,
+        queries: &[&[f32]],
+        k: usize,
+    ) -> Result<Vec<Vec<(String, HakoDoc)>>> {
+        queries
+            .iter()
+            .map(|q| self.find_near(collection, field, q, k))
+            .collect()
     }
 
     /// Operational visibility for ANN state: true once the HNSW graph for

@@ -7,7 +7,7 @@ use super::composite::definition::CompositeIndexDefinition;
 use super::composite::manager::CompositeIndexManager;
 use super::inverted_index::InvertedIndex;
 use super::traverse::BacklinkIndex;
-use super::vector::{decode_f32s, validate_dim, HnswIndex, Metric, VectorDef};
+use super::vector::{decode_f32s, validate_dim, HnswIndex, HnswParams, Metric, VectorDef};
 use crate::index::composite::composite_index::CompositeIndex;
 use crate::index::secondary_index::SecondaryIndex;
 
@@ -55,27 +55,43 @@ impl IndexManager {
         field: &str,
         dim: u32,
         metric: Metric,
+        params: HnswParams,
     ) -> crate::error::Result<()> {
         validate_dim(dim)?;
         self.vector
             .entry(collection.to_string())
             .or_default()
-            .insert(field.to_string(), VectorDef { dim, metric });
+            .insert(
+                field.to_string(),
+                VectorDef {
+                    dim,
+                    metric,
+                    m: params.m,
+                    ef_construction: params.ef_construction,
+                    ef_search: params.ef_search,
+                },
+            );
         Ok(())
     }
 
     /// Ensure an (empty, incomplete) HNSW graph for a registered def.
-    /// Called at create/restore before any backfill fills it.
+    /// Called at create/restore before any backfill fills it. The def
+    /// carries the HNSW params (#141-1), so restore rebuilds graphs with
+    /// the same shape they were created with.
     pub fn ensure_vector_graph(&mut self, collection: &str, field: &str) {
         let def = match self.vector.get(collection).and_then(|m| m.get(field)) {
-            Some(d) => (d.dim as usize, d.metric),
+            Some(d) => (
+                d.dim as usize,
+                d.metric,
+                HnswParams { m: d.m, ef_construction: d.ef_construction, ef_search: d.ef_search },
+            ),
             None => return,
         };
         self.hnsw
             .entry(collection.to_string())
             .or_default()
             .entry(field.to_string())
-            .or_insert_with(|| HnswIndex::new(def.0, def.1));
+            .or_insert_with(|| HnswIndex::new(def.0, def.1, def.2));
     }
 
     /// Upsert one doc's embedding into every HNSW graph of `collection`

@@ -3974,6 +3974,53 @@ pub extern "C" fn hk_engine_create_vector_index(
     }
 }
 
+/// Vector index with explicit HNSW parameters (#141-1). Pass 0 for a
+/// parameter to ride the per-dim derived default. Additive to
+/// `hk_engine_create_vector_index` (unchanged; derived defaults).
+#[no_mangle]
+pub extern "C" fn hk_engine_create_vector_index_v2(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    field: *const c_char,
+    dim: u32,
+    metric: u32,
+    m: usize,
+    ef_construction: usize,
+    ef_search: usize,
+) -> i32 {
+    if engine.is_null() {
+        return -1;
+    }
+    let engine = unsafe { &*engine };
+    let col = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
+    let fld = match cstr_to_string(field) {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
+    let met = match crate::index::vector::Metric::from_u32(metric) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e.to_string()),
+    };
+    let params = crate::index::vector::HnswParams {
+        m: (m > 0).then_some(m),
+        ef_construction: (ef_construction > 0).then_some(ef_construction),
+        ef_search: (ef_search > 0).then_some(ef_search),
+    };
+    match engine
+        .db
+        .create_vector_index_with_params(&col, &fld, dim, met, params)
+    {
+        Ok(_) => {
+            clear_last_error();
+            0
+        }
+        Err(e) => set_last_error_err(e.to_string()),
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn hk_engine_drop_vector_index(
     engine: *mut HK_Engine,

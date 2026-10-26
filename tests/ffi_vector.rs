@@ -8,8 +8,8 @@ use hakodb::document::hako_doc::HakoDoc;
 use hakodb::document::value::Value;
 use hakodb::engine::{BatchMutation, Hako};
 use hakodb::ffi::{
-    hk_engine_await_quiescent, hk_engine_find_near, hk_engine_open, hk_last_error,
-    hk_string_free,
+    hk_engine_await_quiescent, hk_engine_create_vector_index_v2, hk_engine_find_near,
+    hk_engine_open, hk_last_error, hk_string_free,
 };
 use hakodb::index::vector::{distance, encode_f32s, Metric};
 use std::ffi::{CStr, CString};
@@ -131,4 +131,57 @@ fn find_near_unindexed_field_returns_empty() {
     let q = [1.0f32, 0.5];
     let v = to_json(call_near(&dir, "nope", &q, 2));
     assert_eq!(v, serde_json::json!([]));
+}
+
+/// #141-1 FFI surface: `hk_engine_create_vector_index_v2` takes explicit
+/// HNSW params (0 = derived default; metric 2 = inner_product) and the
+/// created index serves scored queries like any other.
+#[test]
+fn create_v2_with_params_serves_scored_queries() {
+    let dir = tmp("v2");
+    {
+        let db = Hako::open(dir.clone(), HakoConfig::default()).expect("open");
+        let batch: Vec<BatchMutation> = [
+            ("a", vec![2.0, 0.0]),
+            ("b", vec![1.0, 1.0]),
+            ("c", vec![3.0, 0.0]),
+        ]
+        .iter()
+        .map(|(id, p)| BatchMutation::Put {
+            collection: "v2col".into(),
+            doc_id: id.to_string(),
+            doc: vdoc(p),
+        })
+        .collect();
+        db.write_batch(batch).expect("seed");
+        db.flush().expect("flush");
+    }
+    let path = CString::new(dir.to_str().expect("path")).expect("cstr");
+    let eng = { hk_engine_open(path.as_ptr()) };
+    assert!(!eng.is_null(), "hk_engine_open failed");
+    assert!({ hk_engine_await_quiescent(eng, 60_000) }, "quiescent");
+    let col = CString::new("v2col").unwrap();
+    let fld = CString::new("emb").unwrap();
+    assert_eq!(
+        hk_engine_create_vector_index_v2(eng, col.as_ptr(), fld.as_ptr(), 2, 2, 32, 400, 1024),
+        0,
+        "v2 create: {}",
+        last_err()
+    );
+    assert!({ hk_engine_await_quiescent(eng, 60_000) }, "index built");
+    let q = [1.0f32, 0.0];
+    let v = to_json(hk_engine_find_near(
+        eng,
+        col.as_ptr(),
+        fld.as_ptr(),
+        q.as_ptr(),
+        q.len(),
+        3,
+    ));
+    let arr = v.as_array().expect("array");
+    // IP on (1,0): dots a=2, b=1, c=3 → distance -dot → order c, a, b.
+    assert_eq!(arr[0]["id"], "c");
+    assert_eq!(arr[1]["id"], "a");
+    assert_eq!(arr[2]["id"], "b");
+    assert!((arr[0]["score"].as_f64().unwrap() - (-3.0)).abs() < 1e-9);
 }

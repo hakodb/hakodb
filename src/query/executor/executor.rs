@@ -1906,7 +1906,15 @@ impl ParallelQueryExecutor {
                 // per hop (duel: recall 0.62 at D=384/ef128), so the floor
                 // steps 128→256 at D≥128.
                 let floor = if qv.len() >= 128 { 256 } else { 128 };
-                let ef = max_ids.saturating_mul(8).clamp(floor, 20_000);
+                // #141-1: a per-def ef_search override rides the index
+                // definition (persisted, syncs); None keeps the derived
+                // formula (max_ids×8, clamped 128/256..20000).
+                let ef = indexes
+                    .vector
+                    .get(collection)
+                    .and_then(|m| m.get(field))
+                    .and_then(|d| d.ef_search)
+                    .unwrap_or_else(|| max_ids.saturating_mul(8).clamp(floor, 20_000));
                 let need = max_ids.min(ef);
                 let rescore_n = need.max((need.saturating_mul(4).max(32)).min(ef));
                 let use_ann = extra.is_empty();

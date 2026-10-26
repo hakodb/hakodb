@@ -4,7 +4,7 @@ use hakodb::config::{DurabilityMode, HakoConfig};
 use hakodb::document::hako_doc::HakoDoc;
 use hakodb::document::value::Value;
 use hakodb::engine::{BatchMutation, Hako};
-use hakodb::index::vector::{cosine_distance, decode_f32s, encode_f32s, Metric};
+use hakodb::index::vector::{cosine_distance, decode_f32s, encode_f32s, HnswParams, Metric};
 use hakodb::query::filter::Operator;
 use hakodb::query::plan::ScanType;
 use hakodb::query::query::Query;
@@ -122,6 +122,111 @@ fn exact_cosine_order_and_k() {
         .map(|(id, _)| id)
         .collect();
     assert_eq!(top2, vec!["c", "a"], "k truncates after ordering");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #141-8 (Phase B): Inner Product — distance = -dot, so magnitude matters
+/// where cosine is scale-invariant. Same 3 docs: cosine ties a/c ahead of
+/// b; IP orders c, a, b.
+#[test]
+fn inner_product_orders_by_dot() {
+    let dir = tmp("ip");
+    let db = open_db(&dir);
+    db.create_vector_index("ips", "emb", 2, Metric::InnerProduct)
+        .expect("create ip");
+    let mut batch = Vec::new();
+    for (id, p) in [
+        ("a", vec![2.0, 0.0]),
+        ("b", vec![1.0, 1.0]),
+        ("c", vec![3.0, 0.0]),
+    ] {
+        let mut doc = HakoDoc::default();
+        doc.insert("emb", Value::Binary(encode_f32s(&p)));
+        batch.push(BatchMutation::Put {
+            collection: "ips".into(),
+            doc_id: id.into(),
+            doc,
+        });
+    }
+    db.write_batch(batch).expect("seed");
+    assert!(db.await_quiescent(std::time::Duration::from_secs(60)));
+    let got: Vec<String> = db
+        .find_near("ips", "emb", &[1.0, 0.0], 10)
+        .expect("ip knn")
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(got, vec!["c", "a", "b"], "inner product: magnitude matters");
+    // Scored surface: distance = negated dot, exactly.
+    let scores: Vec<f64> = db
+        .find_near_scored("ips", "emb", &[1.0, 0.0], 10, None)
+        .expect("ip scored")
+        .into_iter()
+        .map(|(_, s, _)| s)
+        .collect();
+    assert_eq!(scores, vec![-3.0, -2.0, -1.0]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #141-1 (Phase B): explicit HNSW params persist in the index definition
+/// and survive reopen (describe surface carries them through).
+#[test]
+fn hnsw_params_persist_through_reopen() {
+    let dir = tmp("params");
+    {
+        let db = open_db(&dir);
+        db.create_vector_index_with_params(
+            "ptuned",
+            "emb",
+            2,
+            Metric::Cosine,
+            HnswParams { m: Some(32), ef_construction: Some(400), ef_search: Some(1024) },
+        )
+        .expect("create with params");
+        db.write_batch(vec![BatchMutation::Put {
+            collection: "ptuned".into(),
+            doc_id: "v1".into(),
+            doc: vdoc(&[1.0, 0.5], "x"),
+        }])
+        .expect("seed");
+        assert!(db.await_quiescent(std::time::Duration::from_secs(60)));
+    }
+    let db = open_db(&dir);
+    let info = &db.list_indexes(Some("ptuned")).vector["ptuned"][0];
+    assert_eq!(info.m, Some(32), "M persists");
+    assert_eq!(info.ef_construction, Some(400), "ef_construction persists");
+    assert_eq!(info.ef_search, Some(1024), "ef_search persists");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #141-5 (Phase B): batched find_near — per-query results match the
+/// single-query path 1:1.
+#[test]
+fn find_near_batch_matches_single() {
+    let dir = tmp("batch");
+    let db = open_db(&dir);
+    seed(&db);
+    wait_ready(&db);
+    let q1 = [1.0f32, 0.5];
+    let q2 = [0.0f32, 1.0];
+    let batch = db
+        .find_near_batch("pts", "emb", &[&q1, &q2], 3)
+        .expect("batch");
+    assert_eq!(batch.len(), 2);
+    let single: Vec<Vec<String>> = [&q1, &q2]
+        .iter()
+        .map(|q| {
+            db.find_near("pts", "emb", *q, 3)
+                .expect("single")
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        })
+        .collect();
+    for (b, s) in batch.iter().zip(single.iter()) {
+        let bids: Vec<String> = b.iter().map(|(id, _)| id.clone()).collect();
+        assert_eq!(&bids, s, "batch result matches single-query result");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
