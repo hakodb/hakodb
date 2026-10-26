@@ -2,6 +2,33 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.19.2 — Query egress, write-path wins, and single-call JSON insert FFI
+- **Query egress is 4–6× faster.** Query JSON serializes straight into one
+  output buffer instead of building a string tree first (#144); index-satisfied
+  query pages serve rows from a version-stamped row cache (#145); and query
+  row handles are zero-copy views over the cached `Arc` — the first mutation
+  clones, so handles stay snapshots (#146). Paired A/B vs v0.19.1 (11 reps,
+  ABBA, std+all): Qry +408…+444%, QPS +463…+537%, Json +71…+110%, all
+  significant with 11/11 wins; point reads, scans and single writes neutral.
+- **Write-path invalidation without `format!`.** The batch-commit cache
+  invalidation builds its keys in a thread-local scratch buffer instead of a
+  `format!` allocation per written id (#147). Lane-level: `std Bulk_upd` +3.0%
+  and `std Bulk_del` +47.5% (the bulk-delete lane anomaly is documented, not
+  attributed); write lanes neutral-or-better.
+- **Deletes resolve the old document from the hot cache.** When a still-current
+  decoded copy of the pre-delete document is resident, the delete-resolution
+  scan clones it instead of a storage read + decode (#148). Engine `apply*` on
+  warm deletes −2.2…−2.4 µs/mut; cold deletes pay a ~0.3–0.6 µs cache probe
+  first (documented trade-off).
+- **`hk_engine_insert_json` / `hk_batch_set_json`.** One C-ABI call builds a
+  document from a JSON object string and inserts it (owned put, no inbound
+  deep clone); the batch twin queues it on an `HK_Batch` (#149, #150). The
+  header regenerates via cbindgen. Construction-neutral versus the 9-call
+  doc-construction chain (+0.6…+0.7 µs) — the value is the single-call surface
+  for language bindings, measured honestly rather than by the study's estimate.
+- **No C ABI breaks, no on-disk format change.** Existing binaries, headers
+  and databases are unaffected; the two new symbols are additive.
+
 ### v0.19.1 — Get fast path and zero-copy FFI point reads
 - **`get` probes the hot cache directly.** The point read clones straight out
   of the resident `Arc` again instead of routing through `get_arc`, which has
