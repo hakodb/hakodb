@@ -333,6 +333,22 @@ fn parse_json_arg(raw: *const c_char, what: &str) -> Result<serde_json::Value, S
     serde_json::from_str(&s).map_err(|e| format!("invalid {what} JSON: {e}"))
 }
 
+/// Build a [`HakoDoc`] from a JSON object string (W4, #143): one FFI call
+/// replaces the hk_doc_new + N×hk_doc_insert_* + engine-call chain the
+/// client paid per document (~2.5–3 µs of client-side cost). Values keep
+/// the `Value::from_json` semantics (references, blob links, nested maps).
+fn hako_doc_from_json(raw: *const c_char) -> Result<HakoDoc, String> {
+    let obj = match parse_json_arg(raw, "doc")? {
+        serde_json::Value::Object(map) => map,
+        _ => return Err("doc JSON must be an object".to_string()),
+    };
+    let mut doc = HakoDoc::default();
+    for (k, v) in obj {
+        doc.insert(k, Value::from_json(v)?);
+    }
+    Ok(doc)
+}
+
 fn parse_filter_op(name: &str) -> Result<Operator, String> {
     Ok(match name {
         "eq" => Operator::Eq,
@@ -994,6 +1010,41 @@ pub extern "C" fn hk_engine_insert_take(
     })
 }
 
+/// Single-call JSON insert (W4, #143): builds the doc from a JSON object
+/// string and puts it — replaces the hk_doc_new + N×hk_doc_insert_*
+/// + hk_engine_insert chain per document on the client side.
+#[no_mangle]
+pub extern "C" fn hk_engine_insert_json(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    doc_id: *const c_char,
+    json: *const c_char,
+) -> i32 {
+    safety_shield!(-1, {
+        if engine.is_null() {
+            return set_last_error_err("null engine handle");
+        }
+        let collection = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => return set_last_error_err(e),
+        };
+        let doc_id = match cstr_to_string(doc_id) {
+            Ok(v) => v,
+            Err(e) => return set_last_error_err(e),
+        };
+        let doc = match hako_doc_from_json(json) {
+            Ok(d) => d,
+            Err(e) => return set_last_error_err(e),
+        };
+
+        let engine = unsafe { &mut *engine };
+        match engine.db.put(&collection, &doc_id, &doc) {
+            Ok(_) => 0,
+            Err(e) => set_last_error_err(e),
+        }
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn hk_engine_get(
     engine: *mut HK_Engine,
@@ -1461,6 +1512,42 @@ pub extern "C" fn hk_batch_set(
         collection,
         doc_id,
         doc: internal_doc,
+    });
+    clear_last_error();
+    0
+}
+
+/// Single-call JSON batch set (W4, #143): builds the doc from a JSON object
+/// string and queues it on the batch — the batch-construction twin of
+/// [`hk_engine_insert_json`].
+#[no_mangle]
+pub extern "C" fn hk_batch_set_json(
+    batch: *mut HK_Batch,
+    collection: *const c_char,
+    doc_id: *const c_char,
+    json: *const c_char,
+) -> i32 {
+    if batch.is_null() {
+        return set_last_error_err("null batch handle");
+    }
+    let collection = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    let doc_id = match cstr_to_string(doc_id) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    let doc = match hako_doc_from_json(json) {
+        Ok(d) => d,
+        Err(e) => return set_last_error_err(e),
+    };
+
+    let batch = unsafe { &mut *batch };
+    batch.ops.push(BatchMutation::Put {
+        collection,
+        doc_id,
+        doc,
     });
     clear_last_error();
     0
