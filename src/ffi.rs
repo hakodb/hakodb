@@ -2177,17 +2177,9 @@ pub extern "C" fn hk_query_execute_json(
             return hk_query_execute(engine, query);
         }
         let engine = unsafe { &*engine };
-        match engine.db.query_json(query_obj.query.clone()) {
-            Ok(rows) => {
-                let mut out = Vec::new();
-                out.push(b'[');
-                for (i, (_, json)) in rows.into_iter().enumerate() {
-                    if i > 0 {
-                        out.push(b',');
-                    }
-                    out.extend_from_slice(&json);
-                }
-                out.push(b']');
+        let mut out = Vec::with_capacity(4096);
+        match engine.db.query_json_into(query_obj.query.clone(), &mut out) {
+            Ok(_) => {
                 clear_last_error();
                 json_to_cstring(out).into_raw()
             }

@@ -3689,6 +3689,67 @@ impl Hako {
             .collect())
     }
 
+    /// [`Self::query_json`] writing the JSON array straight into `out`.
+    /// Same rows and same bytes, but without the per-row `Vec` that path
+    /// allocates and then copies: 20 rows used to pay 20 allocs + 20 frees
+    /// + 20 memcpys per page for bytes that are written exactly once.
+    pub fn query_json_into(&self, query: Query, out: &mut Vec<u8>) -> Result<usize> {
+        if query.projection.is_empty() && query.aggregations.is_empty() {
+            match self.query_raw(query.clone()) {
+                Ok(rows) => {
+                    out.push(b'[');
+                    let mut n = 0usize;
+                    for (_id, bytes) in rows {
+                        let Some(view) = crate::document::hako_doc::DocView::new(bytes) else {
+                            continue;
+                        };
+                        if n > 0 {
+                            out.push(b',');
+                        }
+                        let mark = out.len();
+                        let wrote = if query.defer_blobs || !view.has_blob_links() {
+                            view.write_json(out).is_some()
+                        } else {
+                            // rare: blob links need a decode + resolve.
+                            match self.json_from_view(&view, &query.collection)? {
+                                Some(json) => {
+                                    out.extend_from_slice(&json);
+                                    true
+                                }
+                                None => false,
+                            }
+                        };
+                        if !wrote {
+                            out.truncate(mark);
+                            if n > 0 {
+                                out.pop();
+                            }
+                            continue;
+                        }
+                        n += 1;
+                    }
+                    out.push(b']');
+                    return Ok(n);
+                }
+                Err(HakoError::QueryError(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let mut q = query;
+        q.raw = false;
+        out.push(b'[');
+        let mut n = 0usize;
+        for (_id, doc) in self.query(q)? {
+            if n > 0 {
+                out.push(b',');
+            }
+            doc.write_json(out);
+            n += 1;
+        }
+        out.push(b']');
+        Ok(n)
+    }
+
     /// Callback over [`Self::query_json`] rows. The rows are materialized
     /// first (this is not the zero-copy `walk_view`); `false` stops early.
     pub fn walk_json<F>(&self, query: Query, callback: &mut F) -> Result<usize>
