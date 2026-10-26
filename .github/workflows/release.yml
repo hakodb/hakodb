@@ -239,3 +239,16 @@ jobs:
           files: release/*
           body_path: body.md
           generate_release_notes: true
+
+  # crates.io is independent of the binary artifacts: publish as soon as the
+  # tag lands, in parallel with the build matrix. A failure here must not
+  # block the GitHub release (and vice versa), hence no `needs`.
+  publish-crate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish to crates.io
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
