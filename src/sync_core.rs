@@ -204,6 +204,9 @@ pub async fn apply_replicated_batch(
         let _ = shard.wal.append_batch_fast(tx_id, &accepted_ops, true);
 
         // B. Index update.
+        // ponytail (#151): batched sorted-view maintenance, flushed before
+        // the shard write lock drops at the end of this block.
+        let mut pending_sorted = Vec::new();
         for (key, doc_opt) in index_puts {
             if let Some(doc) = doc_opt {
                 // Blob-extracted docs stay pending.
@@ -212,9 +215,9 @@ pub async fn apply_replicated_batch(
                 });
 
                 if has_blob {
-                    shard.update_index_entry(key, Some(Pointer::BlobPending(Arc::new(doc))));
+                    shard.update_index_entry_deferred(key, Some(Pointer::BlobPending(Arc::new(doc))), &mut pending_sorted);
                 } else {
-                    shard.update_index_entry(key, Some(Pointer::Inlined(Arc::new(doc.encode()))));
+                    shard.update_index_entry_deferred(key, Some(Pointer::Inlined(Arc::new(doc.encode()))), &mut pending_sorted);
                 }
             } else {
                 // Delete: find its timestamp from the accepted batch.
@@ -224,9 +227,10 @@ pub async fn apply_replicated_batch(
                     }
                     None
                 }).unwrap_or(0);
-                shard.update_index_entry(key, Some(Pointer::Deleted { timestamp: ts }));
+                shard.update_index_entry_deferred(key, Some(Pointer::Deleted { timestamp: ts }), &mut pending_sorted);
             }
         }
+        shard.flush_pending_sorted(&mut pending_sorted);
 
         // C. Queue blobs for the receiver's blob worker.
         let mut total_bytes = 0;

@@ -331,10 +331,13 @@ impl StorageEngine {
             .collect();
         let n = dead.len();
         // ponytail: route through update_index_entry (None = remove) so the
-        // sorted_keys view and byte accounting stay in lockstep.
+        // sorted_keys view and byte accounting stay in lockstep. Batched
+        // (#151): one merge instead of one O(n) remove per tombstone.
+        let mut pending_sorted = Vec::new();
         for k in dead {
-            self.update_index_entry(k, None);
+            self.update_index_entry_deferred(k, None, &mut pending_sorted);
         }
+        self.flush_pending_sorted(&mut pending_sorted);
         n
     }
 
@@ -359,40 +362,25 @@ impl StorageEngine {
         }
     }
 
-    pub(crate) fn update_index_entry(&mut self, key: String, new_pointer: Option<Pointer>) {
+    /// Shared map + memory-stats + live-count effect of an index entry
+    /// update. The sorted-keys view is maintained by the caller: immediate
+    /// in [`Self::update_index_entry`], batched in the deferred path.
+    fn apply_pointer(&mut self, key: &str, new_pointer: Option<&Pointer>) {
+        let new_is_live = matches!(new_pointer, Some(p) if !matches!(p, Pointer::Deleted { .. }));
         // 1. Perform the map operation once.
         // .insert() returns the previous value if it existed.
-        let old_p = if let Some(p) = &new_pointer {
+        let old_p = if let Some(p) = new_pointer {
             // Track memory stats for the NEW pointer
             match p {
                 Pointer::Inlined(d) => { self.inlined_bytes += d.len(); }
                 Pointer::BlobPendingData { skeleton, .. } => { self.inlined_bytes += skeleton.len(); }
                 _ => {}
             }
-            self.index.insert(key.clone(), p.clone())
+            self.index.insert(key.to_string(), p.clone())
         } else {
-            self.index.remove(&key)
+            self.index.remove(key)
         };
 
-        // 1b. Maintain the sorted_keys view in lockstep with `index`.
-        // Only LIVE pointers go in sorted_keys — tombstones are excluded so the
-        // sorted view is a clean offset/cursor index.
-        // Insert: binary_search + insert (O(n) worst case but keys arrive in WAL
-        //   replay order which is mostly sorted, so amortised O(log n)).
-        // Remove: binary_search + remove (O(n) worst case but deletes are rare
-        //   relative to inserts in steady state).
-        // The caller holds &mut StorageEngine so no extra synchronisation needed.
-        let new_is_live = matches!(new_pointer, Some(ref p) if !matches!(p, Pointer::Deleted { .. }));
-        if new_is_live {
-            match self.sorted_keys.binary_search(&key) {
-                Ok(_) => {} // already present — overwrite kept key
-                Err(pos) => self.sorted_keys.insert(pos, key.clone()),
-            }
-        } else if let Ok(pos) = self.sorted_keys.binary_search(&key) {
-            self.sorted_keys.remove(pos);
-        }
-
-        // 2. Adjust stats based on the OLD pointer
         // ponytail: liveness computed before the move below.
         let old_was_live = old_p.as_ref().map(|v| !matches!(v, Pointer::Deleted { .. })).unwrap_or(false);
         if let Some(old_val) = old_p {
@@ -417,6 +405,100 @@ impl StorageEngine {
         } else if !old_was_live && new_is_live {
             *self.collection_counts.entry(self.logical_name.clone()).or_insert(0) += 1;
         }
+    }
+
+    pub(crate) fn update_index_entry(&mut self, key: String, new_pointer: Option<Pointer>) {
+        self.apply_pointer(&key, new_pointer.as_ref());
+
+        // Maintain the sorted_keys view in lockstep with `index`.
+        // Only LIVE pointers go in sorted_keys — tombstones are excluded so the
+        // sorted view is a clean offset/cursor index.
+        // Insert: binary_search + insert (O(n) worst case but keys arrive in WAL
+        //   replay order which is mostly sorted, so amortised O(log n)).
+        // Remove: binary_search + remove (O(n) worst case but deletes are rare
+        //   relative to inserts in steady state).
+        // The caller holds &mut StorageEngine so no extra synchronisation needed.
+        let new_is_live = matches!(new_pointer, Some(ref p) if !matches!(p, Pointer::Deleted { .. }));
+        if new_is_live {
+            match self.sorted_keys.binary_search(&key) {
+                Ok(_) => {} // already present — overwrite kept key
+                Err(pos) => self.sorted_keys.insert(pos, key.clone()),
+            }
+        } else if let Ok(pos) = self.sorted_keys.binary_search(&key) {
+            self.sorted_keys.remove(pos);
+        }
+    }
+
+    /// Batched twin of [`Self::update_index_entry`]: identical map/stats/count
+    /// effect, but the sorted-keys view resolves only at
+    /// [`Self::flush_pending_sorted`] — one merge per commit instead of one
+    /// O(n) Vec memmove per key (#151). Callers MUST flush before releasing
+    /// the shard write lock; readers hold only the read lock, so they never
+    /// see pending keys. `pending` lives in the caller's scope, keeping the
+    /// flush visually adjacent to the loop that fills it.
+    pub(crate) fn update_index_entry_deferred(
+        &mut self,
+        key: String,
+        new_pointer: Option<Pointer>,
+        pending: &mut Vec<String>,
+    ) {
+        self.apply_pointer(&key, new_pointer.as_ref());
+        // Only keys whose view membership actually changes go to pending;
+        // pure pointer-type swaps (Inlined -> Segment etc.) and ghost deletes
+        // keep their O(log n) no-op. Membership == presence in the view.
+        let in_view = self.sorted_keys.binary_search(&key).is_ok();
+        let new_is_live = matches!(new_pointer, Some(ref p) if !matches!(p, Pointer::Deleted { .. }));
+        if new_is_live != in_view {
+            pending.push(key);
+        }
+    }
+
+    /// Resolve the keys collected by [`Self::update_index_entry_deferred`]
+    /// into the sorted view. Tail-ascending keys append with zero memmove;
+    /// anything else is one two-pointer merge per commit (O(n + m), not
+    /// O(n·m)). `self.index` is the liveness source of truth, so keys put
+    /// and deleted inside the same batch resolve correctly in one pass.
+    pub(crate) fn flush_pending_sorted(&mut self, pending: &mut Vec<String>) {
+        if pending.is_empty() { return; }
+        pending.sort_unstable();
+        pending.dedup();
+
+        // Fast path: every pending key is live and sorts after the whole
+        // view (min(pending) > max(view)) — plain extend, zero memmove.
+        let tail_ok = self.sorted_keys.last().is_none_or(|last| {
+            pending.first().is_some_and(|k| k.as_str() > last.as_str())
+        });
+        if tail_ok && pending.iter().all(|k| self.is_live(k)) {
+            self.sorted_keys.append(pending);
+            return;
+        }
+
+        // General merge: old keys pass through; pending keys slot in if
+        // live, drop out if dead. mem::take avoids per-key clones on the
+        // hot side; the drained tail iterates by value.
+        let old = std::mem::take(&mut self.sorted_keys);
+        let mut merged = Vec::with_capacity(old.len() + pending.len());
+        let mut pi = 0usize;
+        for k in old {
+            while pi < pending.len() && pending[pi].as_str() < k.as_str() {
+                if self.is_live(&pending[pi]) { merged.push(std::mem::take(&mut pending[pi])); }
+                pi += 1;
+            }
+            if pi < pending.len() && pending[pi].as_str() == k.as_str() {
+                if self.is_live(&k) { merged.push(k); }
+                pi += 1;
+            } else {
+                merged.push(k);
+            }
+        }
+        for p in pending.drain(pi..) {
+            if self.is_live(&p) { merged.push(p); }
+        }
+        self.sorted_keys = merged;
+    }
+
+    fn is_live(&self, key: &str) -> bool {
+        matches!(self.index.get(key), Some(p) if !matches!(p, Pointer::Deleted { .. }))
     }
 
     /// Returns a half-half-open range `[start_pos, end_pos)` over the sorted key list,
@@ -623,9 +705,14 @@ impl StorageEngine {
         self.wal.append_batch(&wal_ops, is_remote)?;
 
         // Update RAM Index
+        // ponytail (#151): batched sorted-view maintenance — one merge per
+        // commit instead of one O(n) Vec memmove per key. The flush below is
+        // REQUIRED before this &mut self ends; readers never see pending keys.
+        let mut pending_sorted = Vec::new();
         for (key, pointer) in index_updates {
-            self.update_index_entry(key, pointer);
+            self.update_index_entry_deferred(key, pointer, &mut pending_sorted);
         }
+        self.flush_pending_sorted(&mut pending_sorted);
 
         // RETURN: The blob work goes to the background thread. 
         // The replication work is handled by the Standalone Agent tailing the WAL.
@@ -1302,28 +1389,32 @@ impl StorageEngine {
 
     pub fn apply_replicated_ops(&mut self, ops: &[crate::storage::wal::WalOp]) -> Result<()> {
         self.wal.append_batch(ops, true)?;
+        // ponytail (#151): batched sorted-view maintenance, flushed before
+        // the exclusive borrow ends.
+        let mut pending_sorted = Vec::new();
         for op in ops {
             match op {
                 // ponytail: route through update_index_entry (not direct
                 // index.insert) so sorted_keys and the live-count cache stay
                 // in lockstep — the old direct inserts skipped both.
                 WalOp::Put { key, segment_id, segment_offset, len } => {
-                    self.update_index_entry(key.clone(), Some(Pointer::Segment {
+                    self.update_index_entry_deferred(key.clone(), Some(Pointer::Segment {
                         segment_id: *segment_id, offset: *segment_offset, len: *len
-                    }));
+                    }), &mut pending_sorted);
                 }
                 WalOp::PutInlined { key, value } => {
-                    self.update_index_entry(key.clone(), Some(Pointer::Inlined(Arc::new(value.clone()))));
+                    self.update_index_entry_deferred(key.clone(), Some(Pointer::Inlined(Arc::new(value.clone()))), &mut pending_sorted);
                 }
                 WalOp::Delete { key, timestamp } => {
-                    self.update_index_entry(key.clone(), Some(Pointer::Deleted { timestamp: *timestamp }));
+                    self.update_index_entry_deferred(key.clone(), Some(Pointer::Deleted { timestamp: *timestamp }), &mut pending_sorted);
                 }
                 WalOp::PutBlob { key, offset, len } => {
-                    self.update_index_entry(key.clone(), Some(Pointer::Blob { offset: *offset, len: *len }));
+                    self.update_index_entry_deferred(key.clone(), Some(Pointer::Blob { offset: *offset, len: *len }), &mut pending_sorted);
                 }
                 _ => {}
             }
         }
+        self.flush_pending_sorted(&mut pending_sorted);
         Ok(())
     }
 
@@ -1416,6 +1507,44 @@ mod tests {
         let raw = std::fs::read(&wal_path).unwrap();
         assert!(raw.len() > 8, "snapshot flushed, not just staged");
         assert!(raw[0..8].iter().any(|&b| b != 0), "first header is a record, not zeros");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #151: the batched sorted-view path must land the exact same view as
+    /// the immediate path — out-of-order inserts, same-batch put+delete,
+    /// updates of existing keys, and tail appends resolve in one flush.
+    #[test]
+    fn deferred_flush_merges_out_of_order_batch() {
+        let dir = tmp("batchview");
+        let mut eng = StorageEngine::open(&dir, &cfg_for(DurabilityMode::Interval), "c".into(), None).unwrap();
+
+        let ops = vec![
+            WalOp::PutInlined { key: "n_10".into(), value: vec![b'a'] },
+            WalOp::PutInlined { key: "n_2".into(), value: vec![b'b'] },
+            WalOp::PutInlined { key: "n_1".into(), value: vec![b'c'] },
+            WalOp::PutInlined { key: "n_100".into(), value: vec![b'd'] },
+            // put + delete of the same key inside one batch: pending must
+            // resolve to absent, never a stray entry.
+            WalOp::Delete { key: "n_2".into(), timestamp: 1 },
+        ];
+        eng.apply_replicated_ops(&ops).unwrap();
+        let view: Vec<&str> = eng.sorted_keys.iter().map(|k| k.as_str()).collect();
+        assert_eq!(view, vec!["n_1", "n_10", "n_100"], "one flush merged inserts + same-batch delete");
+        for k in &eng.sorted_keys {
+            assert!(eng.index.contains_key(k), "view key {:?} must be in index", k);
+        }
+
+        // Mixed second batch: update of an existing key (no duplicate), a
+        // tail append (fast path), and a mid insert (merge path).
+        let ops2 = vec![
+            WalOp::PutInlined { key: "n_1".into(), value: vec![b'x'] },
+            WalOp::PutInlined { key: "n_99".into(), value: vec![b'y'] },
+            WalOp::PutInlined { key: "n_3".into(), value: vec![b'z'] },
+        ];
+        eng.apply_replicated_ops(&ops2).unwrap();
+        let view2: Vec<&str> = eng.sorted_keys.iter().map(|k| k.as_str()).collect();
+        assert_eq!(view2, vec!["n_1", "n_10", "n_100", "n_3", "n_99"], "mixed batch: update + tail + mid");
+        assert_eq!(eng.get("n_1").unwrap().unwrap(), b"x", "updated bytes visible");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
