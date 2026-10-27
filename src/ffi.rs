@@ -328,6 +328,26 @@ fn json_to_value(v: &serde_json::Value) -> Value {
     }
 }
 
+/// Filtered-traversal FFI arg pair → `TraverseSpec.node_match`: both
+/// nulls = no filter; both set = predicate; one-sided = loud error
+/// (never a silent partial filter). Shared by every traverse-taking
+/// FFI fn (#156 Phase C/E).
+fn parse_node_match(
+    filter_field: *const c_char,
+    filter_json: *const c_char,
+) -> Result<Option<(String, crate::document::value::Value)>, String> {
+    match (filter_field.is_null(), filter_json.is_null()) {
+        (true, true) => Ok(None),
+        (false, false) => {
+            let f = cstr_to_string(filter_field)?;
+            let raw = parse_json_arg(filter_json, "filter_json")?;
+            Ok(Some((f, json_to_value(&raw))))
+        }
+        (false, true) => Err("filter_json required when filter_field is set".to_string()),
+        (true, false) => Err("filter_field required when filter_json is set".to_string()),
+    }
+}
+
 fn parse_json_arg(raw: *const c_char, what: &str) -> Result<serde_json::Value, String> {
     let s = cstr_to_string(raw)?;
     serde_json::from_str(&s).map_err(|e| format!("invalid {what} JSON: {e}"))
@@ -4410,31 +4430,10 @@ pub extern "C" fn hk_engine_find_paths_v2(
             }
         };
         // Both must be present (or both absent) — one-sided is a loud error.
-        let node_match = match (filter_field.is_null(), filter_json.is_null()) {
-            (true, true) => None,
-            (false, false) => {
-                let f = match cstr_to_string(filter_field) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        set_last_error_err(e);
-                        return ptr::null_mut();
-                    }
-                };
-                let raw = match parse_json_arg(filter_json, "filter_json") {
-                    Ok(v) => v,
-                    Err(e) => {
-                        set_last_error_err(e);
-                        return ptr::null_mut();
-                    }
-                };
-                Some((f, json_to_value(&raw)))
-            }
-            (false, true) => {
-                set_last_error_err("filter_json required when filter_field is set");
-                return ptr::null_mut();
-            }
-            (true, false) => {
-                set_last_error_err("filter_field required when filter_json is set");
+        let node_match = match parse_node_match(filter_field, filter_json) {
+            Ok(nm) => nm,
+            Err(e) => {
+                set_last_error_err(e);
                 return ptr::null_mut();
             }
         };
@@ -4520,31 +4519,10 @@ pub extern "C" fn hk_engine_find_simple_paths(
                 cstr_to_string(p).ok()
             }
         };
-        let node_match = match (filter_field.is_null(), filter_json.is_null()) {
-            (true, true) => None,
-            (false, false) => {
-                let f = match cstr_to_string(filter_field) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        set_last_error_err(e);
-                        return ptr::null_mut();
-                    }
-                };
-                let raw = match parse_json_arg(filter_json, "filter_json") {
-                    Ok(v) => v,
-                    Err(e) => {
-                        set_last_error_err(e);
-                        return ptr::null_mut();
-                    }
-                };
-                Some((f, json_to_value(&raw)))
-            }
-            (false, true) => {
-                set_last_error_err("filter_json required when filter_field is set");
-                return ptr::null_mut();
-            }
-            (true, false) => {
-                set_last_error_err("filter_field required when filter_json is set");
+        let node_match = match parse_node_match(filter_field, filter_json) {
+            Ok(nm) => nm,
+            Err(e) => {
+                set_last_error_err(e);
                 return ptr::null_mut();
             }
         };
@@ -4569,6 +4547,201 @@ pub extern "C" fn hk_engine_find_simple_paths(
                 clear_last_error();
                 s.into_raw()
             }
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Whole-collection graph analytics (#156 Phase E): one op over the
+/// collection's node set plus its traversal edges (`edge_field`,
+/// `via_edge` route like the walks; `filter_field`/`filter_json` prune
+/// with Phase C semantics). `op` is one of `"components"`, `"cycle"`,
+/// `"topo"`, `"degrees"` — lowercase, exact. JSON shapes:
+///   components → [["a/b","c/d"], …]  members sorted, comps by min id
+///   cycle      → ["a","b","c"] (one directed cycle) or null
+///   topo       → ["a","b","c"] (Kahn, deterministic) or null on cycle
+///   degrees    → [{"node":"a","in":1,"out":2}, …]  total-degree desc
+/// Cross-collection targets never join the graph; an unknown op is a
+/// loud error. Owned string (`hk_string_free`).
+#[no_mangle]
+pub extern "C" fn hk_engine_graph_analysis(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    op: *const c_char,
+    direction: u32,
+    edge_field: *const c_char,
+    via_edge: *const c_char,
+    filter_field: *const c_char,
+    filter_json: *const c_char,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error_err("null engine handle");
+            return ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let col = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let opname = match cstr_to_string(op) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let dir = match crate::index::traverse::TraverseDir::from_u32(direction) {
+            Ok(d) => d,
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                return ptr::null_mut();
+            }
+        };
+        let opt_str = |p: *const c_char| {
+            if p.is_null() {
+                None
+            } else {
+                cstr_to_string(p).ok()
+            }
+        };
+        let node_match = match parse_node_match(filter_field, filter_json) {
+            Ok(nm) => nm,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        // Whole-graph ops ignore max_depth/limit; both ride validate()'s
+        // floor without touching outcomes (documented in engine.rs).
+        let spec = crate::index::traverse::TraverseSpec {
+            direction: dir,
+            edge_field: opt_str(edge_field),
+            max_depth: 1,
+            limit: 1,
+            via_edge: opt_str(via_edge),
+            weight_field: None,
+            node_match,
+        };
+        let ids = |p: &[(String, String)]| -> Vec<String> {
+            p.iter().map(|(c, i)| format!("{c}/{i}")).collect()
+        };
+        let result: crate::error::Result<serde_json::Value> = match opname.as_str() {
+            "components" => engine.db.graph_components(&col, &spec).map(|cs| {
+                serde_json::json!(cs.iter().map(|c| ids(c)).collect::<Vec<_>>())
+            }),
+            "cycle" => engine
+                .db
+                .graph_find_cycle(&col, &spec)
+                .map(|c| serde_json::json!(c.as_ref().map(|p| ids(p)))),
+            "topo" => engine
+                .db
+                .graph_topo_sort(&col, &spec)
+                .map(|t| serde_json::json!(t.as_ref().map(|p| ids(p)))),
+            "degrees" => engine.db.graph_degree_centrality(&col, &spec).map(|rows| {
+                serde_json::json!(rows
+                    .iter()
+                    .map(|((c, i), ind, outd)| serde_json::json!({
+                        "node": format!("{c}/{i}"),
+                        "in": ind,
+                        "out": outd
+                    }))
+                    .collect::<Vec<_>>())
+            }),
+            other => Err(crate::error::HakoError::InvalidInput(format!(
+                "unknown graph analysis op: {other} (components|cycle|topo|degrees)"
+            ))),
+        };
+        match result {
+            Ok(v) => match serde_json::to_string(&v).ok().and_then(|s| CString::new(s).ok()) {
+                Some(s) => {
+                    clear_last_error();
+                    s.into_raw()
+                }
+                None => ptr::null_mut(),
+            },
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Viz export (#156 Phase E): the collection graph as one JSON document
+/// `{"nodes":[{"collection","id","doc"}],"edges":[{"from","to"}]}` —
+/// same node set/edge rules as `hk_engine_graph_analysis` (cycle among
+/// them: docs inline, edges plain strings). Owned string.
+#[no_mangle]
+pub extern "C" fn hk_engine_export_graph(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    direction: u32,
+    edge_field: *const c_char,
+    via_edge: *const c_char,
+    filter_field: *const c_char,
+    filter_json: *const c_char,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error_err("null engine handle");
+            return ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let col = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let dir = match crate::index::traverse::TraverseDir::from_u32(direction) {
+            Ok(d) => d,
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                return ptr::null_mut();
+            }
+        };
+        let opt_str = |p: *const c_char| {
+            if p.is_null() {
+                None
+            } else {
+                cstr_to_string(p).ok()
+            }
+        };
+        let node_match = match parse_node_match(filter_field, filter_json) {
+            Ok(nm) => nm,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let spec = crate::index::traverse::TraverseSpec {
+            direction: dir,
+            edge_field: opt_str(edge_field),
+            max_depth: 1,
+            limit: 1,
+            via_edge: opt_str(via_edge),
+            weight_field: None,
+            node_match,
+        };
+        match engine.db.export_graph_json(&col, &spec) {
+            Ok(s) => match CString::new(s) {
+                Ok(c) => {
+                    clear_last_error();
+                    c.into_raw()
+                }
+                Err(e) => {
+                    set_last_error_err(e.to_string());
+                    ptr::null_mut()
+                }
+            },
             Err(e) => {
                 set_last_error_err(e.to_string());
                 ptr::null_mut()

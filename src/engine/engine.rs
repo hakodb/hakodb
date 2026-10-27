@@ -374,6 +374,14 @@ pub struct VectorIndexInfo {
     pub mem_estimate: u64,
 }
 
+/// Analytics node key (#156 Phase E): (collection, doc id) - shared by
+/// the whole-graph fns.
+pub type GraphNode = (String, String);
+/// Per-node edge map over `GraphNode`.
+pub type GraphAdj = std::collections::HashMap<GraphNode, Vec<GraphNode>>;
+/// One `graph_degree_centrality` row: (node, in-degree, out-degree).
+pub type DegreeRow = (GraphNode, usize, usize);
+
 /// One graph hit: collection + id (paths cross collections), BFS depth,
 /// and the doc itself. Returned by `Hako::find_paths`.
 #[derive(Debug, Clone)]
@@ -6059,6 +6067,291 @@ impl Hako {
                 .flatten()
                 .is_some_and(|d| d.get(field.as_str()) == Some(want)),
         }
+    }
+
+    // ===== Graph analytics (#156 Phase E): pure functions over one
+    // ===== collection's node set + `expand_neighbors` edges (inline refs
+    // ===== and `via_edge` collections both route through it; incoming
+    // ===== directions honor tracking like the walks do). Cross-collection
+    // ===== targets are skipped — the graph is the spec'd collection,
+    // ===== outbound edges to other collections don't join it (whole-data
+    // ===== analytics stay out of scope). `node_match` prunes nodes and
+    // ===== edges with the Phase C prune semantics. max_depth/limit don't
+    // ===== apply to whole-graph algorithms.
+
+    /// Live doc ids of a collection from its shard index (tombstones
+    /// skip). A shard that never opened = empty node set (fail-closed —
+    /// opening would create the shard, an unwanted side effect on
+    /// analytics of unknown collections).
+    fn graph_node_ids(&self, collection: &str) -> Vec<String> {
+        let shard = match self.shards.read() {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        match shard.get(collection) {
+            None => Vec::new(),
+            Some(arc) => match arc.read() {
+                Ok(st) => st.scan_prefix_keys(""),
+                Err(_) => Vec::new(),
+            },
+        }
+    }
+
+    /// Node set + per-node edges (deduped, sorted — deterministic across
+    /// runs). Only the matching nodes carry edges when `node_match` is
+    /// set; every algorithm over an empty set yields an empty result.
+    fn graph_adjacency(
+        &self,
+        collection: &str,
+        spec: &TraverseSpec,
+    ) -> Result<(Vec<GraphNode>, GraphAdj)> {
+        let mut nodes: Vec<(String, String)> = self
+            .graph_node_ids(collection)
+            .into_iter()
+            .map(|id| (collection.to_string(), id))
+            .filter(|(c, id)| self.node_matches(spec, c, id))
+            .collect();
+        nodes.sort();
+        let mut adj: std::collections::HashMap<(String, String), Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        for key in &nodes {
+            let mut targets: Vec<(String, String)> = self
+                .expand_neighbors(&key.0, &key.1, spec)
+                .into_iter()
+                // Same-collection only + filter prunes the target side.
+                .filter(|(ncol, nid, _)| {
+                    ncol == &key.0 && self.node_matches(spec, ncol, nid)
+                })
+                .map(|(a, b, _)| (a, b))
+                .collect();
+            targets.sort();
+            targets.dedup();
+            adj.insert(key.clone(), targets);
+        }
+        Ok((nodes, adj))
+    }
+
+    /// Weak connected components (#156 Phase E): union-find over the
+    /// adjacency; members sort ascending, components order by their
+    /// smallest member. Direction-agnostic for the node set (both
+    /// endpoints of an edge live in the collection).
+    pub fn graph_components(
+        &self,
+        collection: &str,
+        spec: &TraverseSpec,
+    ) -> Result<Vec<Vec<(String, String)>>> {
+        let (nodes, adj) = self.graph_adjacency(collection, spec)?;
+        let pos: std::collections::HashMap<&(String, String), usize> =
+            nodes.iter().enumerate().map(|(i, k)| (k, i)).collect();
+        let mut parent: Vec<usize> = (0..nodes.len()).collect();
+        fn find(parent: &[usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                x = parent[x];
+            }
+            x
+        }
+        for (src, targets) in &adj {
+            if let Some(&sp) = pos.get(src) {
+                for t in targets {
+                    if let Some(&tp) = pos.get(t) {
+                        let ra = find(&parent, sp);
+                        let rb = find(&parent, tp);
+                        if ra != rb {
+                            parent[ra.min(rb)] = ra.max(rb);
+                            // ponytail: no union-by-rank — embedded
+                            // scale, path-halving is ceremony here.
+                        }
+                    }
+                }
+            }
+        }
+        let mut buckets: std::collections::HashMap<usize, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        for (i, key) in nodes.into_iter().enumerate() {
+            buckets.entry(find(&parent, i)).or_default().push(key);
+        }
+        let mut out: Vec<Vec<(String, String)>> = buckets.into_values().collect();
+        out.sort();
+        Ok(out)
+    }
+
+    /// One directed cycle (#156 Phase E), or `None` if the graph is a
+    /// DAG in the spec's direction. DFS color scan — visits every
+    /// node/edge once, no exponential cycle enumeration; the reported
+    /// path is the stack slice from the revisited node.
+    pub fn graph_find_cycle(
+        &self,
+        collection: &str,
+        spec: &TraverseSpec,
+    ) -> Result<Option<Vec<(String, String)>>> {
+        let (nodes, adj) = self.graph_adjacency(collection, spec)?;
+        let pos: std::collections::HashMap<&(String, String), usize> =
+            nodes.iter().enumerate().map(|(i, k)| (k, i)).collect();
+        let children: Vec<Vec<usize>> = nodes
+            .iter()
+            .map(|k| {
+                adj.get(k)
+                    .map(|ts| ts.iter().filter_map(|t| pos.get(t).copied()).collect())
+                    .unwrap_or_default()
+            })
+            .collect();
+        // 0 white, 1 grey (on stack), 2 black (closed).
+        let mut color = vec![0u8; nodes.len()];
+        let mut stack: Vec<(usize, usize)> = Vec::new();
+        for s in 0..nodes.len() {
+            if color[s] != 0 {
+                continue;
+            }
+            color[s] = 1;
+            stack.push((s, 0));
+            while let Some(&(n, i)) = stack.last() {
+                let ts = &children[n];
+                if i >= ts.len() {
+                    color[n] = 2;
+                    stack.pop();
+                    continue;
+                }
+                stack.last_mut().expect("non-empty").1 = i + 1;
+                let c = ts[i];
+                match color[c] {
+                    0 => {
+                        color[c] = 1;
+                        stack.push((c, 0));
+                    }
+                    1 => {
+                        // Back edge into the grey stack: the cycle is the
+                        // stack slice from the revisited node to the top.
+                        let from = stack.iter().position(|&(v, _)| v == c).expect("grey on stack");
+                        return Ok(Some(
+                            stack[from..].iter().map(|&(v, _)| nodes[v].clone()).collect(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Topological order (#156 Phase E), Kahn-style: `None` when the
+    /// graph closed a cycle (use `graph_find_cycle` for the path).
+    /// Deterministic: the frontier pops the lexicographically smallest
+    /// zero-indegree node first (nodes come sorted; position order is
+    /// the same order).
+    pub fn graph_topo_sort(
+        &self,
+        collection: &str,
+        spec: &TraverseSpec,
+    ) -> Result<Option<Vec<(String, String)>>> {
+        let (nodes, adj) = self.graph_adjacency(collection, spec)?;
+        let pos: std::collections::HashMap<&(String, String), usize> =
+            nodes.iter().enumerate().map(|(i, k)| (k, i)).collect();
+        let children: Vec<Vec<usize>> = nodes
+            .iter()
+            .map(|k| {
+                adj.get(k)
+                    .map(|ts| ts.iter().filter_map(|t| pos.get(t).copied()).collect())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let mut indeg = vec![0usize; nodes.len()];
+        for ts in &children {
+            for &c in ts {
+                indeg[c] += 1;
+            }
+        }
+        // Position order == lexicographic (col, id) order.
+        let mut frontier: std::collections::BTreeSet<usize> =
+            (0..nodes.len()).filter(|&i| indeg[i] == 0).collect();
+        let mut out = Vec::with_capacity(nodes.len());
+        while let Some(&n) = frontier.iter().next() {
+            frontier.remove(&n);
+            out.push(nodes[n].clone());
+            for &c in &children[n] {
+                indeg[c] -= 1;
+                if indeg[c] == 0 {
+                    frontier.insert(c);
+                }
+            }
+        }
+        if out.len() == nodes.len() {
+            Ok(Some(out))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Degree centrality (#156 Phase E): (node, in-degree, out-degree)
+    /// per collection node, sorted by total degree desc then node asc.
+    pub fn graph_degree_centrality(
+        &self,
+        collection: &str,
+        spec: &TraverseSpec,
+    ) -> Result<Vec<DegreeRow>> {
+        let (nodes, adj) = self.graph_adjacency(collection, spec)?;
+        let pos: std::collections::HashMap<&(String, String), usize> =
+            nodes.iter().enumerate().map(|(i, k)| (k, i)).collect();
+        let mut indeg = vec![0usize; nodes.len()];
+        for targets in adj.values() {
+            for t in targets {
+                if let Some(&p) = pos.get(t) {
+                    indeg[p] += 1;
+                }
+            }
+        }
+        let mut rows: Vec<((String, String), usize, usize)> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.clone(), indeg[i], adj.get(k).map_or(0, Vec::len)))
+            .collect();
+        rows.sort_by(|a, b| {
+            (a.1 + a.2)
+                .cmp(&(b.1 + b.2))
+                .reverse()
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        Ok(rows)
+    }
+
+    /// Viz export (#156 Phase E): self-contained JSON —
+    /// `{"nodes":[{"collection","id","doc"}],"edges":[{"from","to"}]}`.
+    /// Nodes = live matching docs (doc JSON re-encodes resolved values);
+    /// edges = the deduped adjacency. Same rules as the analytics fns.
+    pub fn export_graph_json(&self, collection: &str, spec: &TraverseSpec) -> Result<String> {
+        let (nodes, adj) = self.graph_adjacency(collection, spec)?;
+        let nodes_json: Vec<serde_json::Value> = nodes
+            .iter()
+            .map(|(c, id)| {
+                let mut mdoc = serde_json::Map::new();
+                if let Ok(Some(d)) = self.get(c, id) {
+                    for (f, v) in d.fields.iter() {
+                        mdoc.insert(f.to_string(), v.to_json());
+                    }
+                }
+                serde_json::json!({ "collection": c, "id": id, "doc": mdoc })
+            })
+            .collect();
+        let mut edges: Vec<serde_json::Value> = adj
+            .iter()
+            .flat_map(|(from, ts)| {
+                ts.iter().map(move |to| {
+                    serde_json::json!({
+                        "from": format!("{}/{}", from.0, from.1),
+                        "to": format!("{}/{}", to.0, to.1)
+                    })
+                })
+            })
+            .collect();
+        // Deterministic docs: adj is a HashMap, iteration order varies per
+        // process — sort the edge list by (from, to).
+        edges.sort_by(|a, b| {
+            (a["from"].as_str(), a["to"].as_str()).cmp(&(b["from"].as_str(), b["to"].as_str()))
+        });
+        Ok(serde_json::to_string(&serde_json::json!({
+            "nodes": nodes_json,
+            "edges": edges
+        }))
+        .unwrap_or_else(|_| "{}".to_string()))
     }
 
     /// Shared composite backfill spawner: used at explicit creation AND
