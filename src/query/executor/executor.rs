@@ -1603,6 +1603,112 @@ impl ParallelQueryExecutor {
         Ok(final_results)
     }
 
+    /// VectorKnn batch scorer (#156 Phase D): decode each candidate doc,
+    /// apply `extra` filters (missing field rejects — unified-match rule),
+    /// decode the doc vector, exact `distance()`. Rows already scored are
+    /// skipped via `seen` (one shared set across widening stages + the
+    /// fallback, so every id decodes/filters exactly once). Returns how
+    /// many rows were added.
+    #[allow(clippy::too_many_arguments)] // private; the param set is the scoring context
+    fn score_vector_batch(
+        storage: &StorageEngine,
+        pairs: &[(String, Pointer)],
+        field: &str,
+        qv: &[f32],
+        metric: crate::index::vector::Metric,
+        extra: &[crate::query::filter::Filter],
+        seen: &mut std::collections::HashSet<String>,
+        scored: &mut Vec<(f64, String, Pointer)>,
+    ) -> usize {
+        use crate::index::vector::{decode_f32s, distance};
+        use crate::query::filter::compare_values;
+        let mut added = 0usize;
+        for (key, ptr) in pairs {
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            // ponytail: shared read — scoring decodes from the live Arc,
+            // no per-row clone (same rule as every other scan arm now).
+            let bytes = match storage.read_pointer_shared(ptr) {
+                Ok(Some(b)) => b,
+                _ => continue,
+            };
+            let doc = match HakoDoc::decode(&bytes) {
+                Some(d) => d,
+                None => continue,
+            };
+            let mut pass = true;
+            for f in extra {
+                match doc.get(&f.field) {
+                    Some(v) => {
+                        if !compare_values(v, &f.op, &f.value) {
+                            pass = false;
+                            break;
+                        }
+                    }
+                    // Missing field rejects (same rule as the
+                    // unified-match slow path).
+                    None => {
+                        pass = false;
+                        break;
+                    }
+                }
+            }
+            if !pass {
+                continue;
+            }
+            // Missing / non-binary / dim-mismatched fields can't be
+            // ranked — skip (fail-closed, same rule as the planner).
+            // Blob-resident embeddings resolve single (durable: the
+            // indexer drains the flush queue before queries read).
+            let dv = match doc.get(field) {
+                Some(Value::Binary(b)) => decode_f32s(b).unwrap_or_default(),
+                Some(Value::BlobLink { offset, len }) => {
+                    match storage.blob_manager.as_deref() {
+                        Some(bm) => match crate::query::executor::worker::resolve_single_blob_in_worker(bm, *offset, *len) {
+                            Value::Binary(b) => decode_f32s(&b).unwrap_or_default(),
+                            _ => continue,
+                        },
+                        None => continue,
+                    }
+                }
+                _ => continue,
+            };
+            if dv.len() != qv.len() {
+                continue;
+            }
+            scored.push((distance(metric, qv, &dv), key.clone(), ptr.clone()));
+            added += 1;
+        }
+        added
+    }
+
+    /// ANN-candidate id list → live (id, pointer) pairs: deleted or
+    /// vanished candidates drop (same liveness rule as every scan arm).
+    fn knn_pairs_from_ids(storage: &StorageEngine, ids: &[String]) -> Vec<(String, Pointer)> {
+        ids.iter()
+            .filter_map(|id| {
+                storage.index.get(id.as_str()).and_then(|ptr| {
+                    if matches!(ptr, Pointer::Deleted { .. }) {
+                        None
+                    } else {
+                        Some((id.clone(), ptr.clone()))
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Every live key — the exact fallback candidate set.
+    fn knn_pairs_brute(storage: &StorageEngine) -> Vec<(String, Pointer)> {
+        storage
+            .index
+            .iter()
+            .filter(|(_, p)| !matches!(p, Pointer::Deleted { .. }))
+            .map(|(k, p)| (k.clone(), p.clone()))
+            .collect()
+    }
+
     fn execute_single_scan(
         &self,
         storage: &StorageEngine,
@@ -1895,11 +2001,12 @@ impl ParallelQueryExecutor {
                 // max_ids (deep pages can't under-fill) and never exceeds
                 // ef (never rescore more than surfaced). Fallback (no
                 // complete graph): every live key, exact by construction.
-                // Hybrid (extra filters) always brute-forces: ANN ranks
-                // unfiltered, so post-filtering its top-ef could strand
-                // matches it never surfaced. Ties break on doc id.
-                use crate::index::vector::{decode_f32s, distance};
-                use crate::query::filter::compare_values;
+                // Hybrid (extra filters): 2-stage (#156 Phase D) — ANN
+                // over-fetches (×1/×4/×16, widening only on under-fill);
+                // an exact full-scan fallback can only ADD rows, so the
+                // served set is never worse than the old brute force.
+                // Ties break on doc id.
+                use crate::index::vector::decode_f32s;
                 let qv = decode_f32s(query).unwrap_or_default();
                 // ef sizing (P3): int8 graph distances are approximate, so
                 // over-fetch generously. High dims compound routing error
@@ -1917,95 +2024,63 @@ impl ParallelQueryExecutor {
                     .unwrap_or_else(|| max_ids.saturating_mul(8).clamp(floor, 20_000));
                 let need = max_ids.min(ef);
                 let rescore_n = need.max((need.saturating_mul(4).max(32)).min(ef));
-                let use_ann = extra.is_empty();
-                let cand_ids: Option<Vec<String>> = indexes
+                // ANN gate (#156 Phase D): a complete graph serves both
+                // unfiltered queries (proven single-stage path, shape
+                // unchanged) AND filtered ones. #141 rule intact: ANN may
+                // only drop rows — the exact rescore orders THOSE, and
+                // the under-fill fallback can only add rows.
+                let graph = indexes
                     .hnsw
                     .get(collection)
                     .and_then(|m| m.get(field))
-                    .filter(|g| use_ann && g.complete() && !g.is_empty())
-                    .map(|g| {
-                        g.search(&qv, ef)
-                            .into_iter()
-                            .take(rescore_n)
-                            .map(|(_, idx)| g.id_of(idx).to_string())
-                            .collect()
-                    });
+                    .filter(|g| g.complete() && !g.is_empty());
+                let cand_ids: Option<Vec<String>> = graph.as_ref().map(|g| {
+                    g.search(&qv, ef)
+                        .into_iter()
+                        .take(if extra.is_empty() { rescore_n } else { ef })
+                        .map(|(_, idx)| g.id_of(idx).to_string())
+                        .collect()
+                });
                 let pairs: Vec<(String, Pointer)> = match &cand_ids {
-                    Some(ids) => ids
-                        .iter()
-                        .filter_map(|id| {
-                            storage.index.get(id.as_str()).and_then(|ptr| {
-                                if matches!(ptr, Pointer::Deleted { .. }) {
-                                    None
-                                } else {
-                                    Some((id.clone(), ptr.clone()))
-                                }
-                            })
-                        })
-                        .collect(),
-                    None => storage
-                        .index
-                        .iter()
-                        .filter(|(_, p)| !matches!(p, Pointer::Deleted { .. }))
-                        .map(|(k, p)| (k.clone(), p.clone()))
-                        .collect(),
+                    Some(ids) => Self::knn_pairs_from_ids(storage, ids),
+                    None => Self::knn_pairs_brute(storage),
                 };
                 let mut scored: Vec<(f64, String, Pointer)> = Vec::new();
-                for (key, ptr) in pairs {
-                    // ponytail: shared read — scoring decodes from the
-                    // live Arc, no per-row clone (same rule as every
-                    // other scan arm now).
-                    let bytes = match storage.read_pointer_shared(&ptr) {
-                        Ok(Some(b)) => b,
-                        _ => continue,
-                    };
-                    let doc = match HakoDoc::decode(&bytes) {
-                        Some(d) => d,
-                        None => continue,
-                    };
-                    let mut pass = true;
-                    for f in extra {
-                        match doc.get(&f.field) {
-                            Some(v) => {
-                                if !compare_values(v, &f.op, &f.value) {
-                                    pass = false;
-                                    break;
-                                }
+                // One shared `seen` across stages: widened re-searches
+                // re-surface earlier ids and the fallback must not
+                // re-score them either — each id decodes/filters once.
+                let mut seen: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                Self::score_vector_batch(storage, &pairs, field, &qv, *metric, extra, &mut seen, &mut scored);
+                // Stage continuation (filtered only): widen ×4/×16 while
+                // under-filled; ef ≥ graph size or a filled window stops
+                // it; then one exact full scan if still short — union
+                // (ANN ∪ brute) with exact rescore = the same top-k the
+                // brute force alone would produce.
+                if !extra.is_empty() {
+                    if let Some(g) = graph.as_ref() {
+                        for over in [4usize, 16] {
+                            let stag = ef.saturating_mul(over).min(g.len());
+                            if stag <= ef || scored.len() >= max_ids {
+                                break;
                             }
-                            // Missing field rejects (same rule as the
-                            // unified-match slow path).
-                            None => {
-                                pass = false;
+                            let ids: Vec<String> = g
+                                .search(&qv, stag)
+                                .into_iter()
+                                .take(stag)
+                                .map(|(_, idx)| g.id_of(idx).to_string())
+                                .collect();
+                            let pairs = Self::knn_pairs_from_ids(storage, &ids);
+                            Self::score_vector_batch(storage, &pairs, field, &qv, *metric, extra, &mut seen, &mut scored);
+                            if scored.len() >= max_ids || stag == g.len() {
                                 break;
                             }
                         }
-                    }
-                    if !pass {
-                        continue;
-                    }
-                    // Missing / non-binary / dim-mismatched fields can't be
-                    // ranked — skip (fail-closed, same rule as the planner).
-                    // Blob-resident embeddings inflate here (durable: the
-                    // indexer drains the flush queue before resolving, so
-                    // by query time the bytes are on disk; a transient
-                    // miss resolves Null and skips — rebuilds converge).
-                    let dv = match doc.get(field) {
-                        Some(Value::Binary(b)) => decode_f32s(b).unwrap_or_default(),
-                        Some(Value::BlobLink { offset, len }) => {
-                            match storage.blob_manager.as_deref() {
-                                Some(bm) => match crate::query::executor::worker::resolve_single_blob_in_worker(bm, *offset, *len) {
-                                    Value::Binary(b) => decode_f32s(&b).unwrap_or_default(),
-                                    _ => continue,
-                                },
-                                None => continue,
-                            }
+                        if scored.len() < max_ids {
+                            let pairs = Self::knn_pairs_brute(storage);
+                            Self::score_vector_batch(storage, &pairs, field, &qv, *metric, extra, &mut seen, &mut scored);
                         }
-                        _ => continue,
-                    };
-                    if dv.len() != qv.len() {
-                        continue;
                     }
-                    scored.push((distance(*metric, &qv, &dv), key.clone(), ptr.clone()));
                 }
                 // NaN-free by construction (zero-norm guards in vector.rs),
                 // so total_cmp is a true order here.

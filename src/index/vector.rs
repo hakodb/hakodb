@@ -334,6 +334,22 @@ impl HnswIndex {
         self.complete
     }
 
+    /// Rough resident-bytes estimate (#141-7): quantized vectors (1
+    /// byte/dim + scale + shape norm), neighbor lists at CAP (level 0
+    /// keeps `mmax0`, upper levels `mmax`), and the id maps (~2 × 24 B
+    /// per entry). Upper levels are usually sparse, so this over-counts —
+    /// it is an upper bound, documented as such.
+    pub fn bytes_estimate(&self) -> u64 {
+        let n = self.nodes.len() as u64;
+        if n == 0 {
+            return 0;
+        }
+        let vec_bytes = self.dim as u64 + 16;
+        let links_bytes = 8 * (self.mmax0 as u64 + self.mmax as u64);
+        let id_bytes = 48; // id_to_idx + idx_to_id entry, ~2 × 24 B
+        n * (vec_bytes + links_bytes + id_bytes)
+    }
+
     pub fn set_complete(&mut self, v: bool) {
         self.complete = v;
     }
