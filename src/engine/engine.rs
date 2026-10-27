@@ -5859,9 +5859,11 @@ impl Hako {
         // First-visit parent map (#140-1): BFS discovery order IS the
         // shortest-hop path, so walking parents back reconstructs it.
         let mut parent: HashMap<(String, String), (String, String)> = HashMap::new();
-        // F-1 (#140-7): the edge doc used at discovery, per node — walking
-        // it back beside `parent` reconstructs the `via` chain.
+        // G1 (#168): the discovery edge rides per node only when the via
+        // projection is requested — otherwise the walk pays no extra map
+        // writes and hits carry an empty `via`.
         let mut parent_edge: HashMap<(String, String), Option<String>> = HashMap::new();
+        let want_via = spec.include_via;
         let mut queue: VecDeque<((String, String), usize)> = VecDeque::new();
         queue.push_back((start.clone(), 0));
         let mut out = Vec::new();
@@ -5884,7 +5886,9 @@ impl Hako {
                     continue;
                 }
                 parent.insert((ncol.clone(), nid.clone()), (col.clone(), doc_id.clone()));
-                parent_edge.insert((ncol.clone(), nid.clone()), edge);
+                if want_via {
+                    parent_edge.insert((ncol.clone(), nid.clone()), edge);
+                }
                 let nd = depth + 1;
                 if nd < spec.max_depth {
                     queue.push_back(((ncol.clone(), nid.clone()), nd));
@@ -5894,7 +5898,11 @@ impl Hako {
                 }
                 if let Ok(Some(doc)) = self.get(&ncol, &nid) {
                     let path = Self::reconstruct_traverse_path(&parent, &start, (&ncol, &nid));
-                    let via = Self::reconstruct_traverse_via(&parent, &parent_edge, &start, (&ncol, &nid));
+                    let via = if want_via {
+                        Self::reconstruct_traverse_via(&parent, &parent_edge, &start, (&ncol, &nid))
+                    } else {
+                        Vec::new()
+                    };
                     out.push(TraverseHit { collection: ncol, id: nid, depth: nd, cost: nd as f64, path, via, doc });
                 }
             }
@@ -5968,7 +5976,8 @@ impl Hako {
         let mut heap: BinaryHeap<(Reverse<(u64, String, String)>, usize)> = BinaryHeap::new();
         let start = (collection.to_string(), id.to_string());
         let mut parent: HashMap<(String, String), (String, String)> = HashMap::new();
-        // F-1 (#140-7): discovery edge per node, recorded on relax.
+        // G1 (#168): discovery edge recorded on relax only when via is wanted.
+        let want_via = spec.include_via;
         let mut parent_edge: HashMap<(String, String), Option<String>> = HashMap::new();
         dist.insert(start.clone(), 0.0);
         heap.push((Reverse((0, collection.to_string(), id.to_string())), 0));
@@ -5984,7 +5993,11 @@ impl Hako {
                 }
                 if let Ok(Some(doc)) = self.get(&col, &doc_id) {
                     let path = Self::reconstruct_traverse_path(&parent, &start, (&col, &doc_id));
-                    let via = Self::reconstruct_traverse_via(&parent, &parent_edge, &start, (&col, &doc_id));
+                    let via = if want_via {
+                        Self::reconstruct_traverse_via(&parent, &parent_edge, &start, (&col, &doc_id))
+                    } else {
+                        Vec::new()
+                    };
                     out.push(TraverseHit {
                         collection: col.clone(),
                         id: doc_id.clone(),
@@ -6011,7 +6024,9 @@ impl Hako {
                     // Relaxation improved (#140-1): this node's best-known
                     // path now comes through the current node.
                     parent.insert(nkey.clone(), (col.clone(), doc_id.clone()));
-                    parent_edge.insert(nkey.clone(), edge);
+                    if want_via {
+                        parent_edge.insert(nkey.clone(), edge);
+                    }
                     dist.insert(nkey, nc);
                     heap.push((Reverse((nc.to_bits(), ncol, nid)), depth + 1));
                 }
@@ -6120,8 +6135,12 @@ impl Hako {
                 }
                 let mut np = path.clone();
                 np.push((ncol.clone(), nid.clone()));
-                let mut nv = via.clone();
-                nv.push(edge);
+                // G1 (#168): via rides states only when requested; empty
+                // `Vec` clones stay allocation-free otherwise.
+                let mut nv = if spec.include_via { via.clone() } else { Vec::new() };
+                if spec.include_via {
+                    nv.push(edge);
+                }
                 heap.push(Reverse((
                     (f64::from_bits(cbits) + w).to_bits(),
                     ncol.clone(),
