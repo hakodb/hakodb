@@ -36,7 +36,7 @@ fn blank() -> HakoDoc {
 }
 
 fn spec(dir: TraverseDir, depth: usize, limit: usize) -> TraverseSpec {
-    TraverseSpec { direction: dir, edge_field: None, max_depth: depth, limit, via_edge: None, weight_field: None, node_match: None, edge_type: None, edge_match: None, include_via: false }
+    TraverseSpec { direction: dir, edge_field: None, max_depth: depth, limit, via_edge: None, weight_field: None, node_match: None, edge_type: None, edge_match: None, include_path: true, include_via: false }
 }
 
 /// Chain a->b->c plus c->a cycle; users collection untracked.
@@ -157,7 +157,7 @@ fn edge_field_filter_and_validation() {
         .find_paths(
             "docs",
             "m",
-            &TraverseSpec { direction: TraverseDir::Outgoing, edge_field: Some("other".into()), max_depth: 5, limit: 10, via_edge: None, weight_field: None, node_match: None, edge_type: None, edge_match: None, include_via: false },
+            &TraverseSpec { direction: TraverseDir::Outgoing, edge_field: Some("other".into()), max_depth: 5, limit: 10, via_edge: None, weight_field: None, node_match: None, edge_type: None, edge_match: None, include_path: true, include_via: false },
         )
         .unwrap();
     assert_eq!(one.len(), 1);
@@ -237,6 +237,7 @@ fn wspec(dir: TraverseDir, depth: usize, limit: usize) -> TraverseSpec {
         node_match: None,
         edge_type: None,
         edge_match: None,
+        include_path: true,
         include_via: false,
     }
 }
@@ -284,6 +285,7 @@ fn dijkstra_prefers_cheap_over_short() {
             node_match: None,
             edge_type: None,
             edge_match: None,
+            include_path: false,
             include_via: false,
         })
         .unwrap();
@@ -751,6 +753,7 @@ fn f1spec(dir: TraverseDir, t: Option<(&str, Value)>, m: Option<(&str, Value)>) 
         node_match: None,
         edge_type: t.map(|(f, v)| (f.to_string(), v)),
         edge_match: m.map(|(f, v)| (f.to_string(), v)),
+        include_path: true,
         include_via: true,
     }
 }
@@ -877,7 +880,7 @@ fn via_covers_weighted_edge_hops() {
         .find_paths(
             "n",
             "a",
-            &TraverseSpec { include_via: true, ..wspec(TraverseDir::Outgoing, 5, 10) },
+            &TraverseSpec { include_path: true, include_via: true, ..wspec(TraverseDir::Outgoing, 5, 10) },
         )
         .unwrap();
     let c = dj.iter().find(|h| h.id == "c").expect("c in dijkstra rows");
@@ -898,24 +901,29 @@ fn via_covers_weighted_edge_hops() {
 }
 
 #[test]
-fn via_defaults_off_g1_168() {
+fn routes_defaults_off_g1_168() {
     let dir = tmp("g1-off");
     let db = open_db(&dir);
     seed_f1(&db);
     wait(&db);
-    // include_via defaults to false (G1, #168): no via work, empty via on
-    // every hit; path projection (#140-1) is untouched.
+    // include_path/include_via default to false (G1, #168): no route
+    // machinery at all — empty path + via on every hit; discovery itself
+    // (ids/depths) is untouched.
     let hits = db
         .find_paths(
             "n",
             "a",
-            &TraverseSpec { include_via: false, ..f1spec(TraverseDir::Outgoing, None, None) },
+            &TraverseSpec {
+                include_path: false,
+                include_via: false,
+                ..f1spec(TraverseDir::Outgoing, None, None)
+            },
         )
         .unwrap();
-    assert!(hits.iter().all(|h| h.via.is_empty()), "via opt-in off");
+    assert!(!hits.is_empty());
     for h in &hits {
-        assert_eq!(h.path.len() - 1, h.depth);
-        assert_eq!(h.via.len(), 0, "overlay: {h:?}");
+        assert!(h.path.is_empty(), "path opt-in off: {h:?}");
+        assert!(h.via.is_empty(), "via opt-in off: {h:?}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

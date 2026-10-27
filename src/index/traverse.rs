@@ -230,6 +230,12 @@ pub struct TraverseSpec {
     /// edge doc and are exempt (mirrors the start-node exemption).
     pub edge_type: Option<(String, Value)>,
     pub edge_match: Option<(String, Value)>,
+    /// G1 (#168): route projections are opt-in. When false (the default)
+    /// the walk builds no path machinery — no parent map, no per-hit
+    /// backtrack; `TraverseHit.path` stays empty — so the engine cost
+    /// matches pre-v0.19.4 BFS exactly and FFI rows carry the v0.19.3
+    /// shape byte-for-byte (no `path` key).
+    pub include_path: bool,
     /// G1 (#168): via projection is opt-in. When false (the default) the
     /// walk skips the per-node discovery-edge map and the extra backtrack
     /// entirely — `TraverseHit.via` stays empty and FFI rows carry the

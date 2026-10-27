@@ -163,6 +163,7 @@ impl QueryPlanner {
                                             node_match: None,
                                             edge_type: None,
                                             edge_match: None,
+                                            include_path: false,
                                             include_via: false,
                                         };
                                         let mut plan = Self::make_plan(

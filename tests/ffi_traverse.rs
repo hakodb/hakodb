@@ -94,9 +94,10 @@ fn find_paths_returns_bfs_hits_with_depth() {
     assert_eq!(arr[1]["id"], "c");
     assert_eq!(arr[1]["depth"], 2);
     assert!(arr[1]["doc"].is_object());
-    // Full discovery path as "col/id" strings, start-inclusive (#140-1).
-    assert_eq!(arr[0]["path"], serde_json::json!(["pts/a", "pts/b"]));
-    assert_eq!(arr[1]["path"], serde_json::json!(["pts/a", "pts/b", "pts/c"]));
+    // G1 (#168): frozen v1 keeps the v0.19.3 row shape — no route keys.
+    assert!(!arr[0].as_object().unwrap().contains_key("path"));
+    assert!(!arr[1].as_object().unwrap().contains_key("path"));
+    // Opt-in path rows ride the v4 generation (see find_paths_v4 test).
 }
 
 #[test]
@@ -245,7 +246,8 @@ fn find_paths_v2_filter_prunes_descent() {
     let arr = to_json(out).as_array().expect("array").clone();
     assert_eq!(arr.len(), 1, "c must be pruned: {arr:?}");
     assert_eq!(arr[0]["id"], "b");
-    assert_eq!(arr[0]["path"], serde_json::json!(["pts/a", "pts/b"]));
+    // G1 (#168): frozen v2 rows carry no route keys — depth still rides.
+    assert!(!arr[0].as_object().unwrap().contains_key("path"));
     // Unfiltered (nulls): the plain v1-equivalent walk sees c too.
     let out2 = {
         hk_engine_find_paths_v2(
@@ -295,9 +297,11 @@ fn find_simple_paths_over_ffi_route_rows() {
     assert_eq!(arr.len(), 3);
     assert_eq!(arr[0]["id"], "a");
     assert_eq!(arr[0]["depth"], 0);
-    assert_eq!(arr[0]["path"], serde_json::json!(["pts/a"]));
-    assert_eq!(arr[1]["path"], serde_json::json!(["pts/a", "pts/b"]));
-    assert_eq!(arr[2]["path"], serde_json::json!(["pts/a", "pts/b", "pts/c"]));
+    // G1 (#168): frozen v1 rows carry no route keys — simple-pruning
+    // semantics (ordering, depth, cost) are untouched.
+    for r in arr {
+        assert!(!r.as_object().unwrap().contains_key("path"), "{r:?}");
+    }
 }
 
 #[test]
@@ -333,7 +337,7 @@ fn find_simple_paths_weighted_over_ffi() {
     assert!((arr[2]["cost"].as_f64().unwrap() - 2.0).abs() < 1e-9);
     assert_eq!(arr[3]["id"], "c");
     assert!((arr[3]["cost"].as_f64().unwrap() - 10.0).abs() < 1e-9);
-    assert_eq!(arr[3]["path"], serde_json::json!(["n/a", "n/c"]));
+    assert!(!arr[3].as_object().unwrap().contains_key("path"), "frozen v1: {arr:?}");
 }
 
 #[test]
@@ -551,29 +555,31 @@ fn find_paths_v4_include_via_opt_in() {
     let rel = CString::new("rel").unwrap();
     let nul = std::ptr::null();
 
-    // include_via = 1: the "via" key rides with the edge ref.
+    // include_path = 1, include_via = 1: route keys ride together.
     let rows = to_json({
         hk_engine_find_paths_v4(
-            eng, col.as_ptr(), id.as_ptr(), 0, nul, rel.as_ptr(), 5, 10, 1,
+            eng, col.as_ptr(), id.as_ptr(), 0, nul, rel.as_ptr(), 5, 10, 1, 1,
             nul, nul, nul, nul, nul, nul,
         )
     });
     let arr = rows.as_array().expect("rows");
     assert_eq!(arr[0]["id"], "b");
+    assert_eq!(arr[0]["path"], serde_json::json!(["n/a", "n/b"]), "opt-in path: {rows:?}");
     assert_eq!(arr[0]["via"], serde_json::json!(["rel/e1"]), "opt-in via: {rows:?}");
 
-    // include_via = 0: frozen v0.19.3 shape.
+    // Both flags = 0: frozen v0.19.3 shape, byte-for-byte (no route keys).
     let rows = to_json({
         hk_engine_find_paths_v4(
-            eng, col.as_ptr(), id.as_ptr(), 0, nul, rel.as_ptr(), 5, 10, 0,
+            eng, col.as_ptr(), id.as_ptr(), 0, nul, rel.as_ptr(), 5, 10, 0, 0,
             nul, nul, nul, nul, nul, nul,
         )
     });
     let arr = rows.as_array().expect("rows");
     assert_eq!(arr[0]["id"], "b");
+    let obj = arr[0].as_object().unwrap();
     assert!(
-        !arr[0].as_object().unwrap().contains_key("via"),
-        "via off = frozen shape: {rows:?}"
+        !obj.contains_key("path") && !obj.contains_key("via"),
+        "flags off = frozen shape: {rows:?}"
     );
 }
 
@@ -617,7 +623,7 @@ fn find_simple_paths_v2_match_frozen_and_v3_via() {
     let rows = to_json({
         hk_engine_find_simple_paths_v3(
             eng, col.as_ptr(), id.as_ptr(), 0,
-            nul, rel.as_ptr(), nul, 5, 10, 1,
+            nul, rel.as_ptr(), nul, 5, 10, 1, 1,
             nul, nul, nul, nul, w.as_ptr(), one.as_ptr(),
         )
     });
