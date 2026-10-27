@@ -101,6 +101,7 @@ fn incoming(db: &Hako) -> hakodb::error::Result<Vec<hakodb::engine::TraverseHit>
             node_match: None,
             edge_type: None,
             edge_match: None,
+            include_path: false,
             include_via: false,
         },
     )

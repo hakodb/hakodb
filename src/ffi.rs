@@ -4273,36 +4273,39 @@ pub extern "C" fn hk_query_where_traverse(
 /// Shared JSON row emitter for the traverse fns (rows carry `path` since
 /// Phase A): one shape for find_paths / shortest_paths / v2 / simple —
 /// additive keys only, so existing C consumers are unaffected.
-fn traverse_rows_json(rows: &[crate::engine::TraverseHit], include_via: bool) -> String {
+fn traverse_rows_json(
+    rows: &[crate::engine::TraverseHit],
+    include_path: bool,
+    include_via: bool,
+) -> String {
     let mut arr = Vec::with_capacity(rows.len());
     for hit in rows {
         let doc_json: serde_json::Value = match doc_to_json(&hit.doc) {
             Ok(s) => serde_json::from_str(&s).unwrap_or(serde_json::Value::Null),
             Err(_) => serde_json::Value::Null,
         };
-        // G1 (#168): rows stay byte-identical to the v0.19.3 shape unless
-        // the walker explicitly requested the via projection.
-        let obj = if include_via {
-            serde_json::json!({
-                "collection": hit.collection,
-                "id": hit.id,
-                "depth": hit.depth,
-                "cost": hit.cost,
-                "path": hit.path.iter().map(|(c, i)| format!("{c}/{i}")).collect::<Vec<_>>(),
-                "via": hit.via.iter().map(|v| v.as_deref()).collect::<Vec<_>>(),
-                "doc": doc_json,
-            })
-        } else {
-            serde_json::json!({
-                "collection": hit.collection,
-                "id": hit.id,
-                "depth": hit.depth,
-                "cost": hit.cost,
-                "path": hit.path.iter().map(|(c, i)| format!("{c}/{i}")).collect::<Vec<_>>(),
-                "doc": doc_json,
-            })
-        };
-        arr.push(obj);
+        // G1 (#168): the pre-existing fns keep the frozen v0.19.3 row shape
+        // (path/via keys only appear on opt-in); one key set, additive.
+        let mut obj = serde_json::Map::new();
+        obj.insert("collection".into(), serde_json::json!(hit.collection));
+        obj.insert("id".into(), serde_json::json!(hit.id));
+        obj.insert("depth".into(), serde_json::json!(hit.depth));
+        obj.insert("cost".into(), serde_json::json!(hit.cost));
+        if include_path {
+            obj.insert(
+                "path".into(),
+                serde_json::json!(hit.path.iter().map(|(c, i)| format!("{c}/{i}")).collect::<Vec<_>>()),
+            );
+        }
+        if include_via {
+            obj.insert(
+                "via".into(),
+                serde_json::json!(hit.via.iter().map(|v| v.as_deref()).collect::<Vec<_>>()),
+            );
+        }
+        obj.insert("doc".into(), doc_json);
+        let st = serde_json::Value::Object(obj);
+        arr.push(st);
     }
     serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
 }
@@ -4369,6 +4372,7 @@ pub extern "C" fn hk_engine_find_paths(
             node_match: None,
             edge_type: None,
             edge_match: None,
+            include_path: false,
             include_via: false,
         };
         let rows = match engine.db.find_paths(&col, &id, &spec) {
@@ -4378,7 +4382,7 @@ pub extern "C" fn hk_engine_find_paths(
                 return ptr::null_mut();
             }
         };
-        match CString::new(traverse_rows_json(&rows, false)) {
+        match CString::new(traverse_rows_json(&rows, false, false)) {
             Ok(s) => {
                 clear_last_error();
                 s.into_raw()
@@ -4465,6 +4469,7 @@ pub extern "C" fn hk_engine_find_paths_v2(
             node_match,
             edge_type: None,
             edge_match: None,
+            include_path: false,
             include_via: false,
         };
         let rows = match engine.db.find_paths(&col, &id, &spec) {
@@ -4474,7 +4479,7 @@ pub extern "C" fn hk_engine_find_paths_v2(
                 return ptr::null_mut();
             }
         };
-        match CString::new(traverse_rows_json(&rows, false)) {
+        match CString::new(traverse_rows_json(&rows, false, false)) {
             Ok(s) => {
                 clear_last_error();
                 s.into_raw()
@@ -4557,6 +4562,7 @@ pub extern "C" fn hk_engine_find_simple_paths(
             node_match,
             edge_type: None,
             edge_match: None,
+            include_path: false,
             include_via: false,
         };
         let rows = match engine.db.find_simple_paths(&col, &id, &spec) {
@@ -4566,7 +4572,7 @@ pub extern "C" fn hk_engine_find_simple_paths(
                 return ptr::null_mut();
             }
         };
-        match CString::new(traverse_rows_json(&rows, false)) {
+        match CString::new(traverse_rows_json(&rows, false, false)) {
             Ok(s) => {
                 clear_last_error();
                 s.into_raw()
@@ -4673,6 +4679,7 @@ pub extern "C" fn hk_engine_find_paths_v3(
             node_match,
             edge_type,
             edge_match,
+            include_path: false,
             include_via: false,
         };
         let rows = match engine.db.find_paths(&col, &id, &spec) {
@@ -4682,7 +4689,7 @@ pub extern "C" fn hk_engine_find_paths_v3(
                 return ptr::null_mut();
             }
         };
-        match CString::new(traverse_rows_json(&rows, false)) {
+        match CString::new(traverse_rows_json(&rows, false, false)) {
             Ok(s) => {
                 clear_last_error();
                 s.into_raw()
@@ -4783,6 +4790,7 @@ pub extern "C" fn hk_engine_find_simple_paths_v2(
             node_match,
             edge_type,
             edge_match,
+            include_path: false,
             include_via: false,
         };
         let rows = match engine.db.find_simple_paths(&col, &id, &spec) {
@@ -4792,7 +4800,7 @@ pub extern "C" fn hk_engine_find_simple_paths_v2(
                 return ptr::null_mut();
             }
         };
-        match CString::new(traverse_rows_json(&rows, false)) {
+        match CString::new(traverse_rows_json(&rows, false, false)) {
             Ok(s) => {
                 clear_last_error();
                 s.into_raw()
@@ -4805,12 +4813,13 @@ pub extern "C" fn hk_engine_find_simple_paths_v2(
     })
 }
 
-/// Traverse rows with the opt-in via projection (G1, #168): everything
-/// `hk_engine_find_paths_v3` serves, plus `include_via` (1 = rows gain the
-/// additive `"via"` array — per-hop edge doc, null for inline hops; 0 =
-/// rows keep the frozen v0.19.3 shape). The engine skips all via work
-/// when unset (measured −27% BFS_qps when always-on, see #168). Frozen
-/// v1/v2/v3 stay via-free; v4 is the only via-carrying generation.
+/// Traverse rows with opt-in route projections (G1, #168): everything
+/// `hk_engine_find_paths_v3` serves, plus `include_path`/`include_via`
+/// (1 = rows gain the additive `"path"` discovery array / `"via"` edge-doc
+/// array — null for inline hops; 0 = rows keep the frozen v0.19.3 shape,
+/// byte-for-byte, no route keys). The engine skips the matching machinery
+/// per flag (measured −27% BFS_qps when always-on, see #168). Frozen
+/// v1/v2/v3 stay route-free; v4 is the only route-carrying generation.
 #[no_mangle]
 pub extern "C" fn hk_engine_find_paths_v4(
     engine: *mut HK_Engine,
@@ -4821,6 +4830,7 @@ pub extern "C" fn hk_engine_find_paths_v4(
     via_edge: *const c_char,
     max_depth: usize,
     k: usize,
+    include_path: u32,
     include_via: u32,
     filter_field: *const c_char,
     filter_json: *const c_char,
@@ -4894,6 +4904,7 @@ pub extern "C" fn hk_engine_find_paths_v4(
             node_match,
             edge_type,
             edge_match,
+            include_path: include_path != 0,
             include_via: include_via != 0,
         };
         let rows = match engine.db.find_paths(&col, &id, &spec) {
@@ -4903,7 +4914,7 @@ pub extern "C" fn hk_engine_find_paths_v4(
                 return ptr::null_mut();
             }
         };
-        match CString::new(traverse_rows_json(&rows, include_via != 0)) {
+        match CString::new(traverse_rows_json(&rows, include_path != 0, include_via != 0)) {
             Ok(s) => {
                 clear_last_error();
                 s.into_raw()
@@ -4916,10 +4927,11 @@ pub extern "C" fn hk_engine_find_paths_v4(
     })
 }
 
-/// Simple paths with the opt-in via projection (G1, #168): everything
-/// `hk_engine_find_simple_paths_v2` serves, plus `include_via` (1 = rows
-/// gain the additive `"via"` array; 0 = frozen v0.19.3 shape). The engine
-/// skips all via work when unset. Frozen v1/simple_v2 stay via-free.
+/// Simple paths with opt-in route projections (G1, #168): everything
+/// `hk_engine_find_simple_paths_v2` serves, plus `include_path`/`include_via`
+/// (1 = rows gain the additive `"path"`/`"via"` arrays; 0 = frozen v0.19.3
+/// shape). The engine skips the matching machinery per flag. Frozen
+/// v1/simple_v2 stay route-free.
 #[no_mangle]
 pub extern "C" fn hk_engine_find_simple_paths_v3(
     engine: *mut HK_Engine,
@@ -4931,6 +4943,7 @@ pub extern "C" fn hk_engine_find_simple_paths_v3(
     weight_field: *const c_char,
     max_depth: usize,
     k: usize,
+    include_path: u32,
     include_via: u32,
     filter_field: *const c_char,
     filter_json: *const c_char,
@@ -5004,6 +5017,7 @@ pub extern "C" fn hk_engine_find_simple_paths_v3(
             node_match,
             edge_type,
             edge_match,
+            include_path: include_path != 0,
             include_via: include_via != 0,
         };
         let rows = match engine.db.find_simple_paths(&col, &id, &spec) {
@@ -5013,7 +5027,7 @@ pub extern "C" fn hk_engine_find_simple_paths_v3(
                 return ptr::null_mut();
             }
         };
-        match CString::new(traverse_rows_json(&rows, include_via != 0)) {
+            match CString::new(traverse_rows_json(&rows, include_path != 0, include_via != 0)) {
             Ok(s) => {
                 clear_last_error();
                 s.into_raw()
@@ -5101,6 +5115,7 @@ pub extern "C" fn hk_engine_graph_analysis(
             node_match,
             edge_type: None,
             edge_match: None,
+            include_path: false,
             include_via: false,
         };
         let ids = |p: &[(String, String)]| -> Vec<String> {
@@ -5206,6 +5221,7 @@ pub extern "C" fn hk_engine_export_graph(
             node_match,
             edge_type: None,
             edge_match: None,
+            include_path: false,
             include_via: false,
         };
         match engine.db.export_graph_json(&col, &spec) {
@@ -5338,6 +5354,7 @@ pub extern "C" fn hk_engine_shortest_paths(
             node_match: None,
             edge_type: None,
             edge_match: None,
+            include_path: false,
             include_via: false,
         };
         let rows = match engine.db.find_paths(&col, &id, &spec) {
@@ -5347,7 +5364,7 @@ pub extern "C" fn hk_engine_shortest_paths(
                 return ptr::null_mut();
             }
         };
-        match CString::new(traverse_rows_json(&rows, false)) {
+        match CString::new(traverse_rows_json(&rows, false, false)) {
             Ok(s) => {
                 clear_last_error();
                 s.into_raw()
