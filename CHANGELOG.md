@@ -2,6 +2,37 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.19.5 — Perf restore for the v0.19.4 graph/vector lanes (#168)
+- **BFS route projections are opt-in (G1).** v0.19.4 always computed the
+  `path` array and the `via` chain for every hit — measured **−27.1% BFS_qps
+  on the bench lane** (find_paths 13.4→20.1 µs/op, rows 305→399 B). Both
+  projections now default **off**: the walk builds no parent map, no per-hop
+  edge-ref Strings and no backtracks (engine cost matches pre-v0.19.4 BFS;
+  probe on the bench fixtures: **11.5 µs/op, 305 B rows** — byte-identical to
+  the v0.19.3 shape), and FFI rows of the pre-existing fns return to the
+  frozen v0.19.3 shape byte-for-byte (no `path`/`via` keys). **Rust API:**
+  `TraverseSpec.include_path` / `include_via` (both false) restore the arrays;
+  `TraverseHit.path`/`via` are empty by default. The simple-path enumeration
+  keeps its route tracking internally (cycle detection) and gates only the row
+  projection.
+- **ANN reject-path dedup removed (G3).** `score_vector_batch` cloned+hashed
+  every candidate key into `seen` *before* decode/filter, but cross-stage dedup
+  is read only on the hybrid path — the degenerate Vec lane (docs without the
+  embedding field) recovers **+9.7% Vec_qps (11/11 wins)** toward the
+  regression (was −12.2%); the small residual rides the new ANN engine's
+  over-fetch+decode structure — next levers are the deferred SIMD-int8
+  distance (V1) and adaptive ef (V2).
+- **Additive C ABI:** new `hk_engine_find_paths_v4` and
+  `hk_engine_find_simple_paths_v3` (the v3/simple_v2 generation plus opt-in
+  `include_path`/`include_via` flags). The signatures shipped in v0.19.4
+  (`hk_engine_find_paths_v3`, `hk_engine_find_simple_paths_v2`) stay frozen;
+  their rows now serve the route-free v0.19.3 shape (behavior change vs
+  v0.19.4's always-on route keys — route consumers move to the v4 generation).
+- **No C ABI breaks, no on-disk format change.** Full 11-rep ABBA A/B vs the
+  v0.19.4 lane libs on the bench box: **BFS_qps +51.8%** (0/11 CI at the
+  regression's −27.1% fully reversed), Vec_qps +9.7% 11/11 wins, other lanes
+  noise-neutral (run path + pair stats in #168).
+
 ### v0.19.4 — Ergonomics batch: vector + graph (#156 phases A–F)
 - **Vector search control (`#141`):** scores returned by default (`find_near` rides `(score, doc)`, the FFI distance recompute is deleted) with an optional distance threshold; configurable `M` / `ef_construction` / `ef_search` persisted in the index definition; Inner Product metric (ordering-aware comparator + rescore); batch `find_near`; verified multi-vector-fields per collection; hybrid search — filtered + vector in one query via index-satisfied pre-filter or over-fetch + post-filter (planner ANN decision A/B-gated, Qry-lane neutral, exact recall by construction); index statistics (count/keys/memory aesthetic).
 - **Graph traversal (`#140`):** full path reconstruction on every hit (BFS + weighted, start-inclusive); filtered traversal via node predicate + edge-field whitelist (prune-at-expansion semantics); depth cap raised to a configurable 256 (default 32 preserved, O(visited) memory documented); bounded simple-path enumeration (`find_simple_paths`, k-ordered, cycle-safe).
