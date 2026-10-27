@@ -335,3 +335,103 @@ fn find_simple_paths_weighted_over_ffi() {
     assert!((arr[3]["cost"].as_f64().unwrap() - 10.0).abs() < 1e-9);
     assert_eq!(arr[3]["path"], serde_json::json!(["n/a", "n/c"]));
 }
+
+#[test]
+fn graph_analysis_ops_over_ffi() {
+    use hakodb::ffi::hk_engine_graph_analysis;
+    let dir = tmp("ganalysis");
+    seed(&dir); // pts: a -> b -> c
+    let eng = open(&dir);
+    let col = CString::new("pts").unwrap();
+    let call = |op: &str| {
+        let opc = CString::new(op).unwrap();
+        let out = {
+            hk_engine_graph_analysis(
+                eng,
+                col.as_ptr(),
+                opc.as_ptr(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!out.is_null(), "op {op} returned null: {}", last_err());
+        to_json(out)
+    };
+    // degrees: total-degree desc, node asc — b wins (1+1), then a/c tie.
+    let deg = call("degrees");
+    let arr = deg.as_array().expect("degrees array");
+    assert_eq!(arr[0]["node"], "pts/b");
+    assert_eq!(
+        arr[0]["in"].as_i64().unwrap() + arr[0]["out"].as_i64().unwrap(),
+        2
+    );
+    assert_eq!(arr[1]["node"], "pts/a");
+    assert_eq!(arr[2]["node"], "pts/c");
+    assert_eq!(arr.len(), 3);
+    // topo: chain order; cycle: none; components: one.
+    let topo = call("topo");
+    assert_eq!(
+        topo.as_array().expect("topo array"),
+        &vec![
+            serde_json::json!("pts/a"),
+            serde_json::json!("pts/b"),
+            serde_json::json!("pts/c")
+        ]
+    );
+    let cyc = call("cycle");
+    assert!(cyc.is_null(), "acyclic fixture: {cyc:?}");
+    let comps = call("components");
+    assert_eq!(
+        comps.as_array().expect("comps array"),
+        &vec![serde_json::json!(["pts/a", "pts/b", "pts/c"])]
+    );
+    // Unknown op is a loud error, never a silent empty.
+    let opc = CString::new("mystery").unwrap();
+    let bad = {
+        hk_engine_graph_analysis(
+            eng,
+            col.as_ptr(),
+            opc.as_ptr(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert!(bad.is_null(), "unknown op must fail");
+    assert!(last_err().contains("unknown graph analysis op"), "got: {}", last_err());
+}
+
+#[test]
+fn export_graph_over_ffi() {
+    use hakodb::ffi::hk_engine_export_graph;
+    let dir = tmp("gexport");
+    seed(&dir);
+    let eng = open(&dir);
+    let col = CString::new("pts").unwrap();
+    let out = {
+        hk_engine_export_graph(
+            eng,
+            col.as_ptr(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    let v = to_json(out);
+    assert_eq!(v["nodes"].as_array().expect("nodes").len(), 3);
+    assert!(v["nodes"][0]["doc"].is_object(), "docs ride inline");
+    assert_eq!(
+        v["edges"],
+        serde_json::json!([
+            { "from": "pts/a", "to": "pts/b" },
+            { "from": "pts/b", "to": "pts/c" }
+        ])
+    );
+}

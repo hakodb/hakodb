@@ -534,3 +534,186 @@ fn find_simple_paths_weighted_orders_by_cost() {
     assert!(paths[3].cost > paths[2].cost);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ===== Phase E (#156): whole-graph analytics + viz export =====
+
+fn idmat(comps: &[Vec<(String, String)>]) -> Vec<Vec<String>> {
+    comps
+        .iter()
+        .map(|c| c.iter().map(|(col, id)| format!("{col}/{id}")).collect())
+        .collect()
+}
+
+fn refdoc_multi(targets: &[(&str, &str)]) -> HakoDoc {
+    let mut doc = HakoDoc::default();
+    for (f, tgt) in targets {
+        doc.insert((*f).to_string(), Value::Reference { collection: "docs".into(), doc_id: (*tgt).into() });
+    }
+    doc
+}
+
+#[test]
+fn graph_components_weak_and_filtered() {
+    let dir = tmp("comps");
+    let db = open_db(&dir);
+    // No traverse index needed: outgoing inline refs route directly.
+    db.put("docs", "a", &refdoc("docs", "b")).unwrap();
+    db.put("docs", "b", &blank()).unwrap();
+    db.put("docs", "c", &refdoc("docs", "d")).unwrap();
+    db.put("docs", "d", &blank()).unwrap();
+    db.put("docs", "e", &blank()).unwrap();
+    // Cross-collection targets never join the graph: f -> users/u1 stays
+    // its own component even though the reference exists.
+    db.put("docs", "f", &refdoc("users", "x")).unwrap();
+    db.put("users", "x", &blank()).unwrap();
+    let comps = db
+        .graph_components("docs", &spec(TraverseDir::Outgoing, 5, 10))
+        .unwrap();
+    assert_eq!(
+        idmat(&comps),
+        vec![p(&["docs/a", "docs/b"]), p(&["docs/c", "docs/d"]), p(&["docs/e"]), p(&["docs/f"])]
+    );
+    // Filtered: prune q (or any non-matching node) and its component
+    // membership dissolves — Phase C prune semantics carry over.
+    let mut q = HakoDoc::default();
+    q.insert("kind", Value::String("gone".into()));
+    q.insert("link", Value::Reference { collection: "docs".into(), doc_id: "r".into() });
+    let mut pr = HakoDoc::default();
+    pr.insert("kind", Value::String("keep".into()));
+    pr.insert("link", Value::Reference { collection: "docs".into(), doc_id: "q".into() });
+    let mut rr = HakoDoc::default();
+    rr.insert("kind", Value::String("keep".into()));
+    db.put("docs", "p", &pr).unwrap();
+    db.put("docs", "q", &q).unwrap();
+    db.put("docs", "r", &rr).unwrap();
+    let mut nodespec = spec(TraverseDir::Outgoing, 5, 10);
+    nodespec.node_match =
+        Some(("kind".into(), Value::String("keep".into())));
+    let comps = db.graph_components("docs", &nodespec).unwrap();
+    // q excluded; p keeps no edge (its only ref targets a pruned node).
+    assert!(idmat(&comps).iter().any(|c| c == &p(&["docs/p"])));
+    assert!(idmat(&comps).iter().any(|c| c == &p(&["docs/r"])));
+    assert!(!idmat(&comps).iter().any(|c| c.len() == 2 && c[0] == "docs/p"), "q must be pruned");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn graph_cycle_and_topo() {
+    let dir = tmp("cyc");
+    let db = open_db(&dir);
+    db.create_traverse_index("docs").unwrap();
+    seed_chain(&db); // a -> b -> c -> a
+    let cyc = db
+        .graph_find_cycle("docs", &spec(TraverseDir::Outgoing, 5, 10))
+        .unwrap()
+        .expect("cycle exists");
+    assert_eq!(cyc.len(), 3, "one cycle, not exponential enumeration");
+    assert!(db.graph_topo_sort("docs", &spec(TraverseDir::Outgoing, 5, 10)).unwrap().is_none());
+
+    // Same graph broken: a -> b -> c (c no longer closes the loop).
+    db.delete("docs", "c").unwrap();
+    db.put("docs", "c", &blank()).unwrap();
+    assert!(db.graph_find_cycle("docs", &spec(TraverseDir::Outgoing, 5, 10)).unwrap().is_none());
+    let after = db
+        .graph_topo_sort("docs", &spec(TraverseDir::Outgoing, 5, 10))
+        .unwrap()
+        .expect("dag");
+    assert_eq!(idmat(&[after]), vec![p(&["docs/a", "docs/b", "docs/c", "docs/plain"])]);
+
+    // Diamond DAG: deterministic Kahn pops the lexicographic frontier.
+    let mut a = refdoc_multi(&[("r1", "b"), ("r2", "d")]);
+    a.insert("pad", Value::Int(1));
+    let mut d2 = refdoc_multi(&[("r1", "c")]);
+    d2.insert("pad", Value::Int(2));
+    db.put("docs", "a", &a).unwrap();
+    db.put("docs", "d", &d2).unwrap();
+    let topo = db
+        .graph_topo_sort("docs", &spec(TraverseDir::Outgoing, 5, 10))
+        .unwrap()
+        .expect("dag");
+    assert_eq!(idmat(&[topo]), vec![p(&["docs/a", "docs/b", "docs/d", "docs/c", "docs/plain"])]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn graph_degree_centrality_orders_by_total() {
+    let dir = tmp("degrees");
+    let db = open_db(&dir);
+    let mut a = refdoc_multi(&[("r1", "b"), ("r2", "d")]);
+    a.insert("pad", Value::Int(1));
+    let mut d2 = refdoc_multi(&[("r1", "c")]);
+    d2.insert("pad", Value::Int(2));
+    db.put("docs", "a", &a).unwrap();
+    db.put("docs", "b", &blank()).unwrap();
+    db.put("docs", "c", &blank()).unwrap();
+    db.put("docs", "d", &d2).unwrap();
+    let rows = db
+        .graph_degree_centrality("docs", &spec(TraverseDir::Outgoing, 5, 10))
+        .unwrap();
+    // Fixture edges: a -> {b, d}, d -> c. Totals: a/d 2, b/c 1.
+    let got: Vec<(String, usize, usize)> = rows
+        .into_iter()
+        .map(|((c, i), ind, outd)| (format!("{c}/{i}"), ind, outd))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("docs/a".to_string(), 0, 2),
+            ("docs/d".to_string(), 1, 1),
+            ("docs/b".to_string(), 1, 0),
+            ("docs/c".to_string(), 1, 0),
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn export_graph_json_shape() {
+    let dir = tmp("export");
+    let db = open_db(&dir);
+    db.put("docs", "a", &refdoc("docs", "b")).unwrap();
+    db.put("docs", "b", &blank()).unwrap();
+    let s = db
+        .export_graph_json("docs", &spec(TraverseDir::Outgoing, 5, 10))
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+    let nodes = v["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(nodes[0]["collection"], "docs");
+    assert_eq!(nodes[0]["id"], "a");
+    assert!(nodes[0]["doc"].is_object(), "doc rides inline for viz");
+    let edges = v["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["from"], "docs/a");
+    assert_eq!(edges[0]["to"], "docs/b");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn both_direction_walks_both_sides() {
+    // 'Undirected' traversal closes as already-working (#156 Phase E):
+    // TraverseDir::Both exists since Phase A — one walk = outgoing refs
+    // AND incoming backlinks, cross-collection (users/u1 -> docs/a).
+    let dir = tmp("bothdir");
+    let db = open_db(&dir);
+    db.create_traverse_index("docs").unwrap();
+    seed_chain(&db);
+    wait(&db);
+    let hits = db
+        .find_paths("docs", "a", &spec(TraverseDir::Both, 5, 10))
+        .unwrap();
+    let mut got: Vec<(String, String)> = hits
+        .iter()
+        .map(|h| (h.collection.clone(), h.id.clone()))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            ("docs".to_string(), "b".to_string()),
+            ("docs".to_string(), "c".to_string()),
+            ("users".to_string(), "u1".to_string()),
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
