@@ -398,6 +398,110 @@ fn zero_vector_and_offset() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ===== Phase D (#156): 2-stage hybrid ANN + #141-7 index stats =====
+
+#[test]
+fn vector_index_info_reports_live_stats() {
+    let dir = tmp("stats");
+    {
+        let db = open_db(&dir);
+        seed(&db);
+        wait_ready(&db);
+        let info = &db.list_indexes(Some("pts")).vector["pts"][0];
+        assert_eq!(info.indexed, 4, "all seeded vectors are in the graph");
+        assert!(info.complete, "backfill finished → ANN authoritative");
+        assert!(info.mem_estimate > 0, "upper-bound estimate present");
+    }
+    {
+        // Graphs rebuild on open; stats must converge again.
+        let db = open_db(&dir);
+        wait_ready(&db);
+        let info = &db.list_indexes(Some("pts")).vector["pts"][0];
+        assert_eq!(info.indexed, 4);
+        assert!(info.complete);
+        assert!(info.mem_estimate > 0);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hybrid_2stage_ann_matches_filter_and_stays_exact() {
+    let dir = tmp("hybrid2");
+    let db = open_db(&dir);
+    // 200 docs, d000..d199, even = "a", odd = "b"; deterministic 8-dim
+    // vectors so the test can compute the exact ground truth itself.
+    let q = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+    let emb = |i: usize| -> [f32; 8] {
+        core::array::from_fn(|j| (((i * 13 + j * 7) % 11) as f32) - 5.5)
+    };
+    let mutations: Vec<BatchMutation> = (0..200)
+        .map(|i| BatchMutation::Put {
+            collection: "pts".into(),
+            doc_id: format!("d{i:03}"),
+            doc: vdoc(&emb(i), if i % 2 == 0 { "a" } else { "b" }),
+        })
+        .collect();
+    db.write_batch(mutations).expect("seed");
+    db.create_vector_index("pts", "emb", 8, Metric::Cosine).expect("create");
+    wait_ready(&db);
+
+    // (1) Filtered ANN (2-stage): every row matches, exact distances are
+    // non-decreasing, count == limit.
+    let rows = db
+        .query(
+            Query::new("pts")
+                .where_filter("emb", Operator::Near, Value::Binary(encode_f32s(&q)))
+                .where_filter("grp", Operator::Eq, Value::String("b".into()))
+                .limit(10),
+        )
+        .expect("hybrid query");
+    assert_eq!(rows.len(), 10, "fills to the limit, never strands");
+    let mut last: Option<f64> = None;
+    for (id, doc) in &rows {
+        assert_eq!(doc.get("grp"), Some(&Value::String("b".into())), "{id} must match grp=b");
+        let dv = match doc.get("emb") {
+            Some(Value::Binary(b)) => decode_f32s(b).expect("f32"),
+            other => panic!("expected binary vector, got {other:?}"),
+        };
+        let d = cosine_distance(&q, &dv);
+        if let Some(prev) = last {
+            assert!(d >= prev, "rows must stay nearest-first: {id} {d} after {prev}");
+        }
+        last = Some(d);
+    }
+
+    // (2) Under-fill (grp="rare": 4 docs of 200 — d007/d057/d107/d157):
+    // widening ×4/×16 cannot fill 10, so the exact fallback serves —
+    // result must EQUAL the ground truth for that filter (full recall
+    // by construction).
+    let rare: Vec<usize> = (0..200).filter(|i| i % 50 == 7).collect();
+    assert_eq!(rare, vec![7, 57, 107, 157], "fixture: sparse filter band");
+    let rare_ids: Vec<String> = rare.iter().map(|i| format!("d{i:03}")).collect();
+    // Stamp the rare half with grp="rare" (keep the rest for ANN density).
+    let stamps: Vec<BatchMutation> = rare
+        .iter()
+        .map(|&i| BatchMutation::Put {
+            collection: "pts".into(),
+            doc_id: format!("d{i:03}"),
+            doc: vdoc(&emb(i), "rare"),
+        })
+        .collect();
+    db.write_batch(stamps).expect("stamp");
+    wait_ready(&db);
+    let rows = db
+        .query(
+            Query::new("pts")
+                .where_filter("emb", Operator::Near, Value::Binary(encode_f32s(&q)))
+                .where_filter("grp", Operator::Eq, Value::String("rare".into()))
+                .limit(10),
+        )
+        .expect("underfilled query");
+    let mut got: Vec<String> = rows.into_iter().map(|(id, _)| id).collect();
+    got.sort();
+    assert_eq!(got, rare_ids, "fallback must surface every rare match");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn def_survives_restart() {
     let dir = tmp("restart");

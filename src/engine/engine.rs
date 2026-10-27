@@ -356,10 +356,22 @@ pub struct VectorIndexInfo {
     pub dim: u32,
     pub metric: String,
     /// HNSW params (#141-1); `None` = derived defaults. Serialized to FFI
-    /// consumers as null — additive keys, old consumers unaffected.
+    /// consumers as null - additive keys, old consumers unaffected.
     pub m: Option<usize>,
     pub ef_construction: Option<usize>,
     pub ef_search: Option<usize>,
+    /// Live stats (#141-7), serde-defaulted so older persisted defs load
+    /// unchanged and JSON consumers get additive keys only.
+    /// `indexed` = vectors currently in the HNSW graph; `complete` =
+    /// backfill finished (ANN authoritative, same gate the query path
+    /// uses); `mem_estimate` = rough resident-bytes bound (see
+    /// `HnswIndex::bytes_estimate`).
+    #[serde(default)]
+    pub indexed: usize,
+    #[serde(default)]
+    pub complete: bool,
+    #[serde(default)]
+    pub mem_estimate: u64,
 }
 
 /// One graph hit: collection + id (paths cross collections), BFS depth,
@@ -5046,13 +5058,19 @@ impl Hako {
             }
             let mut infos: Vec<VectorIndexInfo> = fields_map
                 .iter()
-                .map(|(f, d)| VectorIndexInfo {
-                    field: f.clone(),
-                    dim: d.dim,
-                    metric: d.metric.name().to_string(),
-                    m: d.m,
-                    ef_construction: d.ef_construction,
-                    ef_search: d.ef_search,
+                .map(|(f, d)| {
+                    let graph = mgr.hnsw.get(col).and_then(|m| m.get(f));
+                    VectorIndexInfo {
+                        field: f.clone(),
+                        dim: d.dim,
+                        metric: d.metric.name().to_string(),
+                        m: d.m,
+                        ef_construction: d.ef_construction,
+                        ef_search: d.ef_search,
+                        indexed: graph.map(|g| g.len()).unwrap_or(0),
+                        complete: graph.is_some_and(|g| g.complete() && !g.is_empty()),
+                        mem_estimate: graph.map(|g| g.bytes_estimate()).unwrap_or(0),
+                    }
                 })
                 .collect();
             infos.sort_by(|a, b| a.field.cmp(&b.field));
