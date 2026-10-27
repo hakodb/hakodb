@@ -36,7 +36,7 @@ fn blank() -> HakoDoc {
 }
 
 fn spec(dir: TraverseDir, depth: usize, limit: usize) -> TraverseSpec {
-    TraverseSpec { direction: dir, edge_field: None, max_depth: depth, limit, via_edge: None, weight_field: None, node_match: None }
+    TraverseSpec { direction: dir, edge_field: None, max_depth: depth, limit, via_edge: None, weight_field: None, node_match: None, edge_type: None, edge_match: None }
 }
 
 /// Chain a->b->c plus c->a cycle; users collection untracked.
@@ -157,7 +157,7 @@ fn edge_field_filter_and_validation() {
         .find_paths(
             "docs",
             "m",
-            &TraverseSpec { direction: TraverseDir::Outgoing, edge_field: Some("other".into()), max_depth: 5, limit: 10, via_edge: None, weight_field: None, node_match: None },
+            &TraverseSpec { direction: TraverseDir::Outgoing, edge_field: Some("other".into()), max_depth: 5, limit: 10, via_edge: None, weight_field: None, node_match: None, edge_type: None, edge_match: None },
         )
         .unwrap();
     assert_eq!(one.len(), 1);
@@ -235,6 +235,8 @@ fn wspec(dir: TraverseDir, depth: usize, limit: usize) -> TraverseSpec {
         via_edge: Some("rel".into()),
         weight_field: Some("w".into()),
         node_match: None,
+        edge_type: None,
+        edge_match: None,
     }
 }
 
@@ -279,6 +281,8 @@ fn dijkstra_prefers_cheap_over_short() {
             via_edge: Some("rel".into()),
             weight_field: None,
             node_match: None,
+            edge_type: None,
+            edge_match: None,
         })
         .unwrap();
     let mut ids: Vec<&str> = bfs.iter().map(|h| h.id.as_str()).collect();
@@ -714,6 +718,172 @@ fn both_direction_walks_both_sides() {
             ("docs".to_string(), "c".to_string()),
             ("users".to_string(), "u1".to_string()),
         ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+
+// ===== Phase F-1 (#140-7): edge predicates + via projection =====
+
+/// Inline a->b hop plus edge b->c; the edge doc carries a type field and
+/// a flag so both predicates have something to bite on.
+fn seed_f1(db: &Hako) {
+    db.create_edge_index("rel").unwrap();
+    let mut e1 = edge_doc("n", "b", "n", "c", serde_json::json!(null));
+    e1.insert("type", Value::String("follows".into()));
+    e1.insert("approved", Value::Bool(true));
+    db.put("rel", "e1", &e1).unwrap();
+    db.put("n", "a", &refdoc("n", "b")).unwrap();
+    db.put("n", "b", &blank()).unwrap();
+    db.put("n", "c", &blank()).unwrap();
+}
+
+fn f1spec(dir: TraverseDir, t: Option<(&str, Value)>, m: Option<(&str, Value)>) -> TraverseSpec {
+    TraverseSpec {
+        direction: dir,
+        edge_field: None,
+        max_depth: 5,
+        limit: 10,
+        via_edge: Some("rel".into()),
+        weight_field: None,
+        node_match: None,
+        edge_type: t.map(|(f, v)| (f.to_string(), v)),
+        edge_match: m.map(|(f, v)| (f.to_string(), v)),
+    }
+}
+
+#[test]
+fn edge_type_routes_relationships() {
+    let dir = tmp("f1-type");
+    let db = open_db(&dir);
+    seed_f1(&db);
+    wait(&db);
+    // Inline hops are exempt; the edge doc is the only b->c route.
+    let follows = db
+        .find_paths(
+            "n",
+            "a",
+            &f1spec(TraverseDir::Outgoing, Some(("type", Value::String("follows".into()))), None),
+        )
+        .unwrap();
+    assert_eq!(
+        follows.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["b", "c"],
+        "follows route reaches c"
+    );
+    let blocks = db
+        .find_paths(
+            "n",
+            "a",
+            &f1spec(TraverseDir::Outgoing, Some(("type", Value::String("blocks".into()))), None),
+        )
+        .unwrap();
+    assert_eq!(
+        blocks.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["b"],
+        "blocks excludes the only edge doc; inline a->b still serves"
+    );
+    // No predicate = Phase B behavior (both routes).
+    let all = db.find_paths("n", "a", &f1spec(TraverseDir::Outgoing, None, None)).unwrap();
+    assert_eq!(all.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), vec!["b", "c"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn edge_match_filters_edge_properties() {
+    let dir = tmp("f1-match");
+    let db = open_db(&dir);
+    seed_f1(&db);
+    wait(&db);
+    let yes = db
+        .find_paths(
+            "n",
+            "a",
+            &f1spec(TraverseDir::Outgoing, None, Some(("approved", Value::Bool(true)))),
+        )
+        .unwrap();
+    assert_eq!(yes.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), vec!["b", "c"]);
+    let no = db
+        .find_paths(
+            "n",
+            "a",
+            &f1spec(TraverseDir::Outgoing, None, Some(("approved", Value::Bool(false)))),
+        )
+        .unwrap();
+    assert_eq!(no.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), vec!["b"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn edge_type_and_edge_match_both_apply() {
+    let dir = tmp("f1-both");
+    let db = open_db(&dir);
+    seed_f1(&db);
+    wait(&db);
+    // AND semantics everywhere: type follows + approved=false rejects e1.
+    let noisy = db
+        .find_paths(
+            "n",
+            "a",
+            &f1spec(
+                TraverseDir::Outgoing,
+                Some(("type", Value::String("follows".into()))),
+                Some(("approved", Value::Bool(false))),
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        noisy.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["b"],
+        "inline hop survives, edge doc rejected"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn via_aligns_with_path_hops() {
+    let dir = tmp("f1-via");
+    let db = open_db(&dir);
+    seed_f1(&db);
+    wait(&db);
+    let hits = db
+        .find_paths("n", "a", &f1spec(TraverseDir::Outgoing, None, None))
+        .unwrap();
+    let b = hits.iter().find(|h| h.id == "b").unwrap();
+    assert_eq!(b.path, vec![("n".to_string(), "a".to_string()), ("n".to_string(), "b".to_string())]);
+    assert_eq!(b.via, vec![None], "inline hop rides null");
+    let c = hits.iter().find(|h| h.id == "c").unwrap();
+    assert_eq!(c.via, vec![None, Some("rel/e1".to_string())], "edge hop rides edge_col/id");
+    assert_eq!(c.via.len() + 1, c.path.len());
+    // Simple paths carry via too; the depth-0 start row has none.
+    let sp = db
+        .find_simple_paths("n", "a", &f1spec(TraverseDir::Outgoing, None, None))
+        .unwrap();
+    let start = sp.iter().find(|h| h.depth == 0).unwrap();
+    assert!(start.via.is_empty(), "start ride is hopless: {:?}", start.via);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn via_covers_weighted_edge_hops() {
+    let dir = tmp("f1-via-w");
+    let db = open_db(&dir);
+    seed_edges(&db);
+    wait(&db);
+    let dj = db.find_paths("n", "a", &wspec(TraverseDir::Outgoing, 5, 10)).unwrap();
+    let c = dj.iter().find(|h| h.id == "c").expect("c in dijkstra rows");
+    assert_eq!(
+        c.path,
+        vec![
+            ("n".to_string(), "a".to_string()),
+            ("n".to_string(), "b".to_string()),
+            ("n".to_string(), "c".to_string()),
+        ]
+    );
+    assert_eq!(
+        c.via,
+        vec![Some("rel/e1".to_string()), Some("rel/e2".to_string())],
+        "pure edge hops carry full edge refs"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

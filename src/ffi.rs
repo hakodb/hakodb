@@ -4286,6 +4286,8 @@ fn traverse_rows_json(rows: &[crate::engine::TraverseHit]) -> String {
             "depth": hit.depth,
             "cost": hit.cost,
             "path": hit.path.iter().map(|(c, i)| format!("{c}/{i}")).collect::<Vec<_>>(),
+            // F-1 (#140-7), additive: per-hop edge doc, null for inline hops.
+            "via": hit.via.iter().map(|v| v.as_deref()).collect::<Vec<_>>(),
             "doc": doc_json,
         }));
     }
@@ -4352,6 +4354,8 @@ pub extern "C" fn hk_engine_find_paths(
             via_edge: None,
             weight_field: None,
             node_match: None,
+            edge_type: None,
+            edge_match: None,
         };
         let rows = match engine.db.find_paths(&col, &id, &spec) {
             Ok(r) => r,
@@ -4445,6 +4449,8 @@ pub extern "C" fn hk_engine_find_paths_v2(
             via_edge: None,
             weight_field: None,
             node_match,
+            edge_type: None,
+            edge_match: None,
         };
         let rows = match engine.db.find_paths(&col, &id, &spec) {
             Ok(r) => r,
@@ -4534,6 +4540,232 @@ pub extern "C" fn hk_engine_find_simple_paths(
             via_edge: opt_str(via_edge),
             weight_field: opt_str(weight_field),
             node_match,
+            edge_type: None,
+            edge_match: None,
+        };
+        let rows = match engine.db.find_simple_paths(&col, &id, &spec) {
+            Ok(r) => r,
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                return ptr::null_mut();
+            }
+        };
+        match CString::new(traverse_rows_json(&rows)) {
+            Ok(s) => {
+                clear_last_error();
+                s.into_raw()
+            }
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Typed/filtered edge-collection BFS (#156 Phase F-1, #140-7): anchors a
+/// walk on `via_edge`-style relationships with first-class edge predicates.
+/// `via_edge` names the relationship layer (required for the predicates to
+/// have anything to bite on — inline refs have no edge doc). `type_field`
+/// and `type_json` name the relationship routing (an equality predicate on
+/// the edge doc); `match_field` with `match_json` filters on any edge
+/// property; both apply to edge-collection hops (AND when both set),
+/// inline-ref hops are exempt. `filter_field` and `filter_json` prune
+/// nodes like `hk_engine_find_paths_v2`. Rows gain an additive `"via"`
+/// array — the edge doc that connected each hop, null for inline hops.
+/// v3 exists only to extend the frozen v2 signature (additive C ABI).
+#[no_mangle]
+pub extern "C" fn hk_engine_find_paths_v3(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    doc_id: *const c_char,
+    direction: u32,
+    edge_field: *const c_char,
+    via_edge: *const c_char,
+    max_depth: usize,
+    k: usize,
+    filter_field: *const c_char,
+    filter_json: *const c_char,
+    type_field: *const c_char,
+    type_json: *const c_char,
+    match_field: *const c_char,
+    match_json: *const c_char,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error_err("null engine handle");
+            return ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let col = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let id = match cstr_to_string(doc_id) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let dir = match crate::index::traverse::TraverseDir::from_u32(direction) {
+            Ok(d) => d,
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                return ptr::null_mut();
+            }
+        };
+        let opt_str = |p: *const c_char| {
+            if p.is_null() {
+                None
+            } else {
+                cstr_to_string(p).ok()
+            }
+        };
+        // Generic (field, json) pair parser shared with the node filter.
+        let node_match = match parse_node_match(filter_field, filter_json) {
+            Ok(nm) => nm,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let edge_type = match parse_node_match(type_field, type_json) {
+            Ok(p) => p,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let edge_match = match parse_node_match(match_field, match_json) {
+            Ok(p) => p,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let spec = crate::index::traverse::TraverseSpec {
+            direction: dir,
+            edge_field: opt_str(edge_field),
+            max_depth,
+            limit: if k == 0 { 10 } else { k },
+            via_edge: opt_str(via_edge),
+            weight_field: None,
+            node_match,
+            edge_type,
+            edge_match,
+        };
+        let rows = match engine.db.find_paths(&col, &id, &spec) {
+            Ok(r) => r,
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                return ptr::null_mut();
+            }
+        };
+        match CString::new(traverse_rows_json(&rows)) {
+            Ok(s) => {
+                clear_last_error();
+                s.into_raw()
+            }
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Simple-path enumeration with edge predicates (#156 Phase F-1, #140-7):
+/// `hk_engine_find_simple_paths` plus `type_field`/`type_json` (relationship
+/// routing) and `match_field`/`match_json` (edge-property filter), same
+/// semantics as `hk_engine_find_paths_v3`. Rows keep the additive `"via"`
+/// array. v2 exists only to extend the frozen v1 signature.
+#[no_mangle]
+pub extern "C" fn hk_engine_find_simple_paths_v2(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    doc_id: *const c_char,
+    direction: u32,
+    edge_field: *const c_char,
+    via_edge: *const c_char,
+    weight_field: *const c_char,
+    max_depth: usize,
+    k: usize,
+    filter_field: *const c_char,
+    filter_json: *const c_char,
+    type_field: *const c_char,
+    type_json: *const c_char,
+    match_field: *const c_char,
+    match_json: *const c_char,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error_err("null engine handle");
+            return ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let col = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let id = match cstr_to_string(doc_id) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let dir = match crate::index::traverse::TraverseDir::from_u32(direction) {
+            Ok(d) => d,
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                return ptr::null_mut();
+            }
+        };
+        let opt_str = |p: *const c_char| {
+            if p.is_null() {
+                None
+            } else {
+                cstr_to_string(p).ok()
+            }
+        };
+        let node_match = match parse_node_match(filter_field, filter_json) {
+            Ok(nm) => nm,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let edge_type = match parse_node_match(type_field, type_json) {
+            Ok(p) => p,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let edge_match = match parse_node_match(match_field, match_json) {
+            Ok(p) => p,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let spec = crate::index::traverse::TraverseSpec {
+            direction: dir,
+            edge_field: opt_str(edge_field),
+            max_depth,
+            limit: if k == 0 { 10 } else { k },
+            via_edge: opt_str(via_edge),
+            weight_field: opt_str(weight_field),
+            node_match,
+            edge_type,
+            edge_match,
         };
         let rows = match engine.db.find_simple_paths(&col, &id, &spec) {
             Ok(r) => r,
@@ -4628,6 +4860,8 @@ pub extern "C" fn hk_engine_graph_analysis(
             via_edge: opt_str(via_edge),
             weight_field: None,
             node_match,
+            edge_type: None,
+            edge_match: None,
         };
         let ids = |p: &[(String, String)]| -> Vec<String> {
             p.iter().map(|(c, i)| format!("{c}/{i}")).collect()
@@ -4730,6 +4964,8 @@ pub extern "C" fn hk_engine_export_graph(
             via_edge: opt_str(via_edge),
             weight_field: None,
             node_match,
+            edge_type: None,
+            edge_match: None,
         };
         match engine.db.export_graph_json(&col, &spec) {
             Ok(s) => match CString::new(s) {
@@ -4859,6 +5095,8 @@ pub extern "C" fn hk_engine_shortest_paths(
             via_edge: opt_str(via_edge),
             weight_field: opt_str(weight_field),
             node_match: None,
+            edge_type: None,
+            edge_match: None,
         };
         let rows = match engine.db.find_paths(&col, &id, &spec) {
             Ok(r) => r,

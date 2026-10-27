@@ -99,6 +99,8 @@ fn incoming(db: &Hako) -> hakodb::error::Result<Vec<hakodb::engine::TraverseHit>
             via_edge: None,
             weight_field: None,
             node_match: None,
+            edge_type: None,
+            edge_match: None,
         },
     )
 }

@@ -161,13 +161,15 @@ impl QueryPlanner {
                                             via_edge: via,
                                             weight_field: weight,
                                             node_match: None,
+                                            edge_type: None,
+                                            edge_match: None,
                                         };
                                         let mut plan = Self::make_plan(
                                             query,
                                             ScanType::Traverse {
                                                 start_col: tf.field.clone(),
                                                 start_id,
-                                                spec,
+                                                spec: Box::new(spec),
                                                 extra,
                                             },
                                             query.limit.map(|l| l + query.offset.unwrap_or(0)),

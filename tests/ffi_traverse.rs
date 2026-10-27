@@ -435,3 +435,141 @@ fn export_graph_over_ffi() {
         ])
     );
 }
+
+
+#[test]
+fn find_paths_v3_routes_and_projects_via() {
+    use hakodb::ffi::hk_engine_find_paths_v3;
+    let dir = tmp("v3");
+    {
+        let mut cfg = HakoConfig::default();
+        cfg.durability_mode = DurabilityMode::Manual;
+        let db = Hako::open(&dir, cfg).expect("open");
+        db.create_edge_index("rel").expect("edge");
+        let edge = |f: &str, t: &str, typ: &str| {
+            let mut doc = HakoDoc::default();
+            doc.insert("_from", Value::Reference { collection: "n".into(), doc_id: f.into() });
+            doc.insert("_to", Value::Reference { collection: "n".into(), doc_id: t.into() });
+            doc.insert("w", Value::Float(1.0));
+            doc.insert("type", Value::String(typ.into()));
+            doc
+        };
+        db.write_batch(vec![
+            BatchMutation::Put { collection: "rel".into(), doc_id: "e1".into(), doc: edge("a", "b", "follows") },
+            BatchMutation::Put { collection: "rel".into(), doc_id: "e2".into(), doc: edge("b", "c", "blocks") },
+        ])
+        .expect("seed");
+        for id in ["a", "b", "c"] {
+            db.write_batch(vec![BatchMutation::Put {
+                collection: "n".into(),
+                doc_id: id.to_string(),
+                doc: HakoDoc::default(),
+            }])
+            .expect("seed");
+        }
+        db.flush().expect("flush");
+    }
+    let eng = open(&dir);
+    let col = CString::new("n").unwrap();
+    let id = CString::new("a").unwrap();
+    let rel = CString::new("rel").unwrap();
+    let tf = CString::new("type").unwrap();
+    let follows = CString::new("\"follows\"").unwrap();
+    let nul = std::ptr::null();
+
+    // Follows only: c unreachable through the blocks edge.
+    let rows = to_json({
+        hk_engine_find_paths_v3(
+            eng, col.as_ptr(), id.as_ptr(), 0, nul, rel.as_ptr(), 5, 10,
+            nul, nul, tf.as_ptr(), follows.as_ptr(), nul, nul,
+        )
+    });
+    let arr = rows.as_array().expect("rows");
+    let ids: Vec<&str> = arr.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["b"], "blocks edge filtered: {rows:?}");
+    for r in arr {
+        assert!(r["via"].is_array(), "additive via key rides: {r:?}");
+        assert_eq!(r["via"].as_array().unwrap().len(), 1);
+    }
+    assert_eq!(arr[0]["via"], serde_json::json!(["rel/e1"]));
+
+    // No predicates (all-null pair args): both hops serve.
+    let rows = to_json({
+        hk_engine_find_paths_v3(
+            eng, col.as_ptr(), id.as_ptr(), 0, nul, rel.as_ptr(), 5, 10,
+            nul, nul, nul, nul, nul, nul,
+        )
+    });
+    let arr = rows.as_array().expect("rows");
+    assert_eq!(arr.iter().map(|r| r["id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["b", "c"]);
+
+    // Mismatched filter pair is a loud error.
+    let past = {
+        hk_engine_find_paths_v3(
+            eng, col.as_ptr(), id.as_ptr(), 0, nul, rel.as_ptr(), 5, 10,
+            nul, nul, tf.as_ptr(), nul, nul, nul,
+        )
+    };
+    assert!(past.is_null(), "field without json = loud error");
+    assert!(last_err().contains("filter_json"));
+}
+
+#[test]
+fn find_simple_paths_v2_match_and_via() {
+    use hakodb::ffi::hk_engine_find_simple_paths_v2;
+    let dir = tmp("simplev2");
+    seed_edge_db(&dir);
+    let eng = open(&dir);
+    let col = CString::new("n").unwrap();
+    let id = CString::new("a").unwrap();
+    let rel = CString::new("rel").unwrap();
+    let w = CString::new("w").unwrap();
+    let one = CString::new("1.0").unwrap();
+    let nul = std::ptr::null();
+
+    // edge_match w == 1.0 excludes the direct a->c shortcut (w = 10).
+    let out = {
+        hk_engine_find_simple_paths_v2(
+            eng, col.as_ptr(), id.as_ptr(), 0,
+            nul, rel.as_ptr(), nul, 5, 10,
+            nul, nul, nul, nul, w.as_ptr(), one.as_ptr(),
+        )
+    };
+    let rows = to_json(out);
+    let arr = rows.as_array().expect("rows");
+    let got: Vec<(&str, usize, Vec<String>)> = arr
+        .iter()
+        .map(|r| {
+            (
+                r["id"].as_str().unwrap(),
+                r["depth"].as_u64().unwrap() as usize,
+                r["via"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap_or("").to_string())
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("a", 0, vec![]),
+            ("b", 1, vec!["rel/e1".to_string()]),
+            ("c", 2, vec!["rel/e1".to_string(), "rel/e2".to_string()]),
+        ],
+        "route rows order by cost, via rides: {rows:?}"
+    );
+
+    // Half a (field, json) pair is a loud error, not a silent no-op.
+    let out = {
+        hk_engine_find_simple_paths_v2(
+            eng, col.as_ptr(), id.as_ptr(), 0,
+            nul, rel.as_ptr(), nul, 5, 10,
+            nul, nul, w.as_ptr(), nul, nul, nul,
+        )
+    };
+    assert!(out.is_null(), "half pair must error");
+    assert!(last_err().contains("filter_json required"), "err: {}", last_err());
+}
