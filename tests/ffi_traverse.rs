@@ -198,3 +198,140 @@ fn seed_edge_db(dir: &std::path::Path) {
     }
     db.flush().expect("flush");
 }
+
+#[test]
+fn find_paths_v2_filter_prunes_descent() {
+    use hakodb::ffi::hk_engine_find_paths_v2;
+    let dir = tmp("v2filter");
+    seed(&dir);
+    // Stamp kinds: b = "hop" (matches), c = "stop" (does not). The start
+    // node "a" has no kind at all — it is expanded regardless.
+    {
+        let mut cfg = HakoConfig::default();
+        cfg.durability_mode = DurabilityMode::Manual;
+        let db = Hako::open(&dir, cfg).expect("open");
+        let mut bdoc = HakoDoc::default();
+        bdoc.insert("kind", Value::String("hop".into()));
+        bdoc.insert("link", Value::Reference { collection: "pts".into(), doc_id: "c".into() });
+        let mut cdoc = HakoDoc::default();
+        cdoc.insert("kind", Value::String("stop".into()));
+        cdoc.insert("v", Value::Int(1));
+        db.write_batch(vec![
+            BatchMutation::Put { collection: "pts".into(), doc_id: "b".into(), doc: bdoc },
+            BatchMutation::Put { collection: "pts".into(), doc_id: "c".into(), doc: cdoc },
+        ])
+        .expect("stamp");
+        db.flush().expect("flush");
+    }
+    let eng = open(&dir);
+    let col = CString::new("pts").unwrap();
+    let id = CString::new("a").unwrap();
+    let kind = CString::new("kind").unwrap();
+    let hop = CString::new("\"hop\"").unwrap();
+    // Filtered: c is pruned (non-matching), so only b serves.
+    let out = {
+        hk_engine_find_paths_v2(
+            eng,
+            col.as_ptr(),
+            id.as_ptr(),
+            0,
+            std::ptr::null(),
+            10,
+            10,
+            kind.as_ptr(),
+            hop.as_ptr(),
+        )
+    };
+    let arr = to_json(out).as_array().expect("array").clone();
+    assert_eq!(arr.len(), 1, "c must be pruned: {arr:?}");
+    assert_eq!(arr[0]["id"], "b");
+    assert_eq!(arr[0]["path"], serde_json::json!(["pts/a", "pts/b"]));
+    // Unfiltered (nulls): the plain v1-equivalent walk sees c too.
+    let out2 = {
+        hk_engine_find_paths_v2(
+            eng, col.as_ptr(), id.as_ptr(), 0, std::ptr::null(), 10, 10,
+            std::ptr::null(), std::ptr::null(),
+        )
+    };
+    assert_eq!(to_json(out2).as_array().expect("array").len(), 2);
+    // One-sided filter is a loud error, never a silent partial filter.
+    let bad = {
+        hk_engine_find_paths_v2(
+            eng, col.as_ptr(), id.as_ptr(), 0, std::ptr::null(), 10, 10,
+            kind.as_ptr(), std::ptr::null(),
+        )
+    };
+    assert!(bad.is_null(), "one-sided filter must fail");
+    assert!(last_err().contains("filter_json"), "got: {}", last_err());
+}
+
+#[test]
+fn find_simple_paths_over_ffi_route_rows() {
+    use hakodb::ffi::hk_engine_find_simple_paths;
+    let dir = tmp("simpleffi");
+    seed(&dir);
+    let eng = open(&dir);
+    let col = CString::new("pts").unwrap();
+    let id = CString::new("a").unwrap();
+    // Chain a -> b -> c: each distinct simple path is one row, cheapest
+    // first, start row included (depth 0).
+    let out = {
+        hk_engine_find_simple_paths(
+            eng,
+            col.as_ptr(),
+            id.as_ptr(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            10,
+            10,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    let v = to_json(out);
+    let arr = v.as_array().expect("array");
+    assert_eq!(arr.len(), 3);
+    assert_eq!(arr[0]["id"], "a");
+    assert_eq!(arr[0]["depth"], 0);
+    assert_eq!(arr[0]["path"], serde_json::json!(["pts/a"]));
+    assert_eq!(arr[1]["path"], serde_json::json!(["pts/a", "pts/b"]));
+    assert_eq!(arr[2]["path"], serde_json::json!(["pts/a", "pts/b", "pts/c"]));
+}
+
+#[test]
+fn find_simple_paths_weighted_over_ffi() {
+    use hakodb::ffi::hk_engine_find_simple_paths;
+    let dir = tmp("simplewffi");
+    seed_edge_db(&dir);
+    let eng = open(&dir);
+    let col = CString::new("n").unwrap();
+    let id = CString::new("a").unwrap();
+    let via = CString::new("rel").unwrap();
+    let w = CString::new("w").unwrap();
+    // Two routes to c: via b costs 2, direct costs 10 — both are rows.
+    let out = {
+        hk_engine_find_simple_paths(
+            eng,
+            col.as_ptr(),
+            id.as_ptr(),
+            0,
+            std::ptr::null(),
+            via.as_ptr(),
+            w.as_ptr(),
+            10,
+            10,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    let v = to_json(out);
+    let arr = v.as_array().expect("array");
+    assert_eq!(arr.len(), 4);
+    assert_eq!(arr[2]["id"], "c");
+    assert!((arr[2]["cost"].as_f64().unwrap() - 2.0).abs() < 1e-9);
+    assert_eq!(arr[3]["id"], "c");
+    assert!((arr[3]["cost"].as_f64().unwrap() - 10.0).abs() < 1e-9);
+    assert_eq!(arr[3]["path"], serde_json::json!(["n/a", "n/c"]));
+}

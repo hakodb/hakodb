@@ -4,7 +4,7 @@ use hakodb::config::{DurabilityMode, HakoConfig};
 use hakodb::document::hako_doc::HakoDoc;
 use hakodb::document::value::Value;
 use hakodb::engine::Hako;
-use hakodb::index::traverse::{TraverseDir, TraverseSpec, MAX_TRAVERSE_DEPTH};
+use hakodb::index::traverse::{TraverseDir, TraverseSpec, MAX_TRAVERSE_DEPTH_CAP};
 
 fn open_db(dir: &std::path::Path) -> Hako {
     let mut cfg = HakoConfig::default();
@@ -36,7 +36,7 @@ fn blank() -> HakoDoc {
 }
 
 fn spec(dir: TraverseDir, depth: usize, limit: usize) -> TraverseSpec {
-    TraverseSpec { direction: dir, edge_field: None, max_depth: depth, limit, via_edge: None, weight_field: None }
+    TraverseSpec { direction: dir, edge_field: None, max_depth: depth, limit, via_edge: None, weight_field: None, node_match: None }
 }
 
 /// Chain a->b->c plus c->a cycle; users collection untracked.
@@ -157,7 +157,7 @@ fn edge_field_filter_and_validation() {
         .find_paths(
             "docs",
             "m",
-            &TraverseSpec { direction: TraverseDir::Outgoing, edge_field: Some("other".into()), max_depth: 5, limit: 10, via_edge: None, weight_field: None },
+            &TraverseSpec { direction: TraverseDir::Outgoing, edge_field: Some("other".into()), max_depth: 5, limit: 10, via_edge: None, weight_field: None, node_match: None },
         )
         .unwrap();
     assert_eq!(one.len(), 1);
@@ -165,7 +165,7 @@ fn edge_field_filter_and_validation() {
     // depth 0 and over-cap are hard errors, never silent clamps.
     assert!(db.find_paths("docs", "m", &spec(TraverseDir::Outgoing, 0, 10)).is_err());
     assert!(db
-        .find_paths("docs", "m", &spec(TraverseDir::Outgoing, MAX_TRAVERSE_DEPTH + 1, 10))
+        .find_paths("docs", "m", &spec(TraverseDir::Outgoing, MAX_TRAVERSE_DEPTH_CAP + 1, 10))
         .is_err());
     assert!(db.find_paths("docs", "m", &spec(TraverseDir::Outgoing, 5, 0)).is_err());
     // Missing anchor = empty (fail-closed).
@@ -234,6 +234,7 @@ fn wspec(dir: TraverseDir, depth: usize, limit: usize) -> TraverseSpec {
         limit,
         via_edge: Some("rel".into()),
         weight_field: Some("w".into()),
+        node_match: None,
     }
 }
 
@@ -277,6 +278,7 @@ fn dijkstra_prefers_cheap_over_short() {
             limit: 10,
             via_edge: Some("rel".into()),
             weight_field: None,
+            node_match: None,
         })
         .unwrap();
     let mut ids: Vec<&str> = bfs.iter().map(|h| h.id.as_str()).collect();
@@ -353,5 +355,182 @@ fn edge_incoming_walks_reverse() {
     let mut ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
     ids.sort();
     assert_eq!(ids, vec!["a", "b"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ===== Phase C (#156): filtered traversal, 256 depth cap, simple paths =====
+
+/// a -(kind:start, link)-> b -(kind:hop, link)-> c -(kind:hop, link)->
+/// d -(kind:stop). Matching nodes visited AND expanded; non-matching
+/// pruned. The start node is expanded regardless (`kind: start`).
+fn seed_kinds(db: &Hako) {
+    let mut a = HakoDoc::default();
+    a.insert("kind", Value::String("start".into()));
+    a.insert("link", Value::Reference { collection: "docs".into(), doc_id: "b".into() });
+    let mut b = HakoDoc::default();
+    b.insert("kind", Value::String("hop".into()));
+    b.insert("link", Value::Reference { collection: "docs".into(), doc_id: "c".into() });
+    let mut c = HakoDoc::default();
+    c.insert("kind", Value::String("hop".into()));
+    c.insert("link", Value::Reference { collection: "docs".into(), doc_id: "d".into() });
+    let mut d = HakoDoc::default();
+    d.insert("kind", Value::String("stop".into()));
+    db.put("docs", "a", &a).unwrap();
+    db.put("docs", "b", &b).unwrap();
+    db.put("docs", "c", &c).unwrap();
+    db.put("docs", "d", &d).unwrap();
+}
+
+fn nodespec(field: &str, want: &str) -> TraverseSpec {
+    TraverseSpec {
+        node_match: Some((field.into(), Value::String(want.into()))),
+        ..spec(TraverseDir::Outgoing, 5, 10)
+    }
+}
+
+fn rows_of(hits: &[hakodb::engine::TraverseHit]) -> Vec<(String, usize, Vec<String>)> {
+    hits.iter()
+        .map(|h| {
+            (
+                h.id.clone(),
+                h.depth,
+                h.path.iter().map(|(c, i)| format!("{c}/{i}")).collect(),
+            )
+        })
+        .collect()
+}
+
+fn p(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn node_match_filters_and_prunes_descent() {
+    let dir = tmp("nmatch");
+    let db = open_db(&dir);
+    db.create_traverse_index("docs").unwrap();
+    seed_kinds(&db);
+    wait(&db);
+    // b and c match ("hop"); d does not and must not be reached (pruned
+    // descent, not post-filter).
+    let hits = db.find_paths("docs", "a", &nodespec("kind", "hop")).unwrap();
+    let want: Vec<(String, usize, Vec<String>)> = vec![
+        ("b".into(), 1, p(&["docs/a", "docs/b"])),
+        ("c".into(), 2, p(&["docs/a", "docs/b", "docs/c"])),
+    ];
+    assert_eq!(rows_of(&hits), want);
+    // A filter nothing satisfies prunes the first neighbor: empty walk.
+    assert!(db.find_paths("docs", "a", &nodespec("kind", "never")).unwrap().is_empty());
+    // Unfiltered walk sees d — the filter changed reachability.
+    let plain = db.find_paths("docs", "a", &spec(TraverseDir::Outgoing, 5, 10)).unwrap();
+    assert_eq!(
+        plain.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["b", "c", "d"]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn depth_cap_allows_256_functionally_and_rejects_257() {
+    let dir = tmp("cap");
+    let db = open_db(&dir);
+    db.create_traverse_index("docs").unwrap();
+    // Real 255-edge chain x000 -> x255: the cap must WORK, not just validate.
+    for i in 0..256usize {
+        let mut doc = HakoDoc::default();
+        if i + 1 < 256 {
+            doc.insert(
+                "link",
+                Value::Reference { collection: "docs".into(), doc_id: format!("x{:03}", i + 1) },
+            );
+        }
+        db.put("docs", &format!("x{i:03}"), &doc).unwrap();
+    }
+    wait(&db);
+    let hits = db.find_paths("docs", "x000", &spec(TraverseDir::Outgoing, 256, 300)).unwrap();
+    let last = hits.last().expect("deep chain must have hits");
+    assert_eq!(last.id, "x255");
+    assert_eq!(last.depth, 255);
+    assert_eq!(last.path.len(), 256);
+    // Above the cap or zero: hard error, never a silent clamp.
+    assert!(db.find_paths("docs", "x000", &spec(TraverseDir::Outgoing, 257, 300)).is_err());
+    assert!(db.find_paths("docs", "x000", &spec(TraverseDir::Outgoing, 0, 300)).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn find_simple_paths_routes_not_node_hits() {
+    let dir = tmp("simple");
+    let db = open_db(&dir);
+    db.create_traverse_index("docs").unwrap();
+    // Diamond: a -> {b, d} -> c, distinct inline ref fields.
+    let mut a = HakoDoc::default();
+    a.insert("r1", Value::Reference { collection: "docs".into(), doc_id: "b".into() });
+    a.insert("r2", Value::Reference { collection: "docs".into(), doc_id: "d".into() });
+    let mut b = HakoDoc::default();
+    b.insert("r1", Value::Reference { collection: "docs".into(), doc_id: "c".into() });
+    let mut d = HakoDoc::default();
+    d.insert("r1", Value::Reference { collection: "docs".into(), doc_id: "c".into() });
+    db.put("docs", "a", &a).unwrap();
+    db.put("docs", "b", &b).unwrap();
+    db.put("docs", "c", &blank()).unwrap();
+    db.put("docs", "d", &d).unwrap();
+    wait(&db);
+    let paths = db
+        .find_simple_paths("docs", "a", &spec(TraverseDir::Outgoing, 5, 10))
+        .unwrap();
+    let want: Vec<(String, usize, Vec<String>)> = vec![
+        ("a".into(), 0, p(&["docs/a"])),
+        ("b".into(), 1, p(&["docs/a", "docs/b"])),
+        ("d".into(), 1, p(&["docs/a", "docs/d"])),
+        ("c".into(), 2, p(&["docs/a", "docs/b", "docs/c"])),
+        ("c".into(), 2, p(&["docs/a", "docs/d", "docs/c"])),
+    ];
+    assert_eq!(rows_of(&paths), want);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn find_simple_paths_never_repeats_nodes_and_respects_limit() {
+    let dir = tmp("simplecyc");
+    let db = open_db(&dir);
+    db.create_traverse_index("docs").unwrap();
+    seed_chain(&db); // a -> b -> c -> a cycle
+    wait(&db);
+    let paths = db
+        .find_simple_paths("docs", "a", &spec(TraverseDir::Outgoing, 10, 100))
+        .unwrap();
+    assert_eq!(
+        paths.iter().map(|h| h.path.len()).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "cycle closes: no path may revisit a node"
+    );
+    // limit caps results, keeping the cheapest.
+    let two = db
+        .find_simple_paths("docs", "a", &spec(TraverseDir::Outgoing, 10, 2))
+        .unwrap();
+    assert_eq!(two.len(), 2);
+    assert_eq!(two[1].id, "b");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn find_simple_paths_weighted_orders_by_cost() {
+    let dir = tmp("simplew");
+    let db = open_db(&dir);
+    seed_edges(&db); // a -1-> b -1-> c, plus a -10-> c (edge docs, via "rel", weight "w")
+    wait(&db);
+    let paths = db
+        .find_simple_paths("n", "a", &wspec(TraverseDir::Outgoing, 5, 10))
+        .unwrap();
+    let want: Vec<(String, usize, Vec<String>)> = vec![
+        ("a".into(), 0, p(&["n/a"])),
+        ("b".into(), 1, p(&["n/a", "n/b"])),
+        ("c".into(), 2, p(&["n/a", "n/b", "n/c"])),
+        ("c".into(), 1, p(&["n/a", "n/c"])),
+    ];
+    assert_eq!(rows_of(&paths), want);
+    // The direct 10-weight route is costlier than the chain: 2 < 10.
+    assert!(paths[3].cost > paths[2].cost);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -160,6 +160,7 @@ impl QueryPlanner {
                                             limit,
                                             via_edge: via,
                                             weight_field: weight,
+                                            node_match: None,
                                         };
                                         let mut plan = Self::make_plan(
                                             query,
