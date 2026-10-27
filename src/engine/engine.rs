@@ -3574,6 +3574,18 @@ impl Hako {
             .collect())
     }
 
+    /// [`Self::query_arc`] keeping the executor's `RowRef` distinction (#161):
+    /// only rows served from the query row cache are `Shared` (the entire
+    /// source of the zero-copy win); freshly decoded rows stay owned, so the
+    /// FFI wraps them as `DocRef::Owned` and large scans pay zero per-row
+    /// `Arc::new`/drop churn — the std scan-regression root cause.
+    pub(crate) fn query_row_refs(
+        &self,
+        query: Query,
+    ) -> Result<Vec<(String, crate::query::executor::executor::RowRef)>> {
+        self.query_rows(query, None)
+    }
+
     /// The single query funnel (plan cache, traverse branch, audit): returns
     /// the executor's `RowRef` rows so the owned and arc wrappers above share
     /// one implementation.
