@@ -80,7 +80,9 @@ pub enum ScanType {
     Traverse {
         start_col: String,
         start_id: String,
-        spec: crate::index::traverse::TraverseSpec,
+        // Boxed: TraverseSpec carries several (String, Value) predicate
+        // fields — inline would dominate the enum's smaller variants.
+        spec: Box<crate::index::traverse::TraverseSpec>,
         extra: Vec<Filter>,
     },
     // UPDATED: CursorIndex now defines a strict range

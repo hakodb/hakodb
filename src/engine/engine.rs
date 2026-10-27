@@ -395,6 +395,11 @@ pub struct TraverseHit {
     /// both ends, as (collection, doc_id) pairs (#140-1). Single node =
     /// the start document itself.
     pub path: Vec<(String, String)>,
+    /// Edge doc used at each hop, positionally aligned with the path's
+    /// hops (#156 Phase F-1, #140-7): `via[i]` = `"edge_col/id"` connecting
+    /// `path[i] -> path[i+1]`, `None` for inline-reference hops. Length ==
+    /// hops == `path.len() - 1`.
+    pub via: Vec<Option<String>>,
     pub doc: HakoDoc,
 }
 
@@ -5687,8 +5692,10 @@ impl Hako {
         col: &str,
         doc_id: &str,
         spec: &TraverseSpec,
-    ) -> Vec<(String, String, f64)> {
-        let mut next: Vec<(String, String, f64)> = Vec::new();
+    ) -> Vec<(String, String, f64, Option<String>)> {
+        // 4th element (#156 Phase F-1): the edge doc that connects the hop,
+        // `"edge_col/id"`, `None` for inline-reference hops.
+        let mut next: Vec<(String, String, f64, Option<String>)> = Vec::new();
         if spec.direction.uses_outgoing() {
             if let Ok(Some(doc)) = self.get(col, doc_id) {
                 for (field, value) in doc.fields.iter() {
@@ -5698,12 +5705,12 @@ impl Hako {
                         }
                     }
                     if let Value::Reference { collection: tgt, doc_id: tid } = value {
-                        next.push((tgt.clone(), tid.clone(), 1.0));
+                        next.push((tgt.clone(), tid.clone(), 1.0, None));
                     }
                 }
             }
             if let Some(edge_col) = spec.via_edge.as_deref() {
-                next.extend(self.edge_step(edge_col, col, doc_id, true, spec.weight_field.as_deref()));
+                next.extend(self.edge_step(edge_col, col, doc_id, true, spec));
             }
         }
         if spec.direction.uses_incoming() {
@@ -5727,14 +5734,18 @@ impl Hako {
                     })
                 });
                 if live {
-                    next.push((scol, sid, 1.0));
+                    next.push((scol, sid, 1.0, None));
                 }
             }
             if let Some(edge_col) = spec.via_edge.as_deref() {
-                next.extend(self.edge_step(edge_col, col, doc_id, false, spec.weight_field.as_deref()));
+                next.extend(self.edge_step(edge_col, col, doc_id, false, spec));
             }
         }
-        next.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        next.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.3.cmp(&b.3))
+        });
         next
     }
 
@@ -5744,14 +5755,23 @@ impl Hako {
     /// (missing/non-numeric/non-finite â†’ 1.0, negative â†’ clamped 0 â€”
     /// documented, never silent-skip). Secondary lookup + verify, same
     /// tolerance as backlinks.
+    /// One edge-collection hop (Phase B / #156 Phase F-1): edge docs in
+    /// `edge_col` whose `match_field` (`_from` outgoing / `_to` incoming)
+    /// references the anchor; the neighbor is the other end, weighted by
+    /// `spec.weight_field` (missing/non-numeric/non-finite → 1.0, negative
+    /// → clamped 0 — documented, never silent-skip). Secondary lookup +
+    /// verify, same tolerance as backlinks. F-1: edge docs must satisfy
+    /// every set field predicate (`edge_type` / `edge_match`); the
+    /// connecting edge doc's `"edge_col/id"` rides the 4th element for
+    /// result projection (`via`).
     fn edge_step(
         &self,
         edge_col: &str,
         anchor_col: &str,
         anchor_id: &str,
         forward: bool,
-        weight_field: Option<&str>,
-    ) -> Vec<(String, String, f64)> {
+        spec: &TraverseSpec,
+    ) -> Vec<(String, String, f64, Option<String>)> {
         let (match_field, other_field) = if forward { ("_from", "_to") } else { ("_to", "_from") };
         let key = crate::index::index_key::encode_scalar(&Value::Reference {
             collection: anchor_col.to_string(),
@@ -5775,8 +5795,13 @@ impl Hako {
             if !linked {
                 continue;
             }
+            if !Self::edge_doc_matches(spec, &edoc) {
+                continue;
+            }
             if let Some(Value::Reference { collection: oc, doc_id: oid }) = edoc.get(other_field) {
-                let w = weight_field
+                let w = spec
+                    .weight_field
+                    .as_deref()
                     .and_then(|wf| edoc.get(wf))
                     .and_then(|v| match v {
                         Value::Int(i) => Some(*i as f64),
@@ -5786,10 +5811,23 @@ impl Hako {
                     .filter(|w| w.is_finite())
                     .map(|w| w.max(0.0))
                     .unwrap_or(1.0);
-                out.push((oc.clone(), oid.clone(), w));
+                out.push((oc.clone(), oid.clone(), w, Some(format!("{edge_col}/{eid}"))));
             }
         }
         out
+    }
+
+    /// F-1 edge predicates (#140-7): every set predicate must hold. One
+    /// compare per predicate — the edge doc is already decoded for the
+    /// liveness verify, so this costs nothing extra. Inline-ref hops have
+    /// no edge doc: they never reach here (exempt by construction).
+    fn edge_doc_matches(spec: &TraverseSpec, edoc: &HakoDoc) -> bool {
+        [&spec.edge_type, &spec.edge_match]
+            .into_iter()
+            .all(|p| match p {
+                Some((field, want)) => edoc.get(field.as_str()) == Some(want),
+                None => true,
+            })
     }
 
     /// BFS traversal from one anchor (issue #53, Phase A). Outgoing
@@ -5821,6 +5859,9 @@ impl Hako {
         // First-visit parent map (#140-1): BFS discovery order IS the
         // shortest-hop path, so walking parents back reconstructs it.
         let mut parent: HashMap<(String, String), (String, String)> = HashMap::new();
+        // F-1 (#140-7): the edge doc used at discovery, per node — walking
+        // it back beside `parent` reconstructs the `via` chain.
+        let mut parent_edge: HashMap<(String, String), Option<String>> = HashMap::new();
         let mut queue: VecDeque<((String, String), usize)> = VecDeque::new();
         queue.push_back((start.clone(), 0));
         let mut out = Vec::new();
@@ -5832,17 +5873,18 @@ impl Hako {
             // visited or expanded — non-matching neighbors are pruned (the
             // walk cannot route through filtered territory). The start
             // node is always expanded, so only neighbors get filtered here.
-            let next: Vec<(String, String)> = self
+            let next: Vec<(String, String, Option<String>)> = self
                 .expand_neighbors(&col, &doc_id, spec)
                 .into_iter()
-                .filter(|(ncol, nid, _)| self.node_matches(spec, ncol, nid))
-                .map(|(a, b, _)| (a, b))
+                .filter(|(ncol, nid, _, _)| self.node_matches(spec, ncol, nid))
+                .map(|(a, b, _, e)| (a, b, e))
                 .collect();
-            for (ncol, nid) in next {
+            for (ncol, nid, edge) in next {
                 if !visited.insert((ncol.clone(), nid.clone())) {
                     continue;
                 }
                 parent.insert((ncol.clone(), nid.clone()), (col.clone(), doc_id.clone()));
+                parent_edge.insert((ncol.clone(), nid.clone()), edge);
                 let nd = depth + 1;
                 if nd < spec.max_depth {
                     queue.push_back(((ncol.clone(), nid.clone()), nd));
@@ -5852,7 +5894,8 @@ impl Hako {
                 }
                 if let Ok(Some(doc)) = self.get(&ncol, &nid) {
                     let path = Self::reconstruct_traverse_path(&parent, &start, (&ncol, &nid));
-                    out.push(TraverseHit { collection: ncol, id: nid, depth: nd, cost: nd as f64, path, doc });
+                    let via = Self::reconstruct_traverse_via(&parent, &parent_edge, &start, (&ncol, &nid));
+                    out.push(TraverseHit { collection: ncol, id: nid, depth: nd, cost: nd as f64, path, via, doc });
                 }
             }
         }
@@ -5882,6 +5925,31 @@ impl Hako {
         chain
     }
 
+    /// Walk the discovery edge chain back to the start (#156 Phase F-1).
+    /// `parent[node]` guides the walk cur-to-start; `parent_edge[node]` =
+    /// the edge doc that connected the parent to it, recorded at first
+    /// visit. Collected cur-to-start, then reversed so `via[i]` matches
+    /// hop `path[i] -> path[i+1]`. Both maps cover every discovered node;
+    /// the `None` arm is defensive only (mirrors the path twin).
+    fn reconstruct_traverse_via(
+        parent: &HashMap<(String, String), (String, String)>,
+        parent_edge: &HashMap<(String, String), Option<String>>,
+        start: &(String, String),
+        node: (&str, &str),
+    ) -> Vec<Option<String>> {
+        let mut chain = Vec::new();
+        let mut cur = (node.0.to_string(), node.1.to_string());
+        while cur != *start {
+            chain.push(parent_edge.get(&cur).cloned().unwrap_or(None));
+            match parent.get(&cur) {
+                Some(p) => cur = p.clone(),
+                None => break,
+            }
+        }
+        chain.reverse();
+        chain
+    }
+
     /// Dijkstra over the same expansion as BFS (issue #53, Phase B):
     /// cost-ordered cheapest paths, same depth cap / limit / liveness /
     /// determinism rules. Twin of the BFS loop above (kept separate so
@@ -5900,6 +5968,8 @@ impl Hako {
         let mut heap: BinaryHeap<(Reverse<(u64, String, String)>, usize)> = BinaryHeap::new();
         let start = (collection.to_string(), id.to_string());
         let mut parent: HashMap<(String, String), (String, String)> = HashMap::new();
+        // F-1 (#140-7): discovery edge per node, recorded on relax.
+        let mut parent_edge: HashMap<(String, String), Option<String>> = HashMap::new();
         dist.insert(start.clone(), 0.0);
         heap.push((Reverse((0, collection.to_string(), id.to_string())), 0));
         let mut out = Vec::new();
@@ -5914,12 +5984,14 @@ impl Hako {
                 }
                 if let Ok(Some(doc)) = self.get(&col, &doc_id) {
                     let path = Self::reconstruct_traverse_path(&parent, &start, (&col, &doc_id));
+                    let via = Self::reconstruct_traverse_via(&parent, &parent_edge, &start, (&col, &doc_id));
                     out.push(TraverseHit {
                         collection: col.clone(),
                         id: doc_id.clone(),
                         depth,
                         cost: f64::from_bits(cbits),
                         path,
+                        via,
                         doc,
                     });
                 }
@@ -5927,7 +5999,7 @@ impl Hako {
             if depth >= spec.max_depth {
                 continue;
             }
-            for (ncol, nid, w) in self.expand_neighbors(&col, &doc_id, spec) {
+            for (ncol, nid, w, edge) in self.expand_neighbors(&col, &doc_id, spec) {
                 // Filtered traversal (#156 Phase C): prune non-matching
                 // neighbors before relaxing (same semantics as the BFS).
                 if !self.node_matches(spec, &ncol, &nid) {
@@ -5939,6 +6011,7 @@ impl Hako {
                     // Relaxation improved (#140-1): this node's best-known
                     // path now comes through the current node.
                     parent.insert(nkey.clone(), (col.clone(), doc_id.clone()));
+                    parent_edge.insert(nkey.clone(), edge);
                     dist.insert(nkey, nc);
                     heap.push((Reverse((nc.to_bits(), ncol, nid)), depth + 1));
                 }
@@ -6004,17 +6077,20 @@ impl Hako {
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
         let start = (collection.to_string(), id.to_string());
-        // (cost bits, endpoint, whole path) — total order = determinism.
-        type SimpleState = (u64, String, String, Vec<(String, String)>);
+        // (cost bits, endpoint, whole path, whole via) — total order =
+        // determinism; `via` (F-1 #140-7) rides the tail so identical node
+        // paths reached over different edge docs stay ordered.
+        type SimpleState = (u64, String, String, Vec<(String, String)>, Vec<Option<String>>);
         let mut heap: BinaryHeap<Reverse<SimpleState>> = BinaryHeap::new();
         heap.push(Reverse((
             0,
             start.0.clone(),
             start.1.clone(),
             vec![start.clone()],
+            Vec::new(),
         )));
         let mut out = Vec::new();
-        while let Some(Reverse((cbits, ecol, eid, path))) = heap.pop() {
+        while let Some(Reverse((cbits, ecol, eid, path, via))) = heap.pop() {
             if out.len() >= spec.limit {
                 break;
             }
@@ -6026,13 +6102,14 @@ impl Hako {
                     depth,
                     cost: f64::from_bits(cbits),
                     path: path.clone(),
+                    via: via.clone(),
                     doc,
                 });
             }
             if depth >= spec.max_depth {
                 continue;
             }
-            for (ncol, nid, w) in self.expand_neighbors(&ecol, &eid, spec) {
+            for (ncol, nid, w, edge) in self.expand_neighbors(&ecol, &eid, spec) {
                 // Simple + filtered: skip repeats within the path, prune
                 // non-matching nodes (same semantics as the walks above).
                 if !self.node_matches(spec, &ncol, &nid) {
@@ -6043,11 +6120,14 @@ impl Hako {
                 }
                 let mut np = path.clone();
                 np.push((ncol.clone(), nid.clone()));
+                let mut nv = via.clone();
+                nv.push(edge);
                 heap.push(Reverse((
                     (f64::from_bits(cbits) + w).to_bits(),
                     ncol.clone(),
                     nid.clone(),
                     np,
+                    nv,
                 )));
             }
         }
@@ -6119,10 +6199,10 @@ impl Hako {
                 .expand_neighbors(&key.0, &key.1, spec)
                 .into_iter()
                 // Same-collection only + filter prunes the target side.
-                .filter(|(ncol, nid, _)| {
+                .filter(|(ncol, nid, _, _)| {
                     ncol == &key.0 && self.node_matches(spec, ncol, nid)
                 })
-                .map(|(a, b, _)| (a, b))
+                .map(|(a, b, _, _)| (a, b))
                 .collect();
             targets.sort();
             targets.dedup();

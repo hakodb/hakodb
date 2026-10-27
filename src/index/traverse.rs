@@ -223,6 +223,13 @@ pub struct TraverseSpec {
     pub via_edge: Option<String>,
     pub weight_field: Option<String>,
     pub node_match: Option<(String, Value)>,
+    /// Edge predicates (#156 Phase F-1, #140-7): both apply to EDGE-COLLECTION
+    /// hops only (via_edge) — an `edge_type` names the relationship routing
+    /// (e.g. ("type", "follows")); an `edge_match` filters on any edge
+    /// property. Both must hold when both are set. Inline-ref hops have no
+    /// edge doc and are exempt (mirrors the start-node exemption).
+    pub edge_type: Option<(String, Value)>,
+    pub edge_match: Option<(String, Value)>,
 }
 
 impl TraverseSpec {
