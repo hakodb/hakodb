@@ -13,6 +13,11 @@ use crate::error::{HakoError, Result};
 pub enum Metric {
     Cosine,
     L2,
+    /// Inner product (#141-8): similarity = dot product. As a DISTANCE the
+    /// engine exposes the negation (`-dot`), keeping the "lower is closer"
+    /// contract every metric shares — including the HNSW comparators, which
+    /// are metric-agnostic by construction.
+    InnerProduct,
 }
 
 impl Metric {
@@ -20,7 +25,10 @@ impl Metric {
         match v {
             0 => Ok(Metric::Cosine),
             1 => Ok(Metric::L2),
-            _ => Err(HakoError::Corrupt(format!("unknown vector metric {v} (0=cosine, 1=l2)"))),
+            2 => Ok(Metric::InnerProduct),
+            _ => Err(HakoError::Corrupt(format!(
+                "unknown vector metric {v} (0=cosine, 1=l2, 2=inner_product)"
+            ))),
         }
     }
 
@@ -28,6 +36,7 @@ impl Metric {
         match self {
             Metric::Cosine => "cosine",
             Metric::L2 => "l2",
+            Metric::InnerProduct => "inner_product",
         }
     }
 }
@@ -38,6 +47,26 @@ impl Metric {
 pub struct VectorDef {
     pub dim: u32,
     pub metric: Metric,
+    /// HNSW M override (#141-1). None = per-dim derived (hnsw_m_for_dim).
+    #[serde(default)]
+    pub m: Option<usize>,
+    /// ef_construction override (#141-1). None = per-dim derived.
+    #[serde(default)]
+    pub ef_construction: Option<usize>,
+    /// Query-time beam override (#141-1). None = the executor's derived
+    /// formula (max_ids*8, clamped 128/256..20000).
+    #[serde(default)]
+    pub ef_search: Option<usize>,
+}
+
+/// Configurable HNSW parameters (#141-1). `None` fields ride the derived
+/// defaults; values validate/clamp when the graph builds (M clamped to
+/// 16..=64, ef_construction floored at 32).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HnswParams {
+    pub m: Option<usize>,
+    pub ef_construction: Option<usize>,
+    pub ef_search: Option<usize>,
 }
 
 /// Max dims per index (Turso allows 65536; embedded starts tighter —
@@ -110,6 +139,19 @@ pub fn l2_distance_squared(a: &[f32], b: &[f32]) -> f64 {
     acc
 }
 
+/// Inner-product DISTANCE (#141-8): negated dot product. Dot itself is a
+/// similarity (higher = closer), so the negation preserves the engine's
+/// "distance, lower is closer" contract across all three metrics - the
+/// HNSW comparators stay metric-agnostic. Unbounded below by design.
+pub fn inner_product_distance(a: &[f32], b: &[f32]) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut acc = 0.0f64;
+    for i in 0..a.len() {
+        acc += (a[i] as f64) * (b[i] as f64);
+    }
+    -acc
+}
+
 /// Dispatch on the index metric. Length mismatch is a caller bug (the
 /// planner gates dim before any row is scored); saturate to +inf so a bad
 /// row sorts last instead of panicking a query worker.
@@ -120,6 +162,7 @@ pub fn distance(metric: Metric, a: &[f32], b: &[f32]) -> f64 {
     match metric {
         Metric::Cosine => cosine_distance(a, b),
         Metric::L2 => l2_distance_squared(a, b),
+        Metric::InnerProduct => inner_product_distance(a, b),
     }
 }
 
@@ -249,15 +292,23 @@ pub struct HnswIndex {
 }
 
 impl HnswIndex {
-    pub fn new(dim: usize, metric: Metric) -> Self {
-        let m = hnsw_m_for_dim(dim);
+    pub fn new(dim: usize, metric: Metric, params: HnswParams) -> Self {
+        // Overrides (#141-1) clamp to the envelopes the derived defaults
+        // use: M within 16..=64, ef_construction floored at 32.
+        let m = params
+            .m
+            .unwrap_or_else(|| hnsw_m_for_dim(dim))
+            .clamp(HNSW_M_MIN, HNSW_M_MAX);
         Self {
             dim,
             metric,
             m,
             mmax: m,
             mmax0: 2 * m,
-            ef_construction: hnsw_ef_construction_for_dim(dim),
+            ef_construction: params
+                .ef_construction
+                .unwrap_or_else(|| hnsw_ef_construction_for_dim(dim))
+                .max(32),
             level_mult: 1.0 / (m as f64).ln(),
             nodes: Vec::new(),
             id_to_idx: std::collections::HashMap::new(),
@@ -337,6 +388,9 @@ impl HnswIndex {
                 let s = n.scale as f64;
                 qn + s * s * n.sum_sq - 2.0 * s * dot
             }
+            // IP on quantized bytes: the node vector is scale*ivec, so the
+            // true dot - and its negated distance - needs the scale back.
+            Metric::InnerProduct => -(n.scale as f64) * dot,
         }
     }
 
@@ -358,6 +412,7 @@ impl HnswIndex {
                 let (sa, sb) = (na.scale as f64, nb.scale as f64);
                 sa * sa * na.sum_sq + sb * sb * nb.sum_sq - 2.0 * sa * sb * dot as f64
             }
+            Metric::InnerProduct => -(na.scale as f64) * (nb.scale as f64) * (dot as f64),
         }
     }
 
@@ -637,9 +692,9 @@ mod tests {
         assert_eq!(hnsw_m_for_dim(128), 34);
         assert_eq!(hnsw_m_for_dim(384), 59);
         assert_eq!(hnsw_m_for_dim(4096), 64);
-        let lo = HnswIndex::new(8, Metric::Cosine);
+        let lo = HnswIndex::new(8, Metric::Cosine, HnswParams::default());
         assert_eq!((lo.m, lo.mmax, lo.mmax0, lo.ef_construction), (16, 16, 32, 200));
-        let hi = HnswIndex::new(384, Metric::Cosine);
+        let hi = HnswIndex::new(384, Metric::Cosine, HnswParams::default());
         assert_eq!((hi.m, hi.mmax, hi.mmax0, hi.ef_construction), (59, 59, 118, 300));
     }
 
@@ -696,7 +751,7 @@ mod tests {
 
     fn hnsw_recall(pts: &[Vec<f32>], queries: &[Vec<f32>], k: usize, m: Metric, ef: usize) -> f64 {
         let dim = pts[0].len();
-        let mut h = HnswIndex::new(dim, m);
+        let mut h = HnswIndex::new(dim, m, HnswParams::default());
         for (i, p) in pts.iter().enumerate() {
             h.upsert(&i.to_string(), p.clone());
         }
@@ -745,7 +800,7 @@ mod tests {
 
     #[test]
     fn hnsw_update_and_wrong_dim() {
-        let mut h = HnswIndex::new(2, Metric::L2);
+        let mut h = HnswIndex::new(2, Metric::L2, HnswParams::default());
         h.upsert("a", vec![0.0, 0.0]);
         h.upsert("b", vec![10.0, 0.0]);
         let top: Vec<usize> = h.search(&[0.1, 0.0], 2).into_iter().map(|(_, i)| i).collect();
@@ -763,8 +818,8 @@ mod tests {
 
     #[test]
     fn hnsw_clear_and_determinism() {
-        let mut h1 = HnswIndex::new(2, Metric::Cosine);
-        let mut h2 = HnswIndex::new(2, Metric::Cosine);
+        let mut h1 = HnswIndex::new(2, Metric::Cosine, HnswParams::default());
+        let mut h2 = HnswIndex::new(2, Metric::Cosine, HnswParams::default());
         for i in 0..50 {
             let v = vec![i as f32 * 0.1, (i % 7) as f32];
             h1.upsert(&i.to_string(), v.clone());
