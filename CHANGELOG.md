@@ -2,6 +2,13 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### v0.19.4 — Ergonomics batch: vector + graph (#156 phases A–F)
+- **Vector search control (`#141`):** scores returned by default (`find_near` rides `(score, doc)`, the FFI distance recompute is deleted) with an optional distance threshold; configurable `M` / `ef_construction` / `ef_search` persisted in the index definition; Inner Product metric (ordering-aware comparator + rescore); batch `find_near`; verified multi-vector-fields per collection; hybrid search — filtered + vector in one query via index-satisfied pre-filter or over-fetch + post-filter (planner ANN decision A/B-gated, Qry-lane neutral, exact recall by construction); index statistics (count/keys/memory aesthetic).
+- **Graph traversal (`#140`):** full path reconstruction on every hit (BFS + weighted, start-inclusive); filtered traversal via node predicate + edge-field whitelist (prune-at-expansion semantics); depth cap raised to a configurable 256 (default 32 preserved, O(visited) memory documented); bounded simple-path enumeration (`find_simple_paths`, k-ordered, cycle-safe).
+- **Graph breadth (`#140`):** whole-graph algorithms — connected components, cycle detection, topological sort, degree centrality — plus `export_graph_json` for viz consumers; undirected traversal verified working.
+- **Edge-model ergonomics (`#140-7`, #166):** `edge_type` routing + `edge_match` property filters on edge-collection hops (AND when both set, inline refs exempt); additive `via` array per hit mapping every hop to its connecting edge doc (`edge_col/id`, null for inline hops); new FFI `hk_engine_find_paths_v3` and `hk_engine_find_simple_paths_v2`.
+- **No C ABI breaks, no on-disk format change.** All new FFI is additive; existing signatures untouched.
+
 ### v0.19.3 — Batched sorted-keys maintenance: bulk-load O(n²) removed
 - **Bulk loads no longer pay O(n²) on the sorted key index.** The storage
   engine's sorted-keys view was maintained with one binary-search + `Vec`
