@@ -19,9 +19,14 @@ use hashbrown::{HashMap, HashSet};
 use crate::document::hako_doc::HakoDoc;
 use crate::document::value::Value;
 
-/// Hard depth cap: traversals always terminate (cycles via visited set,
-/// depth via this). Generous — real queries stop far earlier.
+/// Default depth guidance: traversals always terminate (cycles via the
+/// visited set, depth via the cap below). Generous — real queries stop far
+/// earlier.
 pub const MAX_TRAVERSE_DEPTH: usize = 32;
+/// Hard caller-facing cap (#156 Phase C): depth may be raised up to this
+/// (memory of the walk is O(visited) — the bound exists so a deep walk on
+/// a wide graph cannot balloon unbounded; default guidance stays 32).
+pub const MAX_TRAVERSE_DEPTH_CAP: usize = 256;
 
 /// One inbound edge: a `(field)` of `(src_col/src_id)` points at the key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,11 +202,18 @@ impl TraverseDir {
 /// walk); above MAX_TRAVERSE_DEPTH is a hard error (never silently
 /// clamp — the caller asked for something unbounded-adjacent).
 ///
-/// Phase B: `via_edge` names an edge collection (docs with `_from`/`_to`
+/// Phase B virtues: `via_edge` names an edge collection (docs with `_from`/`_to`
 /// references) whose edges join the walk alongside inline refs;
 /// `weight_field` (requires `via_edge`) switches ordering from BFS to
 /// Dijkstra over the named numeric prop (missing/non-numeric/negative
 /// weights count 1.0/1.0/clamped-0 — documented, never silent-skip).
+///
+/// Phase C: `node_match` = filtered traversal — only nodes whose `field`
+/// equals `Value` are visited AND expanded (the walk prunes descent into
+/// non-matching nodes, so it can end up *unreachable* through filtered
+/// territory — intended). The start node is always expanded regardless.
+/// Comparison reuses `Value::PartialEq` (cross-type numeric aware:
+/// Int(5) == Float(5.0)).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraverseSpec {
     pub direction: TraverseDir,
@@ -210,13 +222,14 @@ pub struct TraverseSpec {
     pub limit: usize,
     pub via_edge: Option<String>,
     pub weight_field: Option<String>,
+    pub node_match: Option<(String, Value)>,
 }
 
 impl TraverseSpec {
     pub fn validate(&self) -> crate::error::Result<()> {
-        if self.max_depth == 0 || self.max_depth > MAX_TRAVERSE_DEPTH {
+        if self.max_depth == 0 || self.max_depth > MAX_TRAVERSE_DEPTH_CAP {
             return Err(crate::error::HakoError::Corrupt(format!(
-                "traverse depth {} out of range 1..={MAX_TRAVERSE_DEPTH}",
+                "traverse depth {} out of range 1..={MAX_TRAVERSE_DEPTH_CAP} (guidance: {MAX_TRAVERSE_DEPTH})",
                 self.max_depth
             )));
         }

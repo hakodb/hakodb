@@ -5780,29 +5780,7 @@ impl Hako {
         spec: &TraverseSpec,
     ) -> Result<Vec<TraverseHit>> {
         spec.validate()?;
-        // Incoming needs reverse state: tracked anchor (backlinks) OR a
-        // registered edge collection (secondary _from/_to). Neither =
-        // loud error (a silent empty walk hides a forgotten create).
-        if spec.direction.uses_incoming() {
-            let (tracked, via_ok) = self
-                .indexes
-                .read()
-                .map(|mgr| {
-                    let tracked = mgr.traverse.is_tracked(collection);
-                    let via_ok = spec.via_edge.as_deref().is_some_and(|e| {
-                        mgr.secondary.get(e).is_some_and(|m| {
-                            m.contains_key("_from") && m.contains_key("_to")
-                        })
-                    });
-                    (tracked, via_ok)
-                })
-                .unwrap_or((false, false));
-            if !tracked && !via_ok {
-                return Err(HakoError::Corrupt(format!(
-                    "traverse incoming needs reverse state: create_traverse_index({collection}) or create_edge_index(<edges>) first"
-                )));
-            }
-        }
+        self.ensure_incoming_state(collection, spec)?;
         if self.get(collection, id)?.is_none() {
             return Ok(Vec::new());
         }
@@ -5824,11 +5802,14 @@ impl Hako {
             if depth >= spec.max_depth {
                 continue;
             }
-            // Shared expansion (helper also serves Dijkstra; visited-set
-            // below absorbs the missing per-node dedup identically).
+            // Filtered traversal (#156 Phase C): only matching nodes are
+            // visited or expanded — non-matching neighbors are pruned (the
+            // walk cannot route through filtered territory). The start
+            // node is always expanded, so only neighbors get filtered here.
             let next: Vec<(String, String)> = self
                 .expand_neighbors(&col, &doc_id, spec)
                 .into_iter()
+                .filter(|(ncol, nid, _)| self.node_matches(spec, ncol, nid))
                 .map(|(a, b, _)| (a, b))
                 .collect();
             for (ncol, nid) in next {
@@ -5921,6 +5902,11 @@ impl Hako {
                 continue;
             }
             for (ncol, nid, w) in self.expand_neighbors(&col, &doc_id, spec) {
+                // Filtered traversal (#156 Phase C): prune non-matching
+                // neighbors before relaxing (same semantics as the BFS).
+                if !self.node_matches(spec, &ncol, &nid) {
+                    continue;
+                }
                 let nc = f64::from_bits(cbits) + w;
                 let nkey = (ncol.clone(), nid.clone());
                 if nc < dist.get(&nkey).copied().unwrap_or(f64::INFINITY) {
@@ -5933,6 +5919,128 @@ impl Hako {
             }
         }
         Ok(out)
+    }
+
+    /// Incoming traversal needs reverse state: tracked anchor (backlinks)
+    /// OR a registered edge collection (secondary `_from`/`_to`). Neither =
+    /// loud error (a silent empty walk hides a forgotten create). Shared by
+    /// `find_paths` and `find_simple_paths` (#156 Phase C).
+    fn ensure_incoming_state(
+        &self,
+        collection: &str,
+        spec: &TraverseSpec,
+    ) -> Result<()> {
+        if !spec.direction.uses_incoming() {
+            return Ok(());
+        }
+        let (tracked, via_ok) = self
+            .indexes
+            .read()
+            .map(|mgr| {
+                let tracked = mgr.traverse.is_tracked(collection);
+                let via_ok = spec.via_edge.as_deref().is_some_and(|e| {
+                    mgr.secondary.get(e).is_some_and(|m| {
+                        m.contains_key("_from") && m.contains_key("_to")
+                    })
+                });
+                (tracked, via_ok)
+            })
+            .unwrap_or((false, false));
+        if !tracked && !via_ok {
+            return Err(HakoError::Corrupt(format!(
+                "traverse incoming needs reverse state: create_traverse_index({collection}) or create_edge_index(<edges>) first"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Bounded simple-path enumeration (#156 Phase C): best-first (UCS)
+    /// over distinct simple paths — no node repeats within one path. Every
+    /// popped state is a result; results come out cost-ordered (hop count
+    /// without `weight_field`, weight sum with) until `spec.limit` serves.
+    /// Routes, not node hits: two routes to the same node are two results,
+    /// and shared prefixes are emitted as separate results (a→b and a→b→c).
+    /// Tie-break is the total heap order (cost bits, endpoint, whole path)
+    /// — deterministic. Filtered specs prune exactly like `find_paths`.
+    /// Memory is O(states) = O(limit × fan-out), each state carrying its
+    /// path — capped by `limit`, not by graph size.
+    pub fn find_simple_paths(
+        &self,
+        collection: &str,
+        id: &str,
+        spec: &TraverseSpec,
+    ) -> Result<Vec<TraverseHit>> {
+        spec.validate()?;
+        self.ensure_incoming_state(collection, spec)?;
+        if self.get(collection, id)?.is_none() {
+            return Ok(Vec::new());
+        }
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let start = (collection.to_string(), id.to_string());
+        // (cost bits, endpoint, whole path) — total order = determinism.
+        type SimpleState = (u64, String, String, Vec<(String, String)>);
+        let mut heap: BinaryHeap<Reverse<SimpleState>> = BinaryHeap::new();
+        heap.push(Reverse((
+            0,
+            start.0.clone(),
+            start.1.clone(),
+            vec![start.clone()],
+        )));
+        let mut out = Vec::new();
+        while let Some(Reverse((cbits, ecol, eid, path))) = heap.pop() {
+            if out.len() >= spec.limit {
+                break;
+            }
+            let depth = path.len() - 1;
+            if let Ok(Some(doc)) = self.get(&ecol, &eid) {
+                out.push(TraverseHit {
+                    collection: ecol.clone(),
+                    id: eid.clone(),
+                    depth,
+                    cost: f64::from_bits(cbits),
+                    path: path.clone(),
+                    doc,
+                });
+            }
+            if depth >= spec.max_depth {
+                continue;
+            }
+            for (ncol, nid, w) in self.expand_neighbors(&ecol, &eid, spec) {
+                // Simple + filtered: skip repeats within the path, prune
+                // non-matching nodes (same semantics as the walks above).
+                if !self.node_matches(spec, &ncol, &nid) {
+                    continue;
+                }
+                if path.iter().any(|(c, i)| c == &ncol && i == &nid) {
+                    continue;
+                }
+                let mut np = path.clone();
+                np.push((ncol.clone(), nid.clone()));
+                heap.push(Reverse((
+                    (f64::from_bits(cbits) + w).to_bits(),
+                    ncol.clone(),
+                    nid.clone(),
+                    np,
+                )));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Filtered-traversal predicate (#156 Phase C): `None` matches all;
+    /// `Some((field, value))` requires the node's field to equal `value`
+    /// (`Value::PartialEq` is cross-type numeric aware). One `get` per
+    /// candidate neighbor — the walk already pays that shape elsewhere.
+    fn node_matches(&self, spec: &TraverseSpec, col: &str, id: &str) -> bool {
+        match &spec.node_match {
+            None => true,
+            Some((field, want)) => self
+                .get(col, id)
+                .ok()
+                .flatten()
+                .is_some_and(|d| d.get(field.as_str()) == Some(want)),
+        }
     }
 
     /// Shared composite backfill spawner: used at explicit creation AND

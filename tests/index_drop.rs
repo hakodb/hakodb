@@ -98,6 +98,7 @@ fn incoming(db: &Hako) -> hakodb::error::Result<Vec<hakodb::engine::TraverseHit>
             limit: 10,
             via_edge: None,
             weight_field: None,
+            node_match: None,
         },
     )
 }
