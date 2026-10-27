@@ -487,11 +487,13 @@ fn find_paths_v3_routes_and_projects_via() {
     let arr = rows.as_array().expect("rows");
     let ids: Vec<&str> = arr.iter().map(|r| r["id"].as_str().unwrap()).collect();
     assert_eq!(ids, vec!["b"], "blocks edge filtered: {rows:?}");
+    // G1 (#168): v3 is frozen via-free — rows keep the v0.19.3 shape.
     for r in arr {
-        assert!(r["via"].is_array(), "additive via key rides: {r:?}");
-        assert_eq!(r["via"].as_array().unwrap().len(), 1);
+        assert!(
+            !r.as_object().unwrap().contains_key("via"),
+            "frozen v3 must not carry via: {r:?}"
+        );
     }
-    assert_eq!(arr[0]["via"], serde_json::json!(["rel/e1"]));
 
     // No predicates (all-null pair args): both hops serve.
     let rows = to_json({
@@ -515,8 +517,69 @@ fn find_paths_v3_routes_and_projects_via() {
 }
 
 #[test]
-fn find_simple_paths_v2_match_and_via() {
-    use hakodb::ffi::hk_engine_find_simple_paths_v2;
+fn find_paths_v4_include_via_opt_in() {
+    use hakodb::ffi::hk_engine_find_paths_v4;
+    let dir = tmp("v4via");
+    {
+        let mut cfg = HakoConfig::default();
+        cfg.durability_mode = DurabilityMode::Manual;
+        let db = Hako::open(&dir, cfg).expect("open");
+        db.create_edge_index("rel").expect("edge");
+        let edge = |f: &str, t: &str| {
+            let mut doc = HakoDoc::default();
+            doc.insert("_from", Value::Reference { collection: "n".into(), doc_id: f.into() });
+            doc.insert("_to", Value::Reference { collection: "n".into(), doc_id: t.into() });
+            doc
+        };
+        db.write_batch(vec![
+            BatchMutation::Put { collection: "rel".into(), doc_id: "e1".into(), doc: edge("a", "b") },
+        ])
+        .expect("seed");
+        for id in ["a", "b"] {
+            db.write_batch(vec![BatchMutation::Put {
+                collection: "n".into(),
+                doc_id: id.to_string(),
+                doc: HakoDoc::default(),
+            }])
+            .expect("seed");
+        }
+        db.flush().expect("flush");
+    }
+    let eng = open(&dir);
+    let col = CString::new("n").unwrap();
+    let id = CString::new("a").unwrap();
+    let rel = CString::new("rel").unwrap();
+    let nul = std::ptr::null();
+
+    // include_via = 1: the "via" key rides with the edge ref.
+    let rows = to_json({
+        hk_engine_find_paths_v4(
+            eng, col.as_ptr(), id.as_ptr(), 0, nul, rel.as_ptr(), 5, 10, 1,
+            nul, nul, nul, nul, nul, nul,
+        )
+    });
+    let arr = rows.as_array().expect("rows");
+    assert_eq!(arr[0]["id"], "b");
+    assert_eq!(arr[0]["via"], serde_json::json!(["rel/e1"]), "opt-in via: {rows:?}");
+
+    // include_via = 0: frozen v0.19.3 shape.
+    let rows = to_json({
+        hk_engine_find_paths_v4(
+            eng, col.as_ptr(), id.as_ptr(), 0, nul, rel.as_ptr(), 5, 10, 0,
+            nul, nul, nul, nul, nul, nul,
+        )
+    });
+    let arr = rows.as_array().expect("rows");
+    assert_eq!(arr[0]["id"], "b");
+    assert!(
+        !arr[0].as_object().unwrap().contains_key("via"),
+        "via off = frozen shape: {rows:?}"
+    );
+}
+
+#[test]
+fn find_simple_paths_v2_match_frozen_and_v3_via() {
+    use hakodb::ffi::{hk_engine_find_simple_paths_v2, hk_engine_find_simple_paths_v3};
     let dir = tmp("simplev2");
     seed_edge_db(&dir);
     let eng = open(&dir);
@@ -537,29 +600,45 @@ fn find_simple_paths_v2_match_and_via() {
     };
     let rows = to_json(out);
     let arr = rows.as_array().expect("rows");
-    let got: Vec<(&str, usize, Vec<String>)> = arr
+    let got: Vec<(&str, usize)> = arr
+        .iter()
+        .map(|r| (r["id"].as_str().unwrap(), r["depth"].as_u64().unwrap() as usize))
+        .collect();
+    assert_eq!(
+        got,
+        vec![("a", 0), ("b", 1), ("c", 2)],
+        "route rows order by cost; v2 is frozen via-free (G1 #168): {rows:?}"
+    );
+    for r in arr {
+        assert!(!r.as_object().unwrap().contains_key("via"), "frozen v2: {r:?}");
+    }
+
+    // simple_v3 include_via = 1: via rides again (opt-in).
+    let rows = to_json({
+        hk_engine_find_simple_paths_v3(
+            eng, col.as_ptr(), id.as_ptr(), 0,
+            nul, rel.as_ptr(), nul, 5, 10, 1,
+            nul, nul, nul, nul, w.as_ptr(), one.as_ptr(),
+        )
+    });
+    let arr = rows.as_array().expect("rows");
+    let got: Vec<(&str, Vec<&str>)> = arr
         .iter()
         .map(|r| {
             (
                 r["id"].as_str().unwrap(),
-                r["depth"].as_u64().unwrap() as usize,
-                r["via"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|v| v.as_str().unwrap_or("").to_string())
-                    .collect(),
+                r["via"].as_array().unwrap().iter().map(|v| v.as_str().unwrap_or("")).collect(),
             )
         })
         .collect();
     assert_eq!(
         got,
         vec![
-            ("a", 0, vec![]),
-            ("b", 1, vec!["rel/e1".to_string()]),
-            ("c", 2, vec!["rel/e1".to_string(), "rel/e2".to_string()]),
+            ("a", vec![]),
+            ("b", vec!["rel/e1"]),
+            ("c", vec!["rel/e1", "rel/e2"]),
         ],
-        "route rows order by cost, via rides: {rows:?}"
+        "opt-in via on v3 rows ride the edge docs: {rows:?}"
     );
 
     // Half a (field, json) pair is a loud error, not a silent no-op.

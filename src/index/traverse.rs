@@ -230,6 +230,14 @@ pub struct TraverseSpec {
     /// edge doc and are exempt (mirrors the start-node exemption).
     pub edge_type: Option<(String, Value)>,
     pub edge_match: Option<(String, Value)>,
+    /// G1 (#168): via projection is opt-in. When false (the default) the
+    /// walk skips the per-node discovery-edge map and the extra backtrack
+    /// entirely — `TraverseHit.via` stays empty and FFI rows carry the
+    /// v0.19.3 shape byte-for-byte (the "via" key is omitted). The via
+    /// chain costs a map insert + 2 String clones per node plus a second
+    /// per-hit backtrack — measured −27% BFS_qps when always-on (#167
+    /// bench kajian), hence opt-in rather than always-on.
+    pub include_via: bool,
 }
 
 impl TraverseSpec {
