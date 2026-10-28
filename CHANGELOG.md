@@ -2,6 +2,17 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
+### Unreleased
+- **SIMD int8/f64 distance kernels (AVX2, runtime-detected) (#172).** Hot-path
+  dots in `index::vector` — rescore (f32·f32 in f64), HNSW walk (f32·i8) and
+  construction (i8·i8, bit-exact integer) — vectorize on AVX2 machines with
+  the original sequential loops kept as fallback and test oracle. Vector lane
+  at dim 768: pointer p50 **6.1 ms → 2.5 ms (~2.5×)**, HNSW build **3.6×**;
+  flat at dim ≤ 32 (math is a small fraction of per-op cost). The f64 kernels
+  fold 4 lanes horizontally, so last-bit fp scores may differ from the scalar
+  path (walk recall variance ≤ 0.5pt at k=10, measured); per-build
+  determinism intact.
+
 ### v0.19.5 — Perf restore for the v0.19.4 graph/vector lanes (#168)
 - **BFS route projections are opt-in (G1).** v0.19.4 always computed the
   `path` array and the `via` chain for every hit — measured **−27.1% BFS_qps
