@@ -379,6 +379,8 @@ pub struct VectorIndexInfo {
 pub type GraphNode = (String, String);
 /// Per-node edge map over `GraphNode`.
 pub type GraphAdj = std::collections::HashMap<GraphNode, Vec<GraphNode>>;
+/// Whole-graph adjacency memo slot: (global_version stamp, spec, nodes, adj).
+pub type AdjMemo = HashMap<String, (u64, TraverseSpec, Vec<GraphNode>, GraphAdj)>;
 /// One `graph_degree_centrality` row: (node, in-degree, out-degree).
 pub type DegreeRow = (GraphNode, usize, usize);
 
@@ -788,6 +790,15 @@ pub struct Hako {
     /// again; they leave by FIFO without the write path paying an eager
     /// removal pass.
     row_cache: RwLock<RowCache>,
+    /// Whole-graph adjacency memo (G2 re-scope #173): one slot per
+    /// collection, stamped with `global_version` at build time. Every doc
+    /// write advances `global_version` (`bump_versions_by_keys`), so an
+    /// exact stamp match proves the adjacency is current — deletes included
+    /// (the commit path bumps deleted keys too). A spec mismatch rebuilds
+    /// and replaces the slot. Serves the `graph_*` whole-graph family
+    /// (components/cycle/topo/degree), which decodes the full node set per
+    /// call; walk lanes never touch this.
+    graph_adj_cache: RwLock<AdjMemo>,
     /// Local-only replication scope ("the signal"): collections and keys
     /// whose writes must never leave this device. Advancing clocks is
     /// untouched (tombstones keep fresh timestamps, so the deleter never
@@ -1331,6 +1342,7 @@ impl Hako {
             plan_cache: PlanCache::default(),
             doc_cache: RwLock::new(HashMap::new()),
             row_cache: RwLock::new(RowCache::default()),
+            graph_adj_cache: RwLock::new(HashMap::new()),
             local_only_cols: RwLock::new(HashSet::new()),
             local_only_keys: RwLock::new(HashSet::new()),
             unique_ledger: std::sync::Arc::new(crate::index::composite::ledger::UniqueLedger::default()),
@@ -6235,6 +6247,13 @@ impl Hako {
         collection: &str,
         spec: &TraverseSpec,
     ) -> Result<(Vec<GraphNode>, GraphAdj)> {
+        // Memo read (G2 re-scope #173): exact stamp + same spec → ride RAM.
+        let ver = self.global_version.load(Ordering::Relaxed);
+        if let Some(c) = self.graph_adj_cache.read().unwrap().get(collection) {
+            if c.0 == ver && c.1 == *spec {
+                return Ok((c.2.clone(), c.3.clone()));
+            }
+        }
         let mut nodes: Vec<(String, String)> = self
             .graph_node_ids(collection)
             .into_iter()
@@ -6258,6 +6277,13 @@ impl Hako {
             targets.dedup();
             adj.insert(key.clone(), targets);
         }
+        self.graph_adj_cache
+            .write()
+            .unwrap()
+            .insert(
+                collection.to_string(),
+                (ver, spec.clone(), nodes.clone(), adj.clone()),
+            );
         Ok((nodes, adj))
     }
 

@@ -3,6 +3,16 @@
 Full per-release history for HakoDB. The README keeps only the latest three.
 
 ### Unreleased
+- **Whole-graph adjacency memo (G2 re-scope, #173).** `graph_components`,
+  `find_cycle`, `topo_sort` and `degree_centrality` today decode the full
+  node set per call; the engine now keeps one adjacency slot per collection
+  stamped with the global write version (every doc write advances it, so an
+  exact stamp + matching spec proves currency — no invalidation path to
+  miss). Scaled ring 10 000/10 000: components **~4.8× on repeat calls**
+  (151 ms → 31 ms); first call after a mutation still pays the decode.
+  Walk lanes (BFS/Dijkstra/paths) deliberately unchanged (kajian negative
+  result).
+
 - **SIMD int8/f64 distance kernels (AVX2, runtime-detected) (#172).** Hot-path
   dots in `index::vector` — rescore (f32·f32 in f64), HNSW walk (f32·i8) and
   construction (i8·i8, bit-exact integer) — vectorize on AVX2 machines with
