@@ -111,15 +111,7 @@ pub fn encode_f32s(v: &[f32]) -> Vec<u8> {
 /// heaps via total_cmp).
 pub fn cosine_distance(a: &[f32], b: &[f32]) -> f64 {
     debug_assert_eq!(a.len(), b.len());
-    let mut dot = 0.0f64;
-    let mut na = 0.0f64;
-    let mut nb = 0.0f64;
-    for i in 0..a.len() {
-        let (x, y) = (a[i] as f64, b[i] as f64);
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
+    let (dot, na, nb) = simd::cosine_parts(a, b);
     let denom = na.sqrt() * nb.sqrt();
     if denom == 0.0 {
         return 1.0;
@@ -131,12 +123,7 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f64 {
 /// top-K only needs order).
 pub fn l2_distance_squared(a: &[f32], b: &[f32]) -> f64 {
     debug_assert_eq!(a.len(), b.len());
-    let mut acc = 0.0f64;
-    for i in 0..a.len() {
-        let d = a[i] as f64 - b[i] as f64;
-        acc += d * d;
-    }
-    acc
+    simd::l2_f32_f32(a, b)
 }
 
 /// Inner-product DISTANCE (#141-8): negated dot product. Dot itself is a
@@ -145,11 +132,7 @@ pub fn l2_distance_squared(a: &[f32], b: &[f32]) -> f64 {
 /// HNSW comparators stay metric-agnostic. Unbounded below by design.
 pub fn inner_product_distance(a: &[f32], b: &[f32]) -> f64 {
     debug_assert_eq!(a.len(), b.len());
-    let mut acc = 0.0f64;
-    for i in 0..a.len() {
-        acc += (a[i] as f64) * (b[i] as f64);
-    }
-    -acc
+    -simd::dot_f32_f32(a, b)
 }
 
 /// Dispatch on the index metric. Length mismatch is a caller bug (the
@@ -167,8 +150,274 @@ pub fn distance(metric: Metric, a: &[f32], b: &[f32]) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// P1: HNSW (in-RAM, per collection+field).
+// V1 (#168 SIMD lever / #172 kajian): runtime-detected AVX2 distance kernels.
 //
+// Three hot dots pay for this module:
+// - rescore (`cosine/l2/ip`): f32·f32 accumulated in f64 — ~20-40 calls/query
+// - walk (`q_dist`): f32 query · int8 node, f64 — one per HNSW hop visited
+// - construction (`node_dist`): int8·int8 — integer dot, EXACT both paths
+//
+// AVX2 semantics: per-element rounding stays the scalar two-step (multiply
+// rounds, add rounds — Rust contracts no FMA), so lanes compute scalar-
+// identical terms; only the addition tree differs (4 partial f64 lanes vs
+// sequential). The integer kernel is associative-exact everywhere. Fallback
+// = the original sequential loops, so a non-AVX2 machine keeps today's
+// arithmetic; each build remains self-deterministic (sorted tiebreaks ride
+// id ordering, not distance bits).
+mod scalars {
+    /// Sequential reference kernels — the ORIGINAL arithmetic, kept as the
+    /// non-AVX2 execution path and as the test oracle.
+    pub fn dot_f32_i8(q: &[f32], v: &[i8]) -> f64 {
+        q.iter().zip(v).map(|(x, b)| *x as f64 * *b as f64).sum()
+    }
+    pub fn dot_f32_f32(a: &[f32], b: &[f32]) -> f64 {
+        a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum()
+    }
+    pub fn l2_f32_f32(a: &[f32], b: &[f32]) -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| {
+                let d = *x as f64 - *y as f64;
+                d * d
+            })
+            .sum()
+    }
+    pub fn cosine_parts(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
+        let mut dot = 0.0f64;
+        let mut na = 0.0f64;
+        let mut nb = 0.0f64;
+        for i in 0..a.len() {
+            let (x, y) = (a[i] as f64, b[i] as f64);
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        (dot, na, nb)
+    }
+    pub fn dot_i8_i8(a: &[i8], b: &[i8]) -> i64 {
+        a.iter().zip(b).map(|(x, y)| *x as i64 * *y as i64).sum()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod simd {
+    use super::scalars;
+    use std::sync::OnceLock;
+
+    pub fn have_avx2() -> bool {
+        static OK: OnceLock<bool> = OnceLock::new();
+        *OK.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
+    }
+
+    pub fn dot_f32_i8(q: &[f32], v: &[i8]) -> f64 {
+        if have_avx2() {
+            unsafe { return dot_f32_i8_avx2(q, v) };
+        }
+        scalars::dot_f32_i8(q, v)
+    }
+    pub fn dot_f32_f32(a: &[f32], b: &[f32]) -> f64 {
+        if have_avx2() {
+            unsafe { return dot_f32_f32_avx2(a, b) };
+        }
+        scalars::dot_f32_f32(a, b)
+    }
+    pub fn l2_f32_f32(a: &[f32], b: &[f32]) -> f64 {
+        if have_avx2() {
+            unsafe { return l2_f32_f32_avx2(a, b) };
+        }
+        scalars::l2_f32_f32(a, b)
+    }
+    pub fn cosine_parts(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
+        if have_avx2() {
+            unsafe { return cosine_parts_avx2(a, b) };
+        }
+        scalars::cosine_parts(a, b)
+    }
+    pub fn dot_i8_i8(a: &[i8], b: &[i8]) -> i64 {
+        // Exact integer paths — associativity-safe, so AVX2 is bit-identical
+        // to the fallback (no reduction-order caveat, unlike the f64 lanes).
+        if have_avx2() && a.len() <= 100_000 {
+            unsafe { return dot_i8_i8_avx2(a, b) };
+        }
+        scalars::dot_i8_i8(a, b)
+    }
+
+    /// f32·int8 → f64: 8 f32 per iteration; i8 sign-extends to i32 then to
+    /// f64 lanes; per lane it keeps multiply-then-add (the scalar's
+    /// two-rounding steps elementwise); tail ≤ 7 uses the same scalar
+    /// expressions. Horizontal fold order = (l0+l2)+(l1+l3) + tail — fp
+    /// addition order differs from sequential, see the module header.
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot_f32_i8_avx2(q: &[f32], v: &[i8]) -> f64 {
+        use std::arch::x86_64::*;
+        let n = q.len().min(v.len());
+        let limbs = n & !7;
+        let mut acc = _mm256_setzero_pd();
+        let mut i = 0;
+        while i < limbs {
+            let x = _mm256_loadu_ps(q.as_ptr().add(i));
+            let b32 = _mm256_cvtepi8_epi32(_mm_loadl_epi64(v.as_ptr().add(i) as *const __m128i));
+            let xl = _mm256_cvtps_pd(_mm256_castps256_ps128(x));
+            let xh = _mm256_cvtps_pd(_mm256_extractf128_ps::<1>(x));
+            let bl = _mm256_cvtepi32_pd(_mm256_castsi256_si128(b32));
+            let bh = _mm256_cvtepi32_pd(_mm256_extracti128_si256::<1>(b32));
+            acc = _mm256_add_pd(acc, _mm256_mul_pd(xl, bl));
+            acc = _mm256_add_pd(acc, _mm256_mul_pd(xh, bh));
+            i += 8;
+        }
+        let mut p = fold4(acc);
+        while i < n {
+            p += q[i] as f64 * v[i] as f64;
+            i += 1;
+        }
+        p
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot_f32_f32_avx2(a: &[f32], b: &[f32]) -> f64 {
+        use std::arch::x86_64::*;
+        let n = a.len().min(b.len());
+        let limbs = n & !7;
+        let mut acc = _mm256_setzero_pd();
+        let mut i = 0;
+        while i < limbs {
+            let x = _mm256_loadu_ps(a.as_ptr().add(i));
+            let y = _mm256_loadu_ps(b.as_ptr().add(i));
+            let xl = _mm256_cvtps_pd(_mm256_castps256_ps128(x));
+            let xh = _mm256_cvtps_pd(_mm256_extractf128_ps::<1>(x));
+            let yl = _mm256_cvtps_pd(_mm256_castps256_ps128(y));
+            let yh = _mm256_cvtps_pd(_mm256_extractf128_ps::<1>(y));
+            acc = _mm256_add_pd(acc, _mm256_mul_pd(xl, yl));
+            acc = _mm256_add_pd(acc, _mm256_mul_pd(xh, yh));
+            i += 8;
+        }
+        let mut p = fold4(acc);
+        while i < n {
+            p += a[i] as f64 * b[i] as f64;
+            i += 1;
+        }
+        p
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn l2_f32_f32_avx2(a: &[f32], b: &[f32]) -> f64 {
+        use std::arch::x86_64::*;
+        let n = a.len().min(b.len());
+        let limbs = n & !7;
+        let mut acc = _mm256_setzero_pd();
+        let mut i = 0;
+        while i < limbs {
+            let x = _mm256_loadu_ps(a.as_ptr().add(i));
+            let y = _mm256_loadu_ps(b.as_ptr().add(i));
+            let xl = _mm256_cvtps_pd(_mm256_castps256_ps128(x));
+            let xh = _mm256_cvtps_pd(_mm256_extractf128_ps::<1>(x));
+            let yl = _mm256_cvtps_pd(_mm256_castps256_ps128(y));
+            let yh = _mm256_cvtps_pd(_mm256_extractf128_ps::<1>(y));
+            let dl = _mm256_sub_pd(xl, yl);
+            let dh = _mm256_sub_pd(xh, yh);
+            acc = _mm256_add_pd(acc, _mm256_mul_pd(dl, dl));
+            acc = _mm256_add_pd(acc, _mm256_mul_pd(dh, dh));
+            i += 8;
+        }
+        let mut p = fold4(acc);
+        while i < n {
+            let d = a[i] as f64 - b[i] as f64;
+            p += d * d;
+            i += 1;
+        }
+        p
+    }
+
+    /// (dot, ‖a‖², ‖b‖²) in one pass — three 4-lane f64 accumulators.
+    #[target_feature(enable = "avx2")]
+    unsafe fn cosine_parts_avx2(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
+        use std::arch::x86_64::*;
+        let n = a.len().min(b.len());
+        let limbs = n & !7;
+        let (mut acc, mut ma, mut mb) = (_mm256_setzero_pd(), _mm256_setzero_pd(), _mm256_setzero_pd());
+        let mut i = 0;
+        while i < limbs {
+            let x = _mm256_loadu_ps(a.as_ptr().add(i));
+            let y = _mm256_loadu_ps(b.as_ptr().add(i));
+            let (xl, xh) = (_mm256_cvtps_pd(_mm256_castps256_ps128(x)), _mm256_cvtps_pd(_mm256_extractf128_ps::<1>(x)));
+            let (yl, yh) = (_mm256_cvtps_pd(_mm256_castps256_ps128(y)), _mm256_cvtps_pd(_mm256_extractf128_ps::<1>(y)));
+            acc = _mm256_add_pd(acc, _mm256_mul_pd(xl, yl));
+            acc = _mm256_add_pd(acc, _mm256_mul_pd(xh, yh));
+            ma = _mm256_add_pd(ma, _mm256_mul_pd(xl, xl));
+            ma = _mm256_add_pd(ma, _mm256_mul_pd(xh, xh));
+            mb = _mm256_add_pd(mb, _mm256_mul_pd(yl, yl));
+            mb = _mm256_add_pd(mb, _mm256_mul_pd(yh, yh));
+            i += 8;
+        }
+        let (mut d, mut n1, mut n2) = (fold4(acc), fold4(ma), fold4(mb));
+        while i < n {
+            let (x, y) = (a[i] as f64, b[i] as f64);
+            d += x * y;
+            n1 += x * x;
+            n2 += y * y;
+            i += 1;
+        }
+        (d, n1, n2)
+    }
+
+    /// Horizontal fold of four f64 lanes: (l0+l2)+(l1+l3) — addition order
+    /// differs from sequential, see the module header.
+    #[inline]
+    unsafe fn fold4(acc: std::arch::x86_64::__m256d) -> f64 {
+        use std::arch::x86_64::*;
+        let lo = _mm256_extractf128_pd::<0>(acc);
+        let hi = _mm256_extractf128_pd::<1>(acc);
+        let p2 = _mm_add_pd(lo, hi); // (l0+l2, l1+l3)
+        let s = _mm_add_sd(p2, _mm_unpackhi_pd(p2, p2));
+        _mm_cvtsd_f64(s)
+    }
+
+    /// int8·int8 exact, 32-byte chunks: i16 widen, `madd` pairs (element
+    /// products ≤ 16384, pair sums ≤ 32768 — no i16/i32 overflow), i32
+    /// lanes folded exactly; tail scalar. Exact for dim ≤ 100k (guarded in
+    /// the dispatcher) — else the sequential path (also exact).
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot_i8_i8_avx2(a: &[i8], b: &[i8]) -> i64 {
+        use std::arch::x86_64::*;
+        let n = a.len().min(b.len());
+        let limbs = n & !31;
+        let mut acc = _mm256_setzero_si256();
+        let mut i = 0;
+        while i < limbs {
+            let ax = _mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i);
+            let bx = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
+            let al = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(ax));
+            let bl = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(bx));
+            let ah = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(ax));
+            let bh = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(bx));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(al, bl));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(ah, bh));
+            i += 32;
+        }
+        // exact horizontal i32 fold
+        let lo = _mm256_extracti128_si256::<0>(acc);
+        let hi = _mm256_extracti128_si256::<1>(acc);
+        let p = _mm_add_epi32(lo, hi);
+        let p2 = _mm_add_epi32(p, _mm_shuffle_epi32::<0b01_01_01_01>(p));
+        let p3 = _mm_add_epi32(p2, _mm_shuffle_epi32::<0b10_10_10_10>(p2));
+        let mut tot = _mm_cvtsi128_si32(p3) as i64;
+        while i < n {
+            tot += a[i] as i64 * b[i] as i64;
+            i += 1;
+        }
+        tot
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+mod simd {
+    pub use super::scalars::{cosine_parts, dot_f32_f32, dot_f32_i8, dot_i8_i8, l2_f32_f32};
+    pub fn have_avx2() -> bool {
+        false
+    }
+}
+
+// P1: HNSW (in-RAM, per collection+field).
 // From-scratch (~200 lines) instead of a new dependency: the algorithm is
 // small, the tree already depends on nothing ANN-shaped, and a fixed-seed
 // xorshift keeps inserts/searches bit-deterministic for tests. Literate
@@ -391,10 +640,7 @@ impl HnswIndex {
     /// Zero-norm either side → 1.0 (cosine) — same guard as the exact path.
     fn q_dist(&self, q: &[f32], qn: f64, idx: usize) -> f64 {
         let n = &self.nodes[idx];
-        let mut dot = 0.0f64;
-        for (i, q) in q.iter().enumerate() {
-            dot += *q as f64 * n.ivec[i] as f64;
-        }
+        let dot = simd::dot_f32_i8(q, &n.ivec);
         match self.metric {
             Metric::Cosine => {
                 let denom = qn.sqrt() * n.sum_sq.sqrt();
@@ -415,10 +661,7 @@ impl HnswIndex {
     /// temporaries.
     fn node_dist(&self, a: usize, b: usize) -> f64 {
         let (na, nb) = (&self.nodes[a], &self.nodes[b]);
-        let mut dot = 0i64;
-        for i in 0..na.ivec.len() {
-            dot += na.ivec[i] as i64 * nb.ivec[i] as i64;
-        }
+        let dot = simd::dot_i8_i8(&na.ivec, &nb.ivec);
         match self.metric {
             Metric::Cosine => {
                 let denom = (na.sum_sq * nb.sum_sq).sqrt();
@@ -675,6 +918,41 @@ mod tests {
         assert_eq!(l2_distance_squared(&q, &[3.0, 3.0]), 8.0);
         assert_eq!(l2_distance_squared(&q, &[2.0, 1.0]), 1.0);
         assert_eq!(l2_distance_squared(&q, &q), 0.0);
+    }
+
+    /// V1 SIMD kernels agree with the sequential oracle: fp kernels within
+    /// 1e-9 (AVX folds 4 lanes — addition order, not element math, differs),
+    /// int8·int8 bit-exact (integer associativity).
+    #[test]
+    fn simd_kernels_match_sequential() {
+        let f = |i: usize| ((i % 13) as f32 / 7.0) - 0.9 + (i % 5) as f32 * 0.01;
+        let g = |i: usize| ((i * 11 + 3) % 17) as f32 / 9.0 - 1.0;
+        for n in [1usize, 7, 8, 9, 32, 33, 96, 4096] {
+            let a: Vec<f32> = (0..n).map(f).collect();
+            let b: Vec<f32> = (0..n).map(g).collect();
+            let (d, na, nb) = simd::cosine_parts(&a, &b);
+            let s = scalars::cosine_parts(&a, &b);
+            let tol = 1e-9 * (n as f64).max(1.0);
+            assert!((d - s.0).abs() <= tol, "cosine dot n={n}: {} vs {}", d, s.0);
+            assert!((na - s.1).abs() <= tol, "norm a n={n}");
+            assert!((nb - s.2).abs() <= tol, "norm b n={n}");
+            assert!((simd::l2_f32_f32(&a, &b) - scalars::l2_f32_f32(&a, &b)).abs() <= tol);
+            assert!((simd::dot_f32_f32(&a, &b) - scalars::dot_f32_f32(&a, &b)).abs() <= tol);
+            let q8: Vec<i8> = (0..n).map(|i| ((i * 7 + 1) % 251) as i64 as i8).collect();
+            let v8: Vec<i8> = (0..n).map(|i| ((i * 5 + 2) % 255) as i64 as i8).collect();
+            assert_eq!(
+                simd::dot_i8_i8(&q8, &v8),
+                scalars::dot_i8_i8(&q8, &v8),
+                "int8 dot n={n}"
+            );
+            assert_eq!(simd::dot_i8_i8(&v8, &q8), scalars::dot_i8_i8(&v8, &q8));
+            // f32·i8 with the same int8 fixtures
+            let qf: Vec<f32> = v8.iter().map(|x| *x as f32 * 0.5).collect();
+            assert!(
+                (simd::dot_f32_i8(&qf, &q8) - scalars::dot_f32_i8(&qf, &q8)).abs()
+                    <= tol * 2.0
+            );
+        }
     }
 
     #[test]
