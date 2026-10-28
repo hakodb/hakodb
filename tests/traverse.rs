@@ -560,6 +560,50 @@ fn refdoc_multi(targets: &[(&str, &str)]) -> HakoDoc {
     doc
 }
 
+/// G2 re-scope #173: adjacency memo serves repeated whole-graph analysis —
+/// identical results on the hit path, and any doc write (node put, node
+/// delete, spec change) rebuilds.
+#[test]
+fn graph_adjacency_memo_hit_and_invalidation() {
+    let dir = tmp("adjmemo");
+    let db = open_db(&dir);
+    db.put("docs", "a", &refdoc("docs", "b")).unwrap();
+    db.put("docs", "b", &blank()).unwrap();
+    db.put("docs", "c", &blank()).unwrap();
+    wait(&db);
+    let s = spec(TraverseDir::Outgoing, 5, 10);
+    let first = db.graph_components("docs", &s).unwrap();
+    // Second call rides the memo: identical output.
+    assert_eq!(db.graph_components("docs", &s).unwrap(), first);
+    // Write to a member doc invalidates: c now links to a — single component.
+    db.put("docs", "c", &refdoc("docs", "a")).unwrap();
+    wait(&db);
+    let merged = db.graph_components("docs", &s).unwrap();
+    assert_eq!(idmat(&merged), vec![p(&["docs/a", "docs/b", "docs/c"])]);
+    // Delete a node: its row leaves the graph entirely (moeo hit —
+    // b's link targeted c, but c is gone, so a-b remains only).
+    db.delete("docs", "c").unwrap();
+    wait(&db);
+    assert_eq!(
+        idmat(&db.graph_components("docs", &s).unwrap()),
+        vec![p(&["docs/a", "docs/b"])]
+    );
+    // A different spec replaces the slot: node_match keeps nothing here,
+    // but the membership shape responds to the spec change (not stale).
+    let mut ns = spec(TraverseDir::Outgoing, 5, 10);
+    ns.node_match = Some(("kind".into(), Value::String("keep".into())));
+    let filtered = db.graph_components("docs", &ns).unwrap();
+    assert_eq!(idmat(&filtered), Vec::<Vec<String>>::new());
+    // Re-adding rebuilds again around the new graph shape.
+    db.put("docs", "c", &blank()).unwrap();
+    wait(&db);
+    assert_eq!(
+        idmat(&db.graph_components("docs", &s).unwrap()),
+        vec![p(&["docs/a", "docs/b"]), p(&["docs/c"])]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn graph_components_weak_and_filtered() {
     let dir = tmp("comps");
