@@ -233,6 +233,12 @@ pub enum BatchMutation {
         collection: String,
         doc_id: String,
     },
+    /// #177: tombstone + retention record in `__hako_softdel` (same
+    /// batch). Restoreable via `Hako::restore` until the sweeper purges.
+    SoftDelete {
+        collection: String,
+        doc_id: String,
+    },
     Patch { 
         collection: String, 
         doc_id: String, 
@@ -520,7 +526,16 @@ impl Transaction {
             doc,
         });
     }
+    /// Soft delete inside the transaction (#177): restoreable until the
+    /// sweeper purges the retention record.
     pub fn delete(&mut self, collection: &str, doc_id: &str) {
+        self.mutations.push(BatchMutation::SoftDelete {
+            collection: collection.to_string(),
+            doc_id: doc_id.to_string(),
+        });
+    }
+    /// Legacy hard delete inside the transaction: no retention record.
+    pub fn delete_force(&mut self, collection: &str, doc_id: &str) {
         self.mutations.push(BatchMutation::Delete {
             collection: collection.to_string(),
             doc_id: doc_id.to_string(),
@@ -599,7 +614,16 @@ impl SerializableTransaction {
             doc,
         });
     }
+    /// Soft delete inside the transaction (#177): restoreable until the
+    /// sweeper purges the retention record.
     pub fn delete(&mut self, collection: &str, doc_id: &str) {
+        self.mutations.push(BatchMutation::SoftDelete {
+            collection: collection.to_string(),
+            doc_id: doc_id.to_string(),
+        });
+    }
+    /// Legacy hard delete inside the transaction: no retention record.
+    pub fn delete_force(&mut self, collection: &str, doc_id: &str) {
         self.mutations.push(BatchMutation::Delete {
             collection: collection.to_string(),
             doc_id: doc_id.to_string(),
@@ -1105,9 +1129,14 @@ impl Hako {
         // a whole run; live-toggling mid-run would only add a race for no
         // benefit (the tick re-reads every 5s anyway if this ever needs it).
         let maintenance_on = config.background_maintenance;
+        // #177 sweeper cadence + budget (copied like maintenance_on).
+        let sweep_interval_secs = config.soft_delete_sweep_interval_secs;
+        let sweep_max_bytes = config.soft_delete_max_bytes;
+        let sweep_max_count = config.soft_delete_max_count;
 
         let system_handle_thread = thread::spawn(move || {
             let mut last_maint = Instant::now();
+            let mut last_sweep = Instant::now();
             // Query-aware shedding: consecutive ticks deferred while
             // queries fly (see below). Bounded so backlog drains under
             // sustained load instead of growing without limit.
@@ -1185,6 +1214,33 @@ impl Hako {
                     maintenance_for_system.store(false, Ordering::Release);
                     } // end maintenance_on hold gate
                 }
+
+                // #177 soft-delete sweeper: own cadence on the same tick.
+                // Cheap probe when idle; skipped with background maintenance
+                // off (deterministic benchmarks) - explicit sweep_now()
+                // still works.
+                if maintenance_on
+                    && sweep_interval_secs > 0
+                    && last_sweep.elapsed() >= Duration::from_secs(sweep_interval_secs)
+                {
+                    maintenance_for_system.store(true, Ordering::Release);
+                    let purged = {
+                        let shards_map = shards_sys_clone.read().unwrap();
+                        crate::engine::softdel::sweep_pass(
+                            &shards_map,
+                            crate::util::clock::now_micros(),
+                            sweep_max_bytes,
+                            sweep_max_count,
+                            crate::engine::softdel::SWEEP_CHUNK,
+                        )
+                    };
+                    maintenance_for_system.store(false, Ordering::Release);
+                    if purged > 0 {
+                        eprintln!("hako softdel: swept {purged} record(s)");
+                    }
+                    last_sweep = Instant::now();
+                }
+
                 if system_stop_rx.recv_timeout(Duration::from_millis(500)).is_ok() { break; }
             }
         });
@@ -1354,6 +1410,11 @@ impl Hako {
         let _ = db.restore_index_defs();
         let _ = db.restore_schemas();
         let _ = db.restore_local_only();
+        // #177: load (or create) the soft-delete retention shard eagerly -
+        // recovery discovery skips `_`-prefixed dirs, so without this the
+        // sweeper's map lookups and restore listings would miss it after
+        // a restart until first touch.
+        let _ = db.get_shard(crate::engine::softdel::SOFTDEL_COLLECTION);
 
         // 6. ORCHESTRATED BACKGROUND RECOVERY
         let shards_ptr = Arc::clone(&db.shards);
@@ -2147,8 +2208,8 @@ impl Hako {
         let mut last_shard: Option<(String, Arc<RwLock<StorageEngine>>, Option<Arc<BlobManager>>)> = None;
         for m in mutations {
             // 1. Resolve basic info immediately
-            let (col, mut doc_id, mut doc, is_delete) = match m {
-                BatchMutation::Put { collection, doc_id, doc } => (collection, doc_id, doc, false),
+            let (col, mut doc_id, mut doc, is_delete, is_soft) = match m {
+                BatchMutation::Put { collection, doc_id, doc } => (collection, doc_id, doc, false, false),
                 BatchMutation::Patch { collection, doc_id, updates } => {
                     let shard_arc = self.get_shard(&collection)?;
                     let current_doc = {
@@ -2159,10 +2220,13 @@ impl Hako {
                     };
                     let mut updated = current_doc;
                     for (k, v) in updates { updated.insert(k, v); }
-                    (collection, doc_id, updated, false)
+                    (collection, doc_id, updated, false, false)
                 }
                 BatchMutation::Delete { collection, doc_id } => {
-                    (collection, doc_id, HakoDoc::default(), true)
+                    (collection, doc_id, HakoDoc::default(), true, false)
+                }
+                BatchMutation::SoftDelete { collection, doc_id } => {
+                    (collection, doc_id, HakoDoc::default(), true, true)
                 }
             };
 
@@ -2177,6 +2241,33 @@ impl Hako {
             // batch member rejects the whole batch atomically.
             if !is_delete {
                 self.apply_schema(&col, &mut doc)?;
+            }
+
+            // #177 soft delete: retain the payload in `__hako_softdel`
+            // (same batch, own shard work) so restore survives restart.
+            // Injected before the target shard-work borrow below; retention
+            // 0 or a missing doc degrades to the legacy tombstone-only shape.
+            if is_soft {
+                if let Some((rec_id, rec_doc)) = self.softdel_record(&col, &doc_id, now_micros) {
+                    let rec_key: Arc<str> = Arc::from(rec_id.as_str());
+                    let rec_bytes = rec_doc.encode_buffered();
+                    let rec_doc = Arc::new(rec_doc);
+                    let rw = shard_map
+                        .entry(crate::engine::softdel::SOFTDEL_COLLECTION.to_string())
+                        .or_insert_with(|| ShardWork {
+                            ops: Vec::new(), keys: Vec::new(), deleted: HashSet::new(),
+                            events: Vec::new(), index_puts: Vec::new(),
+                            blob_queue_items: Vec::new(), index_deletes: Vec::new()
+                        });
+                    rw.ops.push(WalOp::PutInlined { key: rec_id, value: rec_bytes });
+                    rw.index_puts.push((rec_key.to_string(), rec_doc));
+                    rw.keys.push(rec_key.clone());
+                    rw.deleted.remove(rec_key.as_ref());
+                    rw.events.push((
+                        crate::engine::softdel::SOFTDEL_COLLECTION.to_string(),
+                        ChangeEvent { path: rec_key, kind: ChangeKind::Put },
+                    ));
+                }
             }
 
             // 2. COMPUTE KEY ONCE
@@ -3032,7 +3123,20 @@ impl Hako {
         Ok(res.into_iter().next().unwrap_or_default())
     }
 
+    /// Soft delete (#177): tombstone now, payload retained in
+    /// `__hako_softdel` for the retention window, restoreable via
+    /// [`Hako::restore`].
     pub fn delete(&self, col: &str, id: &str) -> Result<String> {
+        let res = self.write_batch(vec![BatchMutation::SoftDelete {
+            collection: col.into(),
+            doc_id: id.into(),
+        }])?;
+        Ok(res.into_iter().next().unwrap_or_default())
+    }
+
+    /// Legacy hard delete: tombstone only, no retention record (the
+    /// pre-#177 semantics; vacuum/drop/sync paths keep this shape).
+    pub fn delete_force(&self, col: &str, id: &str) -> Result<String> {
         let res = self.write_batch(vec![BatchMutation::Delete {
             collection: col.into(),
             doc_id: id.into(),
@@ -4293,6 +4397,7 @@ impl Hako {
         match m {
             BatchMutation::Put { collection, .. } => collection,
             BatchMutation::Delete { collection, .. } => collection,
+            BatchMutation::SoftDelete { collection, .. } => collection,
             BatchMutation::Patch { collection, .. } => collection,
         }
     }

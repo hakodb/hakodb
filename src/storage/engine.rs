@@ -1471,6 +1471,27 @@ impl StorageEngine {
         });
     }
 
+    /// #177 sweeper primitive: durable storage-level removal (WAL-first,
+    /// then index drop) - mirrors the engine delete apply so a crash
+    /// replays to the same end state.
+    pub(crate) fn hard_delete_keys(&mut self, keys: &[String]) -> crate::error::Result<u64> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let tx_id = self.next_tx_id;
+        self.next_tx_id += 1;
+        let now = crate::util::clock::now_micros();
+        let ops: Vec<WalOp> = keys
+            .iter()
+            .map(|k| WalOp::Delete { key: k.clone(), timestamp: now })
+            .collect();
+        self.wal.append_batch_fast(tx_id, &ops, false)?;
+        for k in keys {
+            self.index.remove(k);
+        }
+        Ok(keys.len() as u64)
+    }
+
 }
 
 impl Drop for StorageEngine { fn drop(&mut self) { let _ = self.flush_all(); } }

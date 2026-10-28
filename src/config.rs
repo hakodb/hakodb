@@ -84,6 +84,19 @@ pub sync_excluded: Vec<String>,
 /// `load_collection`, ...) opens + replays + backfills it fully.
 /// Default empty (everything eager, legacy behavior).
 pub lazy_collections: Vec<String>,
+/// Soft-delete retention (#177): how long a soft-deleted doc's payload
+/// stays restoreable in `__hako_softdel` before the sweeper purges it.
+/// 0 disables retention: `delete` degrades to the legacy tombstone-only
+/// shape (force-equivalent).
+pub soft_delete_retention_secs: u64,
+/// Sweeper cadence in seconds on the maintenance tick. 0 disables
+/// background sweeping (explicit `sweep_now` still works).
+pub soft_delete_sweep_interval_secs: u64,
+/// Retention budget: oldest records evicted first once the queue's
+/// estimated bytes exceed this.
+pub soft_delete_max_bytes: u64,
+/// Retention budget: record count.
+pub soft_delete_max_count: u64,
 }
 
 impl Default for HakoConfig {
@@ -110,6 +123,10 @@ wal_reserve_bytes: 4 * 1024 * 1024,
     background_maintenance: true,
     sync_excluded: Vec::new(),
     lazy_collections: Vec::new(),
+    soft_delete_retention_secs: 86400,
+    soft_delete_sweep_interval_secs: 300,
+    soft_delete_max_bytes: 64 * 1024 * 1024,
+    soft_delete_max_count: 1_000_000,
         }
     }
 }

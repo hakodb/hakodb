@@ -1237,6 +1237,174 @@ pub extern "C" fn hk_engine_delete(
     }
 }
 
+/// #177: delete with an explicit mode - 0 = soft (tombstone + retention
+/// record, restoreable via hk_engine_restore), non-zero = force (legacy
+/// tombstone-only).
+#[no_mangle]
+pub extern "C" fn hk_engine_delete_ext(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    doc_id: *const c_char,
+    mode: i32,
+) -> i32 {
+    if engine.is_null() {
+        return set_last_error_err("null engine handle");
+    }
+    let collection = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    let doc_id = match cstr_to_string(doc_id) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+
+    let engine = unsafe { &mut *engine };
+    let res = if mode == 0 {
+        engine.db.delete(&collection, &doc_id)
+    } else {
+        engine.db.delete_force(&collection, &doc_id)
+    };
+    match res {
+        Ok(_) => {
+            clear_last_error();
+            0
+        }
+        Err(e) => set_last_error_err(e.to_string()),
+    }
+}
+
+/// #177: restore a soft-deleted doc from its retention record.
+#[no_mangle]
+pub extern "C" fn hk_engine_restore(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    doc_id: *const c_char,
+) -> i32 {
+    if engine.is_null() {
+        return set_last_error_err("null engine handle");
+    }
+    let collection = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    let doc_id = match cstr_to_string(doc_id) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+
+    let engine = unsafe { &mut *engine };
+    match engine.db.restore(&collection, &doc_id) {
+        Ok(_) => {
+            clear_last_error();
+            0
+        }
+        Err(e) => set_last_error_err(e.to_string()),
+    }
+}
+
+/// #177: restoreable records as a JSON array (owned string; free with
+/// hk_string_free). `collection` may be NULL for all collections.
+#[no_mangle]
+pub extern "C" fn hk_engine_restore_available(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error_err("null engine handle");
+            return std::ptr::null_mut();
+        }
+        let col = if collection.is_null() {
+            None
+        } else {
+            match cstr_to_string(collection) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    set_last_error_err(e);
+                    return std::ptr::null_mut();
+                }
+            }
+        };
+        let engine = unsafe { &*engine };
+        match engine.db.restore_available(col.as_deref()) {
+            Ok(entries) => {
+                let json = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
+                match CString::new(json) {
+                    Ok(c_str) => {
+                        clear_last_error();
+                        c_str.into_raw()
+                    }
+                    Err(_) => std::ptr::null_mut(),
+                }
+            }
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// #177: due-for-sweep subset as a JSON array (owned string; free with
+/// hk_string_free). `collection` may be NULL for all collections.
+#[no_mangle]
+pub extern "C" fn hk_engine_delete_queue(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error_err("null engine handle");
+            return std::ptr::null_mut();
+        }
+        let col = if collection.is_null() {
+            None
+        } else {
+            match cstr_to_string(collection) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    set_last_error_err(e);
+                    return std::ptr::null_mut();
+                }
+            }
+        };
+        let engine = unsafe { &*engine };
+        match engine.db.delete_queue(col.as_deref()) {
+            Ok(entries) => {
+                let json = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
+                match CString::new(json) {
+                    Ok(c_str) => {
+                        clear_last_error();
+                        c_str.into_raw()
+                    }
+                    Err(_) => std::ptr::null_mut(),
+                }
+            }
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// #177: run one sweep pass now; returns the purged count (-1 on error).
+#[no_mangle]
+pub extern "C" fn hk_engine_sweep_now(engine: *mut HK_Engine) -> i32 {
+    if engine.is_null() {
+        return set_last_error_err("null engine handle");
+    }
+    let engine = unsafe { &mut *engine };
+    match engine.db.sweep_now() {
+        Ok(n) => {
+            clear_last_error();
+            n.min(i32::MAX as u64) as i32
+        }
+        Err(e) => set_last_error_err(e.to_string()),
+    }
+}
+
 /// Local-only delete: marks the key so no sync tailer or handshake
 /// catch-up ever transmits it, then deletes normally (fresh tombstone
 /// timestamp keeps the version clock advanced — handshake-stable).
@@ -1595,6 +1763,39 @@ pub extern "C" fn hk_batch_delete(
 
     let batch = unsafe { &mut *batch };
     batch.ops.push(BatchMutation::Delete { collection, doc_id });
+    clear_last_error();
+    0
+}
+
+/// #177: batch delete with an explicit mode - 0 = soft (tombstone +
+/// retention record), non-zero = force (legacy tombstone-only). The
+/// existing hk_batch_delete keeps its legacy (force) behavior.
+#[no_mangle]
+pub extern "C" fn hk_batch_delete_ext(
+    batch: *mut HK_Batch,
+    collection: *const c_char,
+    doc_id: *const c_char,
+    mode: i32,
+) -> i32 {
+    if batch.is_null() {
+        return set_last_error_err("null batch handle");
+    }
+    let collection = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    let doc_id = match cstr_to_string(doc_id) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+
+    let batch = unsafe { &mut *batch };
+    let m = if mode == 0 {
+        BatchMutation::SoftDelete { collection, doc_id }
+    } else {
+        BatchMutation::Delete { collection, doc_id }
+    };
+    batch.ops.push(m);
     clear_last_error();
     0
 }
