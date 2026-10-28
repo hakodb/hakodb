@@ -2,7 +2,7 @@
 
 Full per-release history for HakoDB. The README keeps only the latest three.
 
-### Unreleased
+### v0.19.6 — SIMD distance kernels + whole-graph adjacency memo (#172/#173)
 - **Whole-graph adjacency memo (G2 re-scope, #173).** `graph_components`,
   `find_cycle`, `topo_sort` and `degree_centrality` today decode the full
   node set per call; the engine now keeps one adjacency slot per collection
