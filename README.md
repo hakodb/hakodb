@@ -30,10 +30,11 @@ Your app *is* the database host: ideal for local-first/offline-first products, d
 ## Key features
 
 - **Engine** — `open/put/get/delete/query`, atomic `write_batch`, serializable transactions, `watch_collection` streams, subcollections.
-- **Queries** — `eq/ne/gt/gte/lt/lte/in/notIn/arrayContains/match/contains/startsWith`, ordering, limit/offset, cursor bounds, `count/sum/avg`, cost-aware parallel planner with projection pushdown.
-- **Indexes** — secondary B-Tree, composite, full-text, HNSW vector (KNN), graph backlinks (BFS) + `_from`/`_to` edge collections (weighted Dijkstra); built asynchronously in the background.
+- **Queries** — `eq/ne/gt/gte/lt/lte/in/notIn/arrayContains/match/contains/startsWith`, ordering, limit/offset, cursor bounds, `count/sum/avg/min/max`, cost-aware parallel planner with projection pushdown.
+- **Indexes** — secondary B-Tree, composite, full-text, HNSW vector (KNN), graph (BFS/Dijkstra) with edge predicates; built asynchronously in the background.
 - **Storage** — tiered compaction, group-commit WAL, blob offloading, optional zstd compression (`compression` feature, default-on).
 - **Operations** — collection-prefix allow/deny rules, audit logging, `flush/compact/backup`.
+- **Deletes** — soft by default: tombstone + retention record, restore any time before the sweeper purges (`restore`/`restore_available`/`delete_queue`/`sweep_now`); `--force`-style hard delete stays available.
 
 ## Quick start (Rust)
 
@@ -89,8 +90,8 @@ Two optional, independent replication layers:
 
 ```toml
 [dependencies]
-hakodb = { version = "0.19", features = ["net-sync"] }    # LAN mesh: mDNS discovery, room-key isolation, delta replication
-hakodb = { version = "0.19", features = ["cloud-sync"] }  # central hub: offline-first clients over ws(s), room isolation, auth tokens
+hakodb = { git = "https://github.com/hakodb/hakodb", features = ["net-sync"] }   # LAN mesh: mDNS discovery, room-key isolation, delta replication
+hakodb = { git = "https://github.com/hakodb/hakodb", features = ["cloud-sync"] } # central hub: offline-first clients over ws(s), room isolation, auth tokens
 ```
 
 Rooms isolate data (`room_name` + `room_key`); the cloud server is room-agnostic and hosts any room. Index definitions replicate; derived state (HNSW graphs) rebuilds locally.
