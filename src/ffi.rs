@@ -172,6 +172,11 @@ pub struct HK_NetSyncer {
 #[allow(non_camel_case_types)]
 pub struct HK_CloudSync {
     inner: std::sync::Arc<crate::cloud_sync::CloudSync>,
+    /// Parked Tokio runtime for plain C/C++/ctypes consumers: start()
+    /// spawns spawn_blocking tailers that only exit after stop(), so the
+    /// runtime must outlive the start() call (dropping it there deadlocks
+    /// on Runtime::drop's blocking-task wait).
+    rt: Option<tokio::runtime::Runtime>,
 }
 
 thread_local! {
@@ -6873,6 +6878,7 @@ pub extern "C" fn hk_cloud_sync_new(
         clear_last_error();
         Box::into_raw(Box::new(HK_CloudSync {
             inner: std::sync::Arc::new(cloud_sync),
+            rt: None,
         }))
     })
 }
@@ -6912,6 +6918,7 @@ pub extern "C" fn hk_cloud_sync_server_new(
         clear_last_error();
         Box::into_raw(Box::new(HK_CloudSync {
             inner: std::sync::Arc::new(cloud_sync),
+            rt: None,
         }))
     })
 }
@@ -6951,6 +6958,7 @@ pub extern "C" fn hk_cloud_sync_client_new(
         clear_last_error();
         Box::into_raw(Box::new(HK_CloudSync {
             inner: std::sync::Arc::new(cloud_sync),
+            rt: None,
         }))
     })
 }
@@ -6962,7 +6970,7 @@ pub extern "C" fn hk_cloud_sync_start(cloud_sync: *mut HK_CloudSync, address: *c
         if cloud_sync.is_null() {
             return set_last_error_err("Null cloud_sync handle");
         }
-        let cs_ref = unsafe { &*cloud_sync };
+        let cs_ref = unsafe { &mut *cloud_sync };
         let addr_str = match cstr_to_string(address) {
             Ok(a) => a,
             Err(e) => return set_last_error_err(e),
@@ -6981,11 +6989,21 @@ pub extern "C" fn hk_cloud_sync_start(cloud_sync: *mut HK_CloudSync, address: *c
                 Err(e) => set_last_error_err(e.to_string()),
             }
         } else {
+            // Plain C/C++/ctypes thread: no ambient runtime. Park the
+            // runtime in the handle instead of dropping it at the end of
+            // this call - Runtime::drop waits for spawn_blocking tasks,
+            // and the sync tailers only exit after stop().
+            if cs_ref.rt.is_some() {
+                clear_last_error();
+                return 0; // already started
+            }
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(r) => r,
                 Err(e) => return set_last_error_err(format!("Failed to create Tokio runtime: {}", e)),
             };
-            match rt.block_on(run_sync) {
+            let result = rt.block_on(run_sync);
+            cs_ref.rt = Some(rt);
+            match result {
                 Ok(_) => {
                     clear_last_error();
                     0
