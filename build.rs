@@ -22,17 +22,28 @@ fn main() {
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=cbindgen.toml");
 
+    // One line of truth in every build's output: protects the header flow
+    // from silent regressions (the 1.100 layout change produced none).
+    println!(
+        "cargo:warning=hakodb build-script: header feature={} skip_env={}",
+        std::env::var_os("CARGO_FEATURE_HEADER").is_some(),
+        std::env::var_os("HAKODB_SKIP_CBINDGEN").is_some(),
+    );
+
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR should exist");
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "release".to_string());
-    // ponytail: derive from OUT_DIR (<target>/<profile>/build/<pkg>/out),
-    // not a hardcoded "target/" — a shared CARGO_TARGET_DIR (or any
-    // --target-dir) would otherwise point dependents at an empty dir and
-    // break the FFI test link with LNK1181.
-    let target_dir = std::path::Path::new(&out_dir)
-        .ancestors()
-        .nth(3)
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::Path::new("target").join(&profile));
+    // ponytail: find the profile dir by NAME (PROFILE env), not by depth —
+    // cargo 1.100 moved intermediate artifacts into a new layout, so a
+    // fixed ancestor count no longer points at target/<profile>/. A shared
+    // CARGO_TARGET_DIR (or any --target-dir) stays correct either way.
+    let profile_dir = profile_dir_of(&out_dir, &profile);
+    let target_dir = profile_dir.unwrap_or_else(|| {
+        std::path::Path::new(&out_dir)
+            .ancestors()
+            .nth(3)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::Path::new("target").join(&profile))
+    });
 
 // ponytail: a stale unprefixed import lib SHADOWS the fresh .dll in
 // MinGW ld search order (it ran BEFORE rustc linked, so it always lagged
@@ -56,6 +67,7 @@ if !target.contains("msvc") {
 fn gen_header() {
     let crate_dir = std::env::var("CARGO_MANIFEST_DIR").expect("manifest dir should exist");
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR should exist");
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "release".to_string());
     let output = std::path::Path::new(&out_dir).join("hakodb.h");
 
     // ponytail: absolute path — a relative "cbindgen.toml" silently misses
@@ -69,22 +81,38 @@ fn gen_header() {
     let cfg = cbindgen::Config::from_file(&cbindgen_toml)
         .map_err(|e| format!("read {}: {e}", cbindgen_toml.display()))
         .expect("cbindgen.toml must load — refusing silent-default ABI header");
-    cbindgen::Builder::new()
+    let header = cbindgen::Builder::new()
         .with_crate(crate_dir.clone())
         .with_config(cfg)
         .generate()
-        .expect("Unable to generate C header")
-        .write_to_file(&output);
+        .expect("Unable to generate C header");
+    // cbindgen 0.28: write_to_file reports a plain bool, not a Result —
+    // a swallowed failure here is exactly the "build green, no header"
+    // CI incident, so be loud.
+    if !header.write_to_file(&output) {
+        panic!("Unable to write C header to {}", output.display());
+    }
     // ponytail: stable per-target copy next to the binaries. OUT_DIR hides
-    // under target/<triple>/<profile>/build/<pkg>-<hash>/out — unusable as
-    // a consumer path. The profile dir (3 ancestors up) is stable across
-    // hosts, triples, and profiles, so release CI, sync scripts, and the
+    // under the build dir — unusable as a consumer path, and its depth is
+    // NOT stable (cargo 1.100 layout change), so the copy target is the
+    // profile dir found by name. The profile dir is stable across hosts,
+    // triples, and profiles, so release CI, sync scripts, and the
     // C++ bench all take `target/<...>/hakodb.h` from the build that
     // produced it. There is no checked-in header anymore (deleted in
     // 0.9.1: one header pretending to serve all targets caused the stale
     // socket-API incident). Writing inside target/ keeps `cargo publish
     // --verify` and source-tree hygiene intact.
-    if let Some(profile_dir) = std::path::Path::new(&out_dir).ancestors().nth(3) {
-        let _ = std::fs::copy(&output, profile_dir.join("hakodb.h"));
-    }
+    let profile_dir = profile_dir_of(&out_dir, &profile)
+        .expect("profile dir not found above OUT_DIR — refusing to ship a header consumers can't find");
+    std::fs::copy(&output, profile_dir.join("hakodb.h")).expect("Unable to copy C header");
+}
+
+/// The profile dir (`target/<profile>/`) above OUT_DIR, located by NAME:
+/// the first ancestor whose final component matches the PROFILE env value
+/// ("release"/"debug"). Depth-independent — survives cargo layout changes.
+fn profile_dir_of(out_dir: &str, profile: &str) -> Option<std::path::PathBuf> {
+    std::path::Path::new(out_dir)
+        .ancestors()
+        .find(|p| p.file_name().is_some_and(|n| n == profile))
+        .map(|p| p.to_path_buf())
 }
