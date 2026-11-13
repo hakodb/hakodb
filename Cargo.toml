@@ -1,6 +1,6 @@
 [package]
 name = "hakodb"
-version = "0.20.2"
+version = "0.20.3"
 edition = "2021"
 authors = ["AbcDev Team"]
 description = "Embedded & Cloud-native Document Engine"
@@ -29,6 +29,10 @@ compression = ["dep:zstd"]
 # tokio has no net::unix on Windows, so the module compiles out there and
 # the feature is a silent no-op (Windows builds stay green).
 socket-sync = ["dep:tokio"]
+# Opt-in FFI header generation (build.rs): enabled by release/tag CI and
+# sync scripts (`cargo build --features header`); Rust dependents build
+# without it and compile zero header machinery.
+header = ["dep:cbindgen"]
 
 
 [dependencies]
@@ -80,7 +84,7 @@ name = "write_path"
 harness = false
 
 [build-dependencies]
-cbindgen = "0.28"
+cbindgen = { version = "0.28", optional = true }
 
 [workspace]
 members = [
