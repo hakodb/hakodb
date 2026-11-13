@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build cdylib (MSVC import lib is a release artifact)
-        run: cargo build --release
+        run: cargo build --release --features header
       - name: Collect assets
         shell: pwsh
         run: |
@@ -76,13 +76,20 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ${{ matrix.image }}
+    # Containers run as root but the runner injects HOME=/github/home;
+    # rustup >= 1.28 refuses that mismatch ("$HOME differs from
+    # euid-obtained home directory"). Pin HOME so rustup installs to
+    # /root/.cargo and the rustup shims resolve the same toolchain in
+    # every step.
+    env:
+      HOME: /root
     steps:
       - uses: actions/checkout@v4
       - name: Setup container toolchain
         run: ${{ matrix.setup }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Build cdylib + rlib
-        run: cargo build --release
+        run: cargo build --release --features header
       - name: Collect assets
         run: |
           mkdir -p dist
@@ -114,7 +121,7 @@ jobs:
       - name: Setup musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build rlib (static, embedded core)
-        run: cargo build --release --no-default-features --target x86_64-unknown-linux-musl
+        run: cargo build --release --no-default-features --features header --target x86_64-unknown-linux-musl
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
@@ -150,7 +157,7 @@ jobs:
           # cc-rs (ring, aws-lc-sys) looks for the archiver under the
           # target-prefixed name; the NDK only ships it as llvm-ar.
           export AR_aarch64_linux_android="$BIN/llvm-ar"
-          cargo build --release --target aarch64-linux-android
+          cargo build --release --features header --target aarch64-linux-android
       - name: Collect assets
         run: |
           mkdir -p dist

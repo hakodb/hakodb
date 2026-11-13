@@ -1,17 +1,22 @@
 fn main() {
-    // Header generation runs only when hakodb itself is what the user is
-    // building (cargo build/test here, release/tag CI) — dependents skip
-    // it: CARGO_PRIMARY_PACKAGE is set for the selected packages only,
-    // never for dependency builds, so apps depending on hakodb pay neither
-    // the header parse nor its reruns (few seconds to ~20s on cold trees).
-    // Features were rejected for this on purpose (they fork dependent
-    // builds); the primary-package signal is per-invocation, not a fork.
-    // HAKODB_SKIP_CBINDGEN=1 still forces a skip in hakodb's own dev loops.
+    // Header generation is opt-in via the `header` feature: release/tag CI
+    // and sync scripts build with `--features header`, everything else
+    // (Rust dependents above all) compiles zero header machinery — the
+    // cbindgen build-dependency is optional and stays off, so dependent
+    // builds pay neither its compile nor the whole-crate parse it drives.
+    // Why not an env/primary-package signal: CARGO_PRIMARY_PACKAGE is only
+    // set for rustc invocations, never for build scripts (rust-lang/cargo
+    // #9403), and no env var reliably distinguishes "dependency build".
+    // A feature forks dependent builds in theory, but this one only gates
+    // build-script work — the library itself ignores it. HAKODB_SKIP_CBINDGEN=1
+    // still forces a skip in header-enabled dev loops; set per-invocation,
+    // not globally (it would strip headers from the build that produces
+    // release assets).
     // ponytail: explicit early scope, not a flag threaded through —
     // link-search + lib hygiene below always run (dependents link
     // against them even in dev loops).
-    let primary = std::env::var("CARGO_PRIMARY_PACKAGE").is_ok();
-    if primary && std::env::var("HAKODB_SKIP_CBINDGEN").is_err() {
+    #[cfg(feature = "header")]
+    if std::env::var("HAKODB_SKIP_CBINDGEN").is_err() {
         gen_header();
     }
     println!("cargo:rerun-if-changed=src/");
@@ -47,6 +52,7 @@ if !target.contains("msvc") {
     println!("cargo:rustc-link-search=native={}", target_dir.display());
 }
 
+#[cfg(feature = "header")]
 fn gen_header() {
     let crate_dir = std::env::var("CARGO_MANIFEST_DIR").expect("manifest dir should exist");
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR should exist");
