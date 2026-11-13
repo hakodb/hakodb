@@ -1,12 +1,17 @@
 fn main() {
-    // Dev-loop shortcut: HAKODB_SKIP_CBINDGEN=1 skips header generation
-    // (seconds per rebuild on big trees). CI/release never set it, so
-    // shipped headers always regenerate. Env-gated (not a feature):
-    // features would fork dependent builds, env stays local.
+    // Header generation runs only when hakodb itself is what the user is
+    // building (cargo build/test here, release/tag CI) — dependents skip
+    // it: CARGO_PRIMARY_PACKAGE is set for the selected packages only,
+    // never for dependency builds, so apps depending on hakodb pay neither
+    // the header parse nor its reruns (few seconds to ~20s on cold trees).
+    // Features were rejected for this on purpose (they fork dependent
+    // builds); the primary-package signal is per-invocation, not a fork.
+    // HAKODB_SKIP_CBINDGEN=1 still forces a skip in hakodb's own dev loops.
     // ponytail: explicit early scope, not a flag threaded through —
     // link-search + lib hygiene below always run (dependents link
     // against them even in dev loops).
-    if std::env::var("HAKODB_SKIP_CBINDGEN").is_err() {
+    let primary = std::env::var("CARGO_PRIMARY_PACKAGE").is_ok();
+    if primary && std::env::var("HAKODB_SKIP_CBINDGEN").is_err() {
         gen_header();
     }
     println!("cargo:rerun-if-changed=src/");
