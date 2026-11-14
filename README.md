@@ -82,6 +82,7 @@ Flat C API over opaque handles (`HK_Engine`, `HK_Doc`, `HK_Query`, `HK_Batch`, `
 ```bash
 cargo build --release                                   # full (sync + compression)
 cargo build --release --no-default-features             # embedded core
+cargo build --release --features header                 # also generates the C ABI header (target/release/hakodb.h)
 ```
 
 ## Sync
