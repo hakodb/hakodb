@@ -223,6 +223,93 @@ fn rebuild_on_reopen() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #191: compaction reaps tombstones from storage; the HNSW graph (whose
+/// nodes are never removed) must recycle through the same backfill, so
+/// dead ids leave the graph instead of riding it forever.
+#[test]
+fn compact_gc_reaps_dead_graph_nodes() {
+    let dir = tmp("gc");
+    let db = open_db(&dir);
+    let pts = seed(&db, 100, 0x77);
+    wait_complete(&db, "pts", "emb");
+    assert_eq!(db.vector_graph_len("pts", "emb"), Some(100));
+    // Delete 30: graph keeps them (liveness filters), storage tombstones.
+    let mut live = vec![true; pts.len()];
+    for (i, dead) in live.iter_mut().enumerate() {
+        if i % 10 < 3 {
+            db.delete("pts", &format!("d{i:04}")).expect("delete");
+            *dead = false;
+        }
+    }
+    assert_eq!(db.vector_graph_len("pts", "emb"), Some(100), "no GC yet");
+    // Compaction + graph recycle: dead ids leave, ANN serves again.
+    db.compact_collection("pts").expect("compact");
+    wait_complete(&db, "pts", "emb");
+    assert_eq!(
+        db.vector_graph_len("pts", "emb"),
+        Some(70),
+        "dead ids must leave the graph"
+    );
+    let q = &queries(0x88)[0];
+    assert_eq!(knn_ids(&db, q, 10), brute_top(q, &pts, &live, 10));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #189: the graph rides the index snapshot — reopen restores it and the
+/// repair pass re-upserts live docs (post-snapshot writes included)
+/// before ANN serves. Invariant: complete + exact, same node count.
+#[test]
+fn graph_persists_and_repairs_on_reopen() {
+    let dir = tmp("persist");
+    let pts = {
+        let db = open_db(&dir);
+        let pts = seed(&db, 150, 0x99);
+        wait_complete(&db, "pts", "emb");
+        assert_eq!(db.vector_graph_len("pts", "emb"), Some(150));
+        pts
+    };
+    {
+        let db = open_db(&dir);
+        wait_complete(&db, "pts", "emb");
+        assert_eq!(
+            db.vector_graph_len("pts", "emb"),
+            Some(150),
+            "restored graph must hold every live node after repair"
+        );
+        let live = vec![true; pts.len()];
+        for q in &queries(0xAA) {
+            assert_eq!(knn_ids(&db, q, 10), brute_top(q, &pts, &live, 10));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #189 stale side: a snapshot taken before a delete is stale (WAL tails
+/// mismatch), so the rescan path clears and refills the graph through the
+/// hook — dead id gone, exact results, not the snapshotted count.
+#[test]
+fn stale_snapshot_rescans_graph() {
+    let dir = tmp("stale");
+    let pts = {
+        let db = open_db(&dir);
+        let pts = seed(&db, 100, 0xBB);
+        wait_complete(&db, "pts", "emb");
+        db.delete("pts", "d0003").expect("delete");
+        pts
+    };
+    {
+        let db = open_db(&dir);
+        wait_complete(&db, "pts", "emb");
+        assert_eq!(db.vector_graph_len("pts", "emb"), Some(99));
+        let mut live = vec![true; pts.len()];
+        live[3] = false;
+        for q in &queries(0xCC) {
+            assert_eq!(knn_ids(&db, q, 10), brute_top(q, &pts, &live, 10));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn empty_graph_is_exact_trivially() {
     let dir = tmp("empty");

@@ -1637,6 +1637,10 @@ impl Hako {
                             config_thread.encryption_key.clone(),
                             shard_arc,
                             col,
+                            // Preserve snapshot-carried graphs (#189): the
+                            // repair pass re-upserts live docs over them
+                            // instead of discarding the loaded structure.
+                            false,
                         );
                     }
                 }
@@ -4587,6 +4591,21 @@ impl Hako {
             }
             s.write().unwrap().compact_with_cancel(cancel)?;
         }
+        // #191: same graph GC as compact_collection, for every collection
+        // that owns vector definitions.
+        let targets: Vec<String> = self.indexes.read().map(|mgr| mgr.vector.keys().cloned().collect()).unwrap_or_default();
+        for col in targets {
+            if let Some(shard) = self.try_get_shard(&col) {
+                Self::spawn_vector_backfill(
+                    Arc::clone(&self.indexes),
+                    Arc::clone(&self.backfill_inflight),
+                    self.config.encryption_key.clone(),
+                    shard,
+                    col,
+                    true,
+                );
+            }
+        }
         Ok(())
     }
 
@@ -4624,6 +4643,28 @@ impl Hako {
             token.check()?;
         }
         shard.write().unwrap().compact_with_cancel(cancel)?;
+        // #191 graph GC: compaction reaps tombstoned docs from storage,
+        // but HNSW nodes are never removed — dead ids would ride the
+        // graph forever. Recycle the graph through the same backfill the
+        // recovery path uses: clear -> refill from live (now ghost-free)
+        // pointers -> complete. Queries fail-closed to the exact scan
+        // meanwhile (same gate as recovery/creation backfills). Only
+        // collections that own vector definitions pay for it.
+        if self
+            .indexes
+            .read()
+            .map(|mgr| mgr.vector.contains_key(collection))
+            .unwrap_or(false)
+        {
+            Self::spawn_vector_backfill(
+                Arc::clone(&self.indexes),
+                Arc::clone(&self.backfill_inflight),
+                self.config.encryption_key.clone(),
+                shard,
+                collection.to_string(),
+                true,
+            );
+        }
         Ok(())
     }
 
@@ -5538,6 +5579,7 @@ impl Hako {
             self.config.encryption_key.clone(),
             shard_arc,
             collection.to_string(),
+            true,
         );
 
         let _ = self.persist_index_defs();
@@ -5556,18 +5598,26 @@ impl Hako {
         enc_key: Option<String>,
         shard_arc: Arc<RwLock<StorageEngine>>,
         col_name: String,
+        clear_graphs: bool,
     ) {
         backfill_count.fetch_add(1, Ordering::Relaxed);
         thread::spawn(move || {
             let _guard = BackfillGuard { counter: backfill_count };
-            // Graphs may predate this pass (re-registration) â€” reset to
+            // clear=true (creation/GC): graphs may predate this pass
+            // (re-registration, compacted tombstones) — reset to
             // incomplete so a concurrent query can't ANN-serve a half
             // graph; `complete` flips only after the full pass below.
+            // clear=false (open repair): a snapshot-carried graph (#189)
+            // keeps its nodes — the pass re-upserts live docs over it
+            // (adds new ids, re-quantizes changed vectors in place) and
+            // only ensures any def still lacking its graph slot.
             {
                 if let Ok(mut mgr) = idx_mgr.write() {
-                    if let Some(graphs) = mgr.hnsw.get_mut(&col_name) {
-                        for graph in graphs.values_mut() {
-                            graph.clear();
+                    if clear_graphs {
+                        if let Some(graphs) = mgr.hnsw.get_mut(&col_name) {
+                            for graph in graphs.values_mut() {
+                                graph.clear();
+                            }
                         }
                     }
                     for field in mgr
@@ -5841,6 +5891,14 @@ impl Hako {
                 .and_then(|m| m.get(field))
                 .is_some_and(|g| g.complete() && !g.is_empty())
         })
+    }
+
+    /// Resident node count of one HNSW graph (diagnostic #191/#189):
+    /// GC after compact should equal the live vector count; reopen
+    /// should equal the snapshotted node count until repair adds newer
+    /// docs. `None` = no graph for that field.
+    pub fn vector_graph_len(&self, collection: &str, field: &str) -> Option<usize> {
+        self.indexes.read().ok()?.hnsw.get(collection)?.get(field).map(|g| g.len())
     }
 
     /// Metric of a registered vector index, for FFI score recompute

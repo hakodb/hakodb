@@ -463,6 +463,7 @@ fn hnsw_ef_construction_for_dim(dim: usize) -> usize {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct HnswNode {
     /// int8-quantized vector + scale (dequant = iv * scale). Asymmetric
     /// design: docs keep full f32 (exact rescore reads them), the graph
@@ -522,6 +523,10 @@ impl Ord for Cand {
     }
 }
 
+/// Serde derives power the graph snapshot (#189): neighbor lists (not
+/// vectors — the doc data stays the source of truth) ride ram_indexes.bin
+/// on close/periodic snapshots, so reopen skips the full ANN rebuild.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct HnswIndex {
     dim: usize,
     metric: Metric,
@@ -603,6 +608,18 @@ impl HnswIndex {
 
     pub fn set_complete(&mut self, v: bool) {
         self.complete = v;
+    }
+
+    /// Params fingerprint for snapshot validation (#189): a snapshot
+    /// graph must match the live def exactly, else import drops it to
+    /// the rebuild path. Comparison resolves the def the same way
+    /// [`HnswIndex::new`] does, so overrides and derived defaults agree.
+    pub fn matches_def(&self, dim: u32, metric: Metric, params: HnswParams) -> bool {
+        if self.dim != dim as usize || self.metric != metric {
+            return false;
+        }
+        let expected = HnswIndex::new(dim as usize, metric, params);
+        self.m == expected.m && self.ef_construction == expected.ef_construction
     }
 
     pub fn clear(&mut self) {
