@@ -971,3 +971,121 @@ fn routes_defaults_off_g1_168() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ===== Wave 1 (#196/#198): communities, pagerank, seed subgraph =====
+
+/// Two two-cycles + one isolated node: a<->b, c<->d, e alone.
+fn seed_communities(db: &Hako) {
+    db.put("docs", "a", &refdoc("docs", "b")).unwrap();
+    db.put("docs", "b", &refdoc("docs", "a")).unwrap();
+    db.put("docs", "c", &refdoc("docs", "d")).unwrap();
+    db.put("docs", "d", &refdoc("docs", "c")).unwrap();
+    db.put("docs", "e", &blank()).unwrap();
+}
+
+#[test]
+fn graph_communities_split_and_deterministic() {
+    let dir = tmp("comm");
+    let db = open_db(&dir);
+    seed_communities(&db);
+    wait(&db);
+    let s = spec(TraverseDir::Outgoing, 5, 10);
+    let first = db.graph_communities("docs", &s).unwrap();
+    assert_eq!(
+        idmat(&first),
+        vec![p(&["docs/a", "docs/b"]), p(&["docs/c", "docs/d"]), p(&["docs/e"])]
+    );
+    // Deterministic: identical output on the repeat call.
+    assert_eq!(db.graph_communities("docs", &s).unwrap(), first);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn graph_pagerank_seed_top_and_validation() {
+    let dir = tmp("ppr");
+    let db = open_db(&dir);
+    // Star: hub h -> s1, s2, s3.
+    let mut hub = HakoDoc::default();
+    for (f, t) in [("l1", "s1"), ("l2", "s2"), ("l3", "s3")] {
+        hub.insert(f, Value::Reference { collection: "docs".into(), doc_id: t.into() });
+    }
+    db.put("docs", "h", &hub).unwrap();
+    db.put("docs", "s1", &blank()).unwrap();
+    db.put("docs", "s2", &blank()).unwrap();
+    db.put("docs", "s3", &blank()).unwrap();
+    wait(&db);
+    let s = spec(TraverseDir::Outgoing, 5, 10);
+    // Seeded PPR: the teleport mass puts the hub on top, leaves tie under
+    // it (id order breaks the tie).
+    let rows = db
+        .graph_pagerank(
+            "docs",
+            &[("docs".into(), "h".into())],
+            &s,
+            0.85,
+            2,
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, ("docs".to_string(), "h".to_string()));
+    assert!(rows[0].1 > rows[1].1, "hub must outscore leaves");
+    // Classic PageRank (no seeds): all nodes ranked, probability sum < 1
+    // (dangling mass drops), deterministic across calls.
+    let rows = db.graph_pagerank("docs", &[], &s, 0.85, 0).unwrap();
+    assert_eq!(rows.len(), 4);
+    let total: f64 = rows.iter().map(|(_, sc)| sc).sum();
+    assert!(total < 1.0, "dangling mass must drop: {total}");
+    assert_eq!(db.graph_pagerank("docs", &[], &s, 0.85, 0).unwrap(), rows);
+    // Damping validation: outside [0, 1] rejects.
+    assert!(db.graph_pagerank("docs", &[], &s, 1.5, 0).is_err());
+    assert!(db.graph_pagerank("docs", &[], &s, -0.1, 0).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn subgraph_scopes_hops_seed_and_missing() {
+    let dir = tmp("subg");
+    let db = open_db(&dir);
+    db.put("docs", "a", &refdoc("docs", "b")).unwrap();
+    db.put("docs", "b", &refdoc("docs", "c")).unwrap();
+    db.put("docs", "c", &refdoc("docs", "d")).unwrap();
+    db.put("docs", "d", &blank()).unwrap();
+    wait(&db);
+    let s = spec(TraverseDir::Outgoing, 2, 100);
+    let json = db.subgraph_json("docs", "a", &s).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let nodes: Vec<&str> = v["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(nodes, vec!["a", "b", "c"], "2 hops from a: no d");
+    let edges: Vec<String> = v["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| format!("{}/{}", e["from"].as_str().unwrap(), e["to"].as_str().unwrap()))
+        .collect();
+    assert_eq!(edges, vec!["docs/a/docs/b", "docs/b/docs/c"]);
+    // One hop: only the seed and its direct neighbor.
+    let s1 = spec(TraverseDir::Outgoing, 1, 100);
+    let v: serde_json::Value =
+        serde_json::from_str(&db.subgraph_json("docs", "a", &s1).unwrap()).unwrap();
+    assert_eq!(v["nodes"].as_array().unwrap().len(), 2);
+    assert_eq!(v["edges"].as_array().unwrap().len(), 1);
+    // Missing seed = empty graph (fail-closed).
+    assert_eq!(
+        db.subgraph_json("docs", "nope", &s).unwrap(),
+        "{\"nodes\":[],\"edges\":[]}"
+    );
+    // Cycle-safe: closing the ring (d->a) keeps it 4 nodes + 4 edges.
+    db.put("docs", "d", &refdoc("docs", "a")).unwrap();
+    wait(&db);
+    let s10 = spec(TraverseDir::Outgoing, 10, 100);
+    let v: serde_json::Value =
+        serde_json::from_str(&db.subgraph_json("docs", "a", &s10).unwrap()).unwrap();
+    assert_eq!(v["nodes"].as_array().unwrap().len(), 4);
+    assert_eq!(v["edges"].as_array().unwrap().len(), 4);
+    let _ = std::fs::remove_dir_all(&dir);
+}

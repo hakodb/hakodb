@@ -48,6 +48,19 @@ impl InvertedIndex {
         results
     }
 
+    /// Document frequency of one token (0 when unknown) — the df half of
+    /// the hybrid side's tf·idf-lite scoring (#193), read off the existing
+    /// term map with no format change.
+    pub fn df_of(&self, word: &str) -> usize {
+        self.map.get(word).map_or(0, |ids| ids.len())
+    }
+
+    /// Public tokenizer alias — hybrid scoring re-tokenizes the doc's
+    /// field value with the same rules the index was built by.
+    pub fn tokenize_text(&self, text: &str) -> Vec<String> {
+        self.tokenize(text)
+    }
+
     /// Word-prefix search (autocomplete) over the term map.
     ///
     /// Because the term map is a `BTreeMap`, each query word maps to one
