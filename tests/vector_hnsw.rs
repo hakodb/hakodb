@@ -478,3 +478,44 @@ fn brute_top_dim(q: &[f32], pts: &[Vec<f32>], live: &[bool], k: usize) -> Vec<St
     scored.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     scored.into_iter().take(k).map(|(_, i)| format!("d{i:04}")).collect()
 }
+
+/// #195 parallel bulk build: 2400 docs over 400-doc chunks (6 chunks)
+/// build in worker-local graphs, merge, then a sequential repair pass.
+/// Recall holds against the brute oracle, and the graph is identical
+/// across worker counts (fixed partitions + fixed merge order ⇒ the
+/// worker count changes wall-clock, never the result). Knobs: all other
+/// fixtures here stay < 400 docs, so they can't flip their sequential
+/// paths while these env values are set.
+#[test]
+fn parallel_bulk_deterministic_and_exact() {
+    let queries: Vec<Vec<f32>> = queries(0x61)
+        .into_iter()
+        .chain(queries(0x62))
+        .collect();
+
+    let build = |dir: &std::path::Path, workers: &str| -> Vec<Vec<String>> {
+        std::env::set_var("HKO_HNSW_PAR_CHUNK", "400");
+        std::env::set_var("HKO_HNSW_PAR_WORKERS", workers);
+        let db = open_db(dir);
+        let pts = seed(&db, 2400, 0x51);
+        wait_complete(&db, "pts", "emb");
+        assert_eq!(db.vector_graph_len("pts", "emb"), Some(2400), "all docs indexed");
+        let live = vec![true; pts.len()];
+        let got: Vec<Vec<String>> = queries.iter().map(|q| knn_ids(&db, q, 10)).collect();
+        for (q, ids) in queries.iter().zip(&got) {
+            let hits = ids.iter().filter(|id| brute_top(q, &pts, &live, 10).contains(id)).count();
+            assert!(hits >= 9, "recall {hits}/10 for parallel build");
+        }
+        got
+    };
+
+    let dir4 = tmp("par4");
+    let got4 = build(&dir4, "4");
+    let dir1 = tmp("par1");
+    let got1 = build(&dir1, "1");
+    std::env::remove_var("HKO_HNSW_PAR_CHUNK");
+    std::env::remove_var("HKO_HNSW_PAR_WORKERS");
+    assert_eq!(got4, got1, "1 vs 4 workers must produce identical graphs");
+    let _ = std::fs::remove_dir_all(&dir4);
+    let _ = std::fs::remove_dir_all(&dir1);
+}

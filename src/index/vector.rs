@@ -174,6 +174,11 @@ pub fn distance(metric: Metric, a: &[f32], b: &[f32]) -> f64 {
 // = the original sequential loops, so a non-AVX2 machine keeps today's
 // arithmetic; each build remains self-deterministic (sorted tiebreaks ride
 // id ordering, not distance bits).
+//
+// #194: aarch64 gets a NEON mirror of the same lane schedule (8 f32 per
+// iteration, 4 partial groups, fold `(l0+l2)+(l1+l3)`), so the NEON f64
+// kernels are bit-identical to the AVX2 ones — cross-ISA replicas see the
+// same distances. The integer kernel is exact on every path.
 mod scalars {
     /// Sequential reference kernels — the ORIGINAL arithmetic, kept as the
     /// non-AVX2 execution path and as the test oracle.
@@ -419,7 +424,234 @@ mod simd {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+mod simd {
+    use super::scalars;
+    use std::sync::OnceLock;
+
+    pub fn have_neon() -> bool {
+        static OK: OnceLock<bool> = OnceLock::new();
+        *OK.get_or_init(|| std::arch::is_aarch64_feature_detected!("neon"))
+    }
+
+    pub fn dot_f32_i8(q: &[f32], v: &[i8]) -> f64 {
+        if have_neon() {
+            unsafe { return dot_f32_i8_neon(q, v) };
+        }
+        scalars::dot_f32_i8(q, v)
+    }
+    pub fn dot_f32_f32(a: &[f32], b: &[f32]) -> f64 {
+        if have_neon() {
+            unsafe { return dot_f32_f32_neon(a, b) };
+        }
+        scalars::dot_f32_f32(a, b)
+    }
+    pub fn l2_f32_f32(a: &[f32], b: &[f32]) -> f64 {
+        if have_neon() {
+            unsafe { return l2_f32_f32_neon(a, b) };
+        }
+        scalars::l2_f32_f32(a, b)
+    }
+    pub fn cosine_parts(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
+        if have_neon() {
+            unsafe { return cosine_parts_neon(a, b) };
+        }
+        scalars::cosine_parts(a, b)
+    }
+    pub fn dot_i8_i8(a: &[i8], b: &[i8]) -> i64 {
+        // Exact integer paths — associativity-safe, so NEON is bit-identical
+        // to the fallback (no reduction-order caveat, unlike the f64 lanes).
+        if have_neon() && a.len() <= 100_000 {
+            unsafe { return dot_i8_i8_neon(a, b) };
+        }
+        scalars::dot_i8_i8(a, b)
+    }
+
+    /// NEON mirrors the AVX2 lane schedule exactly: 8 f32 per iteration as
+    /// (e0,e1,e2,e3)+(e4..e7) f64 pairs, two f64x2 accumulators per partial
+    /// group so lanes accumulate (e0 then e4), (e1 then e5), (e2 then e6),
+    /// (e3 then e7) — the fold `(l0+l2)+(l1+l3)` lands on the same
+    /// addition tree, making NEON bit-identical to the AVX2 kernels (and
+    /// the scalar tail identical by construction).
+    #[target_feature(enable = "neon")]
+    unsafe fn dot_f32_f32_neon(a: &[f32], b: &[f32]) -> f64 {
+        use std::arch::aarch64::*;
+        let n = a.len().min(b.len());
+        let limbs = n & !7;
+        let (mut a01, mut a23) = (vreinterpretq_f64_f32(vdupq_n_f32(0.0)), vreinterpretq_f64_f32(vdupq_n_f32(0.0)));
+        let mut i = 0;
+        while i < limbs {
+            let x1 = vld1q_f32(a.as_ptr().add(i));
+            let x2 = vld1q_f32(a.as_ptr().add(i + 4));
+            let y1 = vld1q_f32(b.as_ptr().add(i));
+            let y2 = vld1q_f32(b.as_ptr().add(i + 4));
+            let (xl1, xh1) = (vcvt_f64_f32(vget_low_f32(x1)), vcvt_high_f64_f32(x1));
+            let (xl2, xh2) = (vcvt_f64_f32(vget_low_f32(x2)), vcvt_high_f64_f32(x2));
+            let (yl1, yh1) = (vcvt_f64_f32(vget_low_f32(y1)), vcvt_high_f64_f32(y1));
+            let (yl2, yh2) = (vcvt_f64_f32(vget_low_f32(y2)), vcvt_high_f64_f32(y2));
+            a01 = vaddq_f64(a01, vmulq_f64(xl1, yl1)); // e0, e1
+            a23 = vaddq_f64(a23, vmulq_f64(xh1, yh1)); // e2, e3
+            a01 = vaddq_f64(a01, vmulq_f64(xl2, yl2)); // e4, e5
+            a23 = vaddq_f64(a23, vmulq_f64(xh2, yh2)); // e6, e7
+            i += 8;
+        }
+        let mut p = fold2(a01, a23);
+        while i < n {
+            p += a[i] as f64 * b[i] as f64;
+            i += 1;
+        }
+        p
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn l2_f32_f32_neon(a: &[f32], b: &[f32]) -> f64 {
+        use std::arch::aarch64::*;
+        let n = a.len().min(b.len());
+        let limbs = n & !7;
+        let (mut a01, mut a23) = (vreinterpretq_f64_f32(vdupq_n_f32(0.0)), vreinterpretq_f64_f32(vdupq_n_f32(0.0)));
+        let mut i = 0;
+        while i < limbs {
+            let x1 = vld1q_f32(a.as_ptr().add(i));
+            let x2 = vld1q_f32(a.as_ptr().add(i + 4));
+            let y1 = vld1q_f32(b.as_ptr().add(i));
+            let y2 = vld1q_f32(b.as_ptr().add(i + 4));
+            let (xl1, xh1) = (vcvt_f64_f32(vget_low_f32(x1)), vcvt_high_f64_f32(x1));
+            let (xl2, xh2) = (vcvt_f64_f32(vget_low_f32(x2)), vcvt_high_f64_f32(x2));
+            let (yl1, yh1) = (vcvt_f64_f32(vget_low_f32(y1)), vcvt_high_f64_f32(y1));
+            let (yl2, yh2) = (vcvt_f64_f32(vget_low_f32(y2)), vcvt_high_f64_f32(y2));
+            a01 = vaddq_f64(a01, vmulq_f64(vsubq_f64(xl1, yl1), vsubq_f64(xl1, yl1)));
+            a23 = vaddq_f64(a23, vmulq_f64(vsubq_f64(xh1, yh1), vsubq_f64(xh1, yh1)));
+            a01 = vaddq_f64(a01, vmulq_f64(vsubq_f64(xl2, yl2), vsubq_f64(xl2, yl2)));
+            a23 = vaddq_f64(a23, vmulq_f64(vsubq_f64(xh2, yh2), vsubq_f64(xh2, yh2)));
+            i += 8;
+        }
+        let mut p = fold2(a01, a23);
+        while i < n {
+            let d = a[i] as f64 - b[i] as f64;
+            p += d * d;
+            i += 1;
+        }
+        p
+    }
+
+    /// (dot, ‖a‖², ‖b‖²) in one pass — three partial-pair groups.
+    #[target_feature(enable = "neon")]
+    unsafe fn cosine_parts_neon(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
+        use std::arch::aarch64::*;
+        let n = a.len().min(b.len());
+        let limbs = n & !7;
+        let z = vreinterpretq_f64_f32(vdupq_n_f32(0.0));
+        let ((mut d01, mut d23), (mut ma01, mut ma23), (mut mb01, mut mb23)) = ((z, z), (z, z), (z, z));
+        let mut i = 0;
+        while i < limbs {
+            let x1 = vld1q_f32(a.as_ptr().add(i));
+            let x2 = vld1q_f32(a.as_ptr().add(i + 4));
+            let y1 = vld1q_f32(b.as_ptr().add(i));
+            let y2 = vld1q_f32(b.as_ptr().add(i + 4));
+            let (xl1, xh1) = (vcvt_f64_f32(vget_low_f32(x1)), vcvt_high_f64_f32(x1));
+            let (xl2, xh2) = (vcvt_f64_f32(vget_low_f32(x2)), vcvt_high_f64_f32(x2));
+            let (yl1, yh1) = (vcvt_f64_f32(vget_low_f32(y1)), vcvt_high_f64_f32(y1));
+            let (yl2, yh2) = (vcvt_f64_f32(vget_low_f32(y2)), vcvt_high_f64_f32(y2));
+            d01 = vaddq_f64(d01, vmulq_f64(xl1, yl1));
+            d23 = vaddq_f64(d23, vmulq_f64(xh1, yh1));
+            d01 = vaddq_f64(d01, vmulq_f64(xl2, yl2));
+            d23 = vaddq_f64(d23, vmulq_f64(xh2, yh2));
+            ma01 = vaddq_f64(ma01, vmulq_f64(xl1, xl1));
+            ma23 = vaddq_f64(ma23, vmulq_f64(xh1, xh1));
+            ma01 = vaddq_f64(ma01, vmulq_f64(xl2, xl2));
+            ma23 = vaddq_f64(ma23, vmulq_f64(xh2, xh2));
+            mb01 = vaddq_f64(mb01, vmulq_f64(yl1, yl1));
+            mb23 = vaddq_f64(mb23, vmulq_f64(yh1, yh1));
+            mb01 = vaddq_f64(mb01, vmulq_f64(yl2, yl2));
+            mb23 = vaddq_f64(mb23, vmulq_f64(yh2, yh2));
+            i += 8;
+        }
+        let (mut d, mut n1, mut n2) = (fold2(d01, d23), fold2(ma01, ma23), fold2(mb01, mb23));
+        while i < n {
+            let (x, y) = (a[i] as f64, b[i] as f64);
+            d += x * y;
+            n1 += x * x;
+            n2 += y * y;
+            i += 1;
+        }
+        (d, n1, n2)
+    }
+
+    /// f32·int8 → f64: i8 widens i8→i16→i32 (exact) → f32 (exact, |v| ≤ 127)
+    /// → f64 per pair; the f64 side follows the shared lane schedule.
+    #[target_feature(enable = "neon")]
+    unsafe fn dot_f32_i8_neon(q: &[f32], v: &[i8]) -> f64 {
+        use std::arch::aarch64::*;
+        let n = q.len().min(v.len());
+        let limbs = n & !7;
+        let (mut a01, mut a23) = (vreinterpretq_f64_f32(vdupq_n_f32(0.0)), vreinterpretq_f64_f32(vdupq_n_f32(0.0)));
+        let mut i = 0;
+        while i < limbs {
+            let x1 = vld1q_f32(q.as_ptr().add(i));
+            let x2 = vld1q_f32(q.as_ptr().add(i + 4));
+            let v8 = vld1_s8(v.as_ptr().add(i));
+            let v16 = vmovl_s8(v8);
+            let f1 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(v16)));  // e0..e3 as f32
+            let f2 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(v16))); // e4..e7 as f32
+            let (bl1, bh1) = (vcvt_f64_f32(vget_low_f32(f1)), vcvt_high_f64_f32(f1));
+            let (bl2, bh2) = (vcvt_f64_f32(vget_low_f32(f2)), vcvt_high_f64_f32(f2));
+            let (ql1, qh1) = (vcvt_f64_f32(vget_low_f32(x1)), vcvt_high_f64_f32(x1));
+            let (ql2, qh2) = (vcvt_f64_f32(vget_low_f32(x2)), vcvt_high_f64_f32(x2));
+            a01 = vaddq_f64(a01, vmulq_f64(ql1, bl1)); // e0, e1
+            a23 = vaddq_f64(a23, vmulq_f64(qh1, bh1)); // e2, e3
+            a01 = vaddq_f64(a01, vmulq_f64(ql2, bl2)); // e4, e5
+            a23 = vaddq_f64(a23, vmulq_f64(qh2, bh2)); // e6, e7
+            i += 8;
+        }
+        let mut p = fold2(a01, a23);
+        while i < n {
+            p += q[i] as f64 * v[i] as f64;
+            i += 1;
+        }
+        p
+    }
+
+    /// int8·int8 exact, 16-byte chunks: products widen to i16 (`vmull`,
+    /// each ≤ 16384), pairwise-summed into i32 lanes (`vpaddlq`/`vpadalq`,
+    /// lane ≤ 2·16384 per chunk — dim ≤ 100k keeps lanes < 2³¹), folded
+    /// through i64 exactly; tail scalar. Integer addition is
+    /// associative-exact, so the tree never matters (see the dispatcher).
+    #[target_feature(enable = "neon")]
+    unsafe fn dot_i8_i8_neon(a: &[i8], b: &[i8]) -> i64 {
+        use std::arch::aarch64::*;
+        let n = a.len().min(b.len());
+        let limbs = n & !15;
+        let mut acc = vreinterpretq_s32_u32(vdupq_n_u32(0));
+        let mut i = 0;
+        while i < limbs {
+            let ax = vld1q_s8(a.as_ptr().add(i));
+            let bx = vld1q_s8(b.as_ptr().add(i));
+            let pl = vmull_s8(vget_low_s8(ax), vget_low_s8(bx));
+            let ph = vmull_s8(vget_high_s8(ax), vget_high_s8(bx));
+            acc = vpadalq_s16(acc, pl);
+            acc = vpadalq_s16(acc, ph);
+            i += 16;
+        }
+        // exact horizontal i32 fold: pairwise to i64, then lane sum
+        let p = vpaddlq_s32(acc);
+        let mut tot = vaddvq_s64(p);
+        while i < n {
+            tot += a[i] as i64 * b[i] as i64;
+            i += 1;
+        }
+        tot
+    }
+
+    /// Horizontal fold matching the AVX2 `fold4`: `(l0+l2)+(l1+l3)`.
+    #[inline]
+    unsafe fn fold2(a01: std::arch::aarch64::float64x2_t, a23: std::arch::aarch64::float64x2_t) -> f64 {
+        use std::arch::aarch64::*;
+        let p = vaddq_f64(a01, a23); // (l0+l2, l1+l3)
+        vaddvq_f64(p)
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod simd {
     pub use super::scalars::{cosine_parts, dot_f32_f32, dot_f32_i8, dot_i8_i8, l2_f32_f32};
     pub fn have_avx2() -> bool {
@@ -678,6 +910,86 @@ impl HnswIndex {
     /// Doc id for an internal idx from `search` (caller-verified in range).
     pub fn id_of(&self, idx: usize) -> &str {
         &self.idx_to_id[idx]
+    }
+
+    /// #195 parallel bulk build: merge worker-local chunk graphs into
+    /// one. Chunk nodes keep their quantized vectors, levels and
+    /// within-chunk links (translated to global positions); cross-chunk
+    /// edges ride a bidirectional ring — every node also links its
+    /// nearest neighbor in each adjacent chunk (small beam over that
+    /// chunk's own frozen graph, so the pass is race-free and
+    /// deterministic). Chunk order + per-chunk insert order are fixed
+    /// inputs, so worker count changes wall-clock, never the graph.
+    /// Entry rides chunk 0's upper chain; `complete` stays false until
+    /// the caller flips it. All chunks must share dim/metric/params.
+    pub fn merge_chunk_graphs(chunks: &[&HnswIndex]) -> HnswIndex {
+        debug_assert!(!chunks.is_empty() && chunks.iter().all(|g| !g.is_empty()));
+        let first = chunks[0];
+        let mut out = HnswIndex::new(
+            first.dim,
+            first.metric,
+            HnswParams {
+                m: None,
+                ef_construction: None,
+                ef_search: None,
+                binary_stage1: first.stage1_binary,
+            },
+        );
+        // Ingest nodes verbatim (quantized vector, level count); links
+        // are rewritten after all global positions exist.
+        let mut maps: Vec<Vec<usize>> = Vec::with_capacity(chunks.len());
+        for g in chunks {
+            let base = out.nodes.len();
+            let mut map: Vec<usize> = Vec::with_capacity(g.nodes.len());
+            for node in &g.nodes {
+                out.nodes.push(HnswNode {
+                    ivec: node.ivec.clone(),
+                    scale: node.scale,
+                    sum_sq: node.sum_sq,
+                    links: vec![Vec::new(); node.links.len()],
+                    bits: node.bits.clone(),
+                });
+                out.idx_to_id.push(String::new());
+                map.push(base + map.len());
+            }
+            for (id, &local) in &g.id_to_idx {
+                out.id_to_idx.insert(id.clone(), base + local);
+                out.idx_to_id[base + local] = id.clone();
+            }
+            maps.push(map);
+        }
+        // Translate within-chunk links.
+        for (k, g) in chunks.iter().enumerate() {
+            for (j, node) in g.nodes.iter().enumerate() {
+                for (l, nbs) in node.links.iter().enumerate() {
+                    for &nb in nbs {
+                        out.add_link(maps[k][j], maps[k][nb], l);
+                    }
+                }
+            }
+        }
+        // Bidirectional ring: each node anchors to its nearest neighbor
+        // in each adjacent chunk (beam over that chunk's own graph —
+        // frozen, read-only). Dequantized f32 rides the normal search.
+        const CROSS_EF: usize = 32;
+        for (k, g) in chunks.iter().enumerate() {
+            for (j, node) in g.nodes.iter().enumerate() {
+                let p = maps[k][j];
+                let q: Vec<f32> = node.ivec.iter().map(|&x| x as f32 * node.scale).collect();
+                if k + 1 < chunks.len() {
+                    if let Some(&(_, nb)) = chunks[k + 1].search(&q, CROSS_EF).first() {
+                        out.add_link(p, maps[k + 1][nb], 0);
+                    }
+                }
+                if k > 0 {
+                    if let Some(&(_, nb)) = chunks[k - 1].search(&q, CROSS_EF).first() {
+                        out.add_link(p, maps[k - 1][nb], 0);
+                    }
+                }
+            }
+        }
+        out.entry = first.entry.map(|e| maps[0][e]);
+        out
     }
 
     fn next_random(&mut self) -> f64 {
