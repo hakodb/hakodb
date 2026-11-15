@@ -388,8 +388,38 @@ pub struct VectorIndexInfo {
 pub type GraphNode = (String, String);
 /// Per-node edge map over `GraphNode`.
 pub type GraphAdj = std::collections::HashMap<GraphNode, Vec<GraphNode>>;
-/// Whole-graph adjacency memo slot: (global_version stamp, spec, nodes, adj).
-pub type AdjMemo = HashMap<String, (u64, TraverseSpec, Vec<GraphNode>, GraphAdj)>;
+/// Whole-graph adjacency memo slot (#197): (global_version stamp, spec,
+/// interned-id CSR). Building interns the sorted node keys to u32 and
+/// stores rows as CSR — ~4 B/edge, and every analytics call clones three
+/// plain vectors instead of a String-keyed HashMap.
+pub type AdjMemo = HashMap<String, (u64, TraverseSpec, GraphCsr)>;
+
+/// Interned-id CSR adjacency (#197): node keys sorted ascending
+/// (position = interned u32 id); `targets[offsets[i]..offsets[i+1]]` are
+/// node i's out-neighbors as sorted, deduped u32 ids. Every target is a
+/// member of `ids` (the same `node_matches` predicate gates both sides),
+/// so consumers need no second key→position map — rows speak u32.
+#[derive(Clone)]
+pub struct GraphCsr {
+    pub ids: Vec<GraphNode>,
+    pub offsets: Vec<u32>,
+    pub targets: Vec<u32>,
+}
+
+impl GraphCsr {
+    /// Out-neighbors of node i (sorted u32 positions).
+    pub fn row(&self, i: usize) -> &[u32] {
+        &self.targets[self.offsets[i] as usize..self.offsets[i + 1] as usize]
+    }
+
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+}
 /// One `graph_degree_centrality` row: (node, in-degree, out-degree).
 pub type DegreeRow = (GraphNode, usize, usize);
 
@@ -6545,49 +6575,51 @@ impl Hako {
     /// Node set + per-node edges (deduped, sorted — deterministic across
     /// runs). Only the matching nodes carry edges when `node_match` is
     /// set; every algorithm over an empty set yields an empty result.
-    fn graph_adjacency(
-        &self,
-        collection: &str,
-        spec: &TraverseSpec,
-    ) -> Result<(Vec<GraphNode>, GraphAdj)> {
+    /// Whole-graph adjacency snapshot (#197): interned-id CSR over the
+    /// spec's node set — nodes sorted (position = u32 id), out-rows
+    /// sorted + deduped. Memoized on (global_version, spec); a hit
+    /// clones the three vectors, not a String HashMap.
+    fn graph_csr(&self, collection: &str, spec: &TraverseSpec) -> Result<GraphCsr> {
         // Memo read (G2 re-scope #173): exact stamp + same spec → ride RAM.
         let ver = self.global_version.load(Ordering::Relaxed);
         if let Some(c) = self.graph_adj_cache.read().unwrap().get(collection) {
             if c.0 == ver && c.1 == *spec {
-                return Ok((c.2.clone(), c.3.clone()));
+                return Ok(c.2.clone());
             }
         }
-        let mut nodes: Vec<(String, String)> = self
+        let mut ids: Vec<GraphNode> = self
             .graph_node_ids(collection)
             .into_iter()
             .map(|id| (collection.to_string(), id))
             .filter(|(c, id)| self.node_matches(spec, c, id))
             .collect();
-        nodes.sort();
-        let mut adj: std::collections::HashMap<(String, String), Vec<(String, String)>> =
-            std::collections::HashMap::new();
-        for key in &nodes {
-            let mut targets: Vec<(String, String)> = self
+        ids.sort();
+        let intern: std::collections::HashMap<&GraphNode, u32> =
+            ids.iter().enumerate().map(|(i, k)| (k, i as u32)).collect();
+        let mut offsets = Vec::with_capacity(ids.len() + 1);
+        let mut targets: Vec<u32> = Vec::new();
+        for key in &ids {
+            offsets.push(targets.len() as u32);
+            let mut row: Vec<u32> = self
                 .expand_neighbors(&key.0, &key.1, spec)
                 .into_iter()
                 // Same-collection only + filter prunes the target side.
                 .filter(|(ncol, nid, _, _)| {
                     ncol == &key.0 && self.node_matches(spec, ncol, nid)
                 })
-                .map(|(a, b, _, _)| (a, b))
+                .filter_map(|(a, b, _, _)| intern.get(&(a, b)).copied())
                 .collect();
-            targets.sort();
-            targets.dedup();
-            adj.insert(key.clone(), targets);
+            row.sort_unstable();
+            row.dedup();
+            targets.extend(row);
         }
+        offsets.push(targets.len() as u32);
+        let csr = GraphCsr { ids, offsets, targets };
         self.graph_adj_cache
             .write()
             .unwrap()
-            .insert(
-                collection.to_string(),
-                (ver, spec.clone(), nodes.clone(), adj.clone()),
-            );
-        Ok((nodes, adj))
+            .insert(collection.to_string(), (ver, spec.clone(), csr.clone()));
+        Ok(csr)
     }
 
     /// Weak connected components (#156 Phase E): union-find over the
@@ -6599,34 +6631,28 @@ impl Hako {
         collection: &str,
         spec: &TraverseSpec,
     ) -> Result<Vec<Vec<(String, String)>>> {
-        let (nodes, adj) = self.graph_adjacency(collection, spec)?;
-        let pos: std::collections::HashMap<&(String, String), usize> =
-            nodes.iter().enumerate().map(|(i, k)| (k, i)).collect();
-        let mut parent: Vec<usize> = (0..nodes.len()).collect();
+        let csr = self.graph_csr(collection, spec)?;
+        let mut parent: Vec<usize> = (0..csr.len()).collect();
         fn find(parent: &[usize], mut x: usize) -> usize {
             while parent[x] != x {
                 x = parent[x];
             }
             x
         }
-        for (src, targets) in &adj {
-            if let Some(&sp) = pos.get(src) {
-                for t in targets {
-                    if let Some(&tp) = pos.get(t) {
-                        let ra = find(&parent, sp);
-                        let rb = find(&parent, tp);
-                        if ra != rb {
-                            parent[ra.min(rb)] = ra.max(rb);
-                            // ponytail: no union-by-rank — embedded
-                            // scale, path-halving is ceremony here.
-                        }
-                    }
+        for i in 0..csr.len() {
+            for &t in csr.row(i) {
+                let rb = find(&parent, t as usize);
+                let ra = find(&parent, i);
+                if ra != rb {
+                    parent[ra.min(rb)] = ra.max(rb);
+                    // ponytail: no union-by-rank — embedded
+                    // scale, path-halving is ceremony here.
                 }
             }
         }
         let mut buckets: std::collections::HashMap<usize, Vec<(String, String)>> =
             std::collections::HashMap::new();
-        for (i, key) in nodes.into_iter().enumerate() {
+        for (i, key) in csr.ids.into_iter().enumerate() {
             buckets.entry(find(&parent, i)).or_default().push(key);
         }
         let mut out: Vec<Vec<(String, String)>> = buckets.into_values().collect();
@@ -6643,35 +6669,25 @@ impl Hako {
         collection: &str,
         spec: &TraverseSpec,
     ) -> Result<Option<Vec<(String, String)>>> {
-        let (nodes, adj) = self.graph_adjacency(collection, spec)?;
-        let pos: std::collections::HashMap<&(String, String), usize> =
-            nodes.iter().enumerate().map(|(i, k)| (k, i)).collect();
-        let children: Vec<Vec<usize>> = nodes
-            .iter()
-            .map(|k| {
-                adj.get(k)
-                    .map(|ts| ts.iter().filter_map(|t| pos.get(t).copied()).collect())
-                    .unwrap_or_default()
-            })
-            .collect();
+        let csr = self.graph_csr(collection, spec)?;
         // 0 white, 1 grey (on stack), 2 black (closed).
-        let mut color = vec![0u8; nodes.len()];
+        let mut color = vec![0u8; csr.len()];
         let mut stack: Vec<(usize, usize)> = Vec::new();
-        for s in 0..nodes.len() {
+        for s in 0..csr.len() {
             if color[s] != 0 {
                 continue;
             }
             color[s] = 1;
             stack.push((s, 0));
             while let Some(&(n, i)) = stack.last() {
-                let ts = &children[n];
+                let ts = csr.row(n);
                 if i >= ts.len() {
                     color[n] = 2;
                     stack.pop();
                     continue;
                 }
                 stack.last_mut().expect("non-empty").1 = i + 1;
-                let c = ts[i];
+                let c = ts[i] as usize;
                 match color[c] {
                     0 => {
                         color[c] = 1;
@@ -6682,7 +6698,7 @@ impl Hako {
                         // stack slice from the revisited node to the top.
                         let from = stack.iter().position(|&(v, _)| v == c).expect("grey on stack");
                         return Ok(Some(
-                            stack[from..].iter().map(|&(v, _)| nodes[v].clone()).collect(),
+                            stack[from..].iter().map(|&(v, _)| csr.ids[v].clone()).collect(),
                         ));
                     }
                     _ => {}
@@ -6702,38 +6718,28 @@ impl Hako {
         collection: &str,
         spec: &TraverseSpec,
     ) -> Result<Option<Vec<(String, String)>>> {
-        let (nodes, adj) = self.graph_adjacency(collection, spec)?;
-        let pos: std::collections::HashMap<&(String, String), usize> =
-            nodes.iter().enumerate().map(|(i, k)| (k, i)).collect();
-        let children: Vec<Vec<usize>> = nodes
-            .iter()
-            .map(|k| {
-                adj.get(k)
-                    .map(|ts| ts.iter().filter_map(|t| pos.get(t).copied()).collect())
-                    .unwrap_or_default()
-            })
-            .collect();
-        let mut indeg = vec![0usize; nodes.len()];
-        for ts in &children {
-            for &c in ts {
-                indeg[c] += 1;
+        let csr = self.graph_csr(collection, spec)?;
+        let mut indeg = vec![0usize; csr.len()];
+        for i in 0..csr.len() {
+            for &c in csr.row(i) {
+                indeg[c as usize] += 1;
             }
         }
         // Position order == lexicographic (col, id) order.
         let mut frontier: std::collections::BTreeSet<usize> =
-            (0..nodes.len()).filter(|&i| indeg[i] == 0).collect();
-        let mut out = Vec::with_capacity(nodes.len());
+            (0..csr.len()).filter(|&i| indeg[i] == 0).collect();
+        let mut out = Vec::with_capacity(csr.len());
         while let Some(&n) = frontier.iter().next() {
             frontier.remove(&n);
-            out.push(nodes[n].clone());
-            for &c in &children[n] {
-                indeg[c] -= 1;
-                if indeg[c] == 0 {
-                    frontier.insert(c);
+            out.push(csr.ids[n].clone());
+            for &c in csr.row(n) {
+                indeg[c as usize] -= 1;
+                if indeg[c as usize] == 0 {
+                    frontier.insert(c as usize);
                 }
             }
         }
-        if out.len() == nodes.len() {
+        if out.len() == csr.len() {
             Ok(Some(out))
         } else {
             Ok(None)
@@ -6747,21 +6753,18 @@ impl Hako {
         collection: &str,
         spec: &TraverseSpec,
     ) -> Result<Vec<DegreeRow>> {
-        let (nodes, adj) = self.graph_adjacency(collection, spec)?;
-        let pos: std::collections::HashMap<&(String, String), usize> =
-            nodes.iter().enumerate().map(|(i, k)| (k, i)).collect();
-        let mut indeg = vec![0usize; nodes.len()];
-        for targets in adj.values() {
-            for t in targets {
-                if let Some(&p) = pos.get(t) {
-                    indeg[p] += 1;
-                }
+        let csr = self.graph_csr(collection, spec)?;
+        let mut indeg = vec![0usize; csr.len()];
+        for i in 0..csr.len() {
+            for &t in csr.row(i) {
+                indeg[t as usize] += 1;
             }
         }
-        let mut rows: Vec<((String, String), usize, usize)> = nodes
+        let mut rows: Vec<((String, String), usize, usize)> = csr
+            .ids
             .iter()
             .enumerate()
-            .map(|(i, k)| (k.clone(), indeg[i], adj.get(k).map_or(0, Vec::len)))
+            .map(|(i, k)| (k.clone(), indeg[i], csr.row(i).len()))
             .collect();
         rows.sort_by(|a, b| {
             (a.1 + a.2)
@@ -6784,30 +6787,18 @@ impl Hako {
         collection: &str,
         spec: &TraverseSpec,
     ) -> Result<Vec<Vec<GraphNode>>> {
-        let (nodes, adj) = self.graph_adjacency(collection, spec)?;
-        if nodes.is_empty() {
+        let csr = self.graph_csr(collection, spec)?;
+        if csr.is_empty() {
             return Ok(Vec::new());
         }
-        let pos: std::collections::HashMap<&(String, String), usize> =
-            nodes.iter().enumerate().map(|(i, k)| (k, i)).collect();
-        // Undirected neighbor index lists: forward targets + inbound arcs.
-        let mut nbrs: Vec<Vec<usize>> = nodes
-            .iter()
-            .map(|k| {
-                adj.get(k)
-                    .map(|ts| ts.iter().filter_map(|t| pos.get(t).copied()).collect())
-                    .unwrap_or_default()
-            })
-            .collect();
-        // Inbound arcs: who points at me. Rebuilt from adj (each edge once).
-        for (src, targets) in &adj {
-            if let Some(&sp) = pos.get(src) {
-                for t in targets {
-                    if let Some(&tp) = pos.get(t) {
-                        if !nbrs[tp].contains(&sp) {
-                            nbrs[tp].push(sp);
-                        }
-                    }
+        // Undirected neighbor u32 lists: forward targets + inbound arcs.
+        let mut nbrs: Vec<Vec<u32>> = (0..csr.len()).map(|i| csr.row(i).to_vec()).collect();
+        // Inbound arcs: who points at me (each edge once).
+        for i in 0..csr.len() {
+            for &t in csr.row(i) {
+                let tp = t as usize;
+                if !nbrs[tp].contains(&(i as u32)) {
+                    nbrs[tp].push(i as u32);
                 }
             }
         }
@@ -6816,17 +6807,17 @@ impl Hako {
         }
         // LPA: node i adopts the most common label among its neighbors;
         // ties take the smallest label id; async updates in position order.
-        let mut labels: Vec<usize> = (0..nodes.len()).collect();
+        let mut labels: Vec<usize> = (0..csr.len()).collect();
         for _round in 0..32 {
             let mut changed = false;
-            for i in 0..nodes.len() {
+            for i in 0..csr.len() {
                 if nbrs[i].is_empty() {
                     continue; // isolated node keeps its own label
                 }
                 let mut counts: std::collections::HashMap<usize, usize> =
                     std::collections::HashMap::new();
                 for &n in &nbrs[i] {
-                    *counts.entry(labels[n]).or_default() += 1;
+                    *counts.entry(labels[n as usize]).or_default() += 1;
                 }
                 let best = counts
                     .into_iter()
@@ -6846,7 +6837,7 @@ impl Hako {
         // bucket is sorted; buckets order by their smallest member.
         let mut buckets: std::collections::HashMap<usize, Vec<GraphNode>> =
             std::collections::HashMap::new();
-        for (i, key) in nodes.iter().enumerate() {
+        for (i, key) in csr.ids.iter().enumerate() {
             buckets.entry(labels[i]).or_default().push(key.clone());
         }
         let mut out: Vec<Vec<GraphNode>> = buckets.into_values().collect();
@@ -6874,24 +6865,24 @@ impl Hako {
                 "damping must be in [0, 1], got {damping}"
             )));
         }
-        let (nodes, adj) = self.graph_adjacency(collection, spec)?;
-        if nodes.is_empty() {
+        let csr = self.graph_csr(collection, spec)?;
+        if csr.is_empty() {
             return Ok(Vec::new());
         }
-        let pos: std::collections::HashMap<&(String, String), usize> =
-            nodes.iter().enumerate().map(|(i, k)| (k, i)).collect();
         // Teleport vector: seeds (that exist), or all nodes uniformly.
         let seed_mass = if damping < 1.0 { 1.0 - damping } else { 0.0 };
-        let mut teleport = vec![0.0f64; nodes.len()];
+        let mut teleport = vec![0.0f64; csr.len()];
         if seeds.is_empty() {
-            let share = seed_mass / nodes.len() as f64;
+            let share = seed_mass / csr.len() as f64;
             for t in teleport.iter_mut() {
                 *t = share;
             }
         } else {
+            let intern: std::collections::HashMap<&GraphNode, u32> =
+                csr.ids.iter().enumerate().map(|(i, k)| (k, i as u32)).collect();
             let live: Vec<usize> = seeds
                 .iter()
-                .filter_map(|s| pos.get(s).copied())
+                .filter_map(|s| intern.get(s).map(|&p| p as usize))
                 .collect();
             if !live.is_empty() {
                 let share = seed_mass / live.len() as f64;
@@ -6900,30 +6891,23 @@ impl Hako {
                 }
             }
         }
-        // Out-degree per node (targets are deduped by graph_adjacency).
-        let children: Vec<Vec<usize>> = nodes
-            .iter()
-            .map(|k| {
-                adj.get(k)
-                    .map(|ts| ts.iter().filter_map(|t| pos.get(t).copied()).collect())
-                    .unwrap_or_default()
-            })
-            .collect();
+        // Out-degree per row (targets are deduped by the CSR build).
         let mut rank = teleport.clone();
         for _round in 0..30 {
             let mut next = teleport.clone();
             for (i, r) in rank.iter().enumerate() {
-                if *r == 0.0 || children[i].is_empty() {
+                if *r == 0.0 || csr.row(i).is_empty() {
                     continue; // dangling mass drops
                 }
-                let share = r * damping / children[i].len() as f64;
-                for &c in &children[i] {
-                    next[c] += share;
+                let share = r * damping / csr.row(i).len() as f64;
+                for &c in csr.row(i) {
+                    next[c as usize] += share;
                 }
             }
             rank = next;
         }
-        let mut rows: Vec<(GraphNode, f64)> = nodes
+        let mut rows: Vec<(GraphNode, f64)> = csr
+            .ids
             .iter()
             .enumerate()
             .map(|(i, k)| (k.clone(), rank[i]))
@@ -7036,8 +7020,9 @@ impl Hako {
     /// Nodes = live matching docs (doc JSON re-encodes resolved values);
     /// edges = the deduped adjacency. Same rules as the analytics fns.
     pub fn export_graph_json(&self, collection: &str, spec: &TraverseSpec) -> Result<String> {
-        let (nodes, adj) = self.graph_adjacency(collection, spec)?;
-        let nodes_json: Vec<serde_json::Value> = nodes
+        let csr = self.graph_csr(collection, spec)?;
+        let nodes_json: Vec<serde_json::Value> = csr
+            .ids
             .iter()
             .map(|(c, id)| {
                 let mut mdoc = serde_json::Map::new();
@@ -7049,22 +7034,19 @@ impl Hako {
                 serde_json::json!({ "collection": c, "id": id, "doc": mdoc })
             })
             .collect();
-        let mut edges: Vec<serde_json::Value> = adj
-            .iter()
-            .flat_map(|(from, ts)| {
-                ts.iter().map(move |to| {
-                    serde_json::json!({
-                        "from": format!("{}/{}", from.0, from.1),
-                        "to": format!("{}/{}", to.0, to.1)
-                    })
-                })
-            })
-            .collect();
-        // Deterministic docs: adj is a HashMap, iteration order varies per
-        // process — sort the edge list by (from, to).
-        edges.sort_by(|a, b| {
-            (a["from"].as_str(), a["to"].as_str()).cmp(&(b["from"].as_str(), b["to"].as_str()))
-        });
+        // Rows iterate in position order (= lexicographic (col, id)) and
+        // targets are sorted per row — the edge list is born sorted, no
+        // post-sort pass (the old HashMap needed one to be deterministic).
+        let mut edges: Vec<serde_json::Value> = Vec::new();
+        for (i, from) in csr.ids.iter().enumerate() {
+            for t in csr.row(i) {
+                let to = &csr.ids[*t as usize];
+                edges.push(serde_json::json!({
+                    "from": format!("{}/{}", from.0, from.1),
+                    "to": format!("{}/{}", to.0, to.1)
+                }));
+            }
+        }
         Ok(serde_json::to_string(&serde_json::json!({
             "nodes": nodes_json,
             "edges": edges
