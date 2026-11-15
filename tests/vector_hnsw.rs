@@ -85,6 +85,71 @@ fn seed(db: &Hako, n: usize, seed: u64) -> Vec<Vec<f32>> {
     pts
 }
 
+/// #190 fixture: same shape as `seed` but the index opts into binary
+/// stage-1 (popcount traversal, int8/f32 exact rescore unchanged), with
+/// a 64-dim clustered layout — an 8-bit stage-1 over uniform randoms
+/// can't rank (hamming 0..8; randoms concentrate at ~90°), while real
+/// embeddings are anisotropic and sign bits track cluster direction.
+fn seed_binary(db: &Hako, n: usize, seed: u64) -> Vec<Vec<f32>> {
+    const BDIM: usize = 64;
+    let mut rng = Rng(seed);
+    let center = |c: usize, j: usize| -> f32 {
+        ((c * 7919 + j * 104729) % 1000) as f32 / 500.0 - 1.0
+    };
+    let pts: Vec<Vec<f32>> = (0..n)
+        .map(|i| {
+            (0..BDIM)
+                .map(|j| center(i % 25, j) + rng.next_f32() * 0.05)
+                .collect()
+        })
+        .collect();
+    let batch = pts
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let mut doc = HakoDoc::default();
+            doc.insert("emb", Value::Binary(encode_f32s(p)));
+            doc.insert("grp", Value::String(if i % 2 == 0 { "ev" } else { "od" }.into()));
+            BatchMutation::Put {
+                collection: "pts".into(),
+                doc_id: format!("d{i:04}"),
+                doc,
+            }
+        })
+        .collect();
+    db.write_batch(batch).expect("seed");
+    db.create_vector_index_with_params(
+        "pts",
+        "emb",
+        BDIM as u32,
+        Metric::Cosine,
+        hakodb::index::vector::HnswParams {
+            m: None,
+            ef_construction: None,
+            ef_search: None,
+            binary_stage1: true,
+        },
+    )
+    .expect("create binary-stage1 index");
+    pts
+}
+
+/// Queries that sit inside the binary fixture's clusters (a fresh
+/// center + small noise), so top-10 = own cluster + nearest boundary.
+fn binary_queries(seed: u64) -> Vec<Vec<f32>> {
+    let mut rng = Rng(seed);
+    let center = |c: usize, j: usize| -> f32 {
+        ((c * 7919 + j * 104729) % 1000) as f32 / 500.0 - 1.0
+    };
+    (0..10)
+        .map(|qi| {
+            (0..64)
+                .map(|j| center(qi * 2 % 25, j) + rng.next_f32() * 0.05)
+                .collect()
+        })
+        .collect()
+}
+
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
     let (mut dot, mut na, mut nb) = (0.0f64, 0.0, 0.0);
     for i in 0..a.len() {
@@ -318,6 +383,43 @@ fn empty_graph_is_exact_trivially() {
     wait_ready(&db);
     let q = vec![0.5; DIM];
     assert!(db.find_near("pts", "emb", &q, 5).expect("q").is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #190: a binary-stage1 index traverses on popcount Hamming (sign
+/// bitsets) with the exact rescore unchanged, and the bitsets persist +
+/// restore with the graph (#189 path; params match keeps the graph, not
+/// a rebuild). Recall vs the brute oracle holds at the toy epsilon; the
+/// duel harness owns the 0.99 gate at embedding dims.
+#[test]
+fn binary_stage1_serves_exact_and_persists() {
+    let dir = tmp("bin1");
+    let pts = {
+        let db = open_db(&dir);
+        let pts = seed_binary(&db, 150, 0xDD);
+        wait_complete(&db, "pts", "emb");
+        assert_eq!(db.vector_graph_len("pts", "emb"), Some(150));
+        let live = vec![true; pts.len()];
+        for q in &binary_queries(0xEE) {
+            let got = knn_ids(&db, q, 10);
+            let want = brute_top(q, &pts, &live, 10);
+            let hits = got.iter().filter(|id| want.contains(id)).count();
+            assert!(hits >= 9, "binary stage-1 recall {hits}/10");
+        }
+        pts
+    };
+    {
+        let db = open_db(&dir);
+        wait_complete(&db, "pts", "emb");
+        assert_eq!(db.vector_graph_len("pts", "emb"), Some(150));
+        let live = vec![true; pts.len()];
+        for q in &binary_queries(0xFF) {
+            let got = knn_ids(&db, q, 10);
+            let want = brute_top(q, &pts, &live, 10);
+            let hits = got.iter().filter(|id| want.contains(id)).count();
+            assert!(hits >= 9, "binary stage-1 recall {hits}/10 after reopen");
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

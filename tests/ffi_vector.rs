@@ -163,7 +163,7 @@ fn create_v2_with_params_serves_scored_queries() {
     let col = CString::new("v2col").unwrap();
     let fld = CString::new("emb").unwrap();
     assert_eq!(
-        hk_engine_create_vector_index_v2(eng, col.as_ptr(), fld.as_ptr(), 2, 2, 32, 400, 1024),
+        hk_engine_create_vector_index_v2(eng, col.as_ptr(), fld.as_ptr(), 2, 2, 32, 400, 1024, 0),
         0,
         "v2 create: {}",
         last_err()

@@ -57,6 +57,12 @@ pub struct VectorDef {
     /// formula (max_ids*8, clamped 128/256..20000).
     #[serde(default)]
     pub ef_search: Option<usize>,
+    /// Binary stage-1 (#190): graph traversal ranks by popcount Hamming
+    /// over sign bitsets (~16x cheaper stage-1) with the int8/f32 exact
+    /// rescore untouched. Default false — int8 traversal, no behavior
+    /// change. Node bitsets exist only when this is on at build time.
+    #[serde(default)]
+    pub binary_stage1: bool,
 }
 
 /// Configurable HNSW parameters (#141-1). `None` fields ride the derived
@@ -67,6 +73,8 @@ pub struct HnswParams {
     pub m: Option<usize>,
     pub ef_construction: Option<usize>,
     pub ef_search: Option<usize>,
+    /// #190 binary stage-1 toggle (see `VectorDef::binary_stage1`).
+    pub binary_stage1: bool,
 }
 
 /// Max dims per index (Turso allows 65536; embedded starts tighter —
@@ -476,6 +484,11 @@ struct HnswNode {
     sum_sq: f64,
     /// links[level] = neighbor internal idxs.
     links: Vec<Vec<usize>>,
+    /// Sign bitset (#190): bit j = vec[j] >= 0, one word per 64 dims.
+    /// Only populated when the def enables binary stage-1 (RAM stays
+    /// flat for int8-only indexes); traversal ranks on popcount Hamming
+    /// against the query's own sign bitset.
+    bits: Vec<u64>,
 }
 
 /// Symmetric int8 quantization: scale = max_abs/127 so the largest
@@ -499,6 +512,32 @@ fn quantize(v: &[f32]) -> (Vec<i8>, f32) {
 struct Cand {
     dist: f64,
     idx: usize,
+}
+
+/// Sign bitset (#190): bit j set when v[j] >= 0, one word per 64 dims.
+fn sign_bits(v: &[f32]) -> Vec<u64> {
+    let mut bits = vec![0u64; v.len().div_ceil(64)];
+    for (j, &x) in v.iter().enumerate() {
+        if x >= 0.0 {
+            bits[j / 64] |= 1 << (j % 64);
+        }
+    }
+    bits
+}
+
+/// Popcount Hamming between two same-length bitsets (#190 stage-1
+/// distance): more sign agreement = lower = closer.
+fn hamming(a: &[u64], b: &[u64]) -> u32 {
+    a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
+}
+
+/// Stage-1 distance mode for traversal (#190): int8 asymmetric
+/// (default) or binary popcount Hamming against the query's sign
+/// bitset. Insert-time link building always uses Int8 (structure
+/// identical across the toggle).
+enum Stage1<'a> {
+    Int8,
+    Binary(&'a [u64]),
 }
 
 impl PartialEq for Cand {
@@ -545,6 +584,11 @@ pub struct HnswIndex {
     entry: Option<usize>,
     rng: u64,
     complete: bool,
+    /// #190 binary stage-1: when on, `search` ranks by popcount Hamming
+    /// over node/query sign bitsets; the exact rescore (int8/f32) stays
+    /// untouched downstream. Insert-time link building keeps int8
+    /// distances (structure identical across the toggle).
+    stage1_binary: bool,
 }
 
 impl HnswIndex {
@@ -575,6 +619,7 @@ impl HnswIndex {
             // levels only need geometric spread, not crypto.
             rng: 0x9E3779B97F4A7C15,
             complete: false,
+            stage1_binary: params.binary_stage1,
         }
     }
 
@@ -707,6 +752,9 @@ impl HnswIndex {
             n.sum_sq = ivec.iter().map(|x| (*x as f64) * (*x as f64)).sum();
             n.ivec = ivec;
             n.scale = scale;
+            if self.stage1_binary {
+                n.bits = sign_bits(&vec);
+            }
             return;
         }
         let level = self.random_level();
@@ -718,6 +766,7 @@ impl HnswIndex {
             scale,
             sum_sq,
             links: vec![Vec::new(); level + 1],
+            bits: if self.stage1_binary { sign_bits(&vec) } else { Vec::new() },
         });
         self.id_to_idx.insert(id.to_string(), idx);
         self.idx_to_id.push(id.to_string());
@@ -730,12 +779,14 @@ impl HnswIndex {
         // Insert-time routing uses the FULL-precision vector (better than
         // the quantized copy the node now stores).
         let qn = Self::query_norm_sq(&vec);
-        // Greedy descent to the insertion levels.
+        // Greedy descent to the insertion levels (always int8: link
+        // structure is toggle-independent, #190).
         for l in ((level + 1)..=top).rev() {
-            cur = self.greedy_closest(&vec, qn, cur, l);
+            cur = self.greedy_closest(&vec, qn, cur, l, &Stage1::Int8);
         }
         for l in (0..=level.min(top)).rev() {
-            let cand = self.search_layer(&vec, qn, &[cur], self.ef_construction, l);
+            let cand =
+                self.search_layer(&vec, qn, &[cur], self.ef_construction, l, None, &Stage1::Int8);
             if cand.is_empty() {
                 continue;
             }
@@ -760,16 +811,31 @@ impl HnswIndex {
         }
     }
 
+    /// Stage-1 distance for one node under the current traversal mode.
+    fn stage_dist(&self, q: &[f32], qn: f64, idx: usize, stage1: &Stage1) -> f64 {
+        match stage1 {
+            Stage1::Int8 => self.q_dist(q, qn, idx),
+            Stage1::Binary(qb) => hamming(&self.nodes[idx].bits, qb) as f64,
+        }
+    }
+
     /// Greedy single-best descent at one level (ef=1 beam).
-    fn greedy_closest(&self, q: &[f32], qn: f64, entry: usize, level: usize) -> usize {
+    fn greedy_closest(
+        &self,
+        q: &[f32],
+        qn: f64,
+        entry: usize,
+        level: usize,
+        stage1: &Stage1,
+    ) -> usize {
         let mut best = entry;
-        let mut best_d = self.q_dist(q, qn, entry);
+        let mut best_d = self.stage_dist(q, qn, entry, stage1);
         // ponytail: fixed-point loop, not a worklist — one pass per
         // improvement, terminates when no neighbor is closer.
         loop {
             let mut improved = false;
             for &nb in &self.nodes[best].links[level] {
-                let d = self.q_dist(q, qn, nb);
+                let d = self.stage_dist(q, qn, nb, stage1);
                 if d < best_d {
                     best_d = d;
                     best = nb;
@@ -784,7 +850,13 @@ impl HnswIndex {
 
     /// Beam search at one level from `entries`, keeping `ef` best.
     /// Returns (dist, idx) sorted ascending. `visited`/`tag` dedupe across
-    /// layers without a HashSet alloc per call.
+    /// layers without a HashSet alloc per call. `allow` (#192 filtered
+    /// traversal) gates admission: only matching nodes enter the beam
+    /// and results — non-matching ones are visited-marked and never
+    /// expanded; the caller's widening + exact fallback covers filtered
+    /// regions the walk can't reach. Entry seeds always expand but join
+    /// results only when they match.
+    #[allow(clippy::too_many_arguments)] // private; the args are the beam-search context (query, beam, layer, admission, stage-1 mode)
     fn search_layer(
         &self,
         q: &[f32],
@@ -792,21 +864,30 @@ impl HnswIndex {
         entries: &[usize],
         ef: usize,
         level: usize,
+        allow: Option<&mut dyn FnMut(usize) -> bool>,
+        stage1: &Stage1,
     ) -> Vec<(f64, usize)> {
         use std::collections::BinaryHeap;
         use std::cmp::Reverse;
         let ef = ef.max(1);
+        let mut allow = allow;
         let mut visited = vec![false; self.nodes.len()];
         let mut cands: BinaryHeap<Reverse<Cand>> = BinaryHeap::new();
         let mut result: BinaryHeap<Cand> = BinaryHeap::new();
         for &e in entries {
             if e < self.nodes.len() && !visited[e] {
                 visited[e] = true;
-                let d = self.q_dist(q, qn, e);
+                let d = self.stage_dist(q, qn, e, stage1);
                 cands.push(Reverse(Cand { dist: d, idx: e }));
-                result.push(Cand { dist: d, idx: e });
-                if result.len() > ef {
-                    result.pop();
+                let admitted = match &mut allow {
+                    Some(f) => f(e),
+                    None => true,
+                };
+                if admitted {
+                    result.push(Cand { dist: d, idx: e });
+                    if result.len() > ef {
+                        result.pop();
+                    }
                 }
             }
         }
@@ -823,9 +904,13 @@ impl HnswIndex {
             for &nb in &self.nodes[c.idx].links[level] {
                 if !visited[nb] {
                     visited[nb] = true;
-                    let d = self.q_dist(q, qn, nb);
-                    let mut push = result.len() < ef;
-                    if !push {
+                    let d = self.stage_dist(q, qn, nb, stage1);
+                    let admitted = match &mut allow {
+                        Some(f) => f(nb),
+                        None => true,
+                    };
+                    let mut push = admitted && result.len() < ef;
+                    if admitted && !push {
                         if let Some(worst) = result.peek() {
                             push = d < worst.dist;
                         }
@@ -900,10 +985,55 @@ impl HnswIndex {
         let qn = Self::query_norm_sq(query);
         let top = self.nodes[entry].links.len() - 1;
         let mut cur = entry;
+        // #190: binary stage-1 when the def enabled it and the resident
+        // graph carries bitsets (post-repair the invariant holds; during
+        // repair `complete` is off, so mixed states never serve ANN).
+        let words = self.dim.div_ceil(64);
+        let stage1 = if self.stage1_binary
+            && self.nodes[entry].bits.len() >= words
+        {
+            Stage1::Binary(&sign_bits(query))
+        } else {
+            Stage1::Int8
+        };
         for l in (1..=top).rev() {
-            cur = self.greedy_closest(query, qn, cur, l);
+            cur = self.greedy_closest(query, qn, cur, l, &stage1);
         }
-        self.search_layer(query, qn, &[cur], ef, 0)
+        self.search_layer(query, qn, &[cur], ef, 0, None, &stage1)
+    }
+
+    /// Filter-aware search (#192): same walk as [`Self::search`], but
+    /// `allow` (idx → match) gates admission — only matching nodes enter
+    /// the beam and results, so `ef` isn't wasted on doomed candidates.
+    /// Upper-level descent stays unfiltered (routing, not results). The
+    /// executor's widening + exact fallback stays the safety net for
+    /// filtered regions the walk can't reach.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        ef: usize,
+        allow: &mut dyn FnMut(usize) -> bool,
+    ) -> Vec<(f64, usize)> {
+        let entry = match self.entry {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+        if query.len() != self.dim {
+            return Vec::new();
+        }
+        let qn = Self::query_norm_sq(query);
+        let top = self.nodes[entry].links.len() - 1;
+        let mut cur = entry;
+        let words = self.dim.div_ceil(64);
+        let stage1 = if self.stage1_binary && self.nodes[entry].bits.len() >= words {
+            Stage1::Binary(&sign_bits(query))
+        } else {
+            Stage1::Int8
+        };
+        for l in (1..=top).rev() {
+            cur = self.greedy_closest(query, qn, cur, l, &stage1);
+        }
+        self.search_layer(query, qn, &[cur], ef, 0, Some(allow), &stage1)
     }
 }
 
@@ -981,6 +1111,133 @@ mod tests {
         assert_eq!(b.len(), 12);
         assert_eq!(decode_f32s(&b).expect("decode"), v);
         assert!(decode_f32s(&b[..5]).is_err());
+    }
+
+    /// #190: sign bitset encoding — one bit per dim, set on x >= 0; the
+    /// Hamming stage-1 distance counts sign disagreements. Roundtrip and
+    /// alignment rules extend the byte encoding's test discipline.
+    #[test]
+    fn sign_bitset_encoding_and_hamming() {
+        // Signs +, -, +, + → 0b1101 (bit j set on v[j] >= 0).
+        assert_eq!(sign_bits(&[1.0, -2.0, 0.0, 3.0]), vec![0b1101]);
+        // Identical → 0; mirrored signs → every bit disagrees.
+        let a = sign_bits(&[1.0, -1.0]);
+        let b = sign_bits(&[-1.0, 1.0]);
+        assert_eq!(hamming(&a, &a), 0);
+        assert_eq!(hamming(&a, &b), 2);
+        // 70 dims → two words; zero vector is all-zero bits.
+        let v70: Vec<f32> =
+            (0..70).map(|i| if i % 3 == 0 { -1.0 } else { 1.0 }).collect();
+        assert_eq!(sign_bits(&v70).len(), 2);
+        assert_eq!(hamming(&sign_bits(&v70), &sign_bits(&v70)), 0);
+        assert_eq!(sign_bits(&[0.0, 0.0]), vec![0b11], "0.0 counts as +");
+    }
+
+    /// #190 at graph level: a binary-stage1 graph recalls the int8
+    /// graph's oracle top-k on the same fixture (toy epsilon here; the
+    /// duel harness owns the 0.99 gate at embedding dims). 64 dims so
+    /// the sign bitset has enough resolution to rank (8 dims = 0..8
+    /// hamming values, too coarse to rank anything).
+    #[test]
+    fn binary_stage1_graph_matches_int8_recall() {
+        const DIM: usize = 64;
+        let mk = |bin: bool| {
+            HnswIndex::new(
+                DIM,
+                Metric::Cosine,
+                HnswParams {
+                    m: Some(16),
+                    ef_construction: Some(128),
+                    ef_search: None,
+                    binary_stage1: bin,
+                },
+            )
+        };
+        let (mut g, mut int8) = (mk(true), mk(false));
+        // Clustered fixture (real embeddings are anisotropic): 25 LCG
+        // centers, each doc = center + tiny noise. Pure uniform randoms
+        // concentrate at ~90° apart — sign bits can't rank noise, and
+        // the oracle top-10 would be arbitrary.
+        let lcg = |s: u64| -> f32 { (((s.wrapping_mul(6364136223846793005) >> 33) % 1001) as f32) / 250.0 - 2.0 };
+        let noise = |s: u64| -> f32 { (((s.wrapping_mul(1442695040888963407) >> 33) % 21) as f32) / 1000.0 - 0.01 };
+        let center = |c: usize, j: usize| lcg((c as u64).wrapping_mul(6364136223846793005).wrapping_add(j as u64));
+        let vecs: Vec<Vec<f32>> = (0..200)
+            .map(|i| {
+                (0..DIM)
+                    .map(|j| center(i % 25, j) + noise((i as u64).wrapping_mul(97).wrapping_add(j as u64)))
+                    .collect()
+            })
+            .collect();
+        for (i, v) in vecs.iter().enumerate() {
+            g.upsert(&format!("n{i}"), v.clone());
+            int8.upsert(&format!("n{i}"), v.clone());
+        }
+        g.set_complete(true);
+        int8.set_complete(true);
+        for qi in 0..10 {
+            let q: Vec<f32> = (0..DIM)
+                .map(|j| center(qi * 2 % 25, j) + noise(((qi + 31) as u64).wrapping_mul(97).wrapping_add(j as u64)))
+                .collect();
+            let mut brute: Vec<(f64, usize)> = vecs
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (cosine_distance(&q, v), i))
+                .collect();
+            brute.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let want: Vec<String> =
+                brute.into_iter().take(10).map(|(_, i)| format!("n{i}")).collect();
+            // Beam 8x the k: stage-1 is approximate; the exact rescore
+            // downstream (executor) owns final ordering.
+            // Emulate the executor's two-stage pipeline: the stage-1 beam
+            // (80) prunes, the exact f32 rescore orders the survivors.
+            // Measuring the raw hamming top-10 would test the prune, not
+            // the served recall.
+            let rescore = |cands: Vec<(f64, usize)>| -> Vec<String> {
+                let mut scored: Vec<(f64, usize)> = cands
+                    .into_iter()
+                    .map(|(_, i)| (cosine_distance(&q, &vecs[i]), i))
+                    .collect();
+                scored.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                scored.into_iter().take(10).map(|(_, i)| format!("n{i}")).collect()
+            };
+            let got = rescore(g.search(&q, 80));
+            let hits = got.iter().filter(|id| want.contains(id)).count();
+            assert!(hits >= 9, "binary stage-1 recall {hits}/10 at q{qi}");
+            // The int8 path keeps the same epsilon on the same fixture.
+            let got8 = rescore(int8.search(&q, 80));
+            let hits8 = got8.iter().filter(|id| want.contains(id)).count();
+            assert!(hits8 >= 9, "int8 recall {hits8}/10 at q{qi}");
+        }
+    }
+
+    /// #192: the filtered walk admits only matching nodes into beam and
+    /// results; the unfiltered `search` returns everything. Same query,
+    /// same graph — allowed subset of the unfiltered order.
+    #[test]
+    fn search_filtered_gates_admission() {
+        use crate::index::vector::HnswParams;
+        let mut g = HnswIndex::new(2, Metric::L2, HnswParams::default());
+        // Grid: evens are "matching" (x >= 0), odds far side.
+        for i in 0..12 {
+            let x = if i % 2 == 0 { i as f32 } else { -i as f32 };
+            g.upsert(&format!("n{i}"), vec![x, 0.0]);
+        }
+        g.set_complete(true);
+        let q = vec![5.0, 0.0];
+        let all = g.search(&q, 6);
+        let even: Vec<usize> = (0..12).filter(|i| i % 2 == 0).collect();
+        let mut allow = |idx: usize| even.contains(&idx);
+        let filtered = g.search_filtered(&q, 6, &mut allow);
+        assert!(!filtered.is_empty());
+        for (d, idx) in &filtered {
+            assert!(even.contains(idx), "non-matching node admitted: {idx}");
+            assert!(
+                all.iter().any(|(ad, ai)| ai == idx && ad == d),
+                "filtered row must ride the unfiltered order"
+            );
+        }
+        // Sorted by distance (ties by idx), same contract as search.
+        assert!(filtered.windows(2).all(|w| w[0].0 <= w[1].0));
     }
 
     #[test]
