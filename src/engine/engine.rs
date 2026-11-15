@@ -5705,7 +5705,11 @@ impl Hako {
             .min(n_chunks)
             .max(1);
         let next = AtomicUsize::new(0);
-        let built: Mutex<Vec<Option<HashMap<String, HnswIndex>>>> =
+        /// Phase-1 slot: field → snapshot-ordered (id, vector) items.
+        type ChunkItems = HashMap<String, Vec<(String, Vec<f32>)>>;
+        // Phase 1 (parallel): decode + extract per field. Chunk slots keep
+        // snapshot order, so the concatenated item list is deterministic.
+        let built: Mutex<Vec<Option<ChunkItems>>> =
             Mutex::new((0..n_chunks).map(|_| None).collect());
         std::thread::scope(|s| {
             for _w in 0..workers {
@@ -5715,7 +5719,7 @@ impl Hako {
                         break;
                     }
                     let slice = &pointers[k * chunk_len..((k + 1) * chunk_len).min(n)];
-                    let mut graphs: HashMap<String, HnswIndex> = HashMap::new();
+                    let mut items: ChunkItems = HashMap::new();
                     for (key, ptr) in slice {
                         // Ghost guard: deleted docs must not enter the graph.
                         if matches!(ptr, Pointer::Deleted { .. }) {
@@ -5729,37 +5733,38 @@ impl Hako {
                             continue;
                         };
                         let _ = resolve_doc_static(&mut doc, shard_arc, enc_key.as_deref());
-                        for (field, dim, metric, params) in &defs {
+                        for (field, ..) in &defs {
                             if let Some(Value::Binary(b)) = doc.get(field) {
                                 if let Ok(v) = decode_f32s(b) {
-                                    graphs
+                                    items
                                         .entry(field.clone())
-                                        .or_insert_with(|| HnswIndex::new(*dim, *metric, *params))
-                                        .upsert(key, v);
+                                        .or_default()
+                                        .push((key.clone(), v));
                                 }
                             }
                         }
                     }
-                    built.lock().unwrap()[k] = Some(graphs);
+                    built.lock().unwrap()[k] = Some(items);
                 });
             }
         });
-        // Merge per field: non-empty chunk graphs in chunk order, one
-        // graph per field, installed under the write lock.
-        for (field, _dim, _metric, _params) in &defs {
+        // Phase 2: one batch-simulated graph per field (#206 — candidate
+        // collection parallel, link application sequential), installed
+        // under the write lock.
+        for (field, dim, metric, params) in &defs {
             let guard = built.lock().unwrap();
-            let parts: Vec<&HnswIndex> = guard
+            let items: Vec<(String, Vec<f32>)> = guard
                 .iter()
                 .filter_map(|m| m.as_ref())
-                .filter_map(|g| g.get(field))
-                .filter(|g| !g.is_empty())
+                .flat_map(|m| m.get(field).cloned().unwrap_or_default())
                 .collect();
-            if parts.is_empty() {
+            drop(guard);
+            if items.is_empty() {
                 continue;
             }
-            let merged = HnswIndex::merge_chunk_graphs(&parts);
+            let graph = HnswIndex::build_batched(*dim, *metric, *params, &items);
             if let Ok(mut mgr) = idx_mgr.write() {
-                mgr.install_vector_graph(col_name, field, merged);
+                mgr.install_vector_graph(col_name, field, graph);
             }
         }
     }
