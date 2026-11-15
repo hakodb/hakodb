@@ -347,9 +347,21 @@ impl IndexManager {
     /// WAL tails at export, per collection: (wal data_len, wal file_len).
     /// Lets recovery tell a fresh snapshot from a stale one (crash after
     /// the last snapshot) without trusting timestamps.
+    ///
+    /// 5-element format (#189): the HNSW graphs ride along as derived
+    /// state so reopen skips the full rebuild. Element 4 is the graphs
+    /// keyed (collection, field) → graph; import validates each against
+    /// the live def (dim/metric/params) and drops mismatches — a stale or
+    /// foreign graph degrades to the rebuild path, never to wrong results.
     pub fn export_state_with_tails(&self, tails: &WalTails) -> Result<Vec<u8>, HakoError> {
-        bincode::serialize(&(&self.secondary, &self.fts, self.composite.export_snapshot(), tails))
-            .map_err(|e| HakoError::Corrupt(format!("Index export failed: {}", e)))
+        bincode::serialize(&(
+            &self.secondary,
+            &self.fts,
+            self.composite.export_snapshot(),
+            tails,
+            &self.hnsw,
+        ))
+        .map_err(|e| HakoError::Corrupt(format!("Index export failed: {}", e)))
     }
 
     /// True when the manager holds any RAM entries for `collection`
@@ -426,16 +438,24 @@ impl IndexManager {
         // open — newer than any snapshot — so their entries are left
         // alone (both orders converge identically this way).
         type Trees = HashMap<u32, crate::index::composite::composite_index::CompositeIndex>;
-        if let Ok((sec, fts, (trees, next_id), tails)) = bincode::deserialize::<(
+        // 5-element (#189): graphs ride along. Each graph is validated
+        // against its live def (dim/metric/params) — mismatching or
+        // unregistered fields drop to the rebuild path (graph stays
+        // empty/incomplete; STEP C2's backfill fills it). Imported graphs
+        // start `complete = false`: docs written after the snapshot must
+        // re-upsert through the repair pass before ANN may serve.
+        if let Ok((sec, fts, (trees, next_id), tails, graphs)) = bincode::deserialize::<(
             HashMap<String, HashMap<String, crate::index::secondary_index::SecondaryIndex>>,
             HashMap<String, HashMap<String, crate::index::inverted_index::InvertedIndex>>,
             (Trees, u32),
             WalTails,
+            HashMap<String, HashMap<String, crate::index::vector::HnswIndex>>,
         )>(bytes)
         {
             Self::merge_maps_skipping(&mut self.secondary, sec, skip);
             Self::merge_maps_skipping(&mut self.fts, fts, skip);
             self.composite.import_snapshot_filtered(trees, next_id, skip);
+            self.import_graphs(graphs, skip);
             return Ok((true, Some(tails)));
         }
         if let Ok((sec, fts, (trees, next_id))) = bincode::deserialize::<(
@@ -458,6 +478,49 @@ impl IndexManager {
         Self::merge_maps_skipping(&mut self.secondary, sec, skip);
         Self::merge_maps_skipping(&mut self.fts, fts, skip);
         Ok((false, None))
+    }
+
+    /// Install snapshot-carried HNSW graphs (#189): validate each against
+    /// the live def (dim/metric/params must all match — a def edited
+    /// between snapshots invalidates its graph), skip collections that
+    /// were touched after open (fresher than any snapshot), and force
+    /// `complete = false` so the repair pass gates ANN until it ran.
+    fn import_graphs(
+        &mut self,
+        graphs: HashMap<String, HashMap<String, crate::index::vector::HnswIndex>>,
+        skip: &std::collections::HashSet<String>,
+    ) {
+        for (col, fields) in graphs {
+            if skip.contains(&col) {
+                continue;
+            }
+            let defs = match self.vector.get(&col) {
+                Some(d) => d,
+                None => continue,
+            };
+            for (field, mut graph) in fields {
+                let def = match defs.get(&field) {
+                    Some(d) => d,
+                    None => continue,
+                };
+                if !graph.matches_def(
+                    def.dim,
+                    def.metric,
+                    crate::index::vector::HnswParams {
+                        m: def.m,
+                        ef_construction: def.ef_construction,
+                        ef_search: def.ef_search,
+                    },
+                ) {
+                    continue;
+                }
+                graph.set_complete(false);
+                self.hnsw
+                    .entry(col.clone())
+                    .or_default()
+                    .insert(field, graph);
+            }
+        }
     }
 
     fn merge_maps_skipping<K, V>(
@@ -513,6 +576,51 @@ mod tests {
         m.index_document("students", "d1", &doc("28021988", "F1"));
         m.index_document("students", "d2", &doc("28021988", "F2"));
         m
+    }
+
+    fn vec_def(m: &mut IndexManager, metric: Metric) {
+        m.create_vector_index(
+            "pts",
+            "emb",
+            4,
+            metric,
+            HnswParams { m: Some(16), ef_construction: Some(48), ef_search: Some(64) },
+        )
+        .unwrap();
+        m.ensure_vector_graph("pts", "emb");
+    }
+
+    /// #189: a snapshot-carried graph restores node-for-node, gates ANN
+    /// off (complete=false) until the repair pass ran, and a def mismatch
+    /// (different metric) drops the graph to the rebuild path.
+    #[test]
+    fn hnsw_graph_roundtrips_through_snapshot() {
+        let mut m = IndexManager::default();
+        vec_def(&mut m, Metric::Cosine);
+        {
+            let g = m.hnsw.get_mut("pts").unwrap().get_mut("emb").unwrap();
+            g.upsert("a", vec![1.0, 0.0, 0.0, 0.0]);
+            g.upsert("b", vec![0.0, 1.0, 0.0, 0.0]);
+            g.set_complete(true);
+        }
+        let bytes = m
+            .export_state_with_tails(&Default::default())
+            .expect("export");
+        let mut m2 = IndexManager::default();
+        vec_def(&mut m2, Metric::Cosine);
+        let (restored, tails) = m2.import_state(&bytes, &Default::default()).expect("import");
+        assert!(restored);
+        assert!(tails.is_some(), "5-element format carries tails");
+        let g = m2.hnsw.get("pts").unwrap().get("emb").unwrap();
+        assert_eq!(g.len(), 2, "graph restores node-for-node");
+        assert!(!g.complete(), "imported graphs gate ANN until repair");
+
+        // Metric changed under the same field: the snapshot graph no
+        // longer matches the def — dropped, rebuild path takes over.
+        let mut m3 = IndexManager::default();
+        vec_def(&mut m3, Metric::L2);
+        let _ = m3.import_state(&bytes, &Default::default()).expect("import");
+        assert_eq!(m3.hnsw.get("pts").unwrap().get("emb").unwrap().len(), 0);
     }
 
     #[test]
