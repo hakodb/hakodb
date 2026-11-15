@@ -4208,7 +4208,8 @@ pub extern "C" fn hk_engine_create_vector_index(
 }
 
 /// Vector index with explicit HNSW parameters (#141-1). Pass 0 for a
-/// parameter to ride the per-dim derived default. Additive to
+/// parameter to ride the per-dim derived default. `binary_stage1` != 0
+/// enables the popcount stage-1 (#190; default int8). Additive to
 /// `hk_engine_create_vector_index` (unchanged; derived defaults).
 #[no_mangle]
 pub extern "C" fn hk_engine_create_vector_index_v2(
@@ -4220,6 +4221,7 @@ pub extern "C" fn hk_engine_create_vector_index_v2(
     m: usize,
     ef_construction: usize,
     ef_search: usize,
+    binary_stage1: u32,
 ) -> i32 {
     if engine.is_null() {
         return -1;
@@ -4241,6 +4243,7 @@ pub extern "C" fn hk_engine_create_vector_index_v2(
         m: (m > 0).then_some(m),
         ef_construction: (ef_construction > 0).then_some(ef_construction),
         ef_search: (ef_search > 0).then_some(ef_search),
+        binary_stage1: binary_stage1 != 0,
     };
     match engine
         .db

@@ -69,6 +69,7 @@ impl IndexManager {
                     m: params.m,
                     ef_construction: params.ef_construction,
                     ef_search: params.ef_search,
+                    binary_stage1: params.binary_stage1,
                 },
             );
         Ok(())
@@ -83,7 +84,12 @@ impl IndexManager {
             Some(d) => (
                 d.dim as usize,
                 d.metric,
-                HnswParams { m: d.m, ef_construction: d.ef_construction, ef_search: d.ef_search },
+                HnswParams {
+                    m: d.m,
+                    ef_construction: d.ef_construction,
+                    ef_search: d.ef_search,
+                    binary_stage1: d.binary_stage1,
+                },
             ),
             None => return,
         };
@@ -510,6 +516,7 @@ impl IndexManager {
                         m: def.m,
                         ef_construction: def.ef_construction,
                         ef_search: def.ef_search,
+                        binary_stage1: def.binary_stage1,
                     },
                 ) {
                     continue;
@@ -584,7 +591,7 @@ mod tests {
             "emb",
             4,
             metric,
-            HnswParams { m: Some(16), ef_construction: Some(48), ef_search: Some(64) },
+            HnswParams { m: Some(16), ef_construction: Some(48), ef_search: Some(64), binary_stage1: false },
         )
         .unwrap();
         m.ensure_vector_graph("pts", "emb");

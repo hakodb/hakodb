@@ -1609,6 +1609,16 @@ impl ParallelQueryExecutor {
     /// skipped via `seen` (one shared set across widening stages + the
     /// fallback, so every id decodes/filters exactly once). Returns how
     /// many rows were added.
+    /// Shared `extra`-filter check (#192): every filter must pass on the
+    /// decoded doc; a missing field rejects (unified-match rule). Used by
+    /// the scoring path and the filtered-traversal admission predicate.
+    fn extras_match(doc: &HakoDoc, extra: &[crate::query::filter::Filter]) -> bool {
+        extra.iter().all(|f| {
+            doc.get(&f.field)
+                .is_some_and(|v| crate::query::filter::compare_values(v, &f.op, &f.value))
+        })
+    }
+
     #[allow(clippy::too_many_arguments)] // private; the param set is the scoring context
     fn score_vector_batch(
         storage: &StorageEngine,
@@ -1621,7 +1631,6 @@ impl ParallelQueryExecutor {
         scored: &mut Vec<(f64, String, Pointer)>,
     ) -> usize {
         use crate::index::vector::{decode_f32s, distance};
-        use crate::query::filter::compare_values;
         let mut added = 0usize;
         for (key, ptr) in pairs {
             // G3 (#168): cross-stage dedup rides only the hybrid path —
@@ -1643,24 +1652,7 @@ impl ParallelQueryExecutor {
                 Some(d) => d,
                 None => continue,
             };
-            let mut pass = true;
-            for f in extra {
-                match doc.get(&f.field) {
-                    Some(v) => {
-                        if !compare_values(v, &f.op, &f.value) {
-                            pass = false;
-                            break;
-                        }
-                    }
-                    // Missing field rejects (same rule as the
-                    // unified-match slow path).
-                    None => {
-                        pass = false;
-                        break;
-                    }
-                }
-            }
-            if !pass {
+            if !Self::extras_match(&doc, extra) {
                 continue;
             }
             // Missing / non-binary / dim-mismatched fields can't be
@@ -2040,13 +2032,54 @@ impl ParallelQueryExecutor {
                     .get(collection)
                     .and_then(|m| m.get(field))
                     .filter(|g| g.complete() && !g.is_empty());
-                let cand_ids: Option<Vec<String>> = graph.as_ref().map(|g| {
-                    g.search(&qv, ef)
-                        .into_iter()
-                        .take(if extra.is_empty() { rescore_n } else { ef })
-                        .map(|(_, idx)| g.id_of(idx).to_string())
-                        .collect()
-                });
+                // Filtered traversal (#192): with extra filters, admission
+                // is gated INSIDE the walk (only matching nodes enter the
+                // beam/results), so `ef` isn't wasted on doomed candidates
+                // and selective queries fill without the widening ladder.
+                // The predicate decodes each newly visited node once
+                // (cached); the scoring pass re-checks cheaply (same rule,
+                // same tie-breaks — results identical to post-filter).
+                let mut allow_cache: std::collections::HashMap<String, bool> =
+                    std::collections::HashMap::new();
+                let mut allow = |idx: usize| -> bool {
+                    let id = match graph.as_ref() {
+                        Some(g) => g.id_of(idx),
+                        None => return false,
+                    };
+                    *allow_cache
+                        .entry(id.to_string())
+                        .or_insert_with(|| {
+                            let key = Self::make_key(collection, id);
+                            match storage.index.get(&key) {
+                                Some(ptr) if !matches!(ptr, Pointer::Deleted { .. }) => {
+                                    match storage.read_pointer_shared(ptr) {
+                                        Ok(Some(b)) => HakoDoc::decode(&b)
+                                            .map(|d| Self::extras_match(&d, extra))
+                                            .unwrap_or(false),
+                                        _ => false,
+                                    }
+                                }
+                                _ => false,
+                            }
+                        })
+                };
+                let cand_ids: Option<Vec<String>> = match graph.as_ref() {
+                    Some(g) if extra.is_empty() => Some(
+                        g.search(&qv, ef)
+                            .into_iter()
+                            .take(rescore_n)
+                            .map(|(_, idx)| g.id_of(idx).to_string())
+                            .collect(),
+                    ),
+                    Some(g) => Some(
+                        g.search_filtered(&qv, ef, &mut allow)
+                            .into_iter()
+                            .take(ef)
+                            .map(|(_, idx)| g.id_of(idx).to_string())
+                            .collect(),
+                    ),
+                    None => None,
+                };
                 let pairs: Vec<(String, Pointer)> = match &cand_ids {
                     Some(ids) => Self::knn_pairs_from_ids(storage, ids),
                     None => Self::knn_pairs_brute(storage),
@@ -2070,8 +2103,10 @@ impl ParallelQueryExecutor {
                             if stag <= ef || scored.len() >= max_ids {
                                 break;
                             }
+                            // Widening rides the same filtered walk (#192):
+                            // a bigger beam still admits matches only.
                             let ids: Vec<String> = g
-                                .search(&qv, stag)
+                                .search_filtered(&qv, stag, &mut allow)
                                 .into_iter()
                                 .take(stag)
                                 .map(|(_, idx)| g.id_of(idx).to_string())

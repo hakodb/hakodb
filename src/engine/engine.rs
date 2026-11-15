@@ -366,6 +366,9 @@ pub struct VectorIndexInfo {
     pub m: Option<usize>,
     pub ef_construction: Option<usize>,
     pub ef_search: Option<usize>,
+    /// #190 binary stage-1 toggle. Additive key, serde-defaulted.
+    #[serde(default)]
+    pub binary_stage1: bool,
     /// Live stats (#141-7), serde-defaulted so older persisted defs load
     /// unchanged and JSON consumers get additive keys only.
     /// `indexed` = vectors currently in the HNSW graph; `complete` =
@@ -442,6 +445,9 @@ struct PersistedVectorIndex {
     ef_construction: Option<usize>,
     #[serde(default)]
     ef_search: Option<usize>,
+    /// #190 binary stage-1. Absent on pre-wave-3 files → false (int8).
+    #[serde(default)]
+    binary_stage1: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -4988,6 +4994,7 @@ impl Hako {
                     m: d.m,
                     ef_construction: d.ef_construction,
                     ef_search: d.ef_search,
+                    binary_stage1: d.binary_stage1,
                 })
                 .collect();
             list.sort_by(|a, b| a.field.cmp(&b.field));
@@ -5045,6 +5052,7 @@ impl Hako {
                     m: def.m,
                     ef_construction: def.ef_construction,
                     ef_search: def.ef_search,
+                    binary_stage1: def.binary_stage1,
                 };
                 let _ = mgr.create_vector_index(&collection, &def.field, def.dim, metric, params);
                 mgr.ensure_vector_graph(&collection, &def.field);
@@ -5242,6 +5250,7 @@ impl Hako {
                         m: d.m,
                         ef_construction: d.ef_construction,
                         ef_search: d.ef_search,
+                        binary_stage1: d.binary_stage1,
                         indexed: graph.map(|g| g.len()).unwrap_or(0),
                         complete: graph.is_some_and(|g| g.complete() && !g.is_empty()),
                         mem_estimate: graph.map(|g| g.bytes_estimate()).unwrap_or(0),

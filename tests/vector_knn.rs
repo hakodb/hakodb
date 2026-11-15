@@ -180,7 +180,7 @@ fn hnsw_params_persist_through_reopen() {
             "emb",
             2,
             Metric::Cosine,
-            HnswParams { m: Some(32), ef_construction: Some(400), ef_search: Some(1024) },
+            HnswParams { m: Some(32), ef_construction: Some(400), ef_search: Some(1024), binary_stage1: false },
         )
         .expect("create with params");
         db.write_batch(vec![BatchMutation::Put {
@@ -528,5 +528,54 @@ fn def_survives_restart() {
             .collect();
         assert_eq!(got, vec!["c", "a"]);
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #192 filtered traversal: a selective metadata filter no longer wastes
+/// `ef` on doomed candidates — the walk admits matching nodes only and
+/// fills without the widening ladder or the brute fallback. Result set
+/// must equal the brute oracle over the band (same top-k, same ties).
+#[test]
+fn filtered_traversal_selective_band() {
+    let dir = tmp("ftrav");
+    let db = open_db(&dir);
+    // 300 docs on a line; band = i % 15 == 0 → 20 docs (~6.7%).
+    let mutations: Vec<BatchMutation> = (0..300)
+        .map(|i| BatchMutation::Put {
+            collection: "pts".into(),
+            doc_id: format!("d{i:03}"),
+            doc: vdoc(&[i as f32, 1.0], if i % 15 == 0 { "band" } else { "bg" }),
+        })
+        .collect();
+    db.write_batch(mutations).expect("seed");
+    db.create_vector_index("pts", "emb", 2, Metric::Cosine).expect("create");
+    wait_ready(&db);
+    let q = [150.0f32, 1.0];
+    let rows = db
+        .query(
+            Query::new("pts")
+                .where_filter("emb", Operator::Near, Value::Binary(encode_f32s(&q)))
+                .where_filter("grp", Operator::Eq, Value::String("band".into()))
+                .limit(8),
+        )
+        .expect("selective query");
+    assert_eq!(rows.len(), 8, "band must fill the window");
+    for (id, doc) in &rows {
+        assert_eq!(doc.get("grp"), Some(&Value::String("band".into())), "{id}");
+    }
+    // Brute oracle over the band, same tie-breaking (score, then id).
+    let mut band: Vec<(f64, String)> = (0..300)
+        .filter(|i| i % 15 == 0)
+        .map(|i| {
+            (
+                cosine_distance(&q, &[i as f32, 1.0]),
+                format!("d{i:03}"),
+            )
+        })
+        .collect();
+    band.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let want: Vec<String> = band.into_iter().take(8).map(|(_, id)| id).collect();
+    let got: Vec<String> = rows.into_iter().map(|(id, _)| id).collect();
+    assert_eq!(got, want, "top-k must equal the band oracle");
     let _ = std::fs::remove_dir_all(&dir);
 }
