@@ -117,6 +117,17 @@ impl IndexManager {
         }
     }
 
+    /// #195 parallel bulk build: swap a freshly merged graph in (the
+    /// builder constructs it outside the manager lock; install is one
+    /// pointer-assign under the caller's write lock). Same blind-insert
+    /// semantics as the sequential `index_vector` path.
+    pub fn install_vector_graph(&mut self, collection: &str, field: &str, graph: HnswIndex) {
+        self.hnsw
+            .entry(collection.to_string())
+            .or_default()
+            .insert(field.to_string(), graph);
+    }
+
     /// Mark every graph of `collection` complete after a full pass
     /// (create backfill / recovery rescan) flowed through `index_vector`.
     /// Emptiness is data, not incompleteness: an empty pass still flips

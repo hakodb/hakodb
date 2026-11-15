@@ -5631,6 +5631,139 @@ impl Hako {
     /// whose rescan was skipped (fresh snapshot carries no HNSW bytes in
     /// P1). Same chunks/yield discipline as the FTS spawner; runs under
     /// `backfill_inflight` so queries fail-closed meanwhile.
+    /// #195 parallel bulk build (fresh builds only): chunk graphs are
+    /// built by N workers over disjoint fixed partitions (deterministic:
+    /// chunk size derives from n alone), merged into one graph per field
+    /// and installed. The sequential pass in the caller always still
+    /// runs afterwards as a cheap repair — existing ids re-quantize in
+    /// place (no beam work) and docs written during the build window
+    /// (absent from this snapshot) get indexed, which swap-based builds
+    /// would otherwise strand. The CPU-heavy half (beam graph work)
+    /// happens once, in parallel.
+    ///
+    /// Test knobs: `HKO_HNSW_PAR_CHUNK` overrides the chunk size (0 =
+    /// adaptive), `HKO_HNSW_PAR_WORKERS` overrides the worker count.
+    /// Every other fixture builds < 2 chunks, so these can't flip the
+    /// sequential paths of sibling tests.
+    fn parallel_vector_build(
+        idx_mgr: &Arc<RwLock<IndexManager>>,
+        shard_arc: &Arc<RwLock<StorageEngine>>,
+        enc_key: Option<String>,
+        col_name: &str,
+        wanted: &[String],
+        pointers: &[(String, Pointer)],
+    ) {
+        use crate::index::vector::{decode_f32s, HnswIndex, HnswParams, Metric};
+        let defs: Vec<(String, usize, Metric, HnswParams)> = {
+            let mgr = idx_mgr.read().unwrap();
+            mgr.vector
+                .get(col_name)
+                .map(|m| {
+                    m.iter()
+                        .map(|(f, d)| {
+                            (
+                                f.clone(),
+                                d.dim as usize,
+                                d.metric,
+                                HnswParams {
+                                    m: d.m,
+                                    ef_construction: d.ef_construction,
+                                    ef_search: d.ef_search,
+                                    binary_stage1: d.binary_stage1,
+                                },
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        if defs.is_empty() {
+            return;
+        }
+        // Fixed partitioning: the chunk size is a function of n only, so
+        // worker count changes wall-clock, never the result.
+        let n = pointers.len();
+        let adaptive = n.div_ceil(64).clamp(256, 8192);
+        let chunk_len: usize = std::env::var("HKO_HNSW_PAR_CHUNK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&c| c > 0)
+            .unwrap_or(adaptive)
+            .max(1);
+        let n_chunks = n.div_ceil(chunk_len);
+        if n_chunks < 2 {
+            return; // small builds ride the sequential path unchanged
+        }
+        let chunk_len = chunk_len.min(n);
+        let workers_default =
+            std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1).min(n_chunks);
+        let workers: usize = std::env::var("HKO_HNSW_PAR_WORKERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&w| w > 0)
+            .unwrap_or(workers_default)
+            .min(n_chunks)
+            .max(1);
+        let next = AtomicUsize::new(0);
+        let built: Mutex<Vec<Option<HashMap<String, HnswIndex>>>> =
+            Mutex::new((0..n_chunks).map(|_| None).collect());
+        std::thread::scope(|s| {
+            for _w in 0..workers {
+                s.spawn(|| loop {
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    if k >= n_chunks {
+                        break;
+                    }
+                    let slice = &pointers[k * chunk_len..((k + 1) * chunk_len).min(n)];
+                    let mut graphs: HashMap<String, HnswIndex> = HashMap::new();
+                    for (key, ptr) in slice {
+                        // Ghost guard: deleted docs must not enter the graph.
+                        if matches!(ptr, Pointer::Deleted { .. }) {
+                            continue;
+                        }
+                        let bytes = {
+                            shard_arc.read().unwrap().read_pointer_internal(ptr, false)
+                        };
+                        let Ok(Some(bytes)) = bytes else { continue };
+                        let Some(mut doc) = HakoDoc::decode_projected(&bytes, wanted) else {
+                            continue;
+                        };
+                        let _ = resolve_doc_static(&mut doc, shard_arc, enc_key.as_deref());
+                        for (field, dim, metric, params) in &defs {
+                            if let Some(Value::Binary(b)) = doc.get(field) {
+                                if let Ok(v) = decode_f32s(b) {
+                                    graphs
+                                        .entry(field.clone())
+                                        .or_insert_with(|| HnswIndex::new(*dim, *metric, *params))
+                                        .upsert(key, v);
+                                }
+                            }
+                        }
+                    }
+                    built.lock().unwrap()[k] = Some(graphs);
+                });
+            }
+        });
+        // Merge per field: non-empty chunk graphs in chunk order, one
+        // graph per field, installed under the write lock.
+        for (field, _dim, _metric, _params) in &defs {
+            let guard = built.lock().unwrap();
+            let parts: Vec<&HnswIndex> = guard
+                .iter()
+                .filter_map(|m| m.as_ref())
+                .filter_map(|g| g.get(field))
+                .filter(|g| !g.is_empty())
+                .collect();
+            if parts.is_empty() {
+                continue;
+            }
+            let merged = HnswIndex::merge_chunk_graphs(&parts);
+            if let Ok(mut mgr) = idx_mgr.write() {
+                mgr.install_vector_graph(col_name, field, merged);
+            }
+        }
+    }
+
     fn spawn_vector_backfill(
         idx_mgr: Arc<RwLock<IndexManager>>,
         backfill_count: Arc<AtomicUsize>,
@@ -5676,6 +5809,20 @@ impl Hako {
                 .read()
                 .map(|mgr| Self::indexed_fields_for(&mgr, &col_name))
                 .unwrap_or_default();
+            let mut pointers = pointers;
+            if clear_graphs {
+                Self::parallel_vector_build(
+                    &idx_mgr,
+                    &shard_arc,
+                    enc_key.clone(),
+                    &col_name,
+                    &wanted,
+                    &pointers,
+                );
+                // Fresh snapshot: the repair pass below must also cover
+                // docs written during the parallel build window.
+                pointers = shard_arc.read().unwrap().get_physical_index_snapshot();
+            }
             for chunk in pointers.chunks(100) {
                 let mut resolved_docs = Vec::new();
                 {
