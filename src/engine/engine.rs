@@ -390,6 +390,10 @@ pub type AdjMemo = HashMap<String, (u64, TraverseSpec, Vec<GraphNode>, GraphAdj)
 /// One `graph_degree_centrality` row: (node, in-degree, out-degree).
 pub type DegreeRow = (GraphNode, usize, usize);
 
+/// One `graph_pagerank` row: (node, score). Scores are probabilities and
+/// sum < 1 (dangling mass drops — see `graph_pagerank`).
+pub type RankRow = (GraphNode, f64);
+
 /// One graph hit: collection + id (paths cross collections), BFS depth,
 /// and the doc itself. Returned by `Hako::find_paths`.
 #[derive(Debug, Clone)]
@@ -5686,6 +5690,133 @@ impl Hako {
 
     /// Batched nearest-neighbor search (#141-5): one readiness/wait cycle
     /// for many query vectors. Per-query results match `find_near` 1:1.
+    /// Hybrid retrieval (#193): dense (vector KNN) + sparse (FTS) fusion
+    /// via Reciprocal Rank Fusion — `score = Σ 1/(rrf_k + rank)`, ranks
+    /// 1-based within each side. Text ranks score tf·idf-lite: term
+    /// frequency in the doc's field value × ln(1 + N/df), computed on the
+    /// AND-matched FTS candidates (no index format change; candidates
+    /// decode per doc, capped at 4096 by id order — shortcut: huge AND
+    /// sets lose tail relevance, upgrade = tf in the inverted index).
+    /// Vector ranks reuse `find_near_scored` (distance asc). One empty
+    /// side = the other side's order; both empty = empty. Output rows
+    /// mirror `find_near_scored` (id, fused score, doc), sorted score
+    /// desc then id asc, truncated to `k`. `query()` is untouched —
+    /// single-signal plans stay byte-identical.
+    // ponytail: 8 params mirror the FFI surface 1:1 (hk_engine_hybrid_
+    // search); a params struct would just move the count.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hybrid_search(
+        &self,
+        collection: &str,
+        text_field: &str,
+        text_query: &str,
+        vec_field: &str,
+        query: &[f32],
+        k: usize,
+        rrf_k: usize,
+    ) -> Result<Vec<(String, f64, HakoDoc)>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        if rrf_k == 0 {
+            return Err(crate::error::HakoError::InvalidInput(
+                "rrf_k must be > 0".into(),
+            ));
+        }
+        const MAX_TEXT_CANDIDATES: usize = 4096;
+        let side_k = k.saturating_mul(2).max(16);
+
+        // --- Text side: FTS AND candidates, ranked tf·idf-lite.
+        // The index read guard is held across the doc decodes: `get` locks
+        // shards/caches, never `indexes` (same ordering find_near uses).
+        let text_hits: Vec<(String, f64)> = match self.indexes.read() {
+            Ok(mgr) => match mgr.fts.get(collection).and_then(|m| m.get(text_field)) {
+                None => Vec::new(),
+                Some(ix) => match ix.search(text_query) {
+                    None => Vec::new(),
+                    Some(set) => {
+                        let n_docs = self.graph_node_ids(collection).len();
+                        let terms = ix.tokenize_text(text_query);
+                        let idf: Vec<(String, f64)> = terms
+                            .iter()
+                            .map(|w| {
+                                (
+                                    w.clone(),
+                                    (1.0 + n_docs as f64 / ix.df_of(w) as f64).ln(),
+                                )
+                            })
+                            .collect();
+                        let mut scored: Vec<(String, f64)> = set
+                            .into_iter()
+                            .take(MAX_TEXT_CANDIDATES)
+                            .filter_map(|id| {
+                                let doc = self.get(collection, &id).ok().flatten()?;
+                                let text = match doc.get(text_field) {
+                                    Some(Value::String(s)) => s.as_str(),
+                                    _ => return None,
+                                };
+                                // tf of each query term in the live doc
+                                // value × idf — no index format change.
+                                let mut score = 0.0f64;
+                                if !idf.is_empty() {
+                                    for tok in ix.tokenize_text(text) {
+                                        if let Some(&(_, w)) = idf
+                                            .iter()
+                                            .find(|(t, _)| *t == tok)
+                                        {
+                                            score += w;
+                                        }
+                                    }
+                                }
+                                Some((id, score))
+                            })
+                            .collect();
+                        scored.sort_by(|a, b| {
+                            a.1.total_cmp(&b.1)
+                                .reverse()
+                                .then_with(|| a.0.cmp(&b.0))
+                        });
+                        scored.truncate(side_k);
+                        scored
+                    }
+                },
+            },
+            Err(_) => Vec::new(),
+        };
+
+        // --- Vector side: reuse the scored KNN path (ANN or exact).
+        let vec_hits = self.find_near_scored(collection, vec_field, query, side_k, None)?;
+
+        // --- RRF fuse: 1-based ranks within each side; ties on id.
+        let mut fused: std::collections::BTreeMap<String, f64> =
+            std::collections::BTreeMap::new();
+        for (rank, (id, _)) in text_hits.iter().enumerate() {
+            *fused.entry(id.clone()).or_default() += 1.0 / (rrf_k as f64 + rank as f64 + 1.0);
+        }
+        for (rank, (id, _, _)) in vec_hits.iter().enumerate() {
+            *fused.entry(id.clone()).or_default() += 1.0 / (rrf_k as f64 + rank as f64 + 1.0);
+        }
+        if fused.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rows: Vec<(String, f64)> = fused.into_iter().collect();
+        rows.sort_by(|a, b| {
+            a.1.total_cmp(&b.1).reverse().then_with(|| a.0.cmp(&b.0))
+        });
+        rows.truncate(k);
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, score) in rows {
+            // Both sides already liveness-checked these ids; the doc may
+            // have been reaped between, so the re-read still fail-closes.
+            if let Some(doc) = self.get(collection, &id)? {
+                out.push((id, score, doc));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Batched nearest-neighbor search (#141-5): one readiness/wait cycle
+    /// for many query vectors. Per-query results match `find_near` 1:1.
     pub fn find_near_batch(
         &self,
         collection: &str,
@@ -6572,6 +6703,265 @@ impl Hako {
                 .then_with(|| a.0.cmp(&b.0))
         });
         Ok(rows)
+    }
+
+    /// Label-propagation communities (#196): async LPA over the undirected
+    /// view of the spec'd adjacency — neighbor sets merge outgoing targets
+    /// and inbound arcs, labels update in sorted node order (async, so a
+    /// single sweep is order-deterministic), ties pick the smallest label,
+    /// and the walk stops at the first stable sweep (capped at 32 rounds).
+    /// Output mirrors `graph_components`: communities as sorted member
+    /// lists, ordered by their smallest member.
+    pub fn graph_communities(
+        &self,
+        collection: &str,
+        spec: &TraverseSpec,
+    ) -> Result<Vec<Vec<GraphNode>>> {
+        let (nodes, adj) = self.graph_adjacency(collection, spec)?;
+        if nodes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pos: std::collections::HashMap<&(String, String), usize> =
+            nodes.iter().enumerate().map(|(i, k)| (k, i)).collect();
+        // Undirected neighbor index lists: forward targets + inbound arcs.
+        let mut nbrs: Vec<Vec<usize>> = nodes
+            .iter()
+            .map(|k| {
+                adj.get(k)
+                    .map(|ts| ts.iter().filter_map(|t| pos.get(t).copied()).collect())
+                    .unwrap_or_default()
+            })
+            .collect();
+        // Inbound arcs: who points at me. Rebuilt from adj (each edge once).
+        for (src, targets) in &adj {
+            if let Some(&sp) = pos.get(src) {
+                for t in targets {
+                    if let Some(&tp) = pos.get(t) {
+                        if !nbrs[tp].contains(&sp) {
+                            nbrs[tp].push(sp);
+                        }
+                    }
+                }
+            }
+        }
+        for list in &mut nbrs {
+            list.sort_unstable();
+        }
+        // LPA: node i adopts the most common label among its neighbors;
+        // ties take the smallest label id; async updates in position order.
+        let mut labels: Vec<usize> = (0..nodes.len()).collect();
+        for _round in 0..32 {
+            let mut changed = false;
+            for i in 0..nodes.len() {
+                if nbrs[i].is_empty() {
+                    continue; // isolated node keeps its own label
+                }
+                let mut counts: std::collections::HashMap<usize, usize> =
+                    std::collections::HashMap::new();
+                for &n in &nbrs[i] {
+                    *counts.entry(labels[n]).or_default() += 1;
+                }
+                let best = counts
+                    .into_iter()
+                    .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+                    .map(|(label, _)| label)
+                    .expect("non-empty neighbor set");
+                if best != labels[i] {
+                    labels[i] = best;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // Group by label; nodes were visited in ascending order, so each
+        // bucket is sorted; buckets order by their smallest member.
+        let mut buckets: std::collections::HashMap<usize, Vec<GraphNode>> =
+            std::collections::HashMap::new();
+        for (i, key) in nodes.iter().enumerate() {
+            buckets.entry(labels[i]).or_default().push(key.clone());
+        }
+        let mut out: Vec<Vec<GraphNode>> = buckets.into_values().collect();
+        out.sort();
+        Ok(out)
+    }
+
+    /// Personalized PageRank (#196): power iteration over the spec'd
+    /// directed adjacency, teleport mass `1 - damping` on the seed set
+    /// (uniform over all nodes when seeds are empty — classic PageRank).
+    /// Fixed 30 rounds (deterministic, no convergence threshold), dangling
+    /// mass drops (scores sum < 1 — the embedded trade: no global pass per
+    /// round). Seeds outside the graph are ignored (fail-closed). Output
+    /// sorted by score desc then node asc, truncated to `top` (0 = all).
+    pub fn graph_pagerank(
+        &self,
+        collection: &str,
+        seeds: &[GraphNode],
+        spec: &TraverseSpec,
+        damping: f64,
+        top: usize,
+    ) -> Result<Vec<RankRow>> {
+        if !(0.0..=1.0).contains(&damping) {
+            return Err(crate::error::HakoError::InvalidInput(format!(
+                "damping must be in [0, 1], got {damping}"
+            )));
+        }
+        let (nodes, adj) = self.graph_adjacency(collection, spec)?;
+        if nodes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pos: std::collections::HashMap<&(String, String), usize> =
+            nodes.iter().enumerate().map(|(i, k)| (k, i)).collect();
+        // Teleport vector: seeds (that exist), or all nodes uniformly.
+        let seed_mass = if damping < 1.0 { 1.0 - damping } else { 0.0 };
+        let mut teleport = vec![0.0f64; nodes.len()];
+        if seeds.is_empty() {
+            let share = seed_mass / nodes.len() as f64;
+            for t in teleport.iter_mut() {
+                *t = share;
+            }
+        } else {
+            let live: Vec<usize> = seeds
+                .iter()
+                .filter_map(|s| pos.get(s).copied())
+                .collect();
+            if !live.is_empty() {
+                let share = seed_mass / live.len() as f64;
+                for &i in &live {
+                    teleport[i] = share;
+                }
+            }
+        }
+        // Out-degree per node (targets are deduped by graph_adjacency).
+        let children: Vec<Vec<usize>> = nodes
+            .iter()
+            .map(|k| {
+                adj.get(k)
+                    .map(|ts| ts.iter().filter_map(|t| pos.get(t).copied()).collect())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let mut rank = teleport.clone();
+        for _round in 0..30 {
+            let mut next = teleport.clone();
+            for (i, r) in rank.iter().enumerate() {
+                if *r == 0.0 || children[i].is_empty() {
+                    continue; // dangling mass drops
+                }
+                let share = r * damping / children[i].len() as f64;
+                for &c in &children[i] {
+                    next[c] += share;
+                }
+            }
+            rank = next;
+        }
+        let mut rows: Vec<(GraphNode, f64)> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.clone(), rank[i]))
+            .collect();
+        rows.sort_by(|a, b| {
+            a.1.total_cmp(&b.1)
+                .reverse()
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        if top > 0 {
+            rows.truncate(top);
+        }
+        Ok(rows)
+    }
+
+    /// Seed-scoped N-hop subgraph (#198): the induced neighborhood around
+    /// one seed — BFS with the same expansion/filter/liveness rules as
+    /// `find_paths` (`spec.max_depth` = hop cap, `spec.limit` = node cap),
+    /// then the deduped edges among the visited nodes. Same JSON shape as
+    /// `export_graph_json`, scoped by seed instead of whole-collection.
+    /// Missing seed = empty graph (fail-closed).
+    pub fn subgraph_json(
+        &self,
+        collection: &str,
+        seed_id: &str,
+        spec: &TraverseSpec,
+    ) -> Result<String> {
+        spec.validate()?;
+        if self.get(collection, seed_id)?.is_none() {
+            return Ok("{\"nodes\":[],\"edges\":[]}".to_string());
+        }
+        let start = (collection.to_string(), seed_id.to_string());
+        let mut visited: std::collections::HashSet<GraphNode> =
+            std::collections::HashSet::new();
+        visited.insert(start.clone());
+        let mut queue: std::collections::VecDeque<(GraphNode, usize)> =
+            std::collections::VecDeque::new();
+        queue.push_back((start, 0));
+        'bfs: while let Some((node, depth)) = queue.pop_front() {
+            if depth >= spec.max_depth {
+                continue;
+            }
+            let mut next: Vec<GraphNode> = self
+                .expand_neighbors(&node.0, &node.1, spec)
+                .into_iter()
+                .filter(|(ncol, nid, _, _)| self.node_matches(spec, ncol, nid))
+                .map(|(a, b, _, _)| (a, b))
+                .collect();
+            next.sort();
+            next.dedup();
+            for t in next {
+                if visited.insert(t.clone()) && visited.len() >= spec.limit {
+                    break 'bfs;
+                }
+                if visited.contains(&t) {
+                    let nd = depth + 1;
+                    if nd < spec.max_depth {
+                        queue.push_back((t, nd));
+                    }
+                }
+            }
+        }
+        let mut nodes: Vec<GraphNode> = visited.iter().cloned().collect();
+        nodes.sort();
+        let mut edges: Vec<(GraphNode, GraphNode)> = Vec::new();
+        for u in &nodes {
+            let mut targets: Vec<GraphNode> = self
+                .expand_neighbors(&u.0, &u.1, spec)
+                .into_iter()
+                .filter(|(ncol, nid, _, _)| self.node_matches(spec, ncol, nid))
+                .map(|(a, b, _, _)| (a, b))
+                .filter(|t| visited.contains(t) && *t != *u)
+                .collect();
+            targets.sort();
+            targets.dedup();
+            for t in targets {
+                edges.push((u.clone(), t));
+            }
+        }
+        let nodes_json: Vec<serde_json::Value> = nodes
+            .iter()
+            .map(|(c, id)| {
+                let mut mdoc = serde_json::Map::new();
+                if let Ok(Some(d)) = self.get(c, id) {
+                    for (f, v) in d.fields.iter() {
+                        mdoc.insert(f.to_string(), v.to_json());
+                    }
+                }
+                serde_json::json!({ "collection": c, "id": id, "doc": mdoc })
+            })
+            .collect();
+        let edges_json: Vec<serde_json::Value> = edges
+            .iter()
+            .map(|(from, to)| {
+                serde_json::json!({
+                    "from": format!("{}/{}", from.0, from.1),
+                    "to": format!("{}/{}", to.0, to.1)
+                })
+            })
+            .collect();
+        Ok(serde_json::to_string(&serde_json::json!({
+            "nodes": nodes_json,
+            "edges": edges_json
+        }))
+        .unwrap_or_else(|_| "{\"nodes\":[],\"edges\":[]}".to_string()))
     }
 
     /// Viz export (#156 Phase E): self-contained JSON —

@@ -5331,6 +5331,9 @@ pub extern "C" fn hk_engine_graph_analysis(
             "components" => engine.db.graph_components(&col, &spec).map(|cs| {
                 serde_json::json!(cs.iter().map(|c| ids(c)).collect::<Vec<_>>())
             }),
+            "communities" => engine.db.graph_communities(&col, &spec).map(|cs| {
+                serde_json::json!(cs.iter().map(|c| ids(c)).collect::<Vec<_>>())
+            }),
             "cycle" => engine
                 .db
                 .graph_find_cycle(&col, &spec)
@@ -5350,7 +5353,7 @@ pub extern "C" fn hk_engine_graph_analysis(
                     .collect::<Vec<_>>())
             }),
             other => Err(crate::error::HakoError::InvalidInput(format!(
-                "unknown graph analysis op: {other} (components|cycle|topo|degrees)"
+                "unknown graph analysis op: {other} (components|communities|cycle|topo|degrees)"
             ))),
         };
         match result {
@@ -5441,6 +5444,304 @@ pub extern "C" fn hk_engine_export_graph(
                     ptr::null_mut()
                 }
             },
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Personalized PageRank (#196): teleport mass `1 - damping` on the seed
+/// set (`seeds_json` = null or a JSON array of `"col/id"` strings; null or
+/// empty = classic PageRank with uniform teleport). `damping` 0 = default
+/// 0.85; values outside (0, 1) reject. `top` 0 = all nodes. Output rows:
+/// `{"node": "col/id", "score": f64}` sorted score desc then node asc.
+/// Same spec rules as `hk_engine_graph_analysis` (max_depth/limit ignored).
+#[no_mangle]
+pub extern "C" fn hk_engine_graph_pagerank(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    seeds_json: *const c_char,
+    direction: u32,
+    edge_field: *const c_char,
+    via_edge: *const c_char,
+    filter_field: *const c_char,
+    filter_json: *const c_char,
+    damping: f64,
+    top: usize,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error_err("null engine handle");
+            return ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let col = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let dir = match crate::index::traverse::TraverseDir::from_u32(direction) {
+            Ok(d) => d,
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                return ptr::null_mut();
+            }
+        };
+        let opt_str = |p: *const c_char| {
+            if p.is_null() {
+                None
+            } else {
+                cstr_to_string(p).ok()
+            }
+        };
+        let node_match = match parse_node_match(filter_field, filter_json) {
+            Ok(nm) => nm,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let damping = if damping == 0.0 { 0.85 } else { damping };
+        if damping <= 0.0 || damping >= 1.0 {
+            set_last_error_err(format!("damping must be in (0, 1), got {damping}"));
+            return ptr::null_mut();
+        }
+        // Seeds: "col/id" strings; entries outside the collection graph
+        // are ignored by the engine (fail-closed).
+        let seeds: Vec<(String, String)> = match opt_str(seeds_json) {
+            None => Vec::new(),
+            Some(s) => match serde_json::from_str::<Vec<String>>(&s) {
+                Ok(list) => list
+                    .into_iter()
+                    .map(|v| match v.split_once('/') {
+                        Some((c, i)) => (c.to_string(), i.to_string()),
+                        None => (col.clone(), v),
+                    })
+                    .collect(),
+                Err(e) => {
+                    set_last_error_err(format!("bad seeds_json: {e}"));
+                    return ptr::null_mut();
+                }
+            },
+        };
+        let spec = crate::index::traverse::TraverseSpec {
+            direction: dir,
+            edge_field: opt_str(edge_field),
+            max_depth: 1,
+            limit: 1,
+            via_edge: opt_str(via_edge),
+            weight_field: None,
+            node_match,
+            edge_type: None,
+            edge_match: None,
+            include_path: false,
+            include_via: false,
+        };
+        let result = engine
+            .db
+            .graph_pagerank(&col, &seeds, &spec, damping, top);
+        match result {
+            Ok(rows) => {
+                let arr: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|((c, i), s)| {
+                        serde_json::json!({"node": format!("{c}/{i}"), "score": s})
+                    })
+                    .collect();
+                match CString::new(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into()))
+                {
+                    Ok(s) => {
+                        clear_last_error();
+                        s.into_raw()
+                    }
+                    Err(e) => {
+                        set_last_error_err(e.to_string());
+                        ptr::null_mut()
+                    }
+                }
+            }
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Seed-scoped N-hop subgraph (#198): `{"nodes":[{"collection","id","doc"}],
+/// "edges":[{"from","to"}]}` around one seed — same shape as
+/// `hk_engine_export_graph`, scoped by seed. `max_depth` = hop cap,
+/// `node_cap` 0 = unlimited. Missing seed = empty graph.
+#[no_mangle]
+pub extern "C" fn hk_engine_subgraph(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    seed_id: *const c_char,
+    max_depth: u32,
+    direction: u32,
+    edge_field: *const c_char,
+    via_edge: *const c_char,
+    filter_field: *const c_char,
+    filter_json: *const c_char,
+    node_cap: usize,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error_err("null engine handle");
+            return ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let col = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let seed = match cstr_to_string(seed_id) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let dir = match crate::index::traverse::TraverseDir::from_u32(direction) {
+            Ok(d) => d,
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                return ptr::null_mut();
+            }
+        };
+        let opt_str = |p: *const c_char| {
+            if p.is_null() {
+                None
+            } else {
+                cstr_to_string(p).ok()
+            }
+        };
+        let node_match = match parse_node_match(filter_field, filter_json) {
+            Ok(nm) => nm,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let spec = crate::index::traverse::TraverseSpec {
+            direction: dir,
+            edge_field: opt_str(edge_field),
+            max_depth: max_depth as usize,
+            limit: if node_cap == 0 { usize::MAX } else { node_cap },
+            via_edge: opt_str(via_edge),
+            weight_field: None,
+            node_match,
+            edge_type: None,
+            edge_match: None,
+            include_path: false,
+            include_via: false,
+        };
+        match engine.db.subgraph_json(&col, &seed, &spec) {
+            Ok(s) => match CString::new(s) {
+                Ok(c) => {
+                    clear_last_error();
+                    c.into_raw()
+                }
+                Err(e) => {
+                    set_last_error_err(e.to_string());
+                    ptr::null_mut()
+                }
+            },
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Hybrid retrieval (#193): FTS (sparse) + vector KNN (dense) fused with
+/// Reciprocal Rank Fusion. Rows: `{"id", "score" (fused), "doc"}` sorted
+/// score desc then id asc, truncated to `k`. `rrf_k` 0 = default 60.
+/// Unindexed either side = the other side's ranking (fail-closed).
+#[no_mangle]
+pub extern "C" fn hk_engine_hybrid_search(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    text_field: *const c_char,
+    text_query: *const c_char,
+    vec_field: *const c_char,
+    vec_ptr: *const f32,
+    vec_len: usize,
+    k: usize,
+    rrf_k: usize,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error_err("null engine handle");
+            return ptr::null_mut();
+        }
+        if vec_ptr.is_null() {
+            set_last_error_err("null vector pointer");
+            return ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let col = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let tfield = match cstr_to_string(text_field) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let tquery = match cstr_to_string(text_query) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let vfield = match cstr_to_string(vec_field) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let query_vec = unsafe { std::slice::from_raw_parts(vec_ptr, vec_len) };
+        let rrf_k = if rrf_k == 0 { 60 } else { rrf_k };
+        match engine
+            .db
+            .hybrid_search(&col, &tfield, &tquery, &vfield, query_vec, k, rrf_k)
+        {
+            Ok(rows) => {
+                let mut arr = Vec::with_capacity(rows.len());
+                for (id, score, doc) in &rows {
+                    let doc_json: serde_json::Value = match doc_to_json(doc) {
+                        Ok(s) => serde_json::from_str(&s).unwrap_or(serde_json::Value::Null),
+                        Err(_) => serde_json::Value::Null,
+                    };
+                    arr.push(serde_json::json!({"id": id, "score": score, "doc": doc_json}));
+                }
+                match CString::new(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())) {
+                    Ok(s) => {
+                        clear_last_error();
+                        s.into_raw()
+                    }
+                    Err(e) => {
+                        set_last_error_err(e.to_string());
+                        ptr::null_mut()
+                    }
+                }
+            }
             Err(e) => {
                 set_last_error_err(e.to_string());
                 ptr::null_mut()
