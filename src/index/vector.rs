@@ -823,6 +823,10 @@ pub struct HnswIndex {
     stage1_binary: bool,
 }
 
+/// Per-node candidate list from the batch builder's phase A:
+/// (level, beam results).
+type NodeCands = Vec<(usize, Vec<(f64, usize)>)>;
+
 impl HnswIndex {
     pub fn new(dim: usize, metric: Metric, params: HnswParams) -> Self {
         // Overrides (#141-1) clamp to the envelopes the derived defaults
@@ -912,84 +916,141 @@ impl HnswIndex {
         &self.idx_to_id[idx]
     }
 
-    /// #195 parallel bulk build: merge worker-local chunk graphs into
-    /// one. Chunk nodes keep their quantized vectors, levels and
-    /// within-chunk links (translated to global positions); cross-chunk
-    /// edges ride a bidirectional ring — every node also links its
-    /// nearest neighbor in each adjacent chunk (small beam over that
-    /// chunk's own frozen graph, so the pass is race-free and
-    /// deterministic). Chunk order + per-chunk insert order are fixed
-    /// inputs, so worker count changes wall-clock, never the graph.
-    /// Entry rides chunk 0's upper chain; `complete` stays false until
-    /// the caller flips it. All chunks must share dim/metric/params.
-    pub fn merge_chunk_graphs(chunks: &[&HnswIndex]) -> HnswIndex {
-        debug_assert!(!chunks.is_empty() && chunks.iter().all(|g| !g.is_empty()));
-        let first = chunks[0];
-        let mut out = HnswIndex::new(
-            first.dim,
-            first.metric,
-            HnswParams {
-                m: None,
-                ef_construction: None,
-                ef_search: None,
-                binary_stage1: first.stage1_binary,
-            },
-        );
-        // Ingest nodes verbatim (quantized vector, level count); links
-        // are rewritten after all global positions exist.
-        let mut maps: Vec<Vec<usize>> = Vec::with_capacity(chunks.len());
-        for g in chunks {
-            let base = out.nodes.len();
-            let mut map: Vec<usize> = Vec::with_capacity(g.nodes.len());
-            for node in &g.nodes {
-                out.nodes.push(HnswNode {
-                    ivec: node.ivec.clone(),
-                    scale: node.scale,
-                    sum_sq: node.sum_sq,
-                    links: vec![Vec::new(); node.links.len()],
-                    bits: node.bits.clone(),
+    /// #206 batch-simulated sequential build: the parallel bulk path.
+    /// A batch of nodes first collects its candidate sets in parallel
+    /// against the frozen graph (the read-only half of `upsert`), then
+    /// the batch applies links sequentially in item order — the same
+    /// structure a sequential insert produces, so recall matches the
+    /// sequential oracle (only lag: batch-mates' back-links). Worker
+    /// count changes wall-clock, never the graph. Levels roll in item
+    /// order (the level RNG is sequential state). `complete` stays
+    /// false until the caller flips it.
+    pub fn build_batched(
+        dim: usize,
+        metric: Metric,
+        params: HnswParams,
+        items: &[(String, Vec<f32>)],
+    ) -> HnswIndex {
+        let mut g = HnswIndex::new(dim, metric, params);
+        const BATCH: usize = 256;
+        let workers = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
+        for batch in items.chunks(BATCH) {
+            let levels: Vec<usize> = batch.iter().map(|_| g.random_level()).collect();
+            // Phase A (read-only): candidate sets against the frozen graph.
+            let next_task = std::sync::atomic::AtomicUsize::new(0);
+            let prepared: std::sync::Mutex<Vec<Option<NodeCands>>> =
+                std::sync::Mutex::new(vec![None; batch.len()]);
+            {
+                let reader = &g;
+                std::thread::scope(|s| {
+                    for _w in 0..workers {
+                        s.spawn(|| loop {
+                            let j = next_task.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if j >= batch.len() {
+                                break;
+                            }
+                            let (_, vec) = &batch[j];
+                            prepared.lock().unwrap()[j] = reader.insert_candidates(vec, levels[j]);
+                        });
+                    }
                 });
-                out.idx_to_id.push(String::new());
-                map.push(base + map.len());
             }
-            for (id, &local) in &g.id_to_idx {
-                out.id_to_idx.insert(id.clone(), base + local);
-                out.idx_to_id[base + local] = id.clone();
-            }
-            maps.push(map);
-        }
-        // Translate within-chunk links.
-        for (k, g) in chunks.iter().enumerate() {
-            for (j, node) in g.nodes.iter().enumerate() {
-                for (l, nbs) in node.links.iter().enumerate() {
-                    for &nb in nbs {
-                        out.add_link(maps[k][j], maps[k][nb], l);
-                    }
+            // Phase B: apply links in item order.
+            let prepared = prepared.into_inner().unwrap();
+            for (j, prep) in prepared.into_iter().enumerate() {
+                let (id, vec) = &batch[j];
+                match prep {
+                    Some(cands) => g.insert_apply(id, vec, levels[j], cands),
+                    // Entry was absent at phase A (start of the build):
+                    // plain sequential insert chains properly.
+                    None => g.upsert(id, vec.clone()),
                 }
             }
         }
-        // Bidirectional ring: each node anchors to its nearest neighbor
-        // in each adjacent chunk (beam over that chunk's own graph —
-        // frozen, read-only). Dequantized f32 rides the normal search.
-        const CROSS_EF: usize = 32;
-        for (k, g) in chunks.iter().enumerate() {
-            for (j, node) in g.nodes.iter().enumerate() {
-                let p = maps[k][j];
-                let q: Vec<f32> = node.ivec.iter().map(|&x| x as f32 * node.scale).collect();
-                if k + 1 < chunks.len() {
-                    if let Some(&(_, nb)) = chunks[k + 1].search(&q, CROSS_EF).first() {
-                        out.add_link(p, maps[k + 1][nb], 0);
-                    }
-                }
-                if k > 0 {
-                    if let Some(&(_, nb)) = chunks[k - 1].search(&q, CROSS_EF).first() {
-                        out.add_link(p, maps[k - 1][nb], 0);
-                    }
-                }
+        g
+    }
+
+    /// Read-only candidate collection for one node against a frozen
+    /// graph — the search half of `upsert` (chain `cur = selected[0]`
+    /// across levels; the only difference from a live insert is that
+    /// the batch's own links don't exist yet). None = entry absent.
+    fn insert_candidates(
+        &self,
+        vec: &[f32],
+        level: usize,
+    ) -> Option<NodeCands> {
+        let mut cur = self.entry?;
+        let qn = Self::query_norm_sq(vec);
+        let top = self.nodes[cur].links.len() - 1;
+        for l in ((level + 1)..=top).rev() {
+            cur = self.greedy_closest(vec, qn, cur, l, &Stage1::Int8);
+        }
+        let mut cands: Vec<(usize, Vec<(f64, usize)>)> = Vec::new();
+        for l in (0..=level.min(top)).rev() {
+            let cand =
+                self.search_layer(vec, qn, &[cur], self.ef_construction, l, None, &Stage1::Int8);
+            if cand.is_empty() {
+                continue;
+            }
+            cur = self.select_neighbors(cand.clone(), self.m)[0];
+            cands.push((l, cand));
+        }
+        Some(cands)
+    }
+
+    /// Apply half of `upsert` for `build_batched`: push the node, wire
+    /// links from the precomputed candidates, shrink, update entry.
+    fn insert_apply(
+        &mut self,
+        id: &str,
+        vec: &[f32],
+        level: usize,
+        cands: NodeCands,
+    ) {
+        if vec.len() != self.dim {
+            return;
+        }
+        let idx = self.nodes.len();
+        let (ivec, scale) = quantize(vec);
+        let sum_sq = ivec.iter().map(|x| (*x as f64) * (*x as f64)).sum();
+        self.nodes.push(HnswNode {
+            ivec,
+            scale,
+            sum_sq,
+            links: vec![Vec::new(); level + 1],
+            bits: if self.stage1_binary { sign_bits(vec) } else { Vec::new() },
+        });
+        self.id_to_idx.insert(id.to_string(), idx);
+        self.idx_to_id.push(id.to_string());
+        let Some(entry) = self.entry else {
+            self.entry = Some(idx);
+            return;
+        };
+        let top = self.nodes[entry].links.len() - 1;
+        for (l, cand) in cands {
+            if cand.is_empty() {
+                continue;
+            }
+            // Select M (link caps enforced separately by shrink).
+            let neighbors = self.select_neighbors(cand, self.m);
+            if neighbors.is_empty() {
+                continue;
+            }
+            let mmax = if l == 0 { self.mmax0 } else { self.mmax };
+            for nb in &neighbors {
+                self.add_link(idx, *nb, l);
+                self.add_link(*nb, idx, l);
+            }
+            self.shrink_links(idx, l, mmax);
+            for nb in &neighbors {
+                self.shrink_links(*nb, l, mmax);
             }
         }
-        out.entry = first.entry.map(|e| maps[0][e]);
-        out
+        if level > top {
+            self.entry = Some(idx);
+        }
     }
 
     fn next_random(&mut self) -> f64 {
