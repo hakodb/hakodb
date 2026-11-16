@@ -6138,35 +6138,52 @@ impl Hako {
             self.indexes.write().unwrap().traverse.track(collection);
         }
 
-        // Backfill existing docs (mirror create_fts): snapshot pointers,
-        // full-decode (refs live in any field), hook-feed in chunks.
-        let shard_arc = self.get_shard(collection)?;
+        // Backfill existing docs. Refs live in ANY collection's docs
+        // (edge docs' _from/_to, plain ref fields), so the scan must
+        // cover EVERY shard, not just the tracked one: a doc written
+        // before this create has no IndexOp to replay, and the async
+        // backfills of EARLIER creates may have run before this
+        // collection was tracked (their targets-skip then drops those
+        // refs silently — issue #209). index_doc is blind-add with
+        // dedupe, so re-indexing already-tracked targets is harmless.
+        let shards_map = Arc::clone(&self.shards);
         let idx_mgr = Arc::clone(&self.indexes);
-        let col_name = collection.to_string();
         let enc_key = self.config.encryption_key.clone();
         let backfill_count = Arc::clone(&self.backfill_inflight);
+        // Force-load the tracked collection's shard so it joins the
+        // scan below even when lazily unloaded.
+        let _ = self.get_shard(collection)?;
         backfill_count.fetch_add(1, Ordering::Relaxed);
         thread::spawn(move || {
             let _guard = BackfillGuard { counter: backfill_count };
-            let pointers = {
-                let storage = shard_arc.read().unwrap();
-                storage.get_physical_index_snapshot()
-            };
-            for chunk in pointers.chunks(100) {
-                let mut resolved_docs = Vec::new();
-                {
+            let mut shards: Vec<(String, Arc<RwLock<StorageEngine>>)> = shards_map
+                .read()
+                .unwrap()
+                .iter()
+                .map(|(c, s)| (c.clone(), Arc::clone(s)))
+                .collect();
+            shards.sort_by(|a, b| a.0.cmp(&b.0));
+            for (src_col, shard_arc) in shards {
+                let pointers = {
                     let storage = shard_arc.read().unwrap();
-                    for (key, ptr) in chunk {
-                        if let Ok(Some(bytes)) = storage.read_pointer_internal(ptr, false) {
-                            resolved_docs.push((key.clone(), bytes));
+                    storage.get_physical_index_snapshot()
+                };
+                for chunk in pointers.chunks(100) {
+                    let mut resolved_docs = Vec::new();
+                    {
+                        let storage = shard_arc.read().unwrap();
+                        for (key, ptr) in chunk {
+                            if let Ok(Some(bytes)) = storage.read_pointer_internal(ptr, false) {
+                                resolved_docs.push((key.clone(), bytes));
+                            }
                         }
                     }
-                }
-                let mut mgr = idx_mgr.write().unwrap();
-                for (full_key, bytes) in resolved_docs {
-                    if let Some(mut doc) = HakoDoc::decode(&bytes) {
-                        let _ = resolve_doc_static(&mut doc, &shard_arc, enc_key.as_deref());
-                        mgr.traverse.index_doc(&col_name, &full_key, &doc);
+                    let mut mgr = idx_mgr.write().unwrap();
+                    for (full_key, bytes) in resolved_docs {
+                        if let Some(mut doc) = HakoDoc::decode(&bytes) {
+                            let _ = resolve_doc_static(&mut doc, &shard_arc, enc_key.as_deref());
+                            mgr.traverse.index_doc(&src_col, &full_key, &doc);
+                        }
                     }
                 }
             }
