@@ -6210,8 +6210,15 @@ impl Hako {
         // 4th element (#156 Phase F-1): the edge doc that connects the hop,
         // `"edge_col/id"`, `None` for inline-reference hops.
         let mut next: Vec<(String, String, f64, Option<String>)> = Vec::new();
+        // One memo per walk: each doc is touched by up to three lanes in a
+        // single expansion (live refs, backlink verify, edge hops) and every
+        // lane used to re-read it from storage. With the #209 all-shards
+        // backfill the backlink lane carries rows on every walk, so the
+        // same edge docs were fetched twice per hop (measured: bfs
+        // 65k→38k qps) — the memo folds those to one fetch.
+        let mut memo: HashMap<(String, String), Option<HakoDoc>> = HashMap::new();
         if spec.direction.uses_outgoing() {
-            if let Ok(Some(doc)) = self.get(col, doc_id) {
+            if let Some(doc) = self.memo_get(&mut memo, col, doc_id) {
                 for (field, value) in doc.fields.iter() {
                     if let Some(f) = spec.edge_field.as_deref() {
                         if &**field != f {
@@ -6224,7 +6231,7 @@ impl Hako {
                 }
             }
             if let Some(edge_col) = spec.via_edge.as_deref() {
-                next.extend(self.edge_step(edge_col, col, doc_id, true, spec));
+                next.extend(self.edge_step(edge_col, col, doc_id, true, spec, &mut memo));
             }
         }
         if spec.direction.uses_incoming() {
@@ -6242,7 +6249,9 @@ impl Hako {
                 })
                 .unwrap_or_default();
             for (scol, sid, sfield) in edges {
-                let live = self.get(&scol, &sid).ok().flatten().is_some_and(|d| {
+                let live = self
+                    .memo_get(&mut memo, &scol, &sid)
+                    .is_some_and(|d| {
                     d.get(&sfield).is_some_and(|v| {
                         matches!(v, Value::Reference { collection: c, doc_id: t } if c == col && t == doc_id)
                     })
@@ -6252,7 +6261,7 @@ impl Hako {
                 }
             }
             if let Some(edge_col) = spec.via_edge.as_deref() {
-                next.extend(self.edge_step(edge_col, col, doc_id, false, spec));
+                next.extend(self.edge_step(edge_col, col, doc_id, false, spec, &mut memo));
             }
         }
         next.sort_by(|a, b| {
@@ -6261,6 +6270,21 @@ impl Hako {
                 .then_with(|| a.3.cmp(&b.3))
         });
         next
+    }
+
+    /// Memoized single-doc read for one walk: lanes within one expansion
+    /// (and the two edge_step calls per anchor) share it, cross-anchor
+    /// entries are simply never reused. Shared-borrow return is the point —
+    /// callers only field-match on it.
+    fn memo_get<'a>(
+        &'a self,
+        memo: &'a mut HashMap<(String, String), Option<HakoDoc>>,
+        col: &str,
+        doc_id: &str,
+    ) -> Option<&'a HakoDoc> {
+        memo.entry((col.to_string(), doc_id.to_string()))
+            .or_insert_with(|| self.get(col, doc_id).ok().flatten())
+            .as_ref()
     }
 
     /// One edge-collection hop (Phase B): edge docs in `edge_col` whose
@@ -6285,6 +6309,7 @@ impl Hako {
         anchor_id: &str,
         forward: bool,
         spec: &TraverseSpec,
+        memo: &mut HashMap<(String, String), Option<HakoDoc>>,
     ) -> Vec<(String, String, f64, Option<String>)> {
         let (match_field, other_field) = if forward { ("_from", "_to") } else { ("_to", "_from") };
         let key = crate::index::index_key::encode_scalar(&Value::Reference {
@@ -6300,7 +6325,7 @@ impl Hako {
             .unwrap_or_default();
         let mut out = Vec::new();
         for eid in ids {
-            let Ok(Some(edoc)) = self.get(edge_col, &eid) else {
+            let Some(edoc) = self.memo_get(memo, edge_col, &eid) else {
                 continue;
             };
             let linked = edoc.get(match_field).is_some_and(|v| {
@@ -6309,7 +6334,7 @@ impl Hako {
             if !linked {
                 continue;
             }
-            if !Self::edge_doc_matches(spec, &edoc) {
+            if !Self::edge_doc_matches(spec, edoc) {
                 continue;
             }
             if let Some(Value::Reference { collection: oc, doc_id: oid }) = edoc.get(other_field) {
