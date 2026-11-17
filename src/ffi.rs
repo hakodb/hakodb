@@ -456,6 +456,125 @@ pub extern "C" fn hk_engine_open(path: *const c_char) -> *mut HK_Engine {
     }
 }
 
+/// #217 P1 mirror: exclusive open — refuses (null + last_error naming the
+/// conflict) when the data dir is already held by another HakoDB instance
+/// (cross-process AND cross-handle in-process). Same advisory lock + config
+/// defaults as `hk_engine_open` otherwise.
+#[no_mangle]
+pub extern "C" fn hk_engine_open_exclusive(path: *const c_char) -> *mut HK_Engine {
+    let path = match cstr_to_string(path) {
+        Ok(v) => v,
+        Err(e) => {
+            set_last_error_err(e);
+            return ptr::null_mut();
+        }
+    };
+
+    match Hako::open_exclusive(path, HakoConfig::default()) {
+        Ok(db) => {
+            clear_last_error();
+            Box::into_raw(Box::new(HK_Engine { db: std::sync::Arc::new(db) }))
+        }
+        Err(e) => {
+            set_last_error_err(e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+/// #217 P2 mirror: one idempotent boot-time index declaration. `schema_json`
+/// = `{"fts":[[col,field],...],"vector":[[col,field,dim,metric_u32],...],
+/// "tracked":[col,...]}` (any key optional; `[]`/`null` treated as empty).
+/// Returns 0 on success (declared-or-existing), -1 on error.
+#[no_mangle]
+pub extern "C" fn hk_engine_ensure_indexes(
+    engine: *mut HK_Engine,
+    schema_json: *const c_char,
+) -> i32 {
+    safety_shield!(-1, {
+        if engine.is_null() {
+            set_last_error_err("null engine handle");
+            return -1;
+        }
+        let engine = unsafe { &*engine };
+        let raw = match cstr_to_string(schema_json) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return -1;
+            }
+        };
+        let value = match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(format!("schema_json: {e}"));
+                return -1;
+            }
+        };
+        let empty: Vec<serde_json::Value> = Vec::new();
+        let parse_list = |v: Option<&serde_json::Value>| -> Vec<serde_json::Value> {
+            v.and_then(|v| v.as_array()).unwrap_or(&empty).clone()
+        };
+        let mut schema = crate::engine::IndexSchema::default();
+        for pair in parse_list(value.get("fts")) {
+            let Some(pair) = pair.as_array() else {
+                set_last_error_err("schema.fts entries must be [col, field] arrays");
+                return -1;
+            };
+            let (Some(c), Some(f)) = (pair.first().and_then(|v| v.as_str()), pair.get(1).and_then(|v| v.as_str())) else {
+                set_last_error_err("schema.fts entries must be [col, field] string pairs");
+                return -1;
+            };
+            schema.fts.push((c.to_string(), f.to_string()));
+        }
+        // Vector metrics arrive as u32 (0=cosine 1=l2 2=inner_product); the
+        // Rust struct carries the enum, so stage raw and convert once.
+        let mut vector_raw: Vec<(String, String, u32, u32)> = Vec::new();
+        for entry in parse_list(value.get("vector")) {
+            let Some(entry) = entry.as_array() else {
+                set_last_error_err("schema.vector entries must be [col, field, dim, metric] arrays");
+                return -1;
+            };
+            let c = entry.first().and_then(|v| v.as_str());
+            let f = entry.get(1).and_then(|v| v.as_str());
+            let d = entry.get(2).and_then(|v| v.as_u64());
+            let m = entry.get(3).and_then(|v| v.as_u64());
+            let (Some(c), Some(f), Some(d), Some(m)) = (c, f, d, m) else {
+                set_last_error_err("schema.vector entries must be [col, field, dim, metric] (dim/metric numeric; metric 0=cosine 1=l2 2=inner_product)");
+                return -1;
+            };
+            vector_raw.push((c.to_string(), f.to_string(), d as u32, m as u32));
+        }
+        for (c, f, d, m) in vector_raw {
+            let met = match crate::index::vector::Metric::from_u32(m) {
+                Ok(met) => met,
+                Err(e) => {
+                    set_last_error_err(e.to_string());
+                    return -1;
+                }
+            };
+            schema.vector.push((c, f, d, met));
+        }
+        for c in parse_list(value.get("tracked")) {
+            let Some(c) = c.as_str() else {
+                set_last_error_err("schema.tracked entries must be strings");
+                return -1;
+            };
+            schema.tracked.push(c.to_string());
+        }
+        match engine.db.ensure_indexes(&schema) {
+            Ok(()) => {
+                clear_last_error();
+                0
+            }
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                -1
+            }
+        }
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn hk_engine_is_indexes_ready(engine: *mut HK_Engine) -> bool {
     safety_shield!(false, {
@@ -5742,6 +5861,133 @@ pub extern "C" fn hk_engine_subgraph(
     })
 }
 
+/// #217 P0-B mirror: `hk_engine_subgraph` with node-doc field projection.
+/// `fields_json` = JSON array of field names to KEEP on every node doc
+/// (fields that do not exist on a doc stay absent — decode_projected rule);
+/// `null`/`[]` = no projection, byte-identical to `hk_engine_subgraph`.
+#[no_mangle]
+pub extern "C" fn hk_engine_subgraph_json_projected(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    seed_id: *const c_char,
+    max_depth: u32,
+    direction: u32,
+    edge_field: *const c_char,
+    via_edge: *const c_char,
+    filter_field: *const c_char,
+    filter_json: *const c_char,
+    node_cap: usize,
+    fields_json: *const c_char,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error_err("null engine handle");
+            return ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let col = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let seed = match cstr_to_string(seed_id) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let dir = match crate::index::traverse::TraverseDir::from_u32(direction) {
+            Ok(d) => d,
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                return ptr::null_mut();
+            }
+        };
+        let opt_str = |p: *const c_char| {
+            if p.is_null() {
+                None
+            } else {
+                cstr_to_string(p).ok()
+            }
+        };
+        let node_match = match parse_node_match(filter_field, filter_json) {
+            Ok(nm) => nm,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        // fields_json: null/empty = None (legacy output); otherwise a JSON
+        // array of field-name strings.
+        let fields: Option<Vec<String>> = if fields_json.is_null() {
+            None
+        } else {
+            match parse_json_arg(fields_json, "fields_json") {
+                Ok(v) => {
+                    let Some(arr) = v.as_array() else {
+                        set_last_error_err("fields_json must be a JSON array of field names");
+                        return ptr::null_mut();
+                    };
+                    let mut fs = Vec::with_capacity(arr.len());
+                    for f in arr {
+                        match f.as_str() {
+                            Some(s) => fs.push(s.to_string()),
+                            None => {
+                                set_last_error_err("fields_json entries must be strings");
+                                return ptr::null_mut();
+                            }
+                        }
+                    }
+                    if fs.is_empty() {
+                        None
+                    } else {
+                        Some(fs)
+                    }
+                }
+                Err(e) => {
+                    set_last_error_err(e);
+                    return ptr::null_mut();
+                }
+            }
+        };
+        let spec = crate::index::traverse::TraverseSpec {
+            direction: dir,
+            edge_field: opt_str(edge_field),
+            max_depth: max_depth as usize,
+            limit: if node_cap == 0 { usize::MAX } else { node_cap },
+            via_edge: opt_str(via_edge),
+            weight_field: None,
+            node_match,
+            edge_type: None,
+            edge_match: None,
+            include_path: false,
+            include_via: false,
+        };
+        match engine
+            .db
+            .subgraph_json_projected(&col, &seed, &spec, fields.as_deref())
+        {
+            Ok(s) => match CString::new(s) {
+                Ok(c) => {
+                    clear_last_error();
+                    c.into_raw()
+                }
+                Err(e) => {
+                    set_last_error_err(e.to_string());
+                    ptr::null_mut()
+                }
+            },
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
 /// Hybrid retrieval (#193): FTS (sparse) + vector KNN (dense) fused with
 /// Reciprocal Rank Fusion. Rows: `{"id", "score" (fused), "doc"}` sorted
 /// score desc then id asc, truncated to `k`. `rrf_k` 0 = default 60.
@@ -5802,6 +6048,198 @@ pub extern "C" fn hk_engine_hybrid_search(
             .db
             .hybrid_search(&col, &tfield, &tquery, &vfield, query_vec, k, rrf_k)
         {
+            Ok(rows) => {
+                let mut arr = Vec::with_capacity(rows.len());
+                for (id, score, doc) in &rows {
+                    let doc_json: serde_json::Value = match doc_to_json(doc) {
+                        Ok(s) => serde_json::from_str(&s).unwrap_or(serde_json::Value::Null),
+                        Err(_) => serde_json::Value::Null,
+                    };
+                    arr.push(serde_json::json!({"id": id, "score": score, "doc": doc_json}));
+                }
+                match CString::new(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())) {
+                    Ok(s) => {
+                        clear_last_error();
+                        s.into_raw()
+                    }
+                    Err(e) => {
+                        set_last_error_err(e.to_string());
+                        ptr::null_mut()
+                    }
+                }
+            }
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// #217 P0-A mirror: scored vector KNN with admission filters
+/// (`find_near_scored_filtered`). `max_distance`: NaN or <= 0 = no cap,
+/// otherwise a hard cap on the returned distance (metric-dependent: lower
+/// is closer on every metric). `filters_json` = same grammar as
+/// `hk_engine_hybrid_search_filtered`; `null` = no filters (pure scored
+/// KNN). Output rows: `[{id, score, doc}, ...]` — `score` is the raw
+/// distance (lower = better), NOT RRF-fused.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn hk_engine_find_near_scored_filtered(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    field: *const c_char,
+    vec_ptr: *const f32,
+    vec_len: usize,
+    k: usize,
+    max_distance: f64,
+    filters_json: *const c_char,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error_err("null engine handle");
+            return ptr::null_mut();
+        }
+        if vec_ptr.is_null() {
+            set_last_error_err("null vector pointer");
+            return ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let col = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let fld = match cstr_to_string(field) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let filters = if filters_json.is_null() {
+            Vec::new()
+        } else {
+            match parse_filters_json(filters_json) {
+                Ok(f) => f,
+                Err(e) => {
+                    set_last_error_err(e);
+                    return ptr::null_mut();
+                }
+            }
+        };
+        let query_vec = unsafe { std::slice::from_raw_parts(vec_ptr, vec_len) };
+        let cap = if max_distance.is_nan() || max_distance <= 0.0 {
+            None
+        } else {
+            Some(max_distance)
+        };
+        match engine
+            .db
+            .find_near_scored_filtered(&col, &fld, query_vec, k, cap, &filters)
+        {
+            Ok(rows) => {
+                let mut arr = Vec::with_capacity(rows.len());
+                for (id, score, doc) in &rows {
+                    let doc_json: serde_json::Value = match doc_to_json(doc) {
+                        Ok(s) => serde_json::from_str(&s).unwrap_or(serde_json::Value::Null),
+                        Err(_) => serde_json::Value::Null,
+                    };
+                    arr.push(serde_json::json!({"id": id, "score": score, "doc": doc_json}));
+                }
+                match CString::new(serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())) {
+                    Ok(s) => {
+                        clear_last_error();
+                        s.into_raw()
+                    }
+                    Err(e) => {
+                        set_last_error_err(e.to_string());
+                        ptr::null_mut()
+                    }
+                }
+            }
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// #217 P0-A mirror: `hk_engine_hybrid_search` plus admission filters.
+/// `filters_json` = JSON array of `{field, op, value}` (same grammar as the
+/// `filters` argument on `hk_engine_query*`); `null` = no filters, which
+/// makes this byte-identical to `hk_engine_hybrid_search`. Filters apply
+/// BEFORE rank truncation on both sides.
+#[no_mangle]
+pub extern "C" fn hk_engine_hybrid_search_filtered(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    text_field: *const c_char,
+    text_query: *const c_char,
+    vec_field: *const c_char,
+    vec_ptr: *const f32,
+    vec_len: usize,
+    k: usize,
+    rrf_k: usize,
+    filters_json: *const c_char,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() {
+            set_last_error_err("null engine handle");
+            return ptr::null_mut();
+        }
+        if vec_ptr.is_null() {
+            set_last_error_err("null vector pointer");
+            return ptr::null_mut();
+        }
+        let engine = unsafe { &*engine };
+        let col = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let tfield = match cstr_to_string(text_field) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let tquery = match cstr_to_string(text_query) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let vfield = match cstr_to_string(vec_field) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return ptr::null_mut();
+            }
+        };
+        let filters = if filters_json.is_null() {
+            Vec::new()
+        } else {
+            match parse_filters_json(filters_json) {
+                Ok(f) => f,
+                Err(e) => {
+                    set_last_error_err(e);
+                    return ptr::null_mut();
+                }
+            }
+        };
+        let query_vec = unsafe { std::slice::from_raw_parts(vec_ptr, vec_len) };
+        let rrf_k = if rrf_k == 0 { 60 } else { rrf_k };
+        match engine.db.hybrid_search_filtered(
+            &col, &tfield, &tquery, &vfield, query_vec, k, rrf_k, &filters,
+        ) {
             Ok(rows) => {
                 let mut arr = Vec::with_capacity(rows.len());
                 for (id, score, doc) in &rows {
