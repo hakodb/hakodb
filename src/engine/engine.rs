@@ -6249,16 +6249,31 @@ impl Hako {
                         if spec.edge_field.as_deref().is_some_and(|f| e.field != f) {
                             continue;
                         }
-                        let live = self
-                            .memo_get(&mut memo, &e.src_col, &e.src_id)
-                            .is_some_and(|d| {
-                                d.get(&e.field).is_some_and(|v| {
-                                    matches!(v,
-                                        Value::Reference { collection: c, doc_id: t }
-                                            if c == col && t == doc_id
-                                    )
-                                })
-                            });
+                        // #214 version-stamp fast path: a row whose stamp
+                        // matches the source doc's CURRENT version is still
+                        // live — the source cannot have changed since the
+                        // stamped verify (any write bumps the version), so
+                        // the re-verify fetch is skipped. Stamp u64::MAX =
+                        // unstamped (fresh row: verify the slow way, then
+                        // self-heal the stamp so an overwritten row pays
+                        // only ONE slow verify).
+                        let stamp = e.ver.load(Ordering::Relaxed);
+                        let live = if stamp != u64::MAX
+                            && self.current_version(&e.src_id) == Some(stamp)
+                        {
+                            true
+                        } else {
+                            match self.verify_backlink(&e.src_col, &e.src_id, &e.field, col, doc_id, &mut memo)
+                            {
+                                Some(true) => {
+                                    if let Some(v) = self.current_version(&e.src_id) {
+                                        e.ver.store(v, Ordering::Relaxed);
+                                    }
+                                    true
+                                }
+                                _ => false,
+                            }
+                        };
                         if live {
                             next.push((e.src_col.clone(), e.src_id.clone(), 1.0, None));
                         }
@@ -6290,6 +6305,29 @@ impl Hako {
         memo.entry((col.to_string(), doc_id.to_string()))
             .or_insert_with(|| self.get(col, doc_id).ok().flatten())
             .as_ref()
+    }
+
+    /// One backlink row's slow verify: does the source doc still carry a
+    /// `Value::Reference` to `(col, doc_id)` in `field`? The #212 per-
+    /// expansion memo dedupes repeated candidates; Result shape folded to
+    /// `Option<bool>` (None = unreadable/absent source = not live).
+    fn verify_backlink(
+        &self,
+        src_col: &str,
+        src_id: &str,
+        src_field: &str,
+        tgt_col: &str,
+        tgt_id: &str,
+        memo: &mut HashMap<(String, String), Option<HakoDoc>>,
+    ) -> Option<bool> {
+        self.memo_get(memo, src_col, src_id).map(|d| {
+            d.get(src_field).is_some_and(|v| {
+                matches!(v,
+                    Value::Reference { collection: c, doc_id: t }
+                        if c == tgt_col && t == tgt_id
+                )
+            })
+        })
     }
 
     /// One edge-collection hop (Phase B): edge docs in `edge_col` whose

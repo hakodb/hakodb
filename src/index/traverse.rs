@@ -15,6 +15,7 @@
 //! on that path).
 
 use hashbrown::{HashMap, HashSet};
+use std::sync::atomic::AtomicU64;
 
 use crate::document::hako_doc::HakoDoc;
 use crate::document::value::Value;
@@ -29,11 +30,20 @@ pub const MAX_TRAVERSE_DEPTH: usize = 32;
 pub const MAX_TRAVERSE_DEPTH_CAP: usize = 256;
 
 /// One inbound edge: a `(field)` of `(src_col/src_id)` points at the key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Debug only: AtomicU64 (the ver stamp) carries no Clone/PartialEq and no
+// caller needs them — rows are compared field-wise in index_doc's dedupe.
+#[derive(Debug)]
 pub struct Backlink {
     pub src_col: String,
     pub src_id: String,
     pub field: String,
+    /// #214 fast-path stamp: the source doc's version observed at the last
+    /// live verify (AtomicU64 so a verify can self-heal the row through a
+    /// shared `&Backlink`). `u64::MAX` = unstamped (freshly indexed row:
+    /// the first verify pays the fetch). Transient — the map is rebuilt by
+    /// the boot scan, so the stamp is never persisted; an unstamped row
+    /// always verifies the slow way, which is the pre-#214 behavior.
+    pub ver: AtomicU64,
 }
 
 /// Reverse-edge store + tracked-target registry.
@@ -92,6 +102,8 @@ impl BacklinkIndex {
                     src_col: src_col.to_string(),
                     src_id: src_id.to_string(),
                     field: field.to_string(),
+                    // Unstamped: the first verify fetches and stamps.
+                    ver: AtomicU64::new(u64::MAX),
                 });
             }
         }
