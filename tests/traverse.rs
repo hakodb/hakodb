@@ -121,6 +121,31 @@ fn backlink_version_stamp_skips_stale_and_keeps_live() {
 }
 
 #[test]
+fn find_paths_count_matches_hits_len() {
+    // #217 P0-C: count mode runs the identical walk (visited/limit
+    // accounting untouched) with only the per-hit doc fetch skipped —
+    // the split metric's contract is that count == hits.len().
+    let dir = tmp("count");
+    let db = open_db(&dir);
+    db.create_traverse_index("docs").unwrap();
+    seed_chain(&db);
+    wait(&db);
+    for d in [TraverseDir::Outgoing, TraverseDir::Incoming, TraverseDir::Both] {
+        let s = spec(d, 10, 100);
+        let hits = db.find_paths("docs", "a", &s).unwrap();
+        let count = db.find_paths_count("docs", "a", &s).unwrap();
+        assert_eq!(count, hits.len(), "count must equal hits for the same spec");
+    }
+    // Depth/limit capping also holds: a depth-1 count equals a depth-1 walk.
+    let s1 = spec(TraverseDir::Outgoing, 1, 100);
+    assert_eq!(
+        db.find_paths_count("docs", "a", &s1).unwrap(),
+        db.find_paths("docs", "a", &s1).unwrap().len()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn incoming_needs_tracking_and_walks_backlinks() {
     let dir = tmp("in");
     let db = open_db(&dir);

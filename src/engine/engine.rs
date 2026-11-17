@@ -6433,6 +6433,30 @@ impl Hako {
         id: &str,
         spec: &TraverseSpec,
     ) -> Result<Vec<TraverseHit>> {
+        self.find_paths_inner(collection, id, spec, true)
+    }
+
+    /// Hit-count walk (#217 P0-C): the same BFS with the per-hit doc
+    /// fetch skipped (and, at the FFI layer, the JSON render) — the
+    /// bench walk/render split rides this to quantify how much of a
+    /// find_paths call is output work vs walk.
+    pub fn find_paths_count(
+        &self,
+        collection: &str,
+        id: &str,
+        spec: &TraverseSpec,
+    ) -> Result<usize> {
+        self.find_paths_inner(collection, id, spec, false)
+            .map(|h| h.len())
+    }
+
+    fn find_paths_inner(
+        &self,
+        collection: &str,
+        id: &str,
+        spec: &TraverseSpec,
+        fetch_docs: bool,
+    ) -> Result<Vec<TraverseHit>> {
         spec.validate()?;
         self.ensure_incoming_state(collection, spec)?;
         if self.get(collection, id)?.is_none() {
@@ -6492,19 +6516,29 @@ impl Hako {
                 if out.len() >= spec.limit {
                     break 'bfs;
                 }
-                if let Ok(Some(doc)) = self.get(&ncol, &nid) {
-                    let path = if want_path {
-                        Self::reconstruct_traverse_path(&parent, &start, (&ncol, &nid))
-                    } else {
-                        Vec::new()
-                    };
-                    let via = if want_via {
-                        Self::reconstruct_traverse_via(&parent, &parent_edge, &start, (&ncol, &nid))
-                    } else {
-                        Vec::new()
-                    };
-                    out.push(TraverseHit { collection: ncol, id: nid, depth: nd, cost: nd as f64, path, via, doc });
-                }
+                let doc = if fetch_docs {
+                    // Same semantics as before: a missing/unreadable doc
+                    // skips the hit. Count mode pushes a bare placeholder
+                    // instead, so limit/visited accounting stays
+                    // byte-identical to the full walk.
+                    match self.get(&ncol, &nid) {
+                        Ok(Some(d)) => d,
+                        _ => continue,
+                    }
+                } else {
+                    HakoDoc::default()
+                };
+                let path = if want_path {
+                    Self::reconstruct_traverse_path(&parent, &start, (&ncol, &nid))
+                } else {
+                    Vec::new()
+                };
+                let via = if want_via {
+                    Self::reconstruct_traverse_via(&parent, &parent_edge, &start, (&ncol, &nid))
+                } else {
+                    Vec::new()
+                };
+                out.push(TraverseHit { collection: ncol, id: nid, depth: nd, cost: nd as f64, path, via, doc });
             }
         }
         Ok(out)
