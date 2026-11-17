@@ -87,6 +87,40 @@ fn outgoing_walks_chain_and_stops_at_cycles() {
 }
 
 #[test]
+fn backlink_version_stamp_skips_stale_and_keeps_live() {
+    // #214 fast-path semantics: a stamped row skips the fetch when the
+    // source doc's version is unchanged; after an overwrite the stale row
+    // must be re-verified (dropped or re-stamped), never trusted blindly.
+    let dir = tmp("stamp");
+    let db = open_db(&dir);
+    db.create_traverse_index("docs").unwrap();
+    db.put("docs", "t", &blank()).unwrap();
+    db.put("docs", "src", &refdoc("docs", "t")).unwrap();
+    wait(&db);
+    // Stamp pass: first incoming walk verifies and stamps the row.
+    let hits = db
+        .find_paths("docs", "t", &spec(TraverseDir::Incoming, 1, 100))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    // Overwrite src with a ref to another target: the (src -> t) row is
+    // stale; the version bump must force the slow verify and drop it.
+    db.put("docs", "src", &refdoc("docs", "other")).unwrap();
+    wait(&db);
+    let hits = db
+        .find_paths("docs", "t", &spec(TraverseDir::Incoming, 1, 100))
+        .unwrap();
+    assert!(hits.is_empty(), "stale row must not survive an overwrite");
+    // Re-point src back at t: the row re-verifies live and re-stamps.
+    db.put("docs", "src", &refdoc("docs", "t")).unwrap();
+    wait(&db);
+    let hits = db
+        .find_paths("docs", "t", &spec(TraverseDir::Incoming, 1, 100))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn incoming_needs_tracking_and_walks_backlinks() {
     let dir = tmp("in");
     let db = open_db(&dir);
