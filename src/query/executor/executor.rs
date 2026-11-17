@@ -1612,13 +1612,6 @@ impl ParallelQueryExecutor {
     /// Shared `extra`-filter check (#192): every filter must pass on the
     /// decoded doc; a missing field rejects (unified-match rule). Used by
     /// the scoring path and the filtered-traversal admission predicate.
-    fn extras_match(doc: &HakoDoc, extra: &[crate::query::filter::Filter]) -> bool {
-        extra.iter().all(|f| {
-            doc.get(&f.field)
-                .is_some_and(|v| crate::query::filter::compare_values(v, &f.op, &f.value))
-        })
-    }
-
     #[allow(clippy::too_many_arguments)] // private; the param set is the scoring context
     fn score_vector_batch(
         storage: &StorageEngine,
@@ -1652,7 +1645,7 @@ impl ParallelQueryExecutor {
                 Some(d) => d,
                 None => continue,
             };
-            if !Self::extras_match(&doc, extra) {
+            if !crate::query::filter::extras_match(&doc, extra) {
                 continue;
             }
             // Missing / non-binary / dim-mismatched fields can't be
@@ -2054,7 +2047,7 @@ impl ParallelQueryExecutor {
                                 Some(ptr) if !matches!(ptr, Pointer::Deleted { .. }) => {
                                     match storage.read_pointer_shared(ptr) {
                                         Ok(Some(b)) => HakoDoc::decode(&b)
-                                            .map(|d| Self::extras_match(&d, extra))
+                                            .map(|d| crate::query::filter::extras_match(&d, extra))
                                             .unwrap_or(false),
                                         _ => false,
                                     }
