@@ -6235,29 +6235,34 @@ impl Hako {
             }
         }
         if spec.direction.uses_incoming() {
-            let edges: Vec<(String, String, String)> = self
-                .indexes
-                .read()
-                .unwrap()
-                .traverse
-                .inbound(col, doc_id)
-                .map(|v| {
-                    v.iter()
-                        .filter(|e| spec.edge_field.as_deref().is_none_or(|f| e.field == f))
-                        .map(|e| (e.src_col.clone(), e.src_id.clone(), e.field.clone()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            for (scol, sid, sfield) in edges {
-                let live = self
-                    .memo_get(&mut memo, &scol, &sid)
-                    .is_some_and(|d| {
-                    d.get(&sfield).is_some_and(|v| {
-                        matches!(v, Value::Reference { collection: c, doc_id: t } if c == col && t == doc_id)
-                    })
-                });
-                if live {
-                    next.push((scol, sid, 1.0, None));
+            // #214: iterate the borrowed backlink slice directly — the old
+            // shape cloned every row's scol/sid/sfield into an intermediate
+            // Vec before verification (4 allocs/row on the hottest walk
+            // path). Verification runs on borrowed &str; the only allocs
+            // left are the owned push for live rows. The guard is dropped
+            // before the via_edge block (edge_step takes its own
+            // indexes.read(); parking_lot is not reentrant).
+            {
+                let mgr = self.indexes.read().unwrap();
+                if let Some(rows) = mgr.traverse.inbound(col, doc_id) {
+                    for e in rows {
+                        if spec.edge_field.as_deref().is_some_and(|f| e.field != f) {
+                            continue;
+                        }
+                        let live = self
+                            .memo_get(&mut memo, &e.src_col, &e.src_id)
+                            .is_some_and(|d| {
+                                d.get(&e.field).is_some_and(|v| {
+                                    matches!(v,
+                                        Value::Reference { collection: c, doc_id: t }
+                                            if c == col && t == doc_id
+                                    )
+                                })
+                            });
+                        if live {
+                            next.push((e.src_col.clone(), e.src_id.clone(), 1.0, None));
+                        }
+                    }
                 }
             }
             if let Some(edge_col) = spec.via_edge.as_deref() {
