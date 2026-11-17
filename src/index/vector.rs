@@ -43,7 +43,7 @@ impl Metric {
 
 /// P0 registration: definition only (no RAM structure yet — the P0 scan is
 /// brute-force exact). P1's HNSW lives behind this same registry entry.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VectorDef {
     pub dim: u32,
     pub metric: Metric,

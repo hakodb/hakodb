@@ -763,6 +763,19 @@ impl Drop for BackfillGuard {
     }
 }
 
+/// #217 P2: boot-time index declaration for [`Hako::ensure_indexes`].
+/// Fields are plain lists — declare exactly what the app needs; repeated
+/// declarations are idempotent no-ops.
+#[derive(Debug, Default, Clone)]
+pub struct IndexSchema {
+    /// `(collection, field)` FTS text indexes.
+    pub fts: Vec<(String, String)>,
+    /// `(collection, field, dim, metric)` vector indexes.
+    pub vector: Vec<(String, String, u32, crate::index::vector::Metric)>,
+    /// Collections the traversal (graph) engine tracks.
+    pub tracked: Vec<String>,
+}
+
 pub struct Hako {
     root_path: PathBuf,
     /// #217 P1: exclusive data-dir lock (`open_exclusive` only) — an
@@ -5546,11 +5559,16 @@ impl Hako {
     }
 
     pub fn create_fts_index(&self, collection: &str, field: &str) -> Result<()> {
-        // 1. Register
-        self.indexes
+        // 1. Register (#217 P2: idempotent — an already-declared index
+        // must not be wiped + re-backfilled by every boot's ensure call).
+        let created = self
+            .indexes
             .write()
             .unwrap()
             .create_fts_index(collection, field);
+        if !created {
+            return Ok(());
+        }
 
         // 3. Spawn background thread for backfilling
         let shard_arc = self.get_shard(collection)?;
@@ -5631,6 +5649,24 @@ impl Hako {
         self.create_vector_index_with_params(collection, field, dim, metric, Default::default())
     }
 
+    /// #217 P2: boot-time index declaration in ONE idempotent call,
+    /// issued before the first write (the #209 race class: an index must
+    /// exist before the doc that needs it lands). Every `create_*` is a
+    /// no-op when the index already exists, so re-declaring on every
+    /// boot is cheap and never wipes a populated index.
+    pub fn ensure_indexes(&self, schema: &IndexSchema) -> Result<()> {
+        for (c, f) in &schema.fts {
+            self.create_fts_index(c, f)?;
+        }
+        for (c, f, d, m) in &schema.vector {
+            self.create_vector_index(c, f, *d, *m)?;
+        }
+        for c in &schema.tracked {
+            self.create_traverse_index(c)?;
+        }
+        Ok(())
+    }
+
     /// Vector index with explicit HNSW parameters (#141-1): `None` fields
     /// ride the per-dim derived defaults. Parameters persist in the index
     /// definitions (they sync like the rest of the def) and survive reopen.
@@ -5642,10 +5678,16 @@ impl Hako {
         metric: crate::index::vector::Metric,
         params: crate::index::vector::HnswParams,
     ) -> Result<()> {
-        self.indexes
+        let created = self
+            .indexes
             .write()
             .unwrap()
             .create_vector_index(collection, field, dim, metric, params)?;
+        // #217 P2: idempotent — a no-op re-declaration must not rebuild
+        // the (already populated) HNSW graph.
+        if !created {
+            return Ok(());
+        }
         {
             if let Ok(mut mgr) = self.indexes.write() {
                 mgr.ensure_vector_graph(collection, field);
