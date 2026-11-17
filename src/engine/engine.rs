@@ -7290,6 +7290,24 @@ impl Hako {
         seed_id: &str,
         spec: &TraverseSpec,
     ) -> Result<String> {
+        self.subgraph_json_projected(collection, seed_id, spec, None)
+    }
+
+    /// #217 P0-B: `subgraph_json` with a node-doc projection — raw blobs
+    /// (e.g. 384-dim embedding vectors) must not reach graph clients.
+    /// `None` = legacy behavior (every field); `Some(fields)` keeps only
+    /// the listed fields that exist (missing ones stay absent — the same
+    /// rule as `decode_projected`). Walk, edge list, and row shape are
+    /// unchanged; only the `doc` payload shrinks.
+    pub fn subgraph_json_projected(
+        &self,
+        collection: &str,
+        seed_id: &str,
+        spec: &TraverseSpec,
+        fields: Option<&[String]>,
+    ) -> Result<String> {
+        let keep: Option<std::collections::HashSet<&str>> =
+            fields.map(|fs| fs.iter().map(String::as_str).collect());
         spec.validate()?;
         if self.get(collection, seed_id)?.is_none() {
             return Ok("{\"nodes\":[],\"edges\":[]}".to_string());
@@ -7348,6 +7366,13 @@ impl Hako {
                 let mut mdoc = serde_json::Map::new();
                 if let Ok(Some(d)) = self.get(c, id) {
                     for (f, v) in d.fields.iter() {
+                        // #217 P0-B: projection — keep only the listed
+                        // fields that exist (missing stays absent).
+                        if let Some(k) = &keep {
+                            if !k.contains(f.as_ref()) {
+                                continue;
+                            }
+                        }
                         mdoc.insert(f.to_string(), v.to_json());
                     }
                 }
