@@ -1148,3 +1148,46 @@ fn subgraph_scopes_hops_seed_and_missing() {
     assert_eq!(v["edges"].as_array().unwrap().len(), 4);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn subgraph_json_projection_scopes_fields() {
+    // #217 P0-B: node-doc projection — None is legacy parity; Some(list)
+    // keeps only the listed fields that exist (missing stays absent).
+    let dir = tmp("proj");
+    let db = open_db(&dir);
+    db.create_traverse_index("docs").unwrap();
+    let mut doc = HakoDoc::default();
+    doc.insert("link", Value::Reference { collection: "docs".into(), doc_id: "b".into() });
+    doc.insert("label", Value::String("seed".into()));
+    db.put("docs", "a", &doc).unwrap();
+    db.put("docs", "b", &refdoc("docs", "a")).unwrap();
+    wait(&db);
+    let s = spec(TraverseDir::Both, 5, 100);
+    let full = db.subgraph_json("docs", "a", &s).unwrap();
+    assert_eq!(full, db.subgraph_json_projected("docs", "a", &s, None).unwrap());
+    let v: serde_json::Value =
+        serde_json::from_str(&db.subgraph_json_projected("docs", "a", &s, Some(&["label".into()])).unwrap())
+            .unwrap();
+    let docs = v["nodes"].as_array().unwrap();
+    assert_eq!(docs.len(), 2, "seed + b");
+    for n in docs {
+        let keys: Vec<&str> = n["doc"].as_object().unwrap().keys().map(String::as_str).collect();
+        assert!(
+            keys.iter().all(|k| *k == "label"),
+            "only the projected field survives: {keys:?}"
+        );
+    }
+    // Empty projection = bare {collection,id,doc:{}} rows (ids-only view).
+    let v: serde_json::Value =
+        serde_json::from_str(&db.subgraph_json_projected("docs", "a", &s, Some(&[])).unwrap())
+            .unwrap();
+    for n in v["nodes"].as_array().unwrap() {
+        assert!(n["doc"].as_object().unwrap().is_empty());
+    }
+    // Absent field stays absent, walk/edge list unchanged.
+    let v: serde_json::Value =
+        serde_json::from_str(&db.subgraph_json_projected("docs", "a", &s, Some(&["nope".into()])).unwrap())
+            .unwrap();
+    assert_eq!(v["edges"].as_array().unwrap().len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
