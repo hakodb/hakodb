@@ -5904,12 +5904,55 @@ impl Hako {
         k: usize,
         max_distance: Option<f64>,
     ) -> Result<Vec<(String, f64, HakoDoc)>> {
+        self.find_near_scored_filtered(collection, field, query, k, max_distance, &[])
+    }
+
+    /// #217 P0-A: `find_near_scored` with admission filters. The vector
+    /// side rides the executor's filtered-ANN stack (extra-filter
+    /// admission + widening + exact-scan fallback) by appending the
+    /// filters to the `Near` query — the full-k guarantee comes from the
+    /// same machinery `Query` uses. `filters = &[]` is byte-identical to
+    /// [`Self::find_near_scored`]. Output re-checks the filters on the
+    /// returned docs (already in hand — no extra fetch) so a doc whose
+    /// filter fields changed between scoring and return cannot slip in.
+    pub fn find_near_scored_filtered(
+        &self,
+        collection: &str,
+        field: &str,
+        query: &[f32],
+        k: usize,
+        max_distance: Option<f64>,
+        filters: &[crate::query::filter::Filter],
+    ) -> Result<Vec<(String, f64, HakoDoc)>> {
         let Some(metric) = self.vector_metric(collection, field) else {
             return Ok(Vec::new());
         };
-        let rows = self.find_near(collection, field, query, k)?;
+        let dim = {
+            let mgr = self.indexes.read().unwrap();
+            match mgr.vector.get(collection).and_then(|m| m.get(field)) {
+                Some(def) => def.dim as usize,
+                None => return Ok(Vec::new()),
+            }
+        };
+        if query.len() != dim {
+            return Err(HakoError::Corrupt(format!(
+                "find_near dim mismatch: query {} vs index {dim} on {collection}.{field}",
+                query.len()
+            )));
+        }
+        let bytes = crate::index::vector::encode_f32s(query);
+        let mut q = Query::new(collection)
+            .where_filter(field, crate::query::filter::Operator::Near, Value::Binary(bytes))
+            .limit(k);
+        for f in filters {
+            q.filters.push(f.clone());
+        }
+        let rows = self.query(q)?;
         let mut out = Vec::with_capacity(rows.len());
         for (id, doc) in rows {
+            if !crate::query::filter::extras_match(&doc, filters) {
+                continue;
+            }
             let score = match doc.get(field) {
                 Some(Value::Binary(b)) => crate::index::vector::decode_f32s(b)
                     .ok()
@@ -5956,6 +5999,32 @@ impl Hako {
         k: usize,
         rrf_k: usize,
     ) -> Result<Vec<(String, f64, HakoDoc)>> {
+        self.hybrid_search_filtered(
+            collection, text_field, text_query, vec_field, query, k, rrf_k, &[],
+        )
+    }
+
+    /// #217 P0-A: `hybrid_search` with admission filters. Text side
+    /// applies them BEFORE `truncate(side_k)` (failing candidates never
+    /// consume a rank — filtering after truncation would replicate the
+    /// same bug the app-level workaround has); vector side rides the
+    /// executor's filtered-ANN stack via [`Self::find_near_scored_filtered`];
+    /// the fused output re-checks the filters on the returned docs
+    /// (already in hand — no extra fetch). `filters = &[]` is
+    /// byte-identical to [`Self::hybrid_search`]; RRF fusion, ordering,
+    /// tie-breaks and the `(id, score, doc)` row shape are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hybrid_search_filtered(
+        &self,
+        collection: &str,
+        text_field: &str,
+        text_query: &str,
+        vec_field: &str,
+        query: &[f32],
+        k: usize,
+        rrf_k: usize,
+        filters: &[crate::query::filter::Filter],
+    ) -> Result<Vec<(String, f64, HakoDoc)>> {
         if k == 0 {
             return Ok(Vec::new());
         }
@@ -5992,6 +6061,12 @@ impl Hako {
                             .take(MAX_TEXT_CANDIDATES)
                             .filter_map(|id| {
                                 let doc = self.get(collection, &id).ok().flatten()?;
+                                // #217 P0-A: admission filters BEFORE the
+                                // score+truncate — a failing candidate must
+                                // not consume a `side_k` rank.
+                                if !crate::query::filter::extras_match(&doc, filters) {
+                                    return None;
+                                }
                                 let text = match doc.get(text_field) {
                                     Some(Value::String(s)) => s.as_str(),
                                     _ => return None,
@@ -6025,8 +6100,11 @@ impl Hako {
             Err(_) => Vec::new(),
         };
 
-        // --- Vector side: reuse the scored KNN path (ANN or exact).
-        let vec_hits = self.find_near_scored(collection, vec_field, query, side_k, None)?;
+        // --- Vector side: reuse the scored KNN path (ANN or exact),
+        // with the same admission filters (executor filtered-ANN stack).
+        let vec_hits = self.find_near_scored_filtered(
+            collection, vec_field, query, side_k, None, filters,
+        )?;
 
         // --- RRF fuse: 1-based ranks within each side; ties on id.
         let mut fused: std::collections::BTreeMap<String, f64> =
@@ -6049,7 +6127,13 @@ impl Hako {
         for (id, score) in rows {
             // Both sides already liveness-checked these ids; the doc may
             // have been reaped between, so the re-read still fail-closes.
+            // #217 P0-A: re-check the admission filters on the returned
+            // doc (in hand — no extra fetch) so a doc whose filter fields
+            // changed between scoring and return cannot slip through.
             if let Some(doc) = self.get(collection, &id)? {
+                if !crate::query::filter::extras_match(&doc, filters) {
+                    continue;
+                }
                 out.push((id, score, doc));
             }
         }

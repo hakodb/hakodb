@@ -57,6 +57,19 @@ pub struct Filter {
     pub value: Value,
 }
 
+/// Shared `extra`-filter admission check (#192/#217 P0-A): every filter
+/// must pass on the decoded doc; a missing field rejects (unified-match
+/// rule). One matcher for every consumer of `Filter` lists — the Query
+/// executor's filtered-ANN path and the engine's filtered hybrid search.
+pub(crate) fn extras_match(
+    doc: &crate::document::hako_doc::HakoDoc,
+    extra: &[Filter],
+) -> bool {
+    extra.iter().all(|f| {
+        doc.get(&f.field).is_some_and(|v| compare_values(v, &f.op, &f.value))
+    })
+}
+
 pub fn compare_values(a: &Value, op: &Operator, b: &Value) -> bool {
     // Handle the 'In' operator first because it breaks the standard (a, b) pairing logic
     // (a is the field value, b is the array of allowed values)
