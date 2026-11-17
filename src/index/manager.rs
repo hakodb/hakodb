@@ -39,16 +39,29 @@ pub struct IndexManager {
 pub type WalTails = HashMap<String, (u64, u64)>;
 
 impl IndexManager {
-    pub fn create_fts_index(&mut self, collection: &str, field: &str) {
-        self.fts
-            .entry(collection.to_string())
-            .or_default()
-            .insert(field.to_string(), InvertedIndex::default());
+    /// Register an FTS field. Returns true when the index was newly
+    /// created — false = already present, no-op. The #217 P2 idempotent
+    /// boot contract: re-declaring on every boot must NOT wipe a
+    /// populated inverted index.
+    pub fn create_fts_index(&mut self, collection: &str, field: &str) -> bool {
+        let m = self.fts.entry(collection.to_string()).or_default();
+        if m.contains_key(field) {
+            return false;
+        }
+        m.insert(field.to_string(), InvertedIndex::default());
+        true
     }
 
     /// Register a vector definition (P0: no RAM structure — the exact scan
     /// only needs dim + metric; dim mismatch at query time is fail-closed).
     /// Re-registering overwrites (same overwrite rule as fts/secondary).
+    /// Register a vector definition (P0: no RAM structure — the exact scan
+    /// only needs dim + metric; dim mismatch at query time is fail-closed).
+    ///
+    /// #217 P2 idempotent contract: an identical def is a no-op (returns
+    /// `Ok(false)`); a DIFFERENT def on the same field is an error
+    /// (drop the index first) — a silent replacement would strand the
+    /// populated HNSW graph behind a mismatched definition.
     pub fn create_vector_index(
         &mut self,
         collection: &str,
@@ -56,8 +69,24 @@ impl IndexManager {
         dim: u32,
         metric: Metric,
         params: HnswParams,
-    ) -> crate::error::Result<()> {
+    ) -> crate::error::Result<bool> {
         validate_dim(dim)?;
+        if let Some(existing) = self.vector.get(collection).and_then(|m| m.get(field)) {
+            if existing.dim == dim
+                && existing.metric == metric
+                && existing.m == params.m
+                && existing.ef_construction == params.ef_construction
+                && existing.ef_search == params.ef_search
+                && existing.binary_stage1 == params.binary_stage1
+            {
+                return Ok(false);
+            }
+            return Err(crate::error::HakoError::InvalidInput(format!(
+                "vector index {collection}.{field} already exists with dim {} metric {:?} — \
+                 drop it before declaring a different definition",
+                existing.dim, existing.metric
+            )));
+        }
         self.vector
             .entry(collection.to_string())
             .or_default()
@@ -72,7 +101,7 @@ impl IndexManager {
                     binary_stage1: params.binary_stage1,
                 },
             );
-        Ok(())
+        Ok(true)
     }
 
     /// Ensure an (empty, incomplete) HNSW graph for a registered def.

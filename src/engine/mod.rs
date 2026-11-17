@@ -5,6 +5,6 @@ pub mod softdel;
 
 pub use engine::{
     AccessOp, AuditEntry, BatchMutation, ChangeEvent, ChangeKind, ExplainReport, Hako,
-    QuiescenceStatus, RetryPolicy, SecurityRule, SerializableTransaction, TraverseHit,
-    Transaction,
+    IndexSchema, QuiescenceStatus, RetryPolicy, SecurityRule, SerializableTransaction,
+    TraverseHit, Transaction,
 };
