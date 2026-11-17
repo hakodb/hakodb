@@ -4604,6 +4604,83 @@ pub extern "C" fn hk_engine_find_paths(
     })
 }
 
+/// Hit-count BFS (#217 P0-C): the same walk as `hk_engine_find_paths` with
+/// the per-hit doc fetch + JSON render skipped — the bench walk/render
+/// split rides this. Returns the hit count, or -1 on error.
+#[no_mangle]
+pub extern "C" fn hk_engine_find_paths_count(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    doc_id: *const c_char,
+    direction: u32,
+    edge_field: *const c_char,
+    max_depth: usize,
+    k: usize,
+) -> i64 {
+    safety_shield!(-1, {
+        if engine.is_null() {
+            set_last_error_err("null engine handle");
+            return -1;
+        }
+        let engine = unsafe { &*engine };
+        let col = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return -1;
+            }
+        };
+        let id = match cstr_to_string(doc_id) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error_err(e);
+                return -1;
+            }
+        };
+        let dir = match crate::index::traverse::TraverseDir::from_u32(direction) {
+            Ok(d) => d,
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                return -1;
+            }
+        };
+        let edge: Option<String> = if edge_field.is_null() {
+            None
+        } else {
+            match cstr_to_string(edge_field) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    set_last_error_err(e);
+                    return -1;
+                }
+            }
+        };
+        let spec = crate::index::traverse::TraverseSpec {
+            direction: dir,
+            edge_field: edge,
+            max_depth,
+            limit: if k == 0 { 10 } else { k },
+            via_edge: None,
+            weight_field: None,
+            node_match: None,
+            edge_type: None,
+            edge_match: None,
+            include_path: false,
+            include_via: false,
+        };
+        match engine.db.find_paths_count(&col, &id, &spec) {
+            Ok(n) => {
+                clear_last_error();
+                n as i64
+            }
+            Err(e) => {
+                set_last_error_err(e.to_string());
+                -1
+            }
+        }
+    })
+}
+
 /// Filtered graph BFS (#156 Phase C): like `hk_engine_find_paths` plus a
 /// node predicate — `filter_field` + `filter_json` (a single JSON value,
 /// e.g. `"5"`, `true`, `"a"`) keep only nodes whose field equals it, and
