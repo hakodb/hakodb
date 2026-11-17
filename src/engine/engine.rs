@@ -764,7 +764,12 @@ impl Drop for BackfillGuard {
 }
 
 pub struct Hako {
-    root_path: PathBuf,    pub(crate) config: HakoConfig,
+    root_path: PathBuf,
+    /// #217 P1: exclusive data-dir lock (`open_exclusive` only) — an
+    /// advisory OS lock on `hako.lock` held for the instance's lifetime
+    /// and released when the engine drops. `None` for plain `open` (the
+    /// pre-existing caller-owned semantics, unchanged).
+    exclusive_lock: Option<std::fs::File>,    pub(crate) config: HakoConfig,
     /// Live group-commit window ms (Interval mode). Initialized from the
     /// clamped open-time config; the runtime setter below keeps this and
     /// every shard WAL in lockstep (atomic, no lock on the read path).
@@ -991,8 +996,43 @@ pub struct DropReport {
 }
 
 impl Hako {
-    pub fn open(path: impl AsRef<Path>, config: HakoConfig) -> Result<Self> {
+    /// #217 P1: exclusive open — refuses (loudly) when the data dir is
+    /// already held by another HakoDB instance, via an advisory OS lock
+    /// on `<dir>/hako.lock` (cross-process AND cross-instance-in-process:
+    /// flock/LockFileEx conflict on every independent file handle). The
+    /// lock is held for the instance's lifetime and released on drop.
+    ///
+    /// Multi-instance guarantee: two WRITABLE engines on one data dir are
+    /// forbidden under this API (the dual-open class from
+    /// insiden-hako-wal-20260928: interleaved WAL appends and index
+    /// rebuilds corrupt state that no bootstrap converges). Plain
+    /// [`Self::open`] stays lock-free — its multi-instance semantics are
+    /// the caller's responsibility, unchanged.
+    pub fn open_exclusive(path: impl AsRef<Path>, config: HakoConfig) -> Result<Self> {
+        let root = path.as_ref().to_path_buf();
+        std::fs::create_dir_all(&root)?;
+        let root = std::fs::canonicalize(&root)?;
+        let lock_path = root.join("hako.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&lock_path)?;
+        file.try_lock().map_err(|e| {
+            HakoError::InvalidInput(format!(
+                "open_exclusive: data dir {} is already open by another HakoDB instance \
+                 ({}: {e}) — two writable instances on one data dir are forbidden",
+                root.display(),
+                lock_path.display()
+            ))
+        })?;
+        let mut db = Self::open(&root, config)?;
+        db.exclusive_lock = Some(file);
+        Ok(db)
+    }
 
+    pub fn open(path: impl AsRef<Path>, config: HakoConfig) -> Result<Self> {
         let query_threads = config.query_workers.clamp(1, 8);
         RAYON_INIT.call_once(|| {
             rayon::ThreadPoolBuilder::new()
@@ -1445,6 +1485,7 @@ impl Hako {
             gate_cache: RwLock::new(HashMap::new()),
             schemas: RwLock::new(HashMap::new()),
             schema_enabled: std::sync::atomic::AtomicBool::new(false),
+            exclusive_lock: None,
         };
 
         let _ = db.restore_index_defs();
