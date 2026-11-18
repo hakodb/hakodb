@@ -29,9 +29,9 @@ Your app *is* the database host: ideal for local-first/offline-first products, d
 
 ## Key features
 
-- **Engine** — `open/put/get/delete/query`, atomic `write_batch`, serializable transactions, `watch_collection` streams, subcollections.
+- **Engine** — `open/put/get/delete/query`, atomic `write_batch`, serializable transactions, `watch_collection` streams, subcollections; `open_exclusive` refuses a second writable engine on one data dir, `ensure_indexes` declares the boot schema in one idempotent call.
 - **Queries** — `eq/ne/gt/gte/lt/lte/in/notIn/arrayContains/match/contains/startsWith`, ordering, limit/offset, cursor bounds, `count/sum/avg/min/max`, cost-aware parallel planner with projection pushdown.
-- **Indexes** — secondary B-Tree, composite, full-text, HNSW vector (KNN), graph (BFS/Dijkstra) with edge predicates; built asynchronously in the background.
+- **Indexes** — secondary B-Tree, composite, full-text, HNSW vector (KNN, plus scored/filtered variants and RRF-fused hybrid text+vector search), graph (BFS/Dijkstra) with edge predicates; built asynchronously in the background, or declared up front with idempotent `ensure_indexes`.
 - **Storage** — tiered compaction, group-commit WAL, blob offloading, optional zstd compression (`compression` feature, default-on).
 - **Operations** — collection-prefix allow/deny rules, audit logging, `flush/compact/backup`.
 - **Deletes** — soft by default: tombstone + retention record, restore any time before the sweeper purges (`restore`/`restore_available`/`delete_queue`/`sweep_now`); `--force`-style hard delete stays available.
@@ -65,13 +65,13 @@ See [`example/rust/basic`](example/rust/basic) for a complete runnable project.
 
 ## Vector search (KNN)
 
-`create_vector_index(collection, field, dim, metric)` + `find_near(collection, field, query, k)`: nearest-first hits over a binary LE-`f32` field, cosine or L2, HNSW with exact rescore.
+`create_vector_index(collection, field, dim, metric)` + `find_near(collection, field, query, k)`: nearest-first hits over a binary LE-`f32` field, cosine or L2, HNSW with exact rescore. `hybrid_search` fuses the full-text and vector sides with reciprocal-rank fusion; the `_filtered` variants apply admission filters **before** rank truncation, so results are full-k within the filtered set (not top-k with mismatches dropped after); `find_near_scored` adds an optional raw-distance cap.
 
 > **The index does not embed.** Turning text/images into vectors needs an embedding model you operate separately; query and corpus must share one model (a dim mismatch is a hard error). **Sync carries index definitions, not graphs** — HNSW graphs rebuild locally from replicated documents.
 
 ## Graph traversal
 
-`create_traverse_index(collection)` tracks `Reference` edges into a backlink index; `find_paths(collection, id, spec)` walks out/in/both with BFS (depth-capped, visited-set, deterministic order). For weighted shortest paths, `create_edge_index(edge_collection)` registers `_from`/`_to` edge docs and `TraverseSpec::via_edge` runs Dijkstra (missing weight = 1.0, negatives clamp 0; hits carry `cost`). Untracked incoming anchors fail loudly instead of returning empty.
+`create_traverse_index(collection)` tracks `Reference` edges into a backlink index; `find_paths(collection, id, spec)` walks out/in/both with BFS (depth-capped, visited-set, deterministic order). For weighted shortest paths, `create_edge_index(edge_collection)` registers `_from`/`_to` edge docs and `TraverseSpec::via_edge` runs Dijkstra (missing weight = 1.0, negatives clamp 0; hits carry `cost`). `subgraph_json` exports a seed-scoped neighborhood as JSON — `subgraph_json_projected` keeps only named node fields so raw blobs (embeddings) never reach graph clients. Untracked incoming anchors fail loudly instead of returning empty.
 
 > **Sync carries defs, not state** — backlink/edge indexes rebuild locally from replicated documents, same as HNSW graphs.
 
