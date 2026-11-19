@@ -2,26 +2,44 @@ use crate::document::value::Value;
 use std::cmp::Ordering;
 use std::collections::HashSet; // Added for cleaner FTS logic
 
+/// Predicate used by [`Filter`] and the query planner.
+///
+/// `Near` and `Traverse` are scan markers: outside their dedicated scans they
+/// fail closed (return no rows) rather than silently matching everything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Operator {
+    /// Equal.
     Eq,
+    /// Not equal.
     Ne,
+    /// Greater than.
     Gt,
+    /// Greater than or equal.
     Gte,
+    /// Less than.
     Lt,
+    /// Less than or equal.
     Lte,
+    /// Whole-word full-text match.
     Match,      // Full word matching
+    /// Prefix of a full-text word (autocomplete).
     MatchPrefix, // Word-prefix matching (autocomplete; works on the FTS index)
+    /// Substring match on strings.
     Contains,   // Substring matching
+    /// String prefix match.
     StartsWith, // Prefix matching
+    /// Field value is one of the array in `Filter.value`.
     In,
+    /// Array field contains the given value.
     ArrayContains,
+    /// Array field contains any of the given values.
     ArrayContainsAny,
     /// All array elements compare equal to the value (whole-value
     /// membership semantics, hakodb#71 F3 `all_eq`). Empty array fails
     /// closed (the elemMatch empty-array rule); cross-type numerics
     /// compare equal per `Value::PartialEq`.
     ArrayAllEq,
+    /// Field value is not one of the array in `Filter.value`.
     NotIn,
     /// KNN marker (appended last: `as u8` discriminants of older variants
     /// must stay stable for the plan-cache key). The query vector rides
@@ -38,22 +56,30 @@ pub enum Operator {
     Traverse,
 }
 
+/// How the filters in a group are combined.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum FilterLogic {
+    /// Every filter must hold.
     And,
+    /// At least one filter must hold.
     Or,
 }
 
+/// A named group of filters combined by [`FilterLogic`].
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FilterGroup {
     pub logic: FilterLogic,
     pub filters: Vec<Filter>,
 }
 
+/// One predicate: `field <op> value`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Filter {
+    /// Field name, dotted for nested Map fields.
     pub field: String,
+    /// Predicate to apply.
     pub op: Operator,
+    /// Right-hand side value.
     pub value: Value,
 }
 
@@ -70,6 +96,8 @@ pub(crate) fn extras_match(
     })
 }
 
+/// Evaluate a predicate against one field value. Numeric `Int`/`Float` values
+/// compare together; other types compare within their own kind.
 pub fn compare_values(a: &Value, op: &Operator, b: &Value) -> bool {
     // Handle the 'In' operator first because it breaks the standard (a, b) pairing logic
     // (a is the field value, b is the array of allowed values)
