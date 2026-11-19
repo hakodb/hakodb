@@ -31,3 +31,11 @@ jobs:
 
       - name: check (locked, no codegen)
         run: cargo check --locked --all-targets
+
+      - name: doc (strict missing_docs gate)
+        run: cargo doc --locked --no-deps -p hakodb
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: doctests (runnable API examples)
+        run: cargo test --doc -p hakodb

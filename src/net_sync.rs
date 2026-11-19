@@ -32,11 +32,13 @@ use mdns_sd::{ServiceDaemon, ServiceInfo, ServiceEvent};
 // --- Data Structures ---
 
 #[cfg(feature = "net-sync")]
+/// Connection state of the local mesh peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncStatus { Idle, Connected, Syncing }
 
 #[cfg(feature = "net-sync")]
+/// Snapshot of the local peer and its known mesh peers.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct NetworkStatus {
     pub status: SyncStatus,
@@ -46,6 +48,7 @@ pub struct NetworkStatus {
 }
 
 #[cfg(feature = "net-sync")]
+/// Wire messages exchanged between mesh peers.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum NetPacket {
     Identify { id: String, room_hash: [u8; 32] },
