@@ -1,21 +1,48 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+/// A value stored in a document field.
+///
+/// Most fields are scalars, arrays, or maps. `Reference` is the link type:
+/// it points at `collection/doc_id` in the same database and is followed by
+/// the graph traversals and resolved by [`crate::engine::Hako::get_by_reference`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum Value {
+    /// Explicit null.
     Null,
+    /// Boolean.
     Bool(bool),
+    /// Signed 64-bit integer.
     Int(i64),
+    /// IEEE-754 double.
     Float(f64),
+    /// UTF-8 string.
     String(String),
+    /// Raw bytes. Embeddings are stored as little-endian `f32` in this variant.
     Binary(Vec<u8>),
-    BlobLink { offset: u64, len: u32 }, 
+    /// Pointer into the blob store, produced when a large binary is offloaded.
+    BlobLink { offset: u64, len: u32 },
+    /// Link to another document: `collection` + its `doc_id`.
+    ///
+    /// ```
+    /// use hakodb::document::value::Value;
+    ///
+    /// let reference = Value::Reference {
+    ///     collection: "authors".into(),
+    ///     doc_id: "a1".into(),
+    /// };
+    /// assert_eq!(reference.to_json()["__ref__"], "authors/a1");
+    /// ```
     Reference { collection: String, doc_id: String },
-    Timestamp(i64), 
+    /// Timestamp in microseconds since the Unix epoch.
+    Timestamp(i64),
+    /// Server-assigned timestamp, filled in at write time.
     ServerTimestamp,
     // Map(Vec<(String, Value)>),
-    Map(#[serde(with = "serde_arc_str_map")] Vec<(Arc<str>, Value)>), 
+    /// Nested object with insertion-ordered keys.
+    Map(#[serde(with = "serde_arc_str_map")] Vec<(Arc<str>, Value)>),
+    /// Ordered list of values.
     Array(Vec<Value>),
 }
 
@@ -36,8 +63,11 @@ impl Value {
         }
     }
 
-    /// Converts a HakoDB Value into a serde_json::Value.
-    /// This is used by the FFI, Tauri Gateway, and CLI.
+    /// Convert to JSON for FFI and SDK boundaries.
+    ///
+    /// `Reference` becomes `{"__ref__":"collection/id"}`, `Binary` becomes an
+    /// array of numbers, and `BlobLink` becomes `{"__blob__":{...}}`. JSON
+    /// results therefore do not carry a separate document id.
     pub fn to_json(&self) -> serde_json::Value {
         match self {
             Value::Null | Value::ServerTimestamp => serde_json::Value::Null,
@@ -77,8 +107,17 @@ impl Value {
         }
     }
 
-    /// Converts a serde_json::Value into a HakoDB Value.
-    /// Automatically detects special keys like __ref__ and __blob__.
+    /// Parse JSON into a value, recognising `__ref__` and `__blob__` markers.
+    ///
+    /// The reference path is split at the first `/`, so ids containing `/` are
+    /// not supported through this route; use `Value::Reference` directly.
+    ///
+    /// ```
+    /// use hakodb::document::value::Value;
+    ///
+    /// let value = Value::from_json(serde_json::json!({"__ref__": "users/u1"})).unwrap();
+    /// assert!(matches!(value, Value::Reference { .. }));
+    /// ```
     pub fn from_json(json: serde_json::Value) -> std::result::Result<Self, String> {
         match json {
             serde_json::Value::Null => Ok(Value::Null),

@@ -24,20 +24,28 @@ pub enum ErrorKind {
     Cancelled = 5,
 }
 
+/// Errors returned by the Rust API and classified for FFI consumers.
 #[derive(Debug, Error)]
 pub enum HakoError {
+    /// Filesystem or OS failure.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// A lock guard was poisoned by a panic in another thread.
     #[error("lock poisoned: {0}")]  // <--- ADD THIS
     LockPoisoned(String),
+    /// Storage-layer failure (WAL, mmap, or segment file).
     #[error("storage error: {0}")]
     StorageError(String),
+    /// Query planner or execution failure.
     #[error("query error: {0}")]
     QueryError(String),
+    /// Index creation or lookup failure.
     #[error("index error: {0}")]
     IndexError(String),
+    /// Data does not match the expected on-disk contract.
     #[error("corrupt data: {0}")]
     Corrupt(String),
+    /// Caller supplied an invalid argument or path.
     #[error("invalid input: {0}")]
     InvalidInput(String),
     /// Serializable-transaction read-set validation failed. A NORMAL

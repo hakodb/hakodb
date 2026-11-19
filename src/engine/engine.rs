@@ -222,13 +222,16 @@ pub fn lock_stats_report() -> String {
 
 // --- Data Types ---
 
+/// One operation in an atomic [`Hako::write_batch`].
 #[derive(Debug, Clone)]
 pub enum BatchMutation {
+    /// Replace or create a document with a full `HakoDoc`.
     Put {
         collection: String,
         doc_id: String,
         doc: HakoDoc,
     },
+    /// Hard delete: removes the document and its index entries.
     Delete {
         collection: String,
         doc_id: String,
@@ -239,6 +242,8 @@ pub enum BatchMutation {
         collection: String,
         doc_id: String,
     },
+    /// Upsert individual fields. Absent fields are created; no nested update
+    /// operators exist — pass the final values directly.
     Patch { 
         collection: String, 
         doc_id: String, 
@@ -776,6 +781,10 @@ pub struct IndexSchema {
     pub tracked: Vec<String>,
 }
 
+/// Handle to one embedded database directory.
+///
+/// Collections are named by strings; there is no server or connection string.
+/// Use [`Hako::open_exclusive`] when this process must be the only writer.
 pub struct Hako {
     root_path: PathBuf,
     /// #217 P1: exclusive data-dir lock (`open_exclusive` only) — an
@@ -1045,6 +1054,11 @@ impl Hako {
         Ok(db)
     }
 
+    /// Open a data directory, creating it when absent.
+    ///
+    /// This is lock-free: two handles to one directory are allowed, but two
+    /// concurrent writers are not. Use [`Self::open_exclusive`] to enforce a
+    /// single writer at the OS level.
     pub fn open(path: impl AsRef<Path>, config: HakoConfig) -> Result<Self> {
         let query_threads = config.query_workers.clamp(1, 8);
         RAYON_INIT.call_once(|| {
@@ -2249,6 +2263,11 @@ impl Hako {
         Ok(res)
     }
 
+    /// Commit a list of mutations atomically: all succeed or none do.
+    ///
+    /// Create indexes before the first write; backfills are not automatic
+    /// here. Use [`IndexSchema`] with [`Self::ensure_indexes`]
+    /// for a declarative boot schema.
     pub fn write_batch(&self, mutations: Vec<BatchMutation>) -> Result<Vec<String>> {
         // Read-only enforcement: one guard at the admission gate covers
         // put/put_owned/delete/patch/delete_where/tx (all route here).
@@ -2949,6 +2968,7 @@ impl Hako {
         blob_manager.extract_blobs(collection, key, doc, threshold)
     }
 
+    /// Read a document by id. `None` means missing or soft-deleted.
     pub fn get(&self, collection: &str, doc_id: &str) -> Result<Option<HakoDoc>> {
         // Hot-cache fast path: clone straight out of the resident Arc, without
         // the Arc clone/drop and the extra frame that `get_arc` costs per hit
@@ -3205,6 +3225,32 @@ impl Hako {
         Ok(Some(out))
     }
 
+    /// Insert or replace a whole document under `id`.
+    ///
+    /// Use [`Self::put_owned`] when you already own the `HakoDoc` and want to
+    /// skip the clone. For a reference to another collection, store a
+    /// [`Value::Reference`] field:
+    ///
+    /// ```
+    /// use hakodb::config::HakoConfig;
+    /// use hakodb::document::hako_doc::HakoDoc;
+    /// use hakodb::document::value::Value;
+    /// use hakodb::engine::Hako;
+    ///
+    /// # fn demo(db: &Hako) -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut author = HakoDoc::default();
+    /// author.insert("name", Value::String("Alice".into()));
+    /// db.put("authors", "a1", &author)?;
+    ///
+    /// let mut note = HakoDoc::default();
+    /// note.insert("title", Value::String("Hello".into()));
+    /// note.insert("author", Value::Reference {
+    ///     collection: "authors".into(),
+    ///     doc_id: "a1".into(),
+    /// });
+    /// db.put("notes", "n1", &note)?;
+    /// # Ok(()) }
+    /// ```
     pub fn put(&self, col: &str, id: &str, doc: &HakoDoc) -> Result<String> {
         self.put_owned(col, id, doc.clone())
     }
@@ -3784,6 +3830,7 @@ impl Hako {
         Ok(rows.unwrap_or_default())
     }
 
+    /// Execute a query; each hit is `(doc_id, document)`.
     pub fn query(&self, query: Query) -> Result<Vec<(String, HakoDoc)>> {
         self.query_with_cancel(query, None)
     }
@@ -4301,6 +4348,7 @@ impl Hako {
         Ok(results)
     }
 
+    /// Upsert individual fields. A patch on a missing id creates the document.
     pub fn patch(&self, col: &str, id: &str, updates: Vec<(String, Value)>) -> Result<String> {
         if !self.allowed(col, AccessOp::Put) {
             return Err(self.deny(AccessOp::Put, col, Some(id)));
@@ -4431,6 +4479,8 @@ impl Hako {
         stats
     }
 
+    /// Copy a consistent snapshot to `dest`. Flushes first, then copies files
+    /// for collections that are not currently loaded.
     pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
         self.flush()?;
         let shards = self.shards.write().unwrap();
@@ -4661,6 +4711,7 @@ impl Hako {
         }
     }
 
+    /// Compact all collections. Use the `*_collection` variants to target one.
     pub fn compact(&self) -> Result<()> {
         self.compact_impl(None)
     }
@@ -4758,6 +4809,8 @@ impl Hako {
         Ok(())
     }
 
+    /// Flush pending WAL writes. Durable modes call this on commit; `Manual`
+    /// requires an explicit call.
     pub fn flush(&self) -> Result<()> {
         for s in self.shards.read().unwrap().values() {
             s.write().unwrap().flush_all()?;

@@ -1,13 +1,19 @@
 use std::collections::HashSet;
 
+/// When writes become durable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DurabilityMode {
+    /// fsync on every commit.
     Always,
+    /// fsync on a time/size/count interval.
     Interval,
+    /// Only on explicit [`crate::engine::Hako::flush`].
     Manual,
+    /// fsync when the current transaction commits.
     OnCommit,
 }
 
+/// Engine configuration passed to [`crate::engine::Hako::open`].
 #[derive(Debug, Clone)]
 pub struct HakoConfig {
     pub mmap_size: usize,

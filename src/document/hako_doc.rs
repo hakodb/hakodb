@@ -35,9 +35,15 @@ pub(crate) fn intern_field(key: &str) -> Arc<str> {
     })
 }
 
+/// A document: sorted field pairs plus a write timestamp.
+///
+/// Build one with [`HakoDoc::default`], insert fields, then hand it to
+/// [`crate::engine::Hako::put`] or [`crate::engine::BatchMutation::Put`].
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct HakoDoc {
+    /// Field name/value pairs, sorted by name.
     pub fields: Vec<(Arc<str>, Value)>,
+    /// Write timestamp supplied by the engine.
     pub _time: i64,
 }
 
@@ -45,6 +51,7 @@ pub struct HakoDoc {
 type MapEntry<'a> = (&'a [u8], u8, &'a [u8]);
 
 impl HakoDoc {
+    /// Fetch one field. Returns `None` when the field is absent.
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.fields.binary_search_by(|(k, _)| k.as_ref().cmp(key))
             .ok()
@@ -78,6 +85,16 @@ impl HakoDoc {
         Some(cur)
     }
 
+    /// Insert or replace a field. Replacing keeps the sorted order stable.
+    ///
+    /// ```
+    /// use hakodb::document::hako_doc::HakoDoc;
+    /// use hakodb::document::value::Value;
+    ///
+    /// let mut doc = HakoDoc::default();
+    /// doc.insert("name", Value::String("alice".into()));
+    /// assert_eq!(doc.get("name"), Some(&Value::String("alice".into())));
+    /// ```
     pub fn insert(&mut self, key: impl Into<String>, value: Value) {
         let key_str = key.into();
         match self.fields.binary_search_by(|(k, _)| k.as_ref().cmp(&key_str)) {

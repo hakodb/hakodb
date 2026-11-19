@@ -38,7 +38,7 @@ Your app *is* the database host: ideal for local-first/offline-first products, d
 
 ## Quick start (Rust)
 
-```rust
+```rust,ignore
 use hakodb::config::HakoConfig;
 use hakodb::document::hako_doc::HakoDoc;
 use hakodb::document::value::Value;
