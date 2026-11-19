@@ -251,12 +251,16 @@ pub enum BatchMutation {
     },
 }
 
+/// Kind of change reported by a watch subscription.
 #[derive(Debug, Clone)]
 pub enum ChangeKind {
+    /// Document inserted or replaced.
     Put,
+    /// Document deleted.
     Delete,
 }
 
+/// One watch notification: `collection/path` plus its kind.
 #[derive(Debug, Clone)]
 pub struct ChangeEvent {
     // ponytail: shared id â€” every write fans out one event per mutation and
@@ -594,8 +598,11 @@ impl Transaction {
 /// Bounded retry policy for [`Hako::transaction`] (issue #71/F5 item 2).
 #[derive(Debug, Clone, Copy)]
 pub struct RetryPolicy {
+    /// Attempts including the first one.
     pub max_attempts: u32,
+    /// Initial backoff before the first retry.
     pub base_delay: Duration,
+    /// Upper bound for the exponential delay.
     pub max_delay: Duration,
 }
 
@@ -772,6 +779,8 @@ impl Drop for BackfillGuard {
 /// Fields are plain lists — declare exactly what the app needs; repeated
 /// declarations are idempotent no-ops.
 #[derive(Debug, Default, Clone)]
+/// Declarative index set applied at boot. Pass it to
+/// [`crate::engine::Hako::ensure_indexes`] before the first write.
 pub struct IndexSchema {
     /// `(collection, field)` FTS text indexes.
     pub fts: Vec<(String, String)>,
@@ -4653,6 +4662,11 @@ impl Hako {
         unreachable!("retry loop returns on the last attempt")
     }
 
+    /// Subscribe to changes in one collection.
+    ///
+    /// The channel carries `collection/path` and a [`ChangeKind`]; re-read the
+    /// document to get its new content. Filtered matches are Rust-only
+    /// (`matches_filters_view`).
     pub fn watch_collection(&self, col: &str) -> Receiver<ChangeEvent> {
         let (tx, rx) = channel();
         self.listeners
@@ -5532,6 +5546,7 @@ impl Hako {
         self.persist_index_defs()
     }
 
+    /// Create a secondary index on one field. Idempotent.
     pub fn create_index(&self, collection: &str, field: &str) -> Result<()> {
         // 1. Check if it exists
         {
@@ -5611,6 +5626,7 @@ impl Hako {
         Ok(())
     }
 
+    /// Create a full-text index on a string field. Idempotent.
     pub fn create_fts_index(&self, collection: &str, field: &str) -> Result<()> {
         // 1. Register (#217 P2: idempotent — an already-declared index
         // must not be wiped + re-backfilled by every boot's ensure call).
@@ -6149,6 +6165,23 @@ impl Hako {
     /// (already in hand — no extra fetch). `filters = &[]` is
     /// byte-identical to [`Self::hybrid_search`]; RRF fusion, ordering,
     /// tie-breaks and the `(id, score, doc)` row shape are unchanged.
+    ///
+    /// ```
+    /// use hakodb::document::value::Value;
+    /// use hakodb::query::filter::{Filter, Operator};
+    /// use hakodb::engine::Hako;
+    ///
+    /// # fn demo(db: &Hako, query_vec: Vec<f32>) -> Result<(), Box<dyn std::error::Error>> {
+    /// let filters = [Filter {
+    ///     field: "tenant".into(),
+    ///     op: Operator::Eq,
+    ///     value: Value::String("acme".into()),
+    /// }];
+    /// let hits = db.hybrid_search_filtered(
+    ///     "docs", "content", "vector index", "emb", &query_vec, 10, 60, &filters,
+    /// )?;
+    /// # Ok(()) }
+    /// ```
     #[allow(clippy::too_many_arguments)]
     pub fn hybrid_search_filtered(
         &self,

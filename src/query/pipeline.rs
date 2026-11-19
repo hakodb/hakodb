@@ -22,17 +22,22 @@ use crate::error::HakoError;
 use crate::query::query::Query;
 use std::collections::BTreeMap;
 
-/// One accumulator in a `group` stage.
+/// Accumulator used by a `Group` stage.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Accum {
+    /// Count rows in the group.
     Count,
+    /// Sum a numeric field.
     Sum(String),
+    /// Minimum of a numeric field.
     Min(String),
+    /// Maximum of a numeric field.
     Max(String),
+    /// Average of a numeric field.
     Avg(String),
 }
 
-/// Output name + accumulator.
+/// Output field name paired with its accumulator.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccumSpec {
     pub out: String,
@@ -41,20 +46,28 @@ pub struct AccumSpec {
 
 /// Pipeline stage. `Match` carries a full `Query` (its own limit/offset
 /// apply as written; prefer the pipeline `Limit`/`Offset` stages).
+/// One stage of an aggregation pipeline.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Stage {
+    /// Filter rows with a full [`Query`].
     Match(Query),
+    /// Keep only the named (possibly dotted) fields.
     Project(Vec<String>),
+    /// Sort by one field.
     Sort { field: String, ascending: bool },
+    /// Keep the first `n` rows.
     Limit(usize),
+    /// Skip the first `n` rows.
     Offset(usize),
+    /// Expand a top-level array field into one row per element.
     Unwind { field: String },
+    /// Group rows by a field (`None` = one group) and compute accumulators.
     Group { key: Option<String>, accums: Vec<AccumSpec> },
 }
 
-/// A pipeline over one collection. Non-`Match` stages seed from a full
-/// scan of `collection` when they run before any `Match`.
+/// An ordered sequence of stages over one collection. Run it with
+/// [`crate::engine::Hako::run_pipeline`].
 #[derive(Debug, Clone)]
 pub struct Pipeline {
     pub collection: String,
@@ -62,6 +75,7 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
+    /// Create an empty pipeline on `collection`.
     pub fn new(collection: &str) -> Self {
         Self {
             collection: collection.to_string(),
@@ -69,35 +83,43 @@ impl Pipeline {
         }
     }
 
+    /// Append a stage.
     pub fn stage(mut self, stage: Stage) -> Self {
         self.stages.push(stage);
         self
     }
 
+    /// Append a `Match` stage.
     pub fn match_query(self, query: Query) -> Self {
         self.stage(Stage::Match(query))
     }
 
+    /// Append a `Project` stage.
     pub fn project(self, fields: Vec<&str>) -> Self {
         self.stage(Stage::Project(fields.into_iter().map(|s| s.to_string()).collect()))
     }
 
+    /// Append a `Sort` stage.
     pub fn sort(self, field: &str, ascending: bool) -> Self {
         self.stage(Stage::Sort { field: field.to_string(), ascending })
     }
 
+    /// Append a `Limit` stage.
     pub fn limit(self, n: usize) -> Self {
         self.stage(Stage::Limit(n))
     }
 
+    /// Append an `Offset` stage.
     pub fn offset(self, n: usize) -> Self {
         self.stage(Stage::Offset(n))
     }
 
+    /// Append an `Unwind` stage over a top-level array field.
     pub fn unwind(self, field: &str) -> Self {
         self.stage(Stage::Unwind { field: field.to_string() })
     }
 
+    /// Append a `Group` stage with `(output_name, accumulator)` pairs.
     pub fn group(self, key: Option<&str>, accums: Vec<(&str, Accum)>) -> Self {
         self.stage(Stage::Group {
             key: key.map(|k| k.to_string()),
