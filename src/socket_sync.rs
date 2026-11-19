@@ -74,6 +74,7 @@ pub struct SocketSync {
 }
 
 impl SocketSync {
+    /// Start peering with `db`; `excluded` collections are not replicated.
     pub fn new(db: Arc<Hako>, mut excluded: Vec<String>) -> Self {
         excluded.extend(
             crate::engine::engine::SYNC_EXCLUDED_COLLECTIONS

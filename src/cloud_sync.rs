@@ -79,14 +79,18 @@ fn init_crypto_provider() {
 }
 
 #[cfg(feature = "cloud-sync")]
+/// Role of this side of a cloud room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CloudSyncMode {
+    /// Hosts a room.
     Server,
+    /// Reads/writes a remote room.
     Client,
 }
 
 #[cfg(feature = "cloud-sync")]
+/// Wire messages between a cloud client and server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CloudPacket {
