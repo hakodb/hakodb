@@ -103,4 +103,18 @@ fn query_select_fields_prunes_documents() {
     assert_eq!(rows[0].0, "u2");
     assert!(field(&rows[0].1, "name").is_some());
     assert!(field(&rows[0].1, "age").is_none());
+
+    // ORDER BY on a field that is NOT selected must still rank correctly;
+    // the extra field is decoded for sorting then pruned from the result.
+    let ranked = db
+        .query(
+            Query::new("users")
+                .order_by("age", false)
+                .select_fields(vec!["name".into()])
+                .limit(10),
+        )
+        .expect("ranked");
+    assert_eq!(ranked[0].0, "u2", "older user must rank first");
+    assert!(field(&ranked[0].1, "age").is_none(), "order field must be pruned");
+    assert!(field(&ranked[0].1, "name").is_some());
 }

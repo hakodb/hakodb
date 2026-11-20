@@ -422,12 +422,18 @@ impl ParallelQueryExecutor {
             // Populate budget: the page the query returns (limit+offset), at
             // most 250. Unbounded small scans use the scan itself.
             let cache_budget = std::cell::Cell::new(early_need.unwrap_or(250).min(250));
+            let proj_prefixes = crate::document::value::projection_prefixes(&plan.projection);
             let push_row =
                 |id: String,
                  bytes: &[u8],
                  populate: Option<(&crate::engine::engine::Hako, u64)>,
                  results: &mut Vec<(String, RowRef)>| {
-                    if plan.filters_satisfied_by_index {
+                    if !plan.projection.is_empty() {
+                        // issue #234: selective decode; row cache is gated off for projections.
+                        if let Some(doc) = crate::query::executor::worker::unified_match_projected_doc(&id, bytes, &optimized_plan, &proj_prefixes) {
+                            results.push((id, RowRef::Owned(doc)));
+                        }
+                    } else if plan.filters_satisfied_by_index {
                         if let Some(doc) = HakoDoc::decode(bytes) {
                             if let Some((hk, ver)) = populate {
                                 if !crate::query::executor::worker::doc_has_links(&doc) {
@@ -791,6 +797,7 @@ impl ParallelQueryExecutor {
         Self::check_cancel(cancel)?;
         let mut out = Vec::new();
         let mut skipped = 0usize;
+        let proj_prefixes = crate::document::value::projection_prefixes(&plan.projection);
         for e in entries {
             // ponytail: decode lazily in order; corrupt rows drop and the
             // page backfills from the heap remainder (same rows the legacy
@@ -800,7 +807,11 @@ impl ParallelQueryExecutor {
                 Some(b) => b,
                 None => continue,
             };
-            let Some(doc) = HakoDoc::decode(&bytes) else {
+            let Some(doc) = (if plan.projection.is_empty() {
+                HakoDoc::decode(&bytes)
+            } else {
+                crate::query::executor::worker::unified_match_projected_doc(&e.id, &bytes, plan, &proj_prefixes)
+            }) else {
                 continue;
             };
             if skipped < offset {

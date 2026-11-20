@@ -1,4 +1,4 @@
-﻿use crate::document::hako_doc::{HakoDoc, HakoDocView};
+use crate::document::hako_doc::{HakoDoc, HakoDocView};
 use crate::document::value::Value;
 use super::task::QueryTask;
 use crate::query::filter::Operator;
@@ -76,6 +76,7 @@ pub fn run_task(task: QueryTask) -> Vec<(String, HakoDoc)> {
     let blob_manager = storage_guard.blob_manager.as_ref();
 
     let optimized_plan = prepare_optimized_plan(&task.plan);
+    let proj_prefixes = crate::document::value::projection_prefixes(&task.plan.projection);
 
     for (id, pointer) in task.docs {
         // ponytail: same borrowed-Inlined fast path as execute() â€” decode
@@ -83,13 +84,13 @@ pub fn run_task(task: QueryTask) -> Vec<(String, HakoDoc)> {
         // blob inflation happens once below, concurrently (see execute()).
         match pointer {
             crate::storage::engine::Pointer::Inlined(shared) => {
-                decode_row(id, &shared, &task.plan, &optimized_plan, &mut out);
+                decode_row(id, &shared, &task.plan, &optimized_plan, &proj_prefixes, &mut out);
             }
             other => {
                 // ponytail: shared read (see run_task above) â€” decode
                 // borrows, no per-row clone.
                 if let Ok(Some(bytes)) = storage_guard.read_pointer_shared(&other) {
-                    decode_row(id, &bytes, &task.plan, &optimized_plan, &mut out);
+                    decode_row(id, &bytes, &task.plan, &optimized_plan, &proj_prefixes, &mut out);
                 }
             }
         }
@@ -118,11 +119,17 @@ fn decode_row(
     bytes: &[u8],
     plan: &crate::query::plan::QueryPlan,
     optimized_plan: &crate::query::plan::QueryPlan,
+    prefixes: &[&str],
     out: &mut Vec<(String, HakoDoc)>,
 ) {
     // CRITICAL FIX: If index handled everything, bypass `unified_match_decode` completely.
     // Skeletons only â€” the caller inflates once, concurrently (see above).
-    if plan.filters_satisfied_by_index {
+    if !plan.projection.is_empty() {
+        // issue #234: decode only projected/filter/order fields.
+        if let Some(doc) = unified_match_projected_doc(&id, bytes, optimized_plan, prefixes) {
+            out.push((id, doc));
+        }
+    } else if plan.filters_satisfied_by_index {
         if let Some(doc) = HakoDoc::decode(bytes) {
             out.push((id, doc));
         }
@@ -338,6 +345,63 @@ pub(crate) fn unified_match_projected(doc_id: &str, bytes: &[u8], plan: &crate::
     } else {
         None
     }
+}
+
+/// Projection-aware sibling of [`unified_match_decode`]: decode only the
+/// fields needed for filters/projection plus any ORDER BY field the executor
+/// still has to sort on. The engine's final materialization prunes the extra
+/// order fields from the returned document (issue #234).
+/// Lean path for index-satisfied filters: the index already verified every
+/// predicate, so skip the matcher entirely and decode only projected/order
+/// fields. Dotted projections are pruned later at materialization.
+fn decode_projected_fields(
+    bytes: &[u8],
+    plan: &crate::query::plan::QueryPlan,
+    prefixes: &[&str],
+) -> Option<HakoDoc> {
+    let view = HakoDocView::new(bytes)?;
+    let mut fields = Vec::with_capacity(plan.projection.len() + plan.order_by.len());
+    for (key, tag, data) in view.iter() {
+        if prefixes.contains(&key) || plan.order_by.iter().any(|o| o.field == key) {
+            if let Some(value) = crate::document::hako_doc::decode_value(tag, data) {
+                fields.push((crate::document::hako_doc::intern_field(key), value));
+            }
+        }
+    }
+    Some(HakoDoc { fields, _time: view._time })
+}
+
+pub(crate) fn unified_match_projected_doc(
+    doc_id: &str,
+    bytes: &[u8],
+    plan: &crate::query::plan::QueryPlan,
+    prefixes: &[&str],
+) -> Option<HakoDoc> {
+    if plan.filters_satisfied_by_index && plan.or_groups.is_empty() && plan.elem_match.is_empty() {
+        return decode_projected_fields(bytes, plan, prefixes);
+    }
+    let view = HakoDocView::new(bytes)?;
+    let mut fields = unified_match_projected(doc_id, bytes, plan)?;
+    for order in &plan.order_by {
+        let name = order.field.as_str();
+        if name == "id" || name == "_time" || fields.iter().any(|(key, _)| key == name) {
+            continue;
+        }
+        let found = view
+            .iter()
+            .find(|(key, _, _)| *key == name)
+            .and_then(|(_, tag, data)| crate::document::hako_doc::decode_value(tag, data));
+        if let Some(value) = found {
+            fields.push((name.to_string(), value));
+        }
+    }
+    Some(HakoDoc {
+        fields: fields
+            .into_iter()
+            .map(|(key, value)| (crate::document::hako_doc::intern_field(&key), value))
+            .collect(),
+        _time: view._time,
+    })
 }
 
 /// Internal helper to check ID and Timestamp without scanning document body.
