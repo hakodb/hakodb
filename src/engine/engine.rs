@@ -3849,10 +3849,30 @@ impl Hako {
         query: Query,
         cancel: Option<&CancelToken>,
     ) -> Result<Vec<(String, HakoDoc)>> {
+        let projection = query.projection.clone();
         Ok(self
             .query_rows(query, cancel)?
             .into_iter()
-            .map(|(id, row)| (id, row.into_doc()))
+            .map(|(id, row)| {
+                let mut doc = row.into_doc();
+                // Projection is a result-shaping contract: apply it after
+                // ranking/limit so planner fast lanes (TOPN, early exit,
+                // row cache, cursor bounds) keep their exact semantics.
+                // The dedicated projected executor is a separate API used
+                // by FFI/hakocli when index-only reads matter.
+                if !projection.is_empty() {
+                    let mut kept = Vec::with_capacity(doc.fields.len());
+                    for (field, value) in doc.fields {
+                        if let Some(pruned) =
+                            crate::document::value::prune_field_value(&value, &projection, &field)
+                        {
+                            kept.push((field, pruned));
+                        }
+                    }
+                    doc.fields = kept;
+                }
+                (id, doc)
+            })
             .collect())
     }
 
