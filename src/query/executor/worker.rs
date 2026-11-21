@@ -316,6 +316,11 @@ pub(crate) fn unified_match_projected(doc_id: &str, bytes: &[u8], plan: &crate::
     }
 
     let mut extracted = Vec::with_capacity(plan.projection.len());
+    // issue #235: _time lives in the document header, not the field body —
+    // emit it as a pseudo-field when requested so projected ORDER BY can sort on it.
+    if plan.projection.iter().any(|p| p == "_time") {
+        extracted.push(("_time".to_string(), Value::Int(view._time)));
+    }
     let proj_prefixes = crate::document::value::projection_prefixes(&plan.projection);
     for (key, tag, data) in view.iter() {
         let is_needed_for_filter = plan.filters.iter().any(|f| f.field == key) ||
@@ -382,6 +387,8 @@ pub(crate) fn unified_match_projected_doc(
     }
     let view = HakoDocView::new(bytes)?;
     let mut fields = unified_match_projected(doc_id, bytes, plan)?;
+    // _time is carried in HakoDoc._time; do not duplicate it as a field.
+    fields.retain(|(key, _)| key != "_time");
     for order in &plan.order_by {
         let name = order.field.as_str();
         if name == "id" || name == "_time" || fields.iter().any(|(key, _)| key == name) {
