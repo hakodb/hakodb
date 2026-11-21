@@ -10,6 +10,7 @@ use std::collections::HashSet;
 
 use hashbrown::HashMap;
 
+use crate::cancel::CancelToken;
 use crate::config::{DurabilityMode, HakoConfig};
 use crate::document::hako_doc::HakoDoc;
 use crate::document::value::Value;
@@ -35,6 +36,12 @@ macro_rules! safety_shield {
 pub struct HK_Engine {
     // db: Hako,
     db: std::sync::Arc<Hako>,
+}
+
+#[allow(non_camel_case_types)]
+/// Cooperative cancellation handle for `hk_query_execute_with_cancel`.
+pub struct HK_Cancel {
+    token: CancelToken,
 }
 
 pub enum DocRef {
@@ -2531,8 +2538,11 @@ pub extern "C" fn hk_query_select_field(query: *mut HK_Query, field: *const c_ch
     0
 }
 
-#[no_mangle]
-pub extern "C" fn hk_query_execute(engine: *mut HK_Engine, query: *const HK_Query) -> *mut c_char {
+fn hk_query_execute_inner(
+    engine: *mut HK_Engine,
+    query: *const HK_Query,
+    cancel: Option<&CancelToken>,
+) -> *mut c_char {
     safety_shield!(std::ptr::null_mut(), {
         if engine.is_null() || query.is_null() {
             set_last_error_err("null engine/query handle");
@@ -2546,7 +2556,7 @@ pub extern "C" fn hk_query_execute(engine: *mut HK_Engine, query: *const HK_Quer
         let rows_res: Result<Vec<serde_json::Value>, String> = if query_obj.projection.is_empty() {
             engine
                 .db
-                .query(query_obj)
+                .query_with_cancel(query_obj, cancel)
                 .map_err(|e| e.to_string())
                 .and_then(|rows| {
                     rows.into_iter()
@@ -2561,7 +2571,7 @@ pub extern "C" fn hk_query_execute(engine: *mut HK_Engine, query: *const HK_Quer
         } else {
             engine
                 .db
-                .query_projected_zero_copy(query_obj.clone(), &query_obj.projection)
+                .query_projected_with_cancel(query_obj.clone(), &query_obj.projection, cancel)
                 .map_err(|e| e.to_string())
                 .and_then(|rows| {
                     rows.into_iter()
@@ -2588,6 +2598,54 @@ pub extern "C" fn hk_query_execute(engine: *mut HK_Engine, query: *const HK_Quer
                 set_last_error_err(e);
                 ptr::null_mut()
             }
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn hk_query_execute(engine: *mut HK_Engine, query: *const HK_Query) -> *mut c_char {
+    hk_query_execute_inner(engine, query, None)
+}
+
+#[no_mangle]
+pub extern "C" fn hk_query_execute_with_cancel(
+    engine: *mut HK_Engine,
+    query: *const HK_Query,
+    cancel: *mut HK_Cancel,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if cancel.is_null() {
+            set_last_error_err("null cancel handle");
+            return ptr::null_mut();
+        }
+        let cancel = unsafe { &*cancel };
+        hk_query_execute_inner(engine, query, Some(&cancel.token))
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn hk_cancel_new() -> *mut HK_Cancel {
+    safety_shield!(std::ptr::null_mut(), {
+        Box::into_raw(Box::new(HK_Cancel { token: CancelToken::new() }))
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn hk_cancel(cancel: *mut HK_Cancel) {
+    safety_shield!((), {
+        if cancel.is_null() {
+            set_last_error_err("null cancel handle");
+            return;
+        }
+        unsafe { (*cancel).token.cancel(); }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn hk_cancel_free(cancel: *mut HK_Cancel) {
+    safety_shield!((), {
+        if !cancel.is_null() {
+            drop(unsafe { Box::from_raw(cancel) });
         }
     })
 }

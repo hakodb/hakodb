@@ -86,4 +86,20 @@ fn main() {
     measure("warm projected", true);
     measure("full", false);
     measure("projected", true);
+
+    // TOPN shape: unsorted ORDER BY + small limit over all candidates.
+    let topn_started = Instant::now();
+    for _ in 0..LOOPS {
+        let query = Query::new("bench")
+            .order_by("extra", false)
+            .select_fields(vec!["tenant".into(), "active".into()])
+            .limit(20);
+        let rows = db
+            .query_projected_zero_copy(query, &["tenant".into(), "active".into()])
+            .expect("topn query");
+        assert_eq!(rows.len(), 20, "topn: wrong row count");
+    }
+    let secs = topn_started.elapsed().as_secs_f64();
+    println!("projected TOPN: {} qps ({} loops in {:.3}s)",
+        (LOOPS as f64 / secs) as u64, LOOPS, secs);
 }
