@@ -215,6 +215,22 @@ pub(crate) fn prepare_optimized_plan(plan: &crate::query::plan::QueryPlan) -> cr
 /// bytes against the filter's encoding â€” zero allocation â€” and only rows
 /// that match pay for pass 2 (full decode). Non-matching rows previously paid
 /// a full decode (~15 allocs) just to be discarded.
+/// Shared final verdict for both decoders: dotted clauses and elemMatch are
+/// matcher passes, so they run only when the top-level verdict is not already
+/// proven (refactor; identical logic, no extra allocation).
+fn finish_match(
+    view: &HakoDocView<'_>,
+    plan: &crate::query::plan::QueryPlan,
+    bufs: &mut MatchScratch,
+    verified: bool,
+) -> bool {
+    let verified = verified || {
+        apply_dotted_filters(view, plan, &mut bufs.and_matches, &mut bufs.or_group_results);
+        validate_final_match(plan, &bufs.and_matches, &bufs.or_group_results)
+    };
+    verified && elem_match_pass(view, plan)
+}
+
 pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::query::plan::QueryPlan) -> Option<HakoDoc> {
     let view = HakoDocView::new(bytes)?;
 
@@ -292,14 +308,7 @@ pub(crate) fn unified_match_decode(doc_id: &str, bytes: &[u8], plan: &crate::que
     // Dotted filters decided post-scan when the top-level pass could not;
     // elemMatch clauses are matcher passes too â€” final verdict includes
     // them (any clause without a matching element rejects the row).
-    let verified = (verified
-        || {
-            apply_dotted_filters(&view, plan, &mut match_bufs.and_matches, &mut match_bufs.or_group_results);
-            validate_final_match(plan, &match_bufs.and_matches, &match_bufs.or_group_results)
-        })
-        && elem_match_pass(&view, plan);
-
-    if verified {
+    if finish_match(&view, plan, &mut match_bufs, verified) {
         Some(HakoDoc { fields, _time: view._time })
     } else {
         None
@@ -316,6 +325,11 @@ pub(crate) fn unified_match_projected(doc_id: &str, bytes: &[u8], plan: &crate::
     }
 
     let mut extracted = Vec::with_capacity(plan.projection.len());
+    // issue #237: _time lives in the document header, not the field body —
+    // emit it as a pseudo-field when requested so projected ORDER BY can sort on it.
+    if plan.projection.iter().any(|p| p == "_time") {
+        extracted.push(("_time".to_string(), Value::Int(view._time)));
+    }
     let proj_prefixes = crate::document::value::projection_prefixes(&plan.projection);
     for (key, tag, data) in view.iter() {
         let is_needed_for_filter = plan.filters.iter().any(|f| f.field == key) ||
@@ -336,11 +350,7 @@ pub(crate) fn unified_match_projected(doc_id: &str, bytes: &[u8], plan: &crate::
             }
         }
     }
-    apply_dotted_filters(&view, plan, &mut match_bufs.and_matches, &mut match_bufs.or_group_results);
-
-    if validate_final_match(plan, &match_bufs.and_matches, &match_bufs.or_group_results)
-        && elem_match_pass(&view, plan)
-    {
+    if finish_match(&view, plan, &mut match_bufs, false) {
         Some(extracted)
     } else {
         None
@@ -382,6 +392,8 @@ pub(crate) fn unified_match_projected_doc(
     }
     let view = HakoDocView::new(bytes)?;
     let mut fields = unified_match_projected(doc_id, bytes, plan)?;
+    // _time is carried in HakoDoc._time; do not duplicate it as a field.
+    fields.retain(|(key, _)| key != "_time");
     for order in &plan.order_by {
         let name = order.field.as_str();
         if name == "id" || name == "_time" || fields.iter().any(|(key, _)| key == name) {

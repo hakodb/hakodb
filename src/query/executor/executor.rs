@@ -1469,9 +1469,20 @@ impl ParallelQueryExecutor {
         &self,
         storage_arc: Arc<RwLock<StorageEngine>>,
         indexes: &IndexManager,
-        plan: QueryPlan,
+        mut plan: QueryPlan,
     ) -> Result<Vec<(String, Vec<(String, Value)>)>> {
         let _inflight = InflightGuard::take();
+        // issue #237: ORDER BY fields must be decoded even when they are
+        // outside the caller projection, otherwise the post-scan sort below
+        // compares missing values. Keep the original list to prune them at
+        // the end. _time is a header pseudo-field emitted by the decoder.
+        let original_projection = plan.projection.clone();
+        for order in &plan.order_by {
+            let field = order.field.as_str();
+            if !plan.projection.iter().any(|p| p == field) {
+                plan.projection.push(field.to_string());
+            }
+        }
         let docs: Vec<(String, Pointer)> = {
             // Explicitly set the type
             let storage = storage_arc.read().unwrap();
@@ -1610,6 +1621,13 @@ impl ParallelQueryExecutor {
         } else { results };
 
         if let Some(limit) = plan.limit { final_results.truncate(limit); }
+
+        if !original_projection.is_empty() {
+            let prefixes = crate::document::value::projection_prefixes(&original_projection);
+            for (_, fields) in final_results.iter_mut() {
+                fields.retain(|(key, _)| prefixes.contains(&key.as_str()));
+            }
+        }
 
         Ok(final_results)
     }
