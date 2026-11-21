@@ -4341,8 +4341,11 @@ impl Hako {
         Ok(visited)
     }
 
+    /// Single projected-query entry point for FFI, hakocli and Rust callers
+    /// that need the `(id, fields)` shape (issue #240). Shares the covering,
+    /// TOPN and cancellation machinery with `Hako::query()`.
     #[allow(clippy::type_complexity)]
-    pub fn query_projected_zero_copy(
+    pub fn query_projected(
         &self,
         query: Query,
         fields: &[String],
@@ -4350,7 +4353,17 @@ impl Hako {
         self.query_projected_with_cancel(query, fields, None)
     }
 
-    /// Projection-aware query with cooperative cancellation (issue #238).
+    /// Backward-compatible alias kept for existing callers.
+    #[allow(clippy::type_complexity)]
+    pub fn query_projected_zero_copy(
+        &self,
+        query: Query,
+        fields: &[String],
+    ) -> Result<Vec<(String, Vec<(String, Value)>)>> {
+        self.query_projected(query, fields)
+    }
+
+    /// Projection-aware query with cooperative cancellation (issue #240).
     #[allow(clippy::type_complexity)]
     pub fn query_projected_with_cancel(
         &self,

@@ -1,4 +1,4 @@
-//! FFI cancellation handle and projected-query cancellation (issue #238).
+//! FFI cancellation handle and projected-query cancellation (issue #240).
 
 use hakodb::config::{DurabilityMode, HakoConfig};
 use hakodb::document::hako_doc::HakoDoc;
