@@ -1470,8 +1470,10 @@ impl ParallelQueryExecutor {
         storage_arc: Arc<RwLock<StorageEngine>>,
         indexes: &IndexManager,
         mut plan: QueryPlan,
+        cancel: Option<&CancelToken>,
     ) -> Result<Vec<(String, Vec<(String, Value)>)>> {
         let _inflight = InflightGuard::take();
+        Self::check_cancel(cancel)?;
         // issue #237: ORDER BY fields must be decoded even when they are
         // outside the caller projection, otherwise the post-scan sort below
         // compares missing values. Keep the original list to prune them at
@@ -1582,6 +1584,7 @@ impl ParallelQueryExecutor {
                 }
             }
             for (id, _pointer) in docs_to_process {
+                Self::check_cancel(cancel)?;
                 results.push((id, template.clone()));
             }
         } else if doc_count <= 250 {
@@ -1591,6 +1594,7 @@ impl ParallelQueryExecutor {
             let optimized_plan = crate::query::executor::worker::prepare_optimized_plan(&plan);
 
             for (id, pointer) in docs_to_process {
+                Self::check_cancel(cancel)?;
                 // ponytail: shared read — projected match borrows, no clone.
                 if let Ok(Some(bytes)) = storage_guard.read_pointer_shared(&pointer) {
                     if let Some(mut fields) = crate::query::executor::worker::unified_match_projected(&id, &bytes, &optimized_plan) {
@@ -1606,6 +1610,7 @@ impl ParallelQueryExecutor {
                 }
             }
         } else {
+            Self::check_cancel(cancel)?;
             // SLOW PATH (Rayon Tasks)
             let optimal_workers = self.workers.min((doc_count / 500).max(1));
             let tasks = shard_tasks(docs_to_process, optimal_workers, plan.clone(), Some(storage_arc.clone()));

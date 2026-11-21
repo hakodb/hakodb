@@ -1,4 +1,4 @@
-﻿use std::collections::VecDeque;
+use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -3844,7 +3844,7 @@ impl Hako {
         self.query_with_cancel(query, None)
     }
 
-    fn query_with_cancel(
+    pub fn query_with_cancel(
         &self,
         query: Query,
         cancel: Option<&CancelToken>,
@@ -4347,6 +4347,18 @@ impl Hako {
         query: Query,
         fields: &[String],
     ) -> Result<Vec<(String, Vec<(String, Value)>)>> {
+        self.query_projected_with_cancel(query, fields, None)
+    }
+
+    /// Projection-aware query with cooperative cancellation (issue #238).
+    #[allow(clippy::type_complexity)]
+    pub fn query_projected_with_cancel(
+        &self,
+        query: Query,
+        fields: &[String],
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<(String, Vec<(String, Value)>)>> {
+        if let Some(token) = cancel { token.check()?; }
         // 1. Security Check
         if !self.allowed(&query.collection, AccessOp::Query) {
             return Err(self.deny(AccessOp::Query, &query.collection, None));
@@ -4364,7 +4376,7 @@ impl Hako {
         let plan = self.plan_cache.get_or_compute(&q, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
 
         // SIMPLE CALL: Worker handles blob resolution internally
-        let results = self.executor.execute_projected(shard_arc, &indexes, (*plan).clone())?;
+        let results = self.executor.execute_projected(shard_arc, &indexes, (*plan).clone(), cancel)?;
 
         // 5. Audit & Return
         self.record_audit(AuditEntry {
