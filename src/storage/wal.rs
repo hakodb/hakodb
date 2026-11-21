@@ -72,6 +72,42 @@ pub struct Wal {
 const STRICT_EMERGENCY_BYTES: usize = 16 * 1024 * 1024;
 
 #[inline]
+/// Validate WAL framing and CRC without replaying or repairing the file.
+/// Used by offline restore to refuse truncated/corrupt backups before the
+/// target directory is touched. Zero padding at the tail is accepted.
+pub fn validate_file(path: &Path) -> Result<()> {
+    let mut file = File::open(path)?;
+    let total = file.metadata()?.len();
+    let mut pos = 0u64;
+    loop {
+        if pos == total { return Ok(()); }
+        if total - pos < 8 {
+            return Err(HakoError::Corrupt(format!(
+                "truncated WAL header in {}", path.display()
+            )));
+        }
+        file.seek(SeekFrom::Start(pos))?;
+        let mut header = [0u8; 8];
+        file.read_exact(&mut header)?;
+        if is_zero_header(&header) { return Ok(()); }
+        let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+        let expected_crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        if len == 0 {
+            return Err(HakoError::Corrupt(format!("empty WAL record in {}", path.display())));
+        }
+        if ((total - pos - 8) as usize) < len {
+            return Err(HakoError::Corrupt(format!(
+                "truncated WAL record in {}", path.display()
+            )));
+        }
+        let mut payload = vec![0u8; len];
+        file.read_exact(&mut payload)?;
+        if crc32fast::hash(&payload) != expected_crc {
+            return Err(HakoError::Corrupt(format!("WAL CRC mismatch in {}", path.display())));
+        }
+        pos += 8 + len as u64;
+    }
+}
 fn is_zero_header(header: &[u8; 8]) -> bool {
     header.iter().all(|&b| b == 0)
 }

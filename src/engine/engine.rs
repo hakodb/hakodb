@@ -4563,6 +4563,78 @@ impl Hako {
         Ok(())
     }
 
+    /// Restore a backup produced by [`Self::backup`] into a fresh target.
+    ///
+    /// Offline operation: do not call this on an open `Hako` instance for the
+    /// same target. The target must be absent or empty (refuse by default).
+    /// The backup is fully validated (layout + WAL framing/CRC) before the
+    /// target is touched.
+    pub fn restore_backup(
+        backup_path: impl AsRef<Path>,
+        target_path: impl AsRef<Path>,
+    ) -> Result<()> {
+        let backup = backup_path.as_ref();
+        let target = target_path.as_ref();
+
+        if !backup.is_dir() {
+            return Err(HakoError::InvalidInput(format!(
+                "backup path is not a directory: {}", backup.display()
+            )));
+        }
+        if target.exists() && std::fs::read_dir(target)?.next().is_some() {
+            return Err(HakoError::InvalidInput(format!(
+                "restore target is not empty: {}", target.display()
+            )));
+        }
+
+        let mut collections: Vec<PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(backup)? {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            if ft.is_symlink() {
+                return Err(HakoError::Corrupt(format!(
+                    "backup contains a symlink: {}", entry.path().display()
+                )));
+            }
+            if ft.is_dir() {
+                collections.push(entry.path());
+            } else {
+                return Err(HakoError::Corrupt(format!(
+                    "unexpected file at backup root: {}", entry.path().display()
+                )));
+            }
+        }
+        if collections.is_empty() {
+            return Err(HakoError::Corrupt("backup contains no collections".into()));
+        }
+        for dir in &collections {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if entry.file_type()?.is_symlink()
+                    || entry.file_type()?.is_dir()
+                    || !(name.ends_with(".dat") || name == "wal.log")
+                {
+                    return Err(HakoError::Corrupt(format!(
+                        "unexpected backup entry: {}", entry.path().display()
+                    )));
+                }
+                if name == "wal.log" {
+                    crate::storage::wal::validate_file(&entry.path())?;
+                }
+            }
+        }
+
+        // Validation is complete; the target is still untouched. Copy the
+        // validated collections into it (no rename: on Windows a directory
+        // just opened by the engine cannot be renamed while handles linger).
+        std::fs::create_dir_all(target)?;
+        for dir in &collections {
+            copy_collection_dir(dir, &target.join(dir.file_name().unwrap_or_default()))?;
+        }
+        Ok(())
+    }
+
     fn allowed(&self, col: &str, op: AccessOp) -> bool {
         // ponytail: no-rules fast path without touching the lock.
         if !self.security_enabled.load(std::sync::atomic::Ordering::Relaxed) {
