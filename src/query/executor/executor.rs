@@ -1472,7 +1472,7 @@ impl ParallelQueryExecutor {
         mut plan: QueryPlan,
     ) -> Result<Vec<(String, Vec<(String, Value)>)>> {
         let _inflight = InflightGuard::take();
-        // issue #235: ORDER BY fields must be decoded even when they are
+        // issue #237: ORDER BY fields must be decoded even when they are
         // outside the caller projection, otherwise the post-scan sort below
         // compares missing values. Keep the original list to prune them at
         // the end. _time is a header pseudo-field emitted by the decoder.

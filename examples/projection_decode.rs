@@ -34,7 +34,7 @@ fn main() {
             doc.insert("extra", Value::Int(i as i64));
             for f in 0..8 {
                 doc.insert(
-                    &format!("pad{f}"),
+                    format!("pad{f}"),
                     Value::String(format!("{:0512}", i)),
                 );
             }

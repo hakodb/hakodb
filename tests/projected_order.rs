@@ -1,4 +1,4 @@
-//! Projected FFI path must sort on fields outside the projection (issue #235).
+//! Projected FFI path must sort on fields outside the projection (issue #237).
 
 use hakodb::config::{DurabilityMode, HakoConfig};
 use hakodb::document::hako_doc::HakoDoc;
