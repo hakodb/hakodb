@@ -1537,13 +1537,40 @@ impl ParallelQueryExecutor {
             if let Some(limit) = plan.limit { docs_to_process.truncate(limit); }
         }
         let doc_count = docs_to_process.len();
+        let prefixes = crate::document::value::projection_prefixes(&original_projection);
+        let covering = plan.covering_projection();
+
+        // TOPN parity: when ORDER BY is not served by the scan and the page
+        // is much smaller than the candidate set, reuse execute_topn — it
+        // decodes only the final page. Skip when a covering index exists:
+        // an index-only read is cheaper than any heap, and we must not lose
+        // the F6 zero-decode lane (issue #237 follow-up).
+        let topn = !plan.order_by.is_empty()
+            && !plan.order_by_satisfied
+            && !plan.has_cursor_bounds
+            && covering.is_none()
+            && matches!(plan.limit, Some(l) if l < doc_count);
+        if topn {
+            let rows = self.execute_topn(storage_arc, &plan, docs_to_process, None)?;
+            return Ok(rows.into_iter().map(|(id, doc)| {
+                let time = doc._time;
+                let mut fields: Vec<(String, Value)> = doc.fields.into_iter()
+                    .filter(|(key, _)| prefixes.contains(&key.as_ref()))
+                    .map(|(key, value)| (key.to_string(), value))
+                    .collect();
+                if original_projection.iter().any(|p| p == "_time") {
+                    fields.push(("_time".to_string(), Value::Int(time)));
+                }
+                (id, fields)
+            }).collect());
+        }
 
         // --- INDEX-ONLY (covering) PATH: hakodb#71 F6 -------------------
         // Filters, order and projection are all covered by the composite
         // point scan, so every field value is already in the plan: no
         // document is read or decoded. Rows still come from the scan
         // (liveness/tombstones included).
-        if let Some(mut template) = plan.covering_projection() {
+        if let Some(mut template) = covering {
             {
                 let storage_guard = storage_arc.read().unwrap();
                 if let Some(ref manager) = storage_guard.blob_manager {
@@ -1623,7 +1650,6 @@ impl ParallelQueryExecutor {
         if let Some(limit) = plan.limit { final_results.truncate(limit); }
 
         if !original_projection.is_empty() {
-            let prefixes = crate::document::value::projection_prefixes(&original_projection);
             for (_, fields) in final_results.iter_mut() {
                 fields.retain(|(key, _)| prefixes.contains(&key.as_str()));
             }
