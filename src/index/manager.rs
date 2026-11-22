@@ -31,6 +31,8 @@ pub struct IndexManager {
     /// snapshotted); deletes clean both directions, overwrites dedupe +
     /// verify-at-query.
     pub traverse: BacklinkIndex,
+    /// #243: sampled per-field cardinality, derived (never snapshotted).
+    pub field_stats: std::sync::RwLock<crate::query::field_stats::FieldStats>,
 }
 
 /// WAL tails at snapshot time, per collection: (wal data_len, wal

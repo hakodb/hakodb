@@ -1,4 +1,4 @@
-﻿use super::filter::{Filter, Operator};
+use super::filter::{Filter, Operator};
 use super::plan::{QueryPlan, ScanType};
 use super::query::Query;
 use crate::document::value::Value;
