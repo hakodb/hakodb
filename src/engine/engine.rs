@@ -983,6 +983,10 @@ pub struct ExplainReport {
     /// Index definitions that exist on the collection (candidates the
     /// planner could have used — "why didn't my index run?").
     pub available_indexes: Vec<String>,
+    /// #243: estimated fraction of rows matching each equality filter.
+    pub estimated_selectivity: Vec<(String, f64)>,
+    /// #243: why this scan was chosen.
+    pub plan_reason: String,
 }
 
 impl std::fmt::Display for ExplainReport {
@@ -3904,6 +3908,52 @@ impl Hako {
     /// The single query funnel (plan cache, traverse branch, audit): returns
     /// the executor's `RowRef` rows so the owned and arc wrappers above share
     /// one implementation.
+    /// #243: build a bounded sample of field cardinality once per collection.
+    /// Deterministic scan order, capped at 4096 docs; writes keep it fresh.
+    fn ensure_field_stats(
+        &self,
+        collection: &str,
+        shard_arc: &std::sync::Arc<std::sync::RwLock<crate::storage::engine::StorageEngine>>,
+    ) -> Result<()> {
+        let needs = self
+            .indexes
+            .read()
+            .unwrap()
+            .field_stats
+            .read()
+            .unwrap()
+            .needs_rebuild(collection);
+        if !needs {
+            return Ok(());
+        }
+        let mut sample = crate::query::field_stats::FieldStats::default();
+        {
+            let storage = shard_arc.read().unwrap();
+            for key in storage.scan_prefix_keys("").into_iter().take(4096) {
+                if let Some(ptr) = storage.index.get(&key) {
+                    if let Ok(Some(bytes)) = storage.read_pointer_shared(ptr) {
+                        if let Some(doc) = HakoDoc::decode(&bytes) {
+                            for (field, value) in &doc.fields {
+                                sample.observe(collection, field, value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let indexes = self.indexes.write().unwrap();
+        let mut stats = indexes.field_stats.write().unwrap();
+        if stats.needs_rebuild(collection) {
+            if !sample.is_empty() {
+            for ((col, field), stat) in sample.entries() {
+                if stats.has_field(col, field) { continue; }
+                stats.import(col, field, stat);
+            }
+            }
+            stats.mark_rebuilt(collection);
+        }
+        Ok(())
+    }
     fn query_rows(
         &self,
         query: Query,
@@ -3988,6 +4038,7 @@ impl Hako {
             return Err(HakoError::Corrupt("Denied".into()));
         }
         let shard_arc = self.get_shard(&query.collection)?;
+        self.ensure_field_stats(&query.collection, &shard_arc)?;
         let indexes = self.indexes.read().unwrap();
         let rows = shard_arc.read().unwrap().count_prefix("");
         let is_ready = self.index_query_ready(&query.collection);
@@ -4022,7 +4073,28 @@ impl Hako {
             available.push(format!("composite_index({})", fields.join(",")));
         }
         available.sort();
-        drop(indexes);
+        let stats = indexes.field_stats.read().unwrap();
+        let estimated_selectivity = plan
+            .filters
+            .iter()
+            .filter(|f| f.op == crate::query::filter::Operator::Eq)
+            .map(|f| {
+                let selectivity = stats
+                    .equality_selectivity(&plan.collection, &f.field, rows)
+                    .unwrap_or(1.0);
+                (f.field.clone(), selectivity)
+            })
+            .collect();
+        let plan_reason = match &plan.scan {
+            crate::query::plan::ScanType::CompositeIndex { .. }
+            | crate::query::plan::ScanType::CompositeIndexRange { .. } => "composite-index",
+            crate::query::plan::ScanType::SecondaryIndex { .. } => "secondary-posting",
+            crate::query::plan::ScanType::SortedKeys { .. } => "sorted-keys",
+            crate::query::plan::ScanType::FullCollection => "full-scan",
+            _ => "specialized-scan",
+        }
+        .to_string();
+        drop(stats);
         Ok(ExplainReport {
             collection: plan.collection.clone(),
             scan: plan.scan.describe(),
@@ -4038,6 +4110,8 @@ impl Hako {
             projection: plan.projection.clone(),
             covering: plan.covering_projection().is_some(),
             available_indexes: available,
+            estimated_selectivity,
+            plan_reason,
         })
     }
 
