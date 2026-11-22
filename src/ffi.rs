@@ -1970,6 +1970,23 @@ pub extern "C" fn hk_query_new(collection: *const c_char) -> *mut HK_Query {
     }))
 }
 
+/// #250: reuse an existing query handle by resetting it to a fresh Query
+/// for `collection`. Avoids query_new/query_free per request in SDK pools.
+#[no_mangle]
+pub extern "C" fn hk_query_reset(query: *mut HK_Query, collection: *const c_char) -> i32 {
+    safety_shield!(-1, {
+        if query.is_null() {
+            return set_last_error_err("null query handle");
+        }
+        let collection = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => { return set_last_error_err(e); }
+        };
+        clear_last_error();
+        unsafe { (*query).query = Query::new(&collection); }
+        0
+    })
+}
 #[no_mangle]
 pub extern "C" fn hk_query_free(query: *mut HK_Query) {
     if !query.is_null() {
