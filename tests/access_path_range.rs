@@ -75,3 +75,26 @@ fn filter_index_with_order_by_still_correct() {
         assert_eq!(doc.get("category"), Some(&Value::String("alpha".into())));
     }
 }
+
+#[test]
+fn filter_index_with_order_uses_filter_posting() {
+    let path = dir("filter-topn");
+    let db = setup(&path);
+    let query = Query::new("records")
+        .where_filter("category", Operator::Eq, Value::String("alpha".into()))
+        .order_by("score", true)
+        .limit(10);
+    let plan = db.explain(query.clone()).expect("explain");
+    assert!(matches!(plan.scan, hakodb::query::plan::ScanType::SecondaryIndex { .. }),
+        "expected filter index, got {:?}", plan.scan);
+    assert!(!plan.order_by_satisfied, "TopN must sort, not the index scan");
+
+    let rows = db.query(query).expect("query");
+    assert_eq!(rows.len(), 10);
+    let mut scores = Vec::new();
+    for (_, doc) in &rows {
+        assert_eq!(doc.get("category"), Some(&Value::String("alpha".into())));
+        scores.push(match doc.get("score") { Some(Value::Int(v)) => *v, o => panic!("{o:?}") });
+    }
+    assert!(scores.windows(2).all(|w| w[0] <= w[1]), "scores must be sorted: {scores:?}");
+}

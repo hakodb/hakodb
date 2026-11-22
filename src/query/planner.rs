@@ -271,6 +271,40 @@ impl QueryPlanner {
                 // Unsupported anchor shape: fall through to the composite
                 // loop below (end bounds / exotic values).
             }
+            // #250 follow-up: cost-based choice — when a single equality
+            // filter has a secondary index and ORDER BY is on another field,
+            // ride the (small) filter posting and let the executor TopN-sort
+            // the final page. This beats scanning the whole ORDER BY index
+            // and verifying the filter afterwards.
+            if query.limit.is_some()
+                && query.or_groups.is_empty() && query.elem_match.is_empty()
+                && query.filters.len() == 1
+                && query.start_at.is_none() && query.start_after.is_none()
+                && query.end_at.is_none() && query.end_before.is_none()
+            {
+                let f = &query.filters[0];
+                if f.op == Operator::Eq && f.field != first_order.field && f.field != "id" {
+                    let ambiguous = matches!(&f.value, Value::String(s) if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok());
+                    if !ambiguous {
+                        if let Some(sec_map) = indexes.secondary.get(&query.collection) {
+                            if let Some(sec) = sec_map.get(&f.field) {
+                                let val_bytes = crate::index::index_key::encode_scalar(&f.value);
+                                let posting = sec.get_map().get(&val_bytes).map(|s| s.len()).unwrap_or(0);
+                                if posting > 0 {
+                                    return Self::make_plan(
+                                        query,
+                                        ScanType::SecondaryIndex { field: f.field.clone(), value: val_bytes },
+                                        None, // no scan truncation: executor TOPN needs the full page
+                                        false, // order satisfied by TopN sort, not the scan
+                                        true,  // Eq filter pinned by the index key
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Check Composite Indices for both Cursors AND pure OrderBy Pagination
             for idx in indexes.indexes_for_collection(&query.collection) {
                 if !Self::composite_def_usable(&idx.definition, query) {
