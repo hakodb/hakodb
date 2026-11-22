@@ -290,6 +290,7 @@ impl QueryPlanner {
                             if let Some(sec) = sec_map.get(&f.field) {
                                 let val_bytes = crate::index::index_key::encode_scalar(&f.value);
                                 let posting = sec.get_map().get(&val_bytes).map(|s| s.len()).unwrap_or(0);
+                                eprintln!("COST lane: field={} posting={} limit={:?}", f.field, posting, query.limit);
                                 if posting > 0 {
                                     return Self::make_plan(
                                         query,
