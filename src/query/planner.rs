@@ -228,6 +228,20 @@ impl QueryPlanner {
         }
         }
 
+        // #250 follow-up: composite prefix equality + order/range. When a
+        // composite index starts with an equality-filtered field and the next
+        // field is the ORDER BY field, it satisfies both filter and order and
+        // must win over P3's "order index only" choice. This is the exact
+        // shape of `tenant = ? AND score >= ? ORDER BY score`.
+        if use_index_heuristic && query.or_groups.is_empty() {
+            if let Some((range_scan, order_ok)) = Self::try_composite_prefix_order(query, indexes) {
+                let safe_limit = if order_ok {
+                    query.limit.map(|l| l + query.offset.unwrap_or(0))
+                } else { None };
+                return Self::make_plan(query, range_scan, safe_limit, order_ok, false);
+            }
+        }
+
         // 3. PRIORITY 3: Range / Cursor / Pure Pagination Detection
         if let Some(first_order) = query.order_by.first() {
             // PONYTAIL: special-case the `id` field. When the user orders by
@@ -257,6 +271,40 @@ impl QueryPlanner {
                 // Unsupported anchor shape: fall through to the composite
                 // loop below (end bounds / exotic values).
             }
+            // #250 follow-up: cost-based choice — when a single equality
+            // filter has a secondary index and ORDER BY is on another field,
+            // ride the (small) filter posting and let the executor TopN-sort
+            // the final page. This beats scanning the whole ORDER BY index
+            // and verifying the filter afterwards.
+            if query.limit.is_some()
+                && query.or_groups.is_empty() && query.elem_match.is_empty()
+                && query.filters.len() == 1
+                && query.start_at.is_none() && query.start_after.is_none()
+                && query.end_at.is_none() && query.end_before.is_none()
+            {
+                let f = &query.filters[0];
+                if f.op == Operator::Eq && f.field != first_order.field && f.field != "id" {
+                    let ambiguous = matches!(&f.value, Value::String(s) if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok());
+                    if !ambiguous {
+                        if let Some(sec_map) = indexes.secondary.get(&query.collection) {
+                            if let Some(sec) = sec_map.get(&f.field) {
+                                let val_bytes = crate::index::index_key::encode_scalar(&f.value);
+                                let posting = sec.get_map().get(&val_bytes).map(|s| s.len()).unwrap_or(0);
+                                if posting > 0 {
+                                    return Self::make_plan(
+                                        query,
+                                        ScanType::SecondaryIndex { field: f.field.clone(), value: val_bytes },
+                                        None, // no scan truncation: executor TOPN needs the full page
+                                        false, // order satisfied by TopN sort, not the scan
+                                        true,  // Eq filter pinned by the index key
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Check Composite Indices for both Cursors AND pure OrderBy Pagination
             for idx in indexes.indexes_for_collection(&query.collection) {
                 if !Self::composite_def_usable(&idx.definition, query) {
@@ -308,19 +356,33 @@ impl QueryPlanner {
             // Secondary Index Range Fallback
             if let Some(sec_map) = indexes.secondary.get(&query.collection) {
                 if sec_map.contains_key(&first_order.field) {
+                    // #250 follow-up: derive index bounds from filter
+                    // ranges on the order field (e.g. `score BETWEEN a AND b
+                    // ORDER BY score`). Existing cursor bounds still win if
+                    // present (they are explicit user pagination).
+                    let (filter_start, filter_end) = Self::secondary_filter_bounds(query, &first_order.field);
                     let start = match (&query.start_at, &query.start_after) {
                         (Some(v), _) if !v.is_empty() => Bound::Included(crate::index::index_key::encode_scalar(&v[0])),
                         (_, Some(v)) if !v.is_empty() => Bound::Excluded(crate::index::index_key::encode_scalar(&v[0])),
-                        _ => Bound::Unbounded,
+                        _ => filter_start,
                     };
                     let end = match (&query.end_at, &query.end_before) {
                         (Some(v), _) if !v.is_empty() => Bound::Included(crate::index::index_key::encode_scalar(&v[0])),
                         (_, Some(v)) if !v.is_empty() => Bound::Excluded(crate::index::index_key::encode_scalar(&v[0])),
-                        _ => Bound::Unbounded,
+                        _ => filter_end,
                     };
 
                     let order_satisfied = query.order_by.len() == 1;
-                    let filters_empty = query.filters.is_empty() && query.or_groups.is_empty();
+                    let mut filters_empty = query.filters.is_empty() && query.or_groups.is_empty();
+                    // A single range filter fully expressed as index bounds
+                    // is satisfied by the scan (same encoded-key domain).
+                    if !filters_empty && order_satisfied && query.or_groups.is_empty()
+                        && query.elem_match.is_empty()
+                        && query.filters.iter().all(|f| f.field == first_order.field
+                            && matches!(f.op, Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte))
+                    {
+                        filters_empty = true;
+                    }
                     let safe_limit = if order_satisfied && filters_empty {
                         query.limit.map(|l| l + query.offset.unwrap_or(0))
                     } else { None };
@@ -726,6 +788,79 @@ impl QueryPlanner {
         }
     }
 
+
+    /// #250: encoded index bounds implied by equality/range filters on a
+    /// single field. Used to push `score >= a AND score <= b` into the
+    /// secondary index range instead of scanning every key.
+    fn secondary_filter_bounds(
+        query: &Query,
+        field: &str,
+    ) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
+        let mut start = Bound::Unbounded;
+        let mut end = Bound::Unbounded;
+        for f in &query.filters {
+            if f.field != field || query.or_groups.iter().any(|g| g.iter().any(|x| x.field == field)) {
+                continue;
+            }
+            let key = crate::index::index_key::encode_scalar(&f.value);
+            match f.op {
+                Operator::Eq => {
+                    start = Bound::Included(key.clone());
+                    end = Bound::Included(key);
+                }
+                Operator::Gt => start = Bound::Excluded(key),
+                Operator::Gte => start = Bound::Included(key),
+                Operator::Lt => end = Bound::Excluded(key),
+                Operator::Lte => end = Bound::Included(key),
+                _ => {}
+            }
+        }
+        (start, end)
+    }
+
+    /// #250: composite `(eq_prefix..., order_field)` with a single range
+    /// filter on the order field. Returns (scan, order_satisfied).
+    fn try_composite_prefix_order(
+        query: &Query,
+        indexes: &IndexManager,
+    ) -> Option<(ScanType, bool)> {
+        let first_order = query.order_by.first()?;
+        if query.filters.len() < 2 || !query.or_groups.is_empty() { return None; }
+        for idx in indexes.indexes_for_collection(&query.collection) {
+            if !Self::composite_def_usable(&idx.definition, query) { continue; }
+            let fields = &idx.definition.fields;
+            if fields.len() < 2 { continue; }
+            // Every field before the order field must have an Eq filter.
+            let order_pos = fields.iter().position(|f| f.field == first_order.field)?;
+            if order_pos == 0 || order_pos + 1 > fields.len() { continue; }
+            let mut eq_prefix = Vec::new();
+            let mut ok = true;
+            for f in &fields[..order_pos] {
+                match query.filters.iter().find(|qf| qf.field == f.field) {
+                    Some(qf) if qf.op == Operator::Eq => eq_prefix.push(qf.value.clone()),
+                    _ => { ok = false; break; }
+                }
+            }
+            if !ok { continue; }
+            // The order field must carry exactly one range/Eq filter so the
+            // index range pins it; otherwise fall through to the old path.
+            let of = query.filters.iter().find(|qf| qf.field == first_order.field)?;
+            if !matches!(of.op, Operator::Eq | Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte) { continue; }
+            // Direction: composite range scans ascending; matching ascending
+            // order is satisfied, descending would need a reverse scan (not
+            // yet supported for composite ranges) so leave order unsatisfied.
+            let order_ok = first_order.ascending && idx.definition.fields[order_pos].direction == SortDirection::Asc;
+            let mut range_query = query.clone();
+            // Reuse P4's range construction on a query limited to the eq + range filters.
+            range_query.filters = query.filters.iter()
+                .filter(|f| fields.iter().any(|idx_f| idx_f.field == f.field))
+                .cloned().collect();
+            if let Some(scan) = Self::try_plan_composite_range(&range_query, indexes) {
+                return Some((scan, order_ok));
+            }
+        }
+        None
+    }
 
     fn try_plan_composite_range(query: &Query, indexes: &IndexManager) -> Option<ScanType> {
 
