@@ -6,7 +6,7 @@ use hakodb::document::value::Value;
 use hakodb::engine::{BatchMutation, Hako};
 use hakodb::ffi::{
     hk_cancel, hk_cancel_free, hk_cancel_new, hk_doc_free, hk_doc_insert_str, hk_doc_new,
-    hk_engine_free, hk_engine_insert, hk_engine_open, hk_query_execute, hk_query_execute_with_cancel, hk_query_free, hk_query_reset, hk_query_new,
+    hk_engine_free, hk_engine_insert, hk_engine_open, hk_query_execute_ex, hk_query_free, hk_query_reset, hk_query_new,
     hk_string_free, HK_Engine,
 };
 use hakodb::query::query::Query;
@@ -39,7 +39,7 @@ fn ffi_cancel_token_aborts_query() {
     let token = hk_cancel_new();
     assert!(!token.is_null(), "cancel handle");
     let query = hk_query_new(c"users".as_ptr());
-    let json = hk_query_execute_with_cancel(engine, query, token);
+    let json = hk_query_execute_ex(engine, query, token);
     assert!(!json.is_null(), "query with live cancel token must succeed");
     let text = unsafe { CStr::from_ptr(json) }.to_string_lossy().into_owned();
     assert!(text.contains("alice"), "{text}");
@@ -49,7 +49,7 @@ fn ffi_cancel_token_aborts_query() {
     // Cancelled token: query aborts cooperatively.
     hk_cancel(token);
     let query = hk_query_new(c"users".as_ptr());
-    let json = hk_query_execute_with_cancel(engine, query, token);
+    let json = hk_query_execute_ex(engine, query, token);
     assert!(json.is_null(), "cancelled query must return null");
     hk_query_free(query);
     hk_cancel_free(token);
@@ -108,7 +108,7 @@ fn query_handle_reset_reuses_one_allocation() {
     assert!(!query.is_null());
     for _ in 0..3 {
         assert_eq!(hk_query_reset(query, c"users".as_ptr()), 0, "reset must succeed");
-        let json = hk_query_execute(engine, query);
+        let json = hk_query_execute_ex(engine, query, std::ptr::null_mut());
         assert!(!json.is_null(), "reset query must execute");
         let text = unsafe { CStr::from_ptr(json) }.to_string_lossy().into_owned();
         assert!(text.contains("alice"), "{text}");

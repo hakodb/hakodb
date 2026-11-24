@@ -20,6 +20,10 @@
 
 `hk_query_reset` reuses a handle and avoids re-allocation. `hk_view_*` gives typed field access without building a document. Together with `execute_to_handles`/`execute_raw` these are the low-allocation paths.
 
+## Deprecation status
+
+`hk_query_execute` and `hk_query_execute_with_cancel` are legacy compatibility wrappers and are marked deprecated in source/header comments. Prefer `hk_query_execute_ex` for API calls. They are **not** removed: no breaking major release is planned yet, and the generated C header carries advisory comments rather than compiler attributes.
+
 ## Rules for benchmarking
 
 - `benchmark.cpp` measures `hk_query_execute_to_handles` (plus `hk_doc_to_json` in its JSON-render lane). It does **not** measure `hk_query_execute` / `hk_query_execute_json`.

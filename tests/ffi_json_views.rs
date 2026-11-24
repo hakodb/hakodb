@@ -12,7 +12,7 @@ use hakodb::document::value::Value;
 use hakodb::engine::Hako;
 use hakodb::ffi::{
     hk_cursor_walk_json, hk_doc_to_json, hk_engine_await_quiescent, hk_engine_free,
-    hk_engine_get, hk_engine_get_json, hk_engine_open, hk_last_error, hk_query_execute,
+    hk_engine_get, hk_engine_get_json, hk_engine_open, hk_last_error, hk_query_execute_ex,
     hk_query_execute_json, hk_query_free, hk_query_new, hk_query_select_field, hk_string_free,
     hk_view_free, hk_view_get, hk_view_get_bytes, hk_view_get_path_bool,
     hk_view_get_path_bytes, hk_view_get_path_float, hk_view_get_path_int,
@@ -206,7 +206,7 @@ fn query_json_matches_execute_and_walk_json_visits_rows() {
 
     let q = hk_query_new(col.as_ptr());
     assert!(!q.is_null());
-    let owned = take_string(hk_query_execute(eng, q));
+    let owned = take_string(hk_query_execute_ex(eng, q, std::ptr::null_mut()));
     let fast = take_string(hk_query_execute_json(eng, q));
     assert_eq!(fast, owned, "query_json must match query_execute bytes");
 
@@ -240,7 +240,7 @@ fn query_json_matches_execute_and_walk_json_visits_rows() {
     // delegates when a projection is set).
     let field = cstr("short");
     assert_eq!(hk_query_select_field(q, field.as_ptr()), 0);
-    let owned = take_string(hk_query_execute(eng, q));
+    let owned = take_string(hk_query_execute_ex(eng, q, std::ptr::null_mut()));
     let fast = take_string(hk_query_execute_json(eng, q));
     assert_eq!(fast, owned, "projection bytes must match");
 
