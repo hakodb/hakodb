@@ -79,7 +79,7 @@ See [`example/rust/basic`](example/rust/basic) for a complete runnable project.
 
 Flat C API over opaque handles (`HK_Engine`, `HK_Doc`, `HK_Query`, `HK_Batch`, `HK_Transaction`, `HK_Watch`, `HK_ResultSet`, sync handles): CRUD, batches, transactions, queries, watch, result sets, sync. Build outputs: `target/release/libhakodb.so` (Linux), `.dylib` (macOS), `hakodb.dll` (Windows) + per-target `hakodb.h`.
 
-See [docs/ffi-query-lanes.md](docs/ffi-query-lanes.md) before choosing a query execution function: the seven `hk_query_execute*` entry points differ in what they materialize, and only `execute_to_handles` matches `benchmark.cpp`.
+Use `hk_query_execute_ex` as the canonical query executor; existing execute entry points remain for compatibility but are advisory-deprecated. See [docs/ffi-query-lanes.md](docs/ffi-query-lanes.md) for the materialization trade-offs — the entry points differ in what they return, and only `execute_to_handles` matches `benchmark.cpp`.
 
 ```bash
 cargo build --release                                   # full (sync + compression)
