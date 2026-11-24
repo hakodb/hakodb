@@ -4201,9 +4201,13 @@ impl Hako {
     /// Raw scan: storage-encoded bytes instead of decoded docs. Same
     /// admission path as [`Self::query`] (security, plan cache, audit);
     /// execution stops after the index walk â€” see
-    /// `ParallelQueryExecutor::execute_raw` for the contract (opaque bytes,
-    /// index-satisfied filters/ordering required). Sets `query.raw` so the
-    /// plan-cache key can't collide with a decoded query of the same shape.
+    /// `ParallelQueryExecutor::execute_raw` for the contract (opaque bytes).
+    /// Index-satisfied filters/ordering take the historical lane. A residual
+    /// predicate may also be decided on the borrowed encoding when the full
+    /// ordered stream is available and every predicate is a byte-safe `Eq`;
+    /// shapes outside that gate keep the old `QueryError`. Sets `query.raw`
+    /// so the plan-cache key can't collide with a decoded query of the same
+    /// shape.
     pub fn query_raw(&self, mut query: Query) -> Result<Vec<(String, std::sync::Arc<Vec<u8>>)>> {
         query.raw = true;
         if !self.allowed(&query.collection, AccessOp::Query) {
