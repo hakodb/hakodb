@@ -413,8 +413,11 @@ mod simd {
         let lo = _mm256_extracti128_si256::<0>(acc);
         let hi = _mm256_extracti128_si256::<1>(acc);
         let p = _mm_add_epi32(lo, hi);
-        let p2 = _mm_add_epi32(p, _mm_shuffle_epi32::<0b01_01_01_01>(p));
-        let p3 = _mm_add_epi32(p2, _mm_shuffle_epi32::<0b10_10_10_10>(p2));
+        // Swap opposite halves (0x4e), then adjacent lanes (0xb1):
+        // lane0 = (p0+p2)+(p1+p3). Uniform immediates here broadcast one
+        // lane instead of swapping, which double-counted p1 (issue #255).
+        let p2 = _mm_add_epi32(p, _mm_shuffle_epi32::<0b01_00_11_10>(p));
+        let p3 = _mm_add_epi32(p2, _mm_shuffle_epi32::<0b10_11_00_01>(p2));
         let mut tot = _mm_cvtsi128_si32(p3) as i64;
         while i < n {
             tot += a[i] as i64 * b[i] as i64;

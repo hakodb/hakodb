@@ -5,6 +5,7 @@ pub mod field_stats;
 pub mod filter;
 pub mod order;
 pub mod plan;
+pub mod match_key;
 pub mod plan_cache;
 pub mod planner;
 #[allow(clippy::module_inception)]
