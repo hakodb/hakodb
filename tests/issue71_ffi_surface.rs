@@ -13,7 +13,7 @@ use hakodb::ffi::{
     hk_engine_get_versioned, hk_engine_insert, hk_engine_open, hk_error_is_retryable,
     hk_error_last_kind, hk_last_error, hk_pipeline_execute, hk_pipeline_execute_to_handles,
     hk_pipeline_free, hk_pipeline_group, hk_pipeline_limit, hk_pipeline_match, hk_pipeline_new,
-    hk_pipeline_sort, hk_pipeline_unwind, hk_query_execute, hk_query_explain, hk_query_free,
+    hk_pipeline_sort, hk_pipeline_unwind, hk_query_execute_ex, hk_query_explain, hk_query_free,
     hk_query_new, hk_query_where_array_all_eq, hk_query_where_elem_match, hk_result_set_count,
     hk_result_set_free, hk_string_free, hk_transaction_begin, hk_transaction_commit,
     hk_transaction_free, hk_transaction_get, hk_transaction_get_many, hk_transaction_patch, HK_Engine,
@@ -108,7 +108,7 @@ fn elem_match_and_all_eq_through_ffi() {
     let filters = cstr(r#"[{"field":"sku","op":"eq","value":"B"},{"field":"qty","op":"gt","value":2}]"#);
     let rc = { hk_query_where_elem_match(q, cstr("items").as_ptr(), filters.as_ptr()) };
     assert_eq!(rc, 0, "elem_match: {}", last_error());
-    let rows = take_json(hk_query_execute(eng, q));
+    let rows = take_json(hk_query_execute_ex(eng, q, std::ptr::null_mut()));
     assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
     assert_eq!(rows[0]["name"], "o1");
 
@@ -121,7 +121,7 @@ fn elem_match_and_all_eq_through_ffi() {
     let all = { hk_query_new(cstr("orders").as_ptr()) };
     let rc = { hk_query_where_array_all_eq(all, cstr("tags").as_ptr(), cstr("\"x\"").as_ptr()) };
     assert_eq!(rc, 0, "all_eq: {}", last_error());
-    let rows = take_json(hk_query_execute(eng, all));
+    let rows = take_json(hk_query_execute_ex(eng, all, std::ptr::null_mut()));
     assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
     assert_eq!(rows[0]["name"], "o1", "empty tags fail closed, x+y excluded");
 

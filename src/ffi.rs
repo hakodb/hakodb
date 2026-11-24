@@ -2619,15 +2619,11 @@ fn hk_query_execute_inner(
     })
 }
 
-/// Execute a query and return a JSON array string (`char*`); free with
-/// `hk_string_free`. This path fully decodes each `HakoDoc` before
-/// serializing. For JSON egress prefer `hk_query_execute_json` (pinned-byte
-/// writer); for engine-only throughput use `hk_query_execute_to_handles`.
-/// See `docs/ffi-query-lanes.md`.
 /// Canonical execution entry point: same JSON output as `hk_query_execute`,
 /// with an optional `HK_Cancel*` (`NULL` means no cancellation). New callers
 /// should use this; `hk_query_execute` and `hk_query_execute_with_cancel`
 /// remain as compatibility wrappers. Free with `hk_string_free`.
+/// See `docs/ffi-query-lanes.md`.
 #[no_mangle]
 pub extern "C" fn hk_query_execute_ex(
     engine: *mut HK_Engine,
@@ -2644,14 +2640,17 @@ pub extern "C" fn hk_query_execute_ex(
     })
 }
 
+/// Legacy JSON executor: fully decodes each `HakoDoc` before serializing.
+/// Deprecated in favour of `hk_query_execute_ex`; see `docs/ffi-query-lanes.md`.
+#[deprecated(since = "0.23.0", note = "use hk_query_execute_ex")]
 #[no_mangle]
 pub extern "C" fn hk_query_execute(engine: *mut HK_Engine, query: *const HK_Query) -> *mut c_char {
     hk_query_execute_ex(engine, query, std::ptr::null_mut())
 }
 
-/// Cancellable variant of `hk_query_execute`: same JSON output and same
-/// decode-then-serialize cost, with an `HK_Cancel*` token. Free with
-/// `hk_string_free`. Compatibility wrapper; prefer `hk_query_execute_ex`.
+/// Legacy cancellable JSON executor, kept as a compatibility wrapper.
+/// Deprecated in favour of `hk_query_execute_ex` (which accepts `NULL`).
+#[deprecated(since = "0.23.0", note = "use hk_query_execute_ex")]
 #[no_mangle]
 pub extern "C" fn hk_query_execute_with_cancel(
     engine: *mut HK_Engine,
@@ -2712,7 +2711,7 @@ pub extern "C" fn hk_query_execute_json(
         }
         let query_obj = unsafe { &*query };
         if !query_obj.query.projection.is_empty() {
-            return hk_query_execute(engine, query);
+            return hk_query_execute_ex(engine, query, std::ptr::null_mut());
         }
         let engine = unsafe { &*engine };
         let mut out = Vec::with_capacity(4096);
