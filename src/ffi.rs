@@ -2619,11 +2619,39 @@ fn hk_query_execute_inner(
     })
 }
 
+/// Execute a query and return a JSON array string (`char*`); free with
+/// `hk_string_free`. This path fully decodes each `HakoDoc` before
+/// serializing. For JSON egress prefer `hk_query_execute_json` (pinned-byte
+/// writer); for engine-only throughput use `hk_query_execute_to_handles`.
+/// See `docs/ffi-query-lanes.md`.
+/// Canonical execution entry point: same JSON output as `hk_query_execute`,
+/// with an optional `HK_Cancel*` (`NULL` means no cancellation). New callers
+/// should use this; `hk_query_execute` and `hk_query_execute_with_cancel`
+/// remain as compatibility wrappers. Free with `hk_string_free`.
 #[no_mangle]
-pub extern "C" fn hk_query_execute(engine: *mut HK_Engine, query: *const HK_Query) -> *mut c_char {
-    hk_query_execute_inner(engine, query, None)
+pub extern "C" fn hk_query_execute_ex(
+    engine: *mut HK_Engine,
+    query: *const HK_Query,
+    cancel: *mut HK_Cancel,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        if cancel.is_null() {
+            hk_query_execute_inner(engine, query, None)
+        } else {
+            let cancel = unsafe { &*cancel };
+            hk_query_execute_inner(engine, query, Some(&cancel.token))
+        }
+    })
 }
 
+#[no_mangle]
+pub extern "C" fn hk_query_execute(engine: *mut HK_Engine, query: *const HK_Query) -> *mut c_char {
+    hk_query_execute_ex(engine, query, std::ptr::null_mut())
+}
+
+/// Cancellable variant of `hk_query_execute`: same JSON output and same
+/// decode-then-serialize cost, with an `HK_Cancel*` token. Free with
+/// `hk_string_free`. Compatibility wrapper; prefer `hk_query_execute_ex`.
 #[no_mangle]
 pub extern "C" fn hk_query_execute_with_cancel(
     engine: *mut HK_Engine,
@@ -2667,10 +2695,11 @@ pub extern "C" fn hk_cancel_free(cancel: *mut HK_Cancel) {
     })
 }
 
-/// Query rows as one JSON array string, emitted from pinned bytes (no owned
-/// `HakoDoc`). Output matches `hk_query_execute`; projections reuse that
-/// path because the projected executor has its own field shape. Caller
-/// frees with `hk_string_free`.
+/// JSON egress lane: rows as one JSON array string emitted from pinned
+/// bytes (no owned `HakoDoc`). Output matches `hk_query_execute`, but the
+/// cost is lower. Projections fall back to `hk_query_execute` because the
+/// projected executor has its own field shape. Free with `hk_string_free`.
+/// This is the SDK `get()`/`getJson()` path, not what `benchmark.cpp` times.
 #[no_mangle]
 pub extern "C" fn hk_query_execute_json(
     engine: *mut HK_Engine,
@@ -2760,6 +2789,10 @@ pub extern "C" fn hk_query_explain(
 //     })
 // }
 
+/// Execute a query into `HK_ResultSet*` of borrowed `HK_Doc` handles
+/// (zero-copy row refs, no JSON). Read rows with `hk_result_set_get_doc`
+/// and release with `hk_result_set_free`; never `hk_doc_free` a borrowed
+/// handle. This is the lane `benchmark.cpp` measures.
 #[no_mangle]
 pub extern "C" fn hk_query_execute_to_handles(
     engine: *mut HK_Engine,
@@ -2843,6 +2876,9 @@ pub extern "C" fn hk_result_set_free(results: *mut HK_ResultSet) {
 // Page like the decoded path: execute -> read rows via hk_rawdoc_bytes
 // (borrowed, no copy) -> bound the next page with the last row ->
 // free the set -> repeat. Decode any row later with hk_rawdoc_to_doc.
+/// Execute into `HK_RawResultSet*` of pinned storage bytes: no decode, no
+/// field interning. Only for index-satisfied filters/ordering; otherwise
+/// use `hk_query_execute_to_handles`. Page with `hk_query_start_after_raw`.
 #[no_mangle]
 pub extern "C" fn hk_query_execute_raw(
     engine: *mut HK_Engine,
