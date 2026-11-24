@@ -644,6 +644,73 @@ fn elem_match_pass(view: &HakoDocView, plan: &crate::query::plan::QueryPlan) -> 
     true
 }
 
+/// [`matches_filters_view`] with a pre-compiled key per predicate.
+///
+/// Only valid when `keys` covers `plan.filters` positionally and every slot is
+/// non-empty, which the fused page lane guarantees. Semantics are those of
+/// `matches_filters_view`, with one shortcut that is safe for the admitted
+/// types (`Eq` + byte-safe value):
+///
+/// * stored tag == key tag and bytes equal -> `Eq` is true (no `String`
+///   materialisation needed for that conjunct);
+/// * stored tag == key tag and bytes differ -> this occurrence is a miss, but
+///   a duplicate field later in the framing may still match, so keep walking;
+/// * stored tag != key tag -> cross-type equality is possible; fall back to
+///   `compare_raw_bytes` (semantic) for that field.
+///
+/// Metadata filters, dotted paths and `elemMatch` keep the exact code paths of
+/// `matches_filters_view`.
+pub(crate) fn matches_filters_view_cached(
+    doc_id: &str,
+    bytes: &[u8],
+    plan: &crate::query::plan::QueryPlan,
+    keys: &crate::query::match_key::MatchKeys,
+) -> bool {
+    let doc_time = i64::from_le_bytes(bytes[2..10].try_into().unwrap_or([0;8]));
+    let mut match_bufs = MatchScratch::take(plan.filters.len(), plan.or_groups.len());
+
+    if !check_metadata_filters(
+        doc_id,
+        doc_time,
+        plan,
+        &mut match_bufs.and_matches,
+        &mut match_bufs.or_group_results,
+    ) {
+        return false;
+    }
+
+    let Some(view) = HakoDocView::new(bytes) else { return false; };
+    for (key, tag, data) in view.iter() {
+        for (i, f) in plan.filters.iter().enumerate() {
+            if match_bufs.and_matches[i] || key != f.field { continue; }
+            let Some(expected) = keys.filters.get(i) else { continue };
+            if expected.is_empty() { continue; }
+            if f.op == Operator::Eq && expected.tag() == Some(tag) {
+                // Same canonical tag: byte equality IS value equality.
+                if !expected.matches(tag, data) {
+                    // This occurrence is a miss, but a later duplicate field
+                    // may still match — keep walking, like the legacy matcher.
+                    continue;
+                }
+                match_bufs.and_matches[i] = true;
+            } else if compare_raw_bytes(tag, data, &f.op, &f.value) {
+                match_bufs.and_matches[i] = true;
+            }
+        }
+        for (gi, group) in plan.or_groups.iter().enumerate() {
+            if match_bufs.or_group_results[gi] { continue; }
+            for f in group {
+                if key == f.field && compare_raw_bytes(tag, data, &f.op, &f.value) {
+                    match_bufs.or_group_results[gi] = true;
+                }
+            }
+        }
+    }
+    apply_dotted_filters(&view, plan, &mut match_bufs.and_matches, &mut match_bufs.or_group_results);
+    validate_final_match(plan, &match_bufs.and_matches, &match_bufs.or_group_results)
+        && elem_match_pass(&view, plan)
+}
+
 pub(crate) fn matches_filters_view(doc_id: &str, bytes: &[u8], plan: &crate::query::plan::QueryPlan) -> bool {
     let doc_time = i64::from_le_bytes(bytes[2..10].try_into().unwrap_or([0;8]));
     let mut and_matches = vec![false; plan.filters.len()];

@@ -284,6 +284,32 @@ impl ParallelQueryExecutor {
     ) -> Result<Vec<(String, RowRef)>> {
         let _inflight = InflightGuard::take();
         Self::check_cancel(cancel)?;
+        // Fused residual-filter page path.
+        //
+        // Eligible only when the scan is the whole ordered stream (no page was
+        // pushed into it), the predicates are not already index-satisfied, and
+        // every predicate has a canonical byte key. Then one walk suffices:
+        // test bytes, count matches, apply offset, decode the page winners.
+        // Everything else falls through to the unchanged pipeline below.
+        if plan.scan_limit.is_none()
+            && !plan.filters.is_empty()
+            && plan.projection.is_empty()
+            && !plan.filters_satisfied_by_index
+            && !plan.raw
+            && plan.or_groups.is_empty()
+            && plan.elem_match.is_empty()
+            && !plan.has_cursor_bounds
+            && (plan.order_by.is_empty() || plan.order_by_satisfied)
+            // SortedKeys applies offset inside the scan (raw rows); the fused
+            // lane applies it over matches. Keep the legacy contract there.
+            && !(matches!(plan.scan, ScanType::SortedKeys { .. }) && plan.offset.unwrap_or(0) > 0)
+        {
+            if let Some(page) =
+                self.execute_scan_filter_decode(storage_arc.clone(), indexes, &plan, cancel)?
+            {
+                return Ok(page);
+            }
+        }
         // 1. PHASE 1: INDEX SCAN
         // Fetch physical pointers from the RAM Index
         let mut keys_from_index = {
@@ -835,6 +861,114 @@ impl ParallelQueryExecutor {
             }
         }
         Ok(out)
+    }
+
+    /// Decode only the page winners.
+    ///
+    /// The caller has already established: bounded page, no pushed scan page
+    /// (`scan_limit == None`), not index-satisfied, scan order == output order,
+    /// no cursor bounds, no projection and no OR/elemMatch matcher passes.
+    ///
+    /// This lane walks the scan in order, tests the predicates on borrowed
+    /// bytes against keys compiled once per call and calls `HakoDoc::decode`
+    /// only for rows that pass the predicate; `offset` is counted over those
+    /// decoded matches, and `limit` bounds the page. The old pipeline decoded
+    /// every candidate before testing it, rejected or not; the returned row
+    /// set and order are identical.
+    ///
+    /// Returns `None` if the keys cannot cover the whole conjunct list (the
+    /// generic matcher keeps the row) so the caller falls back to the legacy
+    /// pipeline with unchanged semantics.
+    pub(crate) fn execute_scan_filter_decode(
+        &self,
+        storage_arc: Arc<RwLock<StorageEngine>>,
+        indexes: &IndexManager,
+        plan: &QueryPlan,
+        cancel: Option<&CancelToken>,
+    ) -> Result<Option<Vec<(String, RowRef)>>> {
+        let Some(limit) = plan.limit else { return Ok(None) };
+        let offset = plan.offset.unwrap_or(0);
+        if limit == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        // The comparison values are query constants. Encode them once for this
+        // page; the gate is the same `Eq` + byte-safe rule the per-row fast lane
+        // applies, so an ineligible predicate declines here instead of taking a
+        // different semantic path.
+        let Some(keys) = crate::query::match_key::MatchKeys::compile_fast_eq(&plan.filters) else {
+            return Ok(None);
+        };
+        Self::check_cancel(cancel)?;
+
+        let optimized_plan = crate::query::executor::worker::prepare_optimized_plan(plan);
+        let defer = plan.defer_blobs;
+
+        let storage = storage_arc.read().unwrap();
+        let blob_manager = storage.blob_manager.as_ref();
+
+        // The scan source cannot page early (the caller excluded `scan_limit`),
+        // so this is the only page cut: over matches, in scan order.
+        let found = self.execute_single_scan(
+            &storage,
+            indexes,
+            &plan.scan,
+            &plan.collection,
+            None,
+            None,
+        )?;
+
+        let mut out: Vec<(String, RowRef)> = Vec::with_capacity(limit.min(256));
+        let mut matched = 0usize;
+        for (id, ptr) in found {
+            Self::check_cancel(cancel)?;
+            let owned: Option<Arc<Vec<u8>>> = match &ptr {
+                Pointer::Inlined(_) => None,
+                other => storage.read_pointer_shared(other).ok().flatten(),
+            };
+            let bytes: &[u8] = match (&ptr, &owned) {
+                (Pointer::Inlined(shared), _) => shared.as_slice(),
+                (_, Some(shared)) => shared.as_slice(),
+                _ => continue,
+            };
+            if !crate::query::executor::worker::matches_filters_view_cached(
+                &id,
+                bytes,
+                &optimized_plan,
+                &keys,
+            ) {
+                continue;
+            }
+            // Decode before the offset count so a corrupt row keeps the legacy
+            // backfill behaviour: it is dropped everywhere, never counted as a
+            // page winner, and never shortens the page.
+            let Some(doc) = HakoDoc::decode(bytes) else { continue };
+            matched += 1;
+            if matched <= offset {
+                continue;
+            }
+            out.push((id, RowRef::Owned(doc)));
+            if out.len() >= limit {
+                break;
+            }
+        }
+
+        if !defer {
+            if let Some(bm) = blob_manager {
+                use rayon::prelude::*;
+                use crate::query::executor::worker::{doc_has_links, inflate_blobs};
+                if out
+                    .iter()
+                    .any(|(_, row)| matches!(row, RowRef::Owned(d) if doc_has_links(d)))
+                {
+                    out.par_iter_mut().for_each(|(_, row)| {
+                        if let RowRef::Owned(doc) = row {
+                            let _ = inflate_blobs(doc, bm);
+                        }
+                    });
+                }
+            }
+        }
+        Ok(Some(out))
     }
 
     /// Raw scan: phase-1 index walk with byte materialization — no decode,
