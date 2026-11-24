@@ -291,19 +291,7 @@ impl ParallelQueryExecutor {
         // every predicate has a canonical byte key. Then one walk suffices:
         // test bytes, count matches, apply offset, decode the page winners.
         // Everything else falls through to the unchanged pipeline below.
-        if plan.scan_limit.is_none()
-            && !plan.filters.is_empty()
-            && plan.projection.is_empty()
-            && !plan.filters_satisfied_by_index
-            && !plan.raw
-            && plan.or_groups.is_empty()
-            && plan.elem_match.is_empty()
-            && !plan.has_cursor_bounds
-            && (plan.order_by.is_empty() || plan.order_by_satisfied)
-            // SortedKeys applies offset inside the scan (raw rows); the fused
-            // lane applies it over matches. Keep the legacy contract there.
-            && !(matches!(plan.scan, ScanType::SortedKeys { .. }) && plan.offset.unwrap_or(0) > 0)
-        {
+        if !plan.raw && Self::residual_filter_eligible(&plan) {
             if let Some(page) =
                 self.execute_scan_filter_decode(storage_arc.clone(), indexes, &plan, cancel)?
             {
@@ -887,6 +875,9 @@ impl ParallelQueryExecutor {
         cancel: Option<&CancelToken>,
     ) -> Result<Option<Vec<(String, RowRef)>>> {
         let Some(limit) = plan.limit else { return Ok(None) };
+        if !Self::residual_filter_eligible(plan) {
+            return Ok(None);
+        }
         let offset = plan.offset.unwrap_or(0);
         if limit == 0 {
             return Ok(Some(Vec::new()));
@@ -907,50 +898,47 @@ impl ParallelQueryExecutor {
         let blob_manager = storage.blob_manager.as_ref();
 
         // The scan source cannot page early (the caller excluded `scan_limit`),
-        // so this is the only page cut: over matches, in scan order.
-        let found = self.execute_single_scan(
+        // so this is the only page cut: over matches, in scan order. Walking the
+        // source directly means the rejected prefix is never materialised as
+        // `(String, Pointer)` pairs.
+        let mut out: Vec<(String, RowRef)> = Vec::with_capacity(limit.min(256));
+        let mut matched = 0usize;
+        self.visit_scan_rows(
             &storage,
             indexes,
             &plan.scan,
             &plan.collection,
-            None,
-            None,
+            &mut |id, ptr| {
+                Self::check_cancel(cancel)?;
+                // Match the historical fused-lane skip contract: a read
+                // failure or missing pointer drops the row, never shortens
+                // the page with an error.
+                let Some(shared) = storage.read_pointer_shared(ptr).ok().flatten() else {
+                    return Ok(true);
+                };
+                let bytes: &[u8] = &shared;
+                if !crate::query::executor::worker::matches_filters_view_cached(
+                    id,
+                    bytes,
+                    &optimized_plan,
+                    &keys,
+                ) {
+                    return Ok(true);
+                }
+                // Decode before the offset count so a corrupt row keeps the legacy
+                // backfill behaviour: it is dropped everywhere, never counted as a
+                // page winner, and never shortens the page.
+                let Some(doc) = HakoDoc::decode(bytes) else {
+                    return Ok(true);
+                };
+                matched += 1;
+                if matched <= offset {
+                    return Ok(true);
+                }
+                out.push((id.to_string(), RowRef::Owned(doc)));
+                Ok(out.len() < limit)
+            },
         )?;
-
-        let mut out: Vec<(String, RowRef)> = Vec::with_capacity(limit.min(256));
-        let mut matched = 0usize;
-        for (id, ptr) in found {
-            Self::check_cancel(cancel)?;
-            let owned: Option<Arc<Vec<u8>>> = match &ptr {
-                Pointer::Inlined(_) => None,
-                other => storage.read_pointer_shared(other).ok().flatten(),
-            };
-            let bytes: &[u8] = match (&ptr, &owned) {
-                (Pointer::Inlined(shared), _) => shared.as_slice(),
-                (_, Some(shared)) => shared.as_slice(),
-                _ => continue,
-            };
-            if !crate::query::executor::worker::matches_filters_view_cached(
-                &id,
-                bytes,
-                &optimized_plan,
-                &keys,
-            ) {
-                continue;
-            }
-            // Decode before the offset count so a corrupt row keeps the legacy
-            // backfill behaviour: it is dropped everywhere, never counted as a
-            // page winner, and never shortens the page.
-            let Some(doc) = HakoDoc::decode(bytes) else { continue };
-            matched += 1;
-            if matched <= offset {
-                continue;
-            }
-            out.push((id, RowRef::Owned(doc)));
-            if out.len() >= limit {
-                break;
-            }
-        }
 
         if !defer {
             if let Some(bm) = blob_manager {
@@ -978,10 +966,14 @@ impl ParallelQueryExecutor {
     /// and version-scoped — decode with `HakoDoc::decode`, do not
     /// persist or compare across versions.
     ///
-    /// Requires index-satisfied filters AND ordering (raw cannot match or
-    /// sort without decoding) — otherwise `QueryError`. Single-threaded by
-    /// design: the work is Arc bumps + memcpys, rayon dispatch would only
-    /// add overhead. Scan order is preserved (no re-sort).
+    /// Historical raw scans require index-satisfied filters AND ordering
+    /// (raw cannot match or sort without decoding) — otherwise `QueryError`.
+    /// The residual-filter extension below is the one exception: when the
+    /// whole ordered stream is available and every predicate is a byte-safe
+    /// `Eq`, the borrowed encoding can decide the match, so the page is
+    /// emitted without materialising a document. Single-threaded by design:
+    /// the work is Arc bumps + memcmps, rayon dispatch would only add
+    /// overhead. Scan order is preserved (no re-sort).
     pub fn execute_raw(
         &self,
         storage_arc: Arc<RwLock<StorageEngine>>,
@@ -989,6 +981,60 @@ impl ParallelQueryExecutor {
         plan: QueryPlan,
     ) -> Result<Vec<(String, Arc<Vec<u8>>)>> {
         let _inflight = InflightGuard::take();
+
+        // Residual byte egress: the decoded fused lane established that a
+        // byte-safe predicate can be decided on the borrowed encoding. This
+        // arm does the same, but stops at the encoded bytes: no owned document
+        // is built for either a rejected candidate or a page winner. It only
+        // engages when the whole ordered stream is available (no pushed scan
+        // page) and scan order is output order, so row order/offset/limit are
+        // unchanged. Everything else keeps the historical raw contract below.
+        if Self::raw_residual_eligible(&plan) {
+            if plan.limit == Some(0) {
+                return Ok(Vec::new());
+            }
+            let Some(keys) = crate::query::match_key::MatchKeys::compile_fast_eq(&plan.filters)
+            else {
+                return Err(crate::error::HakoError::QueryError(
+                    "query requires index-satisfied filters (decode to match)".into(),
+                ));
+            };
+            let optimized = crate::query::executor::worker::prepare_optimized_plan(&plan);
+            let offset = plan.offset.unwrap_or(0);
+            let limit = plan.limit;
+
+            let storage = storage_arc.read().unwrap();
+            let mut out: Vec<(String, Arc<Vec<u8>>)> =
+                Vec::with_capacity(limit.unwrap_or(0).min(256));
+            let mut matched = 0usize;
+            self.visit_scan_rows(
+                &storage,
+                indexes,
+                &plan.scan,
+                &plan.collection,
+                &mut |id, ptr| {
+                    let Some(bytes) = storage.read_pointer_shared(ptr).ok().flatten() else {
+                        return Ok(true);
+                    };
+                    if !crate::query::executor::worker::matches_filters_view_cached(
+                        id,
+                        &bytes,
+                        &optimized,
+                        &keys,
+                    ) {
+                        return Ok(true);
+                    }
+                    matched += 1;
+                    if matched <= offset {
+                        return Ok(true);
+                    }
+                    out.push((id.to_string(), bytes));
+                    Ok(limit.map(|l| out.len() < l).unwrap_or(true))
+                },
+            )?;
+            return Ok(out);
+        }
+
         Self::check_index_satisfied(&plan)?;
 
         let storage = storage_arc.read().unwrap();
@@ -1024,6 +1070,239 @@ impl ParallelQueryExecutor {
             out.truncate(limit);
         }
         Ok(out)
+    }
+
+    /// True when [`Self::execute_raw`] may satisfy residual filters on the
+    /// borrowed encoding instead of refusing: whole ordered stream, byte-safe
+    /// `Eq` predicates, and a scan kind the lazy walker can drive. Mirrors the
+    /// decoded fused-page gate; the two lanes must accept the same shapes.
+    fn raw_residual_eligible(plan: &QueryPlan) -> bool {
+        Self::residual_filter_eligible(plan)
+    }
+
+    /// The shape gate shared by the decoded fused page and the residual raw
+    /// egress. Both must admit exactly the same plans: then a row that JSON
+    /// emits is a row `query()` would have decoded, in the same order.
+    fn residual_filter_eligible(plan: &QueryPlan) -> bool {
+        plan.scan_limit.is_none()
+            && !plan.filters.is_empty()
+            && plan.projection.is_empty()
+            && !plan.filters_satisfied_by_index
+            && plan.or_groups.is_empty()
+            && plan.elem_match.is_empty()
+            && !plan.has_cursor_bounds
+            && (plan.order_by.is_empty() || plan.order_by_satisfied)
+            // SortedKeys applies offset inside the scan (raw rows); the fused
+            // lanes apply it over matches. Keep the legacy contract there.
+            && !(matches!(plan.scan, ScanType::SortedKeys { .. })
+                && plan.offset.unwrap_or(0) > 0)
+            && crate::query::match_key::can_preverify(&plan.filters)
+            && Self::residual_scan_supported(&plan.scan)
+    }
+
+    /// Scan kinds the borrow-scoped fused walk can drive. The legacy
+    /// materialising pipeline remains the fallback for every other kind
+    /// (union, FTS, vector, traverse, cursor): semantics are unchanged.
+    fn residual_scan_supported(scan: &ScanType) -> bool {
+        matches!(
+            scan,
+            ScanType::FullCollection
+                | ScanType::SortedKeys { .. }
+                | ScanType::SecondaryIndex { .. }
+                | ScanType::SecondaryIndexRange { .. }
+                | ScanType::CompositeIndex { .. }
+                | ScanType::CompositeIndexRange { .. }
+        )
+    }
+
+    /// Borrow-scoped walk over the scan sources the fused residual lane can
+    /// drive. No `Vec<(String, Pointer)>` is built: each row is presented to
+    /// `visit` in exactly the order [`Self::execute_single_scan`] would have
+    /// returned it, and `Ok(false)` stops the walk immediately.
+    fn visit_scan_rows<F>(
+        &self,
+        storage: &StorageEngine,
+        indexes: &IndexManager,
+        scan: &ScanType,
+        collection: &str,
+        visit: &mut F,
+    ) -> Result<bool>
+    where
+        F: FnMut(&str, &Pointer) -> Result<bool>,
+    {
+        match scan {
+            ScanType::FullCollection => {
+                for (key, ptr) in storage.index.iter() {
+                    if matches!(ptr, Pointer::Deleted { .. }) {
+                        continue;
+                    }
+                    if !visit(key.as_str(), ptr)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            ScanType::SortedKeys { start_key, start_exclusive, reverse } => {
+                let (start, end) = Self::sorted_walk_bounds(
+                    storage,
+                    start_key.as_deref(),
+                    *start_exclusive,
+                    None,
+                    None,
+                    *reverse,
+                );
+                if *reverse {
+                    for key in storage.sorted_keys[start..end].iter().rev() {
+                        let Some(ptr) = storage.index.get(key) else { continue };
+                        if matches!(ptr, Pointer::Deleted { .. }) {
+                            continue;
+                        }
+                        if !visit(key.as_str(), ptr)? {
+                            return Ok(false);
+                        }
+                    }
+                } else {
+                    for key in &storage.sorted_keys[start..end] {
+                        let Some(ptr) = storage.index.get(key) else { continue };
+                        if matches!(ptr, Pointer::Deleted { .. }) {
+                            continue;
+                        }
+                        if !visit(key.as_str(), ptr)? {
+                            return Ok(false);
+                        }
+                    }
+                }
+                Ok(true)
+            }
+            ScanType::SecondaryIndex { field, value } => {
+                if let Some(sec_map) = indexes.secondary.get(collection) {
+                    if let Some(index) = sec_map.get(field) {
+                        if let Some(doc_ids) = index.get_map().get(value) {
+                            for doc_id in doc_ids {
+                                let key = Self::make_key(collection, doc_id);
+                                let Some(ptr) = storage.index.get(&key) else { continue };
+                                if matches!(ptr, Pointer::Deleted { .. }) {
+                                    continue;
+                                }
+                                if !visit(key.as_str(), ptr)? {
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(true)
+            }
+            ScanType::SecondaryIndexRange { field, start, end, reverse } => {
+                if let Some(sec_map) = indexes.secondary.get(collection) {
+                    if let Some(index) = sec_map.get(field) {
+                        let range_iter = index.get_map().range((start.clone(), end.clone()));
+                        if *reverse {
+                            for (_, ids) in range_iter.rev() {
+                                for doc_id in ids.iter().rev() {
+                                    let Some(ptr) = storage.index.get(doc_id.as_ref()) else {
+                                        continue;
+                                    };
+                                    if matches!(ptr, Pointer::Deleted { .. }) {
+                                        continue;
+                                    }
+                                    if !visit(doc_id.as_ref(), ptr)? {
+                                        return Ok(false);
+                                    }
+                                }
+                            }
+                        } else {
+                            for (_, ids) in range_iter {
+                                for doc_id in ids {
+                                    let Some(ptr) = storage.index.get(doc_id.as_ref()) else {
+                                        continue;
+                                    };
+                                    if matches!(ptr, Pointer::Deleted { .. }) {
+                                        continue;
+                                    }
+                                    if !visit(doc_id.as_ref(), ptr)? {
+                                        return Ok(false);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(true)
+            }
+            ScanType::CompositeIndex { index_id, values, reverse, .. } => {
+                if let Some(idx) = indexes.composite.get(*index_id) {
+                    let range = crate::index::composite::range_builder::build_prefix_range(
+                        &idx.definition,
+                        values,
+                    );
+                    let iter = idx.tree.range((
+                        std::ops::Bound::Included(range.start),
+                        std::ops::Bound::Included(range.end),
+                    ));
+                    if *reverse {
+                        for (_, doc_id) in iter.rev() {
+                            let Some(ptr) = storage.index.get(doc_id.as_ref()) else {
+                                continue;
+                            };
+                            if matches!(ptr, Pointer::Deleted { .. }) {
+                                continue;
+                            }
+                            if !visit(doc_id.as_ref(), ptr)? {
+                                return Ok(false);
+                            }
+                        }
+                    } else {
+                        for (_, doc_id) in iter {
+                            let Some(ptr) = storage.index.get(doc_id.as_ref()) else {
+                                continue;
+                            };
+                            if matches!(ptr, Pointer::Deleted { .. }) {
+                                continue;
+                            }
+                            if !visit(doc_id.as_ref(), ptr)? {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                }
+                Ok(true)
+            }
+            ScanType::CompositeIndexRange { index_id, ranges, reverse } => {
+                if let Some(idx) = indexes.composite.get(*index_id) {
+                    for (start_bound, end_bound) in ranges {
+                        let iter = idx.tree.range((start_bound.clone(), end_bound.clone()));
+                        if *reverse {
+                            for (_, doc_id) in iter.rev() {
+                                let Some(ptr) = storage.index.get(doc_id.as_ref()) else {
+                                    continue;
+                                };
+                                if matches!(ptr, Pointer::Deleted { .. }) {
+                                    continue;
+                                }
+                                if !visit(doc_id.as_ref(), ptr)? {
+                                    return Ok(false);
+                                }
+                            }
+                        } else {
+                            for (_, doc_id) in iter {
+                                let Some(ptr) = storage.index.get(doc_id.as_ref()) else {
+                                    continue;
+                                };
+                                if matches!(ptr, Pointer::Deleted { .. }) {
+                                    continue;
+                                }
+                                if !visit(doc_id.as_ref(), ptr)? {
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     /// Zero-alloc scan walk: the engine lends each row (`&str` id borrowed
