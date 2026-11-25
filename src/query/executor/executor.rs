@@ -1581,6 +1581,69 @@ impl ParallelQueryExecutor {
         Ok(results)
     }
 
+    /// Candidate ids for a single-op aggregation whose equality predicates
+    /// are exactly the leading fields of a composite index and whose target
+    /// is one of the remaining fields. Returns `None` for every other shape
+    /// so the historical secondary-index and scan paths stay authoritative.
+    fn composite_covering_aggregation_ids(
+        indexes: &IndexManager,
+        plan: &QueryPlan,
+        target: &str,
+    ) -> Option<Vec<std::sync::Arc<str>>> {
+        if plan.filters.is_empty()
+            || plan.has_cursor_bounds
+            || !plan.or_groups.is_empty()
+            || !plan.elem_match.is_empty()
+            || !plan.projection.is_empty()
+        {
+            return None;
+        }
+        let mut values: HashMap<&str, crate::document::value::Value> = HashMap::new();
+        for filter in &plan.filters {
+            if filter.op != crate::query::filter::Operator::Eq {
+                return None;
+            }
+            values.insert(filter.field.as_str(), filter.value.clone());
+        }
+        let prefix_len = values.len();
+        for idx in indexes.indexes_for_collection(&plan.collection) {
+            if idx.definition.fields.len() <= prefix_len {
+                continue;
+            }
+            let fields: Vec<&str> = idx
+                .definition
+                .fields
+                .iter()
+                .map(|f| f.field.as_str())
+                .collect();
+            if !fields[..prefix_len]
+                .iter()
+                .all(|f| values.contains_key(*f))
+            {
+                continue;
+            }
+            if !fields[prefix_len..].contains(&target) {
+                continue;
+            }
+            let prefix_values: Vec<crate::document::value::Value> = fields[..prefix_len]
+                .iter()
+                .map(|f| values.get(*f).expect("checked above").clone())
+                .collect();
+            let range =
+                crate::index::composite::range_builder::build_prefix_range(&idx.definition, &prefix_values);
+            let ids = idx
+                .tree
+                .range((
+                    std::ops::Bound::Included(range.start),
+                    std::ops::Bound::Included(range.end),
+                ))
+                .map(|(_, doc_id)| doc_id.clone())
+                .collect();
+            return Some(ids);
+        }
+        None
+    }
+
     pub fn execute_aggregation(
         &self,
         storage_arc: Arc<RwLock<StorageEngine>>,
@@ -1622,6 +1685,62 @@ impl ParallelQueryExecutor {
             }
 
             if can_use_fast_path {
+                // Composite covering lane: a prefix of Eq predicates plus the
+                // aggregate field lives in one index, so only the matching
+                // range is visited and no document is materialised.
+                let target = match op {
+                    AggregateOp::Sum(field)
+                    | AggregateOp::Avg(field)
+                    | AggregateOp::Min(field)
+                    | AggregateOp::Max(field) => Some(field.as_str()),
+                    AggregateOp::Count => None,
+                };
+                if let Some(target) = target {
+                    if let Some(ids) =
+                        Self::composite_covering_aggregation_ids(indexes, &plan, target)
+                    {
+                        let storage = storage_arc.read().unwrap();
+                        let mut res: HashMap<String, f64> = HashMap::new();
+                        for id in ids {
+                            let Some(ptr) = storage.index.get(id.as_ref()) else { continue };
+                            let Some(bytes) = storage.read_pointer_shared(ptr).ok().flatten()
+                            else { continue };
+                            let Some(view) = HakoDocView::new(&bytes) else { continue };
+                            let Some((_, tag, data)) =
+                                view.iter().find(|(key, _, _)| *key == target)
+                            else { continue };
+                            let Some(num) = BorrowedValue { tag, data }.as_f64() else { continue };
+                            match op {
+                                AggregateOp::Sum(_) => {
+                                    *res.entry(format!("sum_{target}")).or_insert(0.0) += num;
+                                }
+                                AggregateOp::Avg(_) => {
+                                    *res.entry(format!("avg_tmp_{target}")).or_insert(0.0) += num;
+                                    *res.entry(format!("avg_cnt_{target}")).or_insert(0.0) += 1.0;
+                                }
+                                AggregateOp::Min(_) => {
+                                    let entry = res.entry(format!("min_{target}")).or_insert(num);
+                                    *entry = entry.min(num);
+                                }
+                                AggregateOp::Max(_) => {
+                                    let entry = res.entry(format!("max_{target}")).or_insert(num);
+                                    *entry = entry.max(num);
+                                }
+                                AggregateOp::Count => unreachable!(),
+                            }
+                        }
+                        let tmp_key = format!("avg_tmp_{target}");
+                        if let Some(sum) = res.remove(&tmp_key) {
+                            let count = res
+                                .remove(&format!("avg_cnt_{target}"))
+                                .unwrap_or(0.0);
+                            if count > 0.0 {
+                                res.insert(format!("avg_{target}"), sum / count);
+                            }
+                        }
+                        return Ok(res);
+                    }
+                }
                 match op {
                     // CASE 1: COUNT
                     AggregateOp::Count => {
