@@ -169,6 +169,10 @@ fn wal_snapshot_reclaims_stale_history() {
             db.put("bench", &format!("k_{i}"), &doc).expect("put");
         }
     }
+    // Group commit is now asynchronous: make the setup observable on disk
+    // before measuring the snapshot size, without changing the durability
+    // semantics under test.
+    db.flush().expect("flush setup");
     let wal_path = dir.join("bench").join("wal.log");
     let before = std::fs::metadata(&wal_path).expect("wal").len();
     assert!(before > 500_000, "test setup too small: {before} bytes");
