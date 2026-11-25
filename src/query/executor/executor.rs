@@ -2028,6 +2028,24 @@ impl ParallelQueryExecutor {
     }
 
     #[allow(clippy::type_complexity)]
+    /// True when a projected page can use the residual byte filter: the scan
+    /// is the whole ordered stream, predicates are byte-safe Eq, and scan
+    /// order is output order. Projection is allowed here; only the page
+    /// winners are decoded into projected fields.
+    fn projected_residual_eligible(plan: &QueryPlan) -> bool {
+        plan.scan_limit.is_none()
+            && !plan.filters.is_empty()
+            && !plan.filters_satisfied_by_index
+            && plan.or_groups.is_empty()
+            && plan.elem_match.is_empty()
+            && !plan.has_cursor_bounds
+            && (plan.order_by.is_empty() || plan.order_by_satisfied)
+            && !(matches!(plan.scan, ScanType::SortedKeys { .. }) && plan.offset.unwrap_or(0) > 0)
+            && crate::query::match_key::can_preverify(&plan.filters)
+            && Self::residual_scan_supported(&plan.scan)
+    }
+
+    #[allow(clippy::type_complexity)]
     pub fn execute_projected(
         &self,
         storage_arc: Arc<RwLock<StorageEngine>>,
@@ -2048,6 +2066,67 @@ impl ParallelQueryExecutor {
                 plan.projection.push(field.to_string());
             }
         }
+        // Residual byte filter for projected pages: reject candidates on
+        // borrowed bytes, count offset/limit over survivors, and decode only
+        // the winners' projection fields. Unsupported shapes fall through.
+        if Self::projected_residual_eligible(&plan) {
+            if let Some(keys) = crate::query::match_key::MatchKeys::compile_fast_eq(&plan.filters) {
+                let optimized = crate::query::executor::worker::prepare_optimized_plan(&plan);
+                let offset = plan.offset.unwrap_or(0);
+                let limit = plan.limit;
+                let storage = storage_arc.read().unwrap();
+                let mut winners: Vec<(String, Arc<Vec<u8>>)> =
+                    Vec::with_capacity(limit.unwrap_or(0).min(256));
+                let mut matched = 0usize;
+                self.visit_scan_rows(
+                    &storage,
+                    indexes,
+                    &plan.scan,
+                    &plan.collection,
+                    &mut |id, ptr| {
+                        Self::check_cancel(cancel)?;
+                        let Some(bytes) = storage.read_pointer_shared(ptr).ok().flatten() else {
+                            return Ok(true);
+                        };
+                        if !crate::query::executor::worker::matches_filters_view_cached(
+                            id, &bytes, &optimized, &keys,
+                        ) {
+                            return Ok(true);
+                        }
+                        matched += 1;
+                        if matched <= offset {
+                            return Ok(true);
+                        }
+                        winners.push((id.to_string(), bytes));
+                        Ok(limit.map(|l| winners.len() < l).unwrap_or(true))
+                    },
+                )?;
+
+                let prefixes = crate::document::value::projection_prefixes(&original_projection);
+                let blob_manager = storage.blob_manager.as_ref();
+                let mut projected = Vec::with_capacity(winners.len());
+                for (id, bytes) in winners {
+                    let Some(mut fields) = crate::query::executor::worker::unified_match_projected(
+                        &id, &bytes, &optimized,
+                    ) else { continue };
+                    if !plan.defer_blobs {
+                        if let Some(bm) = blob_manager {
+                            for (_, value) in fields.iter_mut() {
+                                if let Value::BlobLink { offset, len } = *value {
+                                    *value = crate::query::executor::worker::resolve_single_blob_in_worker(
+                                        bm, offset, len,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    fields.retain(|(key, _)| prefixes.contains(&key.as_str()));
+                    projected.push((id, fields));
+                }
+                return Ok(projected);
+            }
+        }
+
         let docs: Vec<(String, Pointer)> = {
             // Explicitly set the type
             let storage = storage_arc.read().unwrap();
