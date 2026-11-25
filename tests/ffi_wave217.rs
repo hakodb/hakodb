@@ -59,6 +59,7 @@ fn seed(dir: &std::path::Path) {
         fts: vec![("items".into(), "name".into())],
         vector: vec![("items".into(), "emb".into(), 2, Metric::Cosine)],
         tracked: vec!["items".into()],
+        ..Default::default()
     };
     db.ensure_indexes(&schema).expect("ensure_indexes");
     assert!(db.await_quiescent(std::time::Duration::from_secs(60)));

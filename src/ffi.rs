@@ -500,7 +500,9 @@ pub extern "C" fn hk_engine_open_exclusive(path: *const c_char) -> *mut HK_Engin
 }
 
 /// #217 P2 mirror: one idempotent boot-time index declaration. `schema_json`
-/// = `{"fts":[[col,field],...],"vector":[[col,field,dim,metric_u32],...],
+/// = `{"secondary":[[col,field],...],
+/// "composite":[[col,[field,...]],...],
+/// "fts":[[col,field],...],"vector":[[col,field,dim,metric_u32],...],
 /// "tracked":[col,...]}` (any key optional; `[]`/`null` treated as empty).
 /// Returns 0 on success (declared-or-existing), -1 on error.
 #[no_mangle]
@@ -533,6 +535,37 @@ pub extern "C" fn hk_engine_ensure_indexes(
             v.and_then(|v| v.as_array()).unwrap_or(&empty).clone()
         };
         let mut schema = crate::engine::IndexSchema::default();
+        for pair in parse_list(value.get("secondary")) {
+            let Some(pair) = pair.as_array() else {
+                set_last_error_err("schema.secondary entries must be [col, field] arrays");
+                return -1;
+            };
+            let (Some(c), Some(f)) = (pair.first().and_then(|v| v.as_str()), pair.get(1).and_then(|v| v.as_str())) else {
+                set_last_error_err("schema.secondary entries must be [col, field] string pairs");
+                return -1;
+            };
+            schema.secondary.push((c.to_string(), f.to_string()));
+        }
+        for entry in parse_list(value.get("composite")) {
+            let Some(entry) = entry.as_array() else {
+                set_last_error_err("schema.composite entries must be [col, [field,...]] arrays");
+                return -1;
+            };
+            let Some(c) = entry.first().and_then(|v| v.as_str()) else {
+                set_last_error_err("schema.composite entries need a collection name");
+                return -1;
+            };
+            let Some(fields) = entry.get(1).and_then(|v| v.as_array()) else {
+                set_last_error_err("schema.composite entries need a field array");
+                return -1;
+            };
+            let fields: Option<Vec<String>> = fields.iter().map(|f| f.as_str().map(str::to_string)).collect();
+            let Some(fields) = fields else {
+                set_last_error_err("schema.composite fields must be strings");
+                return -1;
+            };
+            schema.composite.push((c.to_string(), fields));
+        }
         for pair in parse_list(value.get("fts")) {
             let Some(pair) = pair.as_array() else {
                 set_last_error_err("schema.fts entries must be [col, field] arrays");
@@ -2097,6 +2130,40 @@ pub extern "C" fn hk_query_delete(engine: *mut HK_Engine, query: *mut HK_Query) 
                 clear_last_error();
                 count as i32
             },
+            Err(e) => set_last_error_err(e.to_string()),
+        }
+    })
+}
+
+/// Hard mass delete: returns the number of deleted documents, or -1 on
+/// error. No tombstone or restore record is left behind.
+#[no_mangle]
+pub extern "C" fn hk_query_delete_hard(engine: *mut HK_Engine, query: *mut HK_Query) -> i32 {
+    safety_shield!(-1, {
+        if engine.is_null() || query.is_null() { return -1; }
+        let engine = unsafe { &*engine };
+        let query_ptr = unsafe { &*query };
+        match engine.db.delete_where_hard(query_ptr.query.clone()) {
+            Ok(count) => { clear_last_error(); count as i32 }
+            Err(e) => set_last_error_err(e.to_string()),
+        }
+    })
+}
+
+/// Hard-clear a collection in place (no tombstones, no retention records).
+/// The collection and its index definitions remain registered.
+/// Returns the number of removed ids, or -1 on error.
+#[no_mangle]
+pub extern "C" fn hk_engine_reset_collection(engine: *mut HK_Engine, collection: *const c_char) -> i32 {
+    safety_shield!(-1, {
+        if engine.is_null() { return -1; }
+        let col = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => return set_last_error_err(e),
+        };
+        let engine = unsafe { &*engine };
+        match engine.db.reset_collection(&col) {
+            Ok(count) => { clear_last_error(); count as i32 }
             Err(e) => set_last_error_err(e.to_string()),
         }
     })

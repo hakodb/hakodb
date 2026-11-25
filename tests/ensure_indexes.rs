@@ -31,6 +31,7 @@ fn schema() -> IndexSchema {
         fts: vec![("items".into(), "name".into())],
         vector: vec![("items".into(), "emb".into(), 2, Metric::Cosine)],
         tracked: vec!["items".into()],
+        ..Default::default()
     }
 }
 

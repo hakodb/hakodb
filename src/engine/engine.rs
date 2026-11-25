@@ -782,6 +782,10 @@ impl Drop for BackfillGuard {
 /// Declarative index set applied at boot. Pass it to
 /// [`crate::engine::Hako::ensure_indexes`] before the first write.
 pub struct IndexSchema {
+    /// `(collection, field)` secondary indexes.
+    pub secondary: Vec<(String, String)>,
+    /// `(collection, fields)` composite indexes; every direction is Asc.
+    pub composite: Vec<(String, Vec<String>)>,
     /// `(collection, field)` FTS text indexes.
     pub fts: Vec<(String, String)>,
     /// `(collection, field, dim, metric)` vector indexes.
@@ -4509,7 +4513,13 @@ impl Hako {
     }
 
     pub fn delete_where(&self, query: crate::query::query::Query) -> Result<usize> {
-        self.delete_where_impl(query, None)
+        self.delete_where_impl(query, None, false)
+    }
+
+    /// Hard delete every match: no tombstone, no restore record. The default
+    /// `delete_where` keeps the soft-delete/restore contract unchanged.
+    pub fn delete_where_hard(&self, query: crate::query::query::Query) -> Result<usize> {
+        self.delete_where_impl(query, None, true)
     }
 
     /// [`Self::delete_where`] with cooperative cancellation.
@@ -4523,13 +4533,14 @@ impl Hako {
         query: crate::query::query::Query,
         cancel: &CancelToken,
     ) -> Result<usize> {
-        self.delete_where_impl(query, Some(cancel))
+        self.delete_where_impl(query, Some(cancel), false)
     }
 
     fn delete_where_impl(
         &self,
         query: crate::query::query::Query,
         cancel: Option<&CancelToken>,
+        hard: bool,
     ) -> Result<usize> {
         // 1. Find the matches (cancel checks ride the scan).
         let results = self.query_with_cancel(query.clone(), cancel)?;
@@ -4541,9 +4552,16 @@ impl Hako {
         // 2. Map to delete mutations
         let count = results.len();
         let mutations = results.into_iter()
-            .map(|(id, _)| BatchMutation::Delete { 
-                collection: query.collection.clone(), 
-                doc_id: id 
+            .map(|(id, _)| if hard {
+                BatchMutation::Delete {
+                    collection: query.collection.clone(),
+                    doc_id: id,
+                }
+            } else {
+                BatchMutation::SoftDelete {
+                    collection: query.collection.clone(),
+                    doc_id: id,
+                }
             })
             .collect();
 
@@ -4553,6 +4571,33 @@ impl Hako {
         }
         self.write_batch(mutations)?;
         Ok(count)
+    }
+
+    /// Hard-clear a collection without leaving tombstones or retention
+    /// records. Unlike `drop_collection`, the collection stays registered and
+    /// its index definitions remain in place, so it is safe as a benchmark
+    /// reset between iterations.
+    pub fn reset_collection(&self, collection: &str) -> Result<usize> {
+        if self.read_only.load(Ordering::Relaxed) {
+            return Err(HakoError::Corrupt("ReadOnly".into()));
+        }
+        let ids: Vec<String> = {
+            let shards = self.shards.read().unwrap();
+            let Some(shard) = shards.get(collection) else { return Ok(0) };
+            let storage = shard.read().unwrap();
+            storage.index.keys().cloned().collect()
+        };
+        for chunk in ids.chunks(1000) {
+            let mutations = chunk.iter().map(|id| BatchMutation::Delete {
+                collection: collection.to_string(),
+                doc_id: id.clone(),
+            }).collect();
+            self.write_batch(mutations)?;
+        }
+        if !ids.is_empty() {
+            self.compact()?; // reclaim tombstones so reset is truly hard
+        }
+        Ok(ids.len())
     }
 
     pub fn patch_where(&self, query: crate::query::query::Query, updates: Vec<(String, Value)>) -> Result<usize> {
@@ -6075,7 +6120,20 @@ impl Hako {
     /// exist before the doc that needs it lands). Every `create_*` is a
     /// no-op when the index already exists, so re-declaring on every
     /// boot is cheap and never wipes a populated index.
+    #[allow(clippy::type_complexity)]
     pub fn ensure_indexes(&self, schema: &IndexSchema) -> Result<()> {
+        let mut by_collection: HashMap<String, (Vec<String>, Vec<Vec<(String, SortDirection)>>)> = HashMap::new();
+        for (c, f) in &schema.secondary {
+            by_collection.entry(c.clone()).or_default().0.push(f.clone());
+        }
+        for (c, fields) in &schema.composite {
+            by_collection.entry(c.clone()).or_default().1.push(
+                fields.iter().map(|f| (f.clone(), SortDirection::Asc)).collect(),
+            );
+        }
+        for (c, (fields, composites)) in by_collection {
+            self.create_indexes(&c, &fields, &composites)?;
+        }
         for (c, f) in &schema.fts {
             self.create_fts_index(c, f)?;
         }
