@@ -4198,6 +4198,78 @@ pub extern "C" fn hk_engine_patch(
 
 // --- 1. INDEX MANAGEMENT ---
 
+/// Declare several secondary and composite indexes in one pass.
+///
+/// `fields_json` is a JSON array of field names; `composites_json` is a JSON
+/// array of arrays of `{"field": name, "dir": "asc"|"desc"}` objects. Returns
+/// Returns a JSON array of the composite index ids in order, or NULL on
+/// invalid input (with `hk_last_error()` set). Free the returned string with
+/// `hk_string_free`.
+#[no_mangle]
+pub extern "C" fn hk_engine_create_indexes(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+    fields_json: *const c_char,
+    composites_json: *const c_char,
+) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        let engine = unsafe { &*engine };
+        let col = match cstr_to_string(collection) {
+            Ok(v) => v,
+            Err(e) => { set_last_error_err(e.to_string()); return std::ptr::null_mut(); },
+        };
+        let parse_fields = |ptr: *const c_char| -> std::result::Result<Vec<String>, String> {
+            let s = cstr_to_string(ptr)?;
+            serde_json::from_str::<Vec<String>>(&s).map_err(|e| e.to_string())
+        };
+        let parse_composites = |ptr: *const c_char|
+            -> std::result::Result<Vec<Vec<(String, crate::index::composite::definition::SortDirection)>>, String>
+        {
+            let s = cstr_to_string(ptr)?;
+            let raw = serde_json::from_str::<Vec<Vec<serde_json::Value>>>(&s)
+                .map_err(|e| e.to_string())?;
+            let mut out = Vec::with_capacity(raw.len());
+            for group in raw {
+                let mut fields = Vec::with_capacity(group.len());
+                for item in group {
+                    let field = item.get("field").and_then(|v| v.as_str())
+                        .ok_or_else(|| "missing field".to_string())?.to_string();
+                    let desc = item.get("dir").and_then(|v| v.as_str())
+                        .map(|v| v.eq_ignore_ascii_case("desc"))
+                        .unwrap_or(false);
+                    fields.push((field, if desc {
+                        crate::index::composite::definition::SortDirection::Desc
+                    } else {
+                        crate::index::composite::definition::SortDirection::Asc
+                    }));
+                }
+                out.push(fields);
+            }
+            Ok(out)
+        };
+        let fields = match parse_fields(fields_json) {
+            Ok(v) => v,
+            Err(e) => { set_last_error_err(e); return std::ptr::null_mut(); },
+        };
+        let composites = match parse_composites(composites_json) {
+            Ok(v) => v,
+            Err(e) => { set_last_error_err(e); return std::ptr::null_mut(); },
+        };
+        match engine.db.create_indexes(&col, &fields, &composites) {
+            Ok(ids) => {
+                clear_last_error();
+                let json = serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string());
+                match CString::new(json) {
+                    Ok(s) => s.into_raw(),
+                    Err(e) => { set_last_error_err(e.to_string()); std::ptr::null_mut() },
+                }
+            }
+            Err(e) => { set_last_error_err(e.to_string()); std::ptr::null_mut() },
+        }
+    })
+}
+
+
 /// Creates a composite index from C++.
 /// fields_json should be like: [{"field": "age", "desc": false}]
 /// Optional constraint form (hakodb#71):
