@@ -5823,6 +5823,86 @@ impl Hako {
         Ok(())
     }
 
+    /// Declare several indexes in one pass. All definitions are registered
+    /// before a single backfill walk, so each stored document is read and
+    /// decoded once no matter how many indexes are being added. Every index
+    /// keeps the same key/value contract as `create_index` and
+    /// `create_composite_index`.
+    ///
+    /// The returned ids correspond to the composite definitions in order.
+    pub fn create_indexes(
+        &self,
+        collection: &str,
+        fields: &[String],
+        composites: &[Vec<(String, SortDirection)>],
+    ) -> Result<Vec<u32>> {
+        let mut ids = Vec::with_capacity(composites.len());
+        {
+            let mut mgr = self.indexes.write().unwrap();
+            for field in fields {
+                mgr.create_secondary_index(collection, field);
+            }
+            for definition_fields in composites {
+                let mut definition =
+                    crate::index::composite::definition::CompositeIndexDefinition::new(collection);
+                definition.fields = definition_fields
+                    .iter()
+                    .map(|(field, direction)| {
+                        crate::index::composite::definition::CompositeField {
+                            field: field.clone(),
+                            direction: direction.clone(),
+                        }
+                    })
+                    .collect();
+                ids.push(mgr.composite.create_index(definition));
+            }
+        }
+        let _ = self.persist_index_defs();
+        self.plan_cache.invalidate();
+
+        let shard_arc = self.get_shard(collection)?;
+        let idx_mgr = Arc::clone(&self.indexes);
+        let col_name = collection.to_string();
+        let backfill_count = Arc::clone(&self.backfill_inflight);
+        let wanted = Self::indexed_fields_for(&idx_mgr.read().unwrap(), collection);
+        backfill_count.fetch_add(1, Ordering::Relaxed);
+
+        thread::spawn(move || {
+            let _guard = BackfillGuard { counter: backfill_count };
+            let pointers = {
+                let storage = shard_arc.read().unwrap();
+                storage.get_physical_index_snapshot()
+            };
+            for chunk in pointers.chunks(200) {
+                let mut resolved_docs = Vec::new();
+                {
+                    let storage = shard_arc.read().unwrap();
+                    for (key, ptr) in chunk {
+                        if let Ok(Some(bytes)) = storage.read_pointer_internal(ptr, false) {
+                            resolved_docs.push((key.clone(), bytes));
+                        }
+                    }
+                }
+                let mut decoded_docs = Vec::new();
+                for (full_key, bytes) in resolved_docs {
+                    if let Some(doc) = HakoDoc::decode_projected(&bytes, &wanted) {
+                        decoded_docs.push((full_key, doc));
+                    }
+                }
+                let mut mgr = idx_mgr.write().unwrap();
+                let docs: Vec<(&str, &HakoDoc)> = decoded_docs
+                    .iter()
+                    .map(|(id, doc)| (id.as_str(), doc))
+                    .collect();
+                IndexingService::backfill_secondary(&mut mgr, &col_name, docs.iter().copied());
+                IndexingService::backfill_composite(&mut mgr, &col_name, docs.iter().copied());
+                thread::yield_now();
+            }
+        });
+
+        Ok(ids)
+    }
+
     /// Create a full-text index on a string field. Idempotent.
     pub fn create_fts_index(&self, collection: &str, field: &str) -> Result<()> {
         // 1. Register (#217 P2: idempotent — an already-declared index
