@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::ffi::{c_char, c_int, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::time::Duration;
 use std::{ptr, thread};
@@ -18,6 +19,15 @@ use crate::engine::{BatchMutation, Hako};
 use crate::index::composite::definition::SortDirection;
 use crate::query::filter::Operator;
 use crate::query::query::{AggregateOp, Query};
+
+static WARN_EXECUTE: AtomicBool = AtomicBool::new(false);
+static WARN_EXECUTE_WITH_CANCEL: AtomicBool = AtomicBool::new(false);
+
+fn warn_deprecated_once(name: &str, flag: &AtomicBool) {
+    if !flag.swap(true, Ordering::Relaxed) {
+        eprintln!("deprecated: {name} is a compatibility wrapper; use hk_query_execute_ex");
+    }
+}
 
 macro_rules! safety_shield {
     ($fallback:expr, $block:block) => {
@@ -2658,6 +2668,7 @@ pub extern "C" fn hk_query_execute_ex(
 #[deprecated(since = "0.23.0", note = "use hk_query_execute_ex")]
 #[no_mangle]
 pub extern "C" fn hk_query_execute(engine: *mut HK_Engine, query: *const HK_Query) -> *mut c_char {
+    warn_deprecated_once("hk_query_execute", &WARN_EXECUTE);
     hk_query_execute_ex(engine, query, std::ptr::null_mut())
 }
 
@@ -2670,6 +2681,7 @@ pub extern "C" fn hk_query_execute_with_cancel(
     query: *const HK_Query,
     cancel: *mut HK_Cancel,
 ) -> *mut c_char {
+    warn_deprecated_once("hk_query_execute_with_cancel", &WARN_EXECUTE_WITH_CANCEL);
     safety_shield!(std::ptr::null_mut(), {
         if cancel.is_null() {
             set_last_error_err("null cancel handle");

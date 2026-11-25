@@ -10,7 +10,8 @@
 
 | Function | Returns | Materialization | Use when |
 |---|---|---|---|
-| `hk_query_execute` | `char*` (JSON array) | full `HakoDoc` decode → serialize | simple native callers; legacy default |
+| `hk_query_execute_ex` | `char*` (JSON array) | canonical executor with optional cancel handle | ordinary API calls |
+| `hk_query_execute` | `char*` (JSON array) | full `HakoDoc` decode → serialize | legacy compatibility only |
 | `hk_query_execute_with_cancel` | `char*` (JSON array) | same as `execute`, with `HK_Cancel*` | cancellable variant of the same path |
 | `hk_query_execute_json` | `char*` (JSON array) | JSON emitted from pinned bytes via `query_json_into`; no owned `HakoDoc` (falls back to `execute` for projections) | JSON egress / SDK wire output |
 | `hk_query_execute_to_handles` | `HK_ResultSet*` | borrowed `HK_Doc` handles from zero-copy row refs; no JSON | engine throughput; caller reads fields via handle accessors |
@@ -22,7 +23,19 @@
 
 ## Deprecation status
 
-`hk_query_execute` and `hk_query_execute_with_cancel` are legacy compatibility wrappers and are marked deprecated in source/header comments. Prefer `hk_query_execute_ex` for API calls. They are **not** removed: no breaking major release is planned yet, and the generated C header carries advisory comments rather than compiler attributes.
+`hk_query_execute` and `hk_query_execute_with_cancel` are legacy compatibility wrappers and are marked deprecated in source/header comments. They also emit one warning per process when called. Prefer `hk_query_execute_ex` for API calls. They are **not** removed: no breaking major release is planned yet, and the generated C header carries advisory comments rather than compiler attributes.
+
+## Materialization cost (illustrative)
+
+Measured on the same hardware with the same 20-row query; treat as an order-of-magnitude guide, not a contract:
+
+| Lane | Median | What dominates |
+|---|---:|---|
+| `handles` / `raw` | ~0.2 ms | borrowed storage bytes, no JSON |
+| `docs` (`execute_ex`) | ~1.4 ms | owned document build + JSON |
+| SDK `get()` with JSON parse | ~2 ms | JSON copy + JS object tree |
+
+A large gap between these lanes is expected and does not indicate a slow engine. Always label the lane in results.
 
 ## Rules for benchmarking
 
