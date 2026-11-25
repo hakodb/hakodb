@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock, Once};
 use std::thread;
@@ -805,6 +805,7 @@ pub struct Hako {
     /// clamped open-time config; the runtime setter below keeps this and
     /// every shard WAL in lockstep (atomic, no lock on the read path).
     group_commit_interval_ms: AtomicU64,
+    commit_trigger_mode: AtomicU8,
     pub(crate) shards: Arc<RwLock<HashMap<String, Arc<RwLock<StorageEngine>>>>>, // The only storage
     index_storage: Arc<Mutex<IndexStorage>>,
     pub(crate) indexes: Arc<RwLock<IndexManager>>,
@@ -1477,6 +1478,10 @@ impl Hako {
             group_commit_interval_ms: AtomicU64::new(crate::config::clamp_group_commit_interval_ms(
                 config.group_commit_interval_ms,
             )),
+            commit_trigger_mode: AtomicU8::new(match config.commit_trigger_mode {
+                crate::config::CommitTriggerMode::Legacy => 0,
+                crate::config::CommitTriggerMode::StrictTime => 1,
+            }),
             shards,
             index_storage: Arc::clone(&index_storage),
             indexes,
@@ -5240,6 +5245,76 @@ impl Hako {
                 s.set_group_commit_interval_ms(ms);
             }
         }
+    }
+
+    /// Set the Interval commit-trigger mode on every shard. This is explicit:
+    /// changing the interval never changes the trigger mode by itself.
+    pub fn set_commit_trigger_mode_all(&self, mode: crate::config::CommitTriggerMode) {
+        self.commit_trigger_mode.store(
+            match mode {
+                crate::config::CommitTriggerMode::Legacy => 0,
+                crate::config::CommitTriggerMode::StrictTime => 1,
+            },
+            Ordering::Relaxed,
+        );
+        for shard in self.shards.read().unwrap().values() {
+            if let Ok(mut s) = shard.write() {
+                s.set_commit_trigger_mode(mode);
+            }
+        }
+    }
+
+    /// Effective live configuration as JSON. Consumers can record this
+    /// directly instead of guessing which defaults and setters took effect.
+    pub fn effective_config(&self) -> serde_json::Value {
+        let shards = self.shards.read().unwrap();
+        let (durability, interval_ms, max_ops, strict) = shards
+            .values()
+            .find_map(|shard| shard.read().ok().map(|s| {
+                (
+                    format!("{:?}", s.wal.durability_mode()).to_lowercase(),
+                    s.wal.group_commit_interval_ms(),
+                    s.wal.group_commit_max_ops(),
+                    s.wal.strict_interval(),
+                )
+            }))
+            .unwrap_or_else(|| {
+                (
+                    format!("{:?}", self.config.durability_mode).to_lowercase(),
+                    self.config.group_commit_interval_ms,
+                    self.config.group_commit_max_ops,
+                    self.config.commit_trigger_mode == crate::config::CommitTriggerMode::StrictTime,
+                )
+            });
+        drop(shards);
+
+        let mut index_defs = Vec::new();
+        let indexes = self.indexes.read().unwrap();
+        for (collection, fields) in &indexes.secondary {
+            for field in fields.keys() {
+                index_defs.push(format!("secondary:{collection}:{field}"));
+            }
+        }
+        for idx in indexes.composite.all_indexes() {
+            let fields: Vec<&str> = idx.definition.fields.iter().map(|f| f.field.as_str()).collect();
+            index_defs.push(format!("composite:{}:{}", idx.definition.collection, fields.join(",")));
+        }
+
+        serde_json::json!({
+            "durability_mode": durability,
+            "commit_trigger_mode": if strict { "strict-time" } else { "legacy" },
+            "group_commit_interval_ms": interval_ms,
+            "group_commit_max_ops": max_ops,
+            "query_workers": self.config.query_workers,
+            "compression": { "enabled": self.config.use_compression, "level": self.config.compression_level },
+            "maintenance": {
+                "background": self.config.background_maintenance,
+                "soft_delete_retention_secs": self.config.soft_delete_retention_secs,
+                "sweep_interval_secs": self.config.soft_delete_sweep_interval_secs
+            },
+            "indexes_ready": self.is_indexes_ready(),
+            "index_defs": index_defs
+        })
     }
 
     pub fn execute_aggregation(&self, query: Query) -> Result<HashMap<String, f64>> {

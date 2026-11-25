@@ -160,8 +160,9 @@ impl StorageEngine {
             wal_reserve,
         )?;
         // Per-instance group-commit window (cluster fsync staggering).
-        // Clamped + strict-armed inside the setter; see HakoConfig docs.
+        // Trigger mode is explicit; changing the interval is side-effect free.
         wal.set_group_commit_interval(cfg.group_commit_interval_ms);
+        wal.set_commit_trigger_mode(cfg.commit_trigger_mode);
 
         let mut segments = HashMap::new();
         let mut max_id = 0;
@@ -1349,6 +1350,10 @@ impl StorageEngine {
     /// Live group-commit window (clamped inside the WAL call, same as open).
     pub fn set_group_commit_interval_ms(&mut self, ms: u64) { self.wal.set_group_commit_interval(ms); }
 
+    pub fn set_commit_trigger_mode(&mut self, mode: crate::config::CommitTriggerMode) {
+        self.wal.set_commit_trigger_mode(mode);
+    }
+
     pub fn base_dir(&self) -> &Path { &self.base_dir }
 
     /// Count of registered segment files (issue #32 stats surface).
@@ -1677,6 +1682,7 @@ mod tests {
         let dir = tmp("strict-count");
         let cfg = HakoConfig {
             durability_mode: DurabilityMode::Interval,
+            commit_trigger_mode: crate::config::CommitTriggerMode::StrictTime,
             wal_reserve_bytes: 0,
             auto_compaction_threshold_bytes: 1024,
             group_commit_interval_ms: 30_000,
