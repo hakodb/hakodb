@@ -104,6 +104,17 @@ fn run(db: &Hako, op: AggregateOp) -> HashMap<String, f64> {
         .collect()
 }
 
+fn run_ops(db: &Hako, ops: Vec<AggregateOp>) -> HashMap<String, f64> {
+    let mut query = base_query();
+    for op in ops {
+        query = query.aggregate(op);
+    }
+    db.execute_aggregation(query)
+        .expect("aggregate")
+        .into_iter()
+        .collect()
+}
+
 #[test]
 fn covering_aggregation_matches_scan() {
     let d = dir("cover");
@@ -130,6 +141,41 @@ fn covering_aggregation_matches_scan() {
             Some(want) => assert!((got.get(&key).copied().unwrap_or(f64::NAN) - want).abs() < 1e-9,
                 "op={op:?} got={got:?} want={want}"),
             None => assert!(!got.contains_key(&key), "op={op:?} got={got:?}"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn multi_op_covering_matches_reference() {
+    let d = dir("multi");
+    let db = open(&d, true);
+    let nums = reference_numbers(&db, &base_query());
+    assert!(!nums.is_empty());
+
+    let combos: Vec<Vec<AggregateOp>> = vec![
+        vec![AggregateOp::Count, AggregateOp::Sum("score".into())],
+        vec![
+            AggregateOp::Count,
+            AggregateOp::Sum("score".into()),
+            AggregateOp::Avg("score".into()),
+            AggregateOp::Min("score".into()),
+            AggregateOp::Max("score".into()),
+        ],
+    ];
+    for ops in combos {
+        let got = run_ops(&db, ops.clone());
+        for op in &ops {
+            let key = match op {
+                AggregateOp::Count => "count".to_string(),
+                AggregateOp::Sum(f) => format!("sum_{f}"),
+                AggregateOp::Avg(f) => format!("avg_{f}"),
+                AggregateOp::Min(f) => format!("min_{f}"),
+                AggregateOp::Max(f) => format!("max_{f}"),
+            };
+            let want = expected(op, &nums).expect("multi-op fixture has values");
+            assert!((got.get(&key).copied().unwrap_or(f64::NAN) - want).abs() < 1e-9,
+                "ops={ops:?} key={key} got={got:?} want={want}");
         }
     }
     let _ = std::fs::remove_dir_all(&d);

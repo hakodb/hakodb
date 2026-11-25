@@ -1581,14 +1581,14 @@ impl ParallelQueryExecutor {
         Ok(results)
     }
 
-    /// Candidate ids for a single-op aggregation whose equality predicates
-    /// are exactly the leading fields of a composite index and whose target
-    /// is one of the remaining fields. Returns `None` for every other shape
-    /// so the historical secondary-index and scan paths stay authoritative.
+    /// Candidate ids for an aggregation whose equality predicates are exactly
+    /// the leading fields of a composite index and every aggregate target is
+    /// one of the remaining fields. Returns `None` for every other shape so
+    /// the historical secondary-index and scan paths stay authoritative.
     fn composite_covering_aggregation_ids(
         indexes: &IndexManager,
         plan: &QueryPlan,
-        target: &str,
+        targets: &[&str],
     ) -> Option<Vec<std::sync::Arc<str>>> {
         if plan.filters.is_empty()
             || plan.has_cursor_bounds
@@ -1622,7 +1622,10 @@ impl ParallelQueryExecutor {
             {
                 continue;
             }
-            if !fields[prefix_len..].contains(&target) {
+            if !targets
+                .iter()
+                .all(|target| fields[prefix_len..].contains(target))
+            {
                 continue;
             }
             let prefix_values: Vec<crate::document::value::Value> = fields[..prefix_len]
@@ -1653,10 +1656,10 @@ impl ParallelQueryExecutor {
     ) -> Result<HashMap<String, f64>> {
         let _inflight = InflightGuard::take();
         // --- 1. UNIFIED FAST PATH (Index-Only Aggregation) ---
-        // Conditions: Only 1 op, no OR groups, and simple Equality filters
-        if ops.len() == 1 && plan.or_groups.is_empty() {
-            let op = &ops[0];
-
+        // No OR groups and simple Equality filters. A composite range can
+        // cover several operations at once; the per-op secondary paths below
+        // remain single-operation only.
+        if plan.or_groups.is_empty() {
             // Determine if the operation is eligible for RAM-only execution
             let mut filter_ids: Option<hashbrown::HashSet<std::sync::Arc<str>>> = None;
             let mut can_use_fast_path = true;
@@ -1685,19 +1688,22 @@ impl ParallelQueryExecutor {
             }
 
             if can_use_fast_path {
-                // Composite covering lane: a prefix of Eq predicates plus the
-                // aggregate field lives in one index, so only the matching
-                // range is visited and no document is materialised.
-                let target = match op {
-                    AggregateOp::Sum(field)
-                    | AggregateOp::Avg(field)
-                    | AggregateOp::Min(field)
-                    | AggregateOp::Max(field) => Some(field.as_str()),
-                    AggregateOp::Count => None,
-                };
-                if let Some(target) = target {
+                // Composite covering lane: an Eq prefix plus every aggregate
+                // field lives in one index, so one bounded walk covers all
+                // operations and no document is materialised.
+                let targets: Vec<&str> = ops
+                    .iter()
+                    .filter_map(|op| match op {
+                        AggregateOp::Sum(field)
+                        | AggregateOp::Avg(field)
+                        | AggregateOp::Min(field)
+                        | AggregateOp::Max(field) => Some(field.as_str()),
+                        AggregateOp::Count => None,
+                    })
+                    .collect();
+                if !targets.is_empty() {
                     if let Some(ids) =
-                        Self::composite_covering_aggregation_ids(indexes, &plan, target)
+                        Self::composite_covering_aggregation_ids(indexes, &plan, &targets)
                     {
                         let storage = storage_arc.read().unwrap();
                         let mut res: HashMap<String, f64> = HashMap::new();
@@ -1706,41 +1712,65 @@ impl ParallelQueryExecutor {
                             let Some(bytes) = storage.read_pointer_shared(ptr).ok().flatten()
                             else { continue };
                             let Some(view) = HakoDocView::new(&bytes) else { continue };
-                            let Some((_, tag, data)) =
-                                view.iter().find(|(key, _, _)| *key == target)
-                            else { continue };
-                            let Some(num) = BorrowedValue { tag, data }.as_f64() else { continue };
-                            match op {
-                                AggregateOp::Sum(_) => {
-                                    *res.entry(format!("sum_{target}")).or_insert(0.0) += num;
+                            for op in ops {
+                                match op {
+                                    AggregateOp::Count => {
+                                        *res.entry("count".to_string()).or_insert(0.0) += 1.0;
+                                    }
+                                    AggregateOp::Sum(target)
+                                    | AggregateOp::Avg(target)
+                                    | AggregateOp::Min(target)
+                                    | AggregateOp::Max(target) => {
+                                        let Some((_, tag, data)) =
+                                            view.iter().find(|(key, _, _)| *key == target)
+                                        else { continue };
+                                        let Some(num) = BorrowedValue { tag, data }.as_f64()
+                                        else { continue };
+                                        match op {
+                                            AggregateOp::Sum(_) => {
+                                                *res.entry(format!("sum_{target}")).or_insert(0.0)
+                                                    += num;
+                                            }
+                                            AggregateOp::Avg(_) => {
+                                                *res.entry(format!("avg_tmp_{target}")).or_insert(0.0)
+                                                    += num;
+                                                *res.entry(format!("avg_cnt_{target}")).or_insert(0.0)
+                                                    += 1.0;
+                                            }
+                                            AggregateOp::Min(_) => {
+                                                let entry = res
+                                                    .entry(format!("min_{target}"))
+                                                    .or_insert(num);
+                                                *entry = entry.min(num);
+                                            }
+                                            AggregateOp::Max(_) => {
+                                                let entry = res
+                                                    .entry(format!("max_{target}"))
+                                                    .or_insert(num);
+                                                *entry = entry.max(num);
+                                            }
+                                            AggregateOp::Count => unreachable!(),
+                                        }
+                                    }
                                 }
-                                AggregateOp::Avg(_) => {
-                                    *res.entry(format!("avg_tmp_{target}")).or_insert(0.0) += num;
-                                    *res.entry(format!("avg_cnt_{target}")).or_insert(0.0) += 1.0;
-                                }
-                                AggregateOp::Min(_) => {
-                                    let entry = res.entry(format!("min_{target}")).or_insert(num);
-                                    *entry = entry.min(num);
-                                }
-                                AggregateOp::Max(_) => {
-                                    let entry = res.entry(format!("max_{target}")).or_insert(num);
-                                    *entry = entry.max(num);
-                                }
-                                AggregateOp::Count => unreachable!(),
                             }
                         }
-                        let tmp_key = format!("avg_tmp_{target}");
-                        if let Some(sum) = res.remove(&tmp_key) {
-                            let count = res
-                                .remove(&format!("avg_cnt_{target}"))
-                                .unwrap_or(0.0);
-                            if count > 0.0 {
-                                res.insert(format!("avg_{target}"), sum / count);
+                        for target in &targets {
+                            let tmp_key = format!("avg_tmp_{target}");
+                            if let Some(sum) = res.remove(&tmp_key) {
+                                let count = res
+                                    .remove(&format!("avg_cnt_{target}"))
+                                    .unwrap_or(0.0);
+                                if count > 0.0 {
+                                    res.insert(format!("avg_{target}"), sum / count);
+                                }
                             }
                         }
                         return Ok(res);
                     }
                 }
+                if ops.len() == 1 {
+                let op = &ops[0];
                 match op {
                     // CASE 1: COUNT
                     AggregateOp::Count => {
@@ -1838,6 +1868,7 @@ impl ParallelQueryExecutor {
                             }
                         }
                     }
+                }
                 }
             }
         }
