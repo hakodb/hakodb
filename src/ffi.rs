@@ -2721,6 +2721,30 @@ pub extern "C" fn hk_query_execute_ex(
     cancel: *mut HK_Cancel,
 ) -> *mut c_char {
     safety_shield!(std::ptr::null_mut(), {
+        if engine.is_null() || query.is_null() {
+            set_last_error_err("null engine/query handle");
+            return std::ptr::null_mut();
+        }
+        let engine_ref = unsafe { &*engine };
+        let query_ptr = unsafe { &*query };
+
+        // Fast JSON egress: for a plain page query the pinned-byte writer
+        // produces byte-identical JSON without owning a HakoDoc per row.
+        // Cancellable, projected and aggregate shapes keep the canonical
+        // decoded path so their contracts do not change.
+        if cancel.is_null()
+            && query_ptr.query.projection.is_empty()
+            && query_ptr.query.aggregations.is_empty()
+        {
+            let mut out = Vec::with_capacity(4096);
+            if engine_ref.db.query_json_into(query_ptr.query.clone(), &mut out).is_ok() {
+                clear_last_error();
+                return CString::new(out)
+                    .map(|s| s.into_raw())
+                    .unwrap_or_else(|_| std::ptr::null_mut());
+            }
+        }
+
         if cancel.is_null() {
             hk_query_execute_inner(engine, query, None)
         } else {

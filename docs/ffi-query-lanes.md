@@ -10,7 +10,7 @@
 
 | Function | Returns | Materialization | Use when |
 |---|---|---|---|
-| `hk_query_execute_ex` | `char*` (JSON array) | canonical executor with optional cancel handle | ordinary API calls |
+| `hk_query_execute_ex` | `char*` (JSON array) | canonical executor with optional cancel; plain pages use the pinned-byte JSON writer, projected/cancellable shapes use the decoded path | ordinary API calls |
 | `hk_query_execute` | `char*` (JSON array) | full `HakoDoc` decode → serialize | legacy compatibility only |
 | `hk_query_execute_with_cancel` | `char*` (JSON array) | same as `execute`, with `HK_Cancel*` | cancellable variant of the same path |
 | `hk_query_execute_json` | `char*` (JSON array) | JSON emitted from pinned bytes via `query_json_into`; no owned `HakoDoc` (falls back to `execute` for projections) | JSON egress / SDK wire output |
