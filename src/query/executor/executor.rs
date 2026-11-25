@@ -2070,6 +2070,7 @@ impl ParallelQueryExecutor {
         // borrowed bytes, count offset/limit over survivors, and decode only
         // the winners' projection fields. Unsupported shapes fall through.
         if Self::projected_residual_eligible(&plan) {
+            eprintln!("DEBUG projected residual gate engaged");
             if let Some(keys) = crate::query::match_key::MatchKeys::compile_fast_eq(&plan.filters) {
                 let optimized = crate::query::executor::worker::prepare_optimized_plan(&plan);
                 let offset = plan.offset.unwrap_or(0);
