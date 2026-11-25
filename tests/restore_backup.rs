@@ -71,6 +71,7 @@ fn restore_refuses_truncated_wal_without_touching_target() {
     let target = dir("target2");
     seed(&src);
     let db = Hako::open(&src, config()).expect("reopen");
+    db.flush().expect("flush before backup");
     db.backup(&backup).expect("backup");
     drop(db);
 

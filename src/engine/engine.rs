@@ -5092,8 +5092,10 @@ impl Hako {
             }
         }
         let dir = self.root_path.join(collection);
-        let total_bytes = dir_size(&dir);
+        // Background group commit can grow the WAL between two filesystem
+        // reads; sample it first and never report total < wal_bytes.
         let wal_bytes = storage.wal.file_len();
+        let total_bytes = dir_size(&dir).max(wal_bytes);
         let blob_bytes = std::fs::metadata(dir.join("blobs.dat")).map(|m| m.len()).unwrap_or(0);
         Ok(CollectionStats {
             collection: collection.to_string(),

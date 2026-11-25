@@ -1,6 +1,9 @@
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write, BufReader};
 use std::path::Path;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::config::DurabilityMode;
@@ -59,6 +62,8 @@ pub struct Wal {
     /// replay/reset/flush; buffered-but-unflushed appends don't count
     /// (undercount = fewer rewrites = the safe direction).
     data_len: u64,
+    /// Interval-mode background flusher. `None` for every other mode.
+    flusher: Option<WalFlusher>,
 }
 
 /// ponytail: every encoded op is >= 1 byte, so an all-zero 8-byte header can
@@ -70,6 +75,117 @@ pub struct Wal {
 /// limit. Count/size triggers are OFF there by design; this is the only
 /// non-clock flush left (besides explicit/Drop/rewrite flushes).
 const STRICT_EMERGENCY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Background group-commit flusher for Interval mode. Writers enqueue a
+/// complete WAL buffer and return; a dedicated thread performs the one
+/// `write_all` + `sync_data` per interval. The durability contract (flush at
+/// the configured interval) is unchanged — only the blocking wait moves off
+/// the writer thread.
+struct WalFlusher {
+    state: Arc<(Mutex<FlusherState>, Condvar)>,
+    handle: Option<JoinHandle<()>>,
+}
+
+struct FlusherState {
+    queue: VecDeque<Vec<u8>>,
+    submitted: u64,
+    flushed: u64,
+    /// Reposition the flusher's private file handle before the next batch
+    /// (WAL reset/rewrite moves the logical end-of-records cursor).
+    seek_to: Option<u64>,
+    err: Option<String>,
+    stop: bool,
+}
+
+impl WalFlusher {
+    fn new(mut file: File, start: u64) -> std::io::Result<Self> {
+        file.seek(SeekFrom::Start(start))?;
+        let state = Arc::new((
+            Mutex::new(FlusherState {
+                queue: VecDeque::new(),
+                submitted: start,
+                flushed: start,
+                seek_to: None,
+                err: None,
+                stop: false,
+            }),
+            Condvar::new(),
+        ));
+        let shared = Arc::clone(&state);
+        let handle = thread::spawn(move || loop {
+            let (lock, cv) = &*shared;
+            let mut s = lock.lock().expect("wal flusher poisoned");
+            while s.queue.is_empty() && !s.stop {
+                s = cv.wait(s).expect("wal flusher poisoned");
+            }
+            if s.stop && s.queue.is_empty() {
+                return;
+            }
+            let bytes = s.queue.pop_front().expect("queue checked");
+            let seek_to = s.seek_to.take();
+            drop(s);
+            let result = (|| {
+                if let Some(pos) = seek_to {
+                    file.seek(SeekFrom::Start(pos))?;
+                }
+                file.write_all(&bytes)?;
+                file.sync_data()
+            })();
+            let mut s = lock.lock().expect("wal flusher poisoned");
+            if let Err(e) = result {
+                s.err = Some(e.to_string());
+            } else if let Ok(pos) = file.stream_position() {
+                s.flushed = pos;
+            }
+            cv.notify_all();
+        });
+        Ok(Self { state, handle: Some(handle) })
+    }
+
+    fn submit(&self, bytes: Vec<u8>) -> Result<()> {
+        let (lock, cv) = &*self.state;
+        let mut s = lock.lock().expect("wal flusher poisoned");
+        if let Some(msg) = &s.err {
+            return Err(HakoError::Io(std::io::Error::other(msg.clone())));
+        }
+        s.submitted = s.submitted.saturating_add(bytes.len() as u64);
+        s.queue.push_back(bytes);
+        cv.notify_one();
+        Ok(())
+    }
+
+    fn drain(&self) -> Result<u64> {
+        let (lock, cv) = &*self.state;
+        let mut s = lock.lock().expect("wal flusher poisoned");
+        while s.flushed < s.submitted {
+            s = cv.wait(s).expect("wal flusher poisoned");
+            if let Some(msg) = &s.err {
+                return Err(HakoError::Io(std::io::Error::other(msg.clone())));
+            }
+        }
+        Ok(s.flushed)
+    }
+
+    fn reset_baseline(&self, pos: u64) {
+        let (lock, _) = &*self.state;
+        let mut s = lock.lock().expect("wal flusher poisoned");
+        s.submitted = pos;
+        s.flushed = pos;
+        s.seek_to = Some(pos);
+    }
+
+    fn stop(&mut self) {
+        {
+            let (lock, cv) = &*self.state;
+            let mut s = lock.lock().expect("wal flusher poisoned");
+            s.stop = true;
+            cv.notify_all();
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
 
 #[inline]
 /// Validate WAL framing and CRC without replaying or repairing the file.
@@ -165,6 +281,11 @@ impl Wal {
             let _ = file.set_len(reserve_bytes);
         }
         file.seek(SeekFrom::Start(end))?;
+        let flusher = if mode == DurabilityMode::Interval {
+            Some(WalFlusher::new(file.try_clone()?, end)?)
+        } else {
+            None
+        };
 
         Ok(Self {
             file,
@@ -181,6 +302,7 @@ impl Wal {
             // Unknown until the first replay/reset/flush recounts it;
             // heuristics must not run on file length meanwhile (see field).
             data_len: 0,
+            flusher,
         })
     }
 
@@ -219,6 +341,17 @@ impl Wal {
     }
 
     pub fn append_raw(&mut self, op: &WalOp) -> Result<()> {
+        if let Some(flusher) = self.flusher.as_ref() {
+            // Direct writes bypass the queue; drain it first so no queued
+            // record is lost, then move the flusher's baseline to the new
+            // file cursor after this record is written.
+            if !self.write_buffer.is_empty() {
+                let bytes = std::mem::take(&mut self.write_buffer);
+                flusher.submit(bytes)?;
+            }
+            let pos = flusher.drain()?;
+            flusher.reset_baseline(pos);
+        }
         // 1. Clear internal WAL buffer
         self.write_buffer.clear();
         
@@ -248,6 +381,10 @@ impl Wal {
             // SQLite/LMDB rely on; ~2-3x cheaper per commit on Linux.
             // (On Windows both map to FlushFileBuffers: no-op difference.)
             self.file.sync_data()?;
+        }
+        if let Some(flusher) = self.flusher.as_ref() {
+            let pos = self.file.stream_position()?;
+            flusher.reset_baseline(pos);
         }
         
         Ok(())
@@ -323,6 +460,16 @@ impl Wal {
     }
 
     pub fn flush(&mut self) -> Result<()> {
+        if let Some(flusher) = self.flusher.as_ref() {
+            if !self.write_buffer.is_empty() {
+                let bytes = std::mem::take(&mut self.write_buffer);
+                flusher.submit(bytes)?;
+            }
+            self.data_len = flusher.drain()?;
+            self.pending_ops_since_sync = 0;
+            self.last_sync = Instant::now();
+            return Ok(());
+        }
         if self.write_buffer.is_empty() {
             return Ok(());
         }
@@ -389,7 +536,19 @@ impl Wal {
         };
 
         if should_flush {
-            self.flush()?; // This writes the WHOLE buffer in one syscall and calls sync_all
+            if let Some(flusher) = self.flusher.as_ref() {
+                // Interval: hand the whole buffer to the background flusher
+                // and let the writer continue immediately. The configured
+                // loss window is unchanged; only the blocking fsync moves.
+                let bytes = std::mem::take(&mut self.write_buffer);
+                if !bytes.is_empty() {
+                    flusher.submit(bytes)?;
+                }
+                self.pending_ops_since_sync = 0;
+                self.last_sync = Instant::now();
+            } else {
+                self.flush()?; // one syscall + sync on the calling thread
+            }
         }
         Ok(())
     }
@@ -569,6 +728,12 @@ impl Wal {
         // after reset. Manual mode never flushes during a session, so the
         // buffer grows unbounded; on shutdown the rewrite_wal_snapshot
         // snapshot ends up double-written to disk.
+        if self.flusher.is_some() {
+            let _ = self.flush(); // drain any queued batch before the wipe
+        }
+        if let Some(flusher) = self.flusher.as_ref() {
+            flusher.reset_baseline(0);
+        }
         self.write_buffer.clear();
         self.file.set_len(0)?;
         // ponytail: re-reserve headroom after the wipe (see open()) —
@@ -715,6 +880,9 @@ impl Drop for Wal {
     fn drop(&mut self) {
         // Final attempt to save data when the database handle is closed
         let _ = self.flush();
+        if let Some(flusher) = self.flusher.as_mut() {
+            flusher.stop();
+        }
     }
 }
 

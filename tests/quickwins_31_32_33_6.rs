@@ -108,6 +108,9 @@ fn collection_stats_reports_accurate_counts() {
         db.put("metrics", &format!("k{i:03}"), &doc("v")).unwrap();
     }
     db.delete("metrics", "k001").unwrap(); // tombstone
+    // Group commit is asynchronous; make the setup observable before
+    // asserting on on-disk byte counts.
+    db.flush().unwrap();
 
     let s = db.collection_stats("metrics").unwrap();
     assert_eq!(s.collection, "metrics");
