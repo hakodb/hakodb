@@ -238,7 +238,8 @@ impl QueryPlanner {
                 let safe_limit = if order_ok {
                     query.limit.map(|l| l + query.offset.unwrap_or(0))
                 } else { None };
-                return Self::make_plan(query, range_scan, safe_limit, order_ok, false);
+                let filters_done = Self::composite_scan_filters_satisfied(query, &range_scan, indexes);
+                return Self::make_plan(query, range_scan, safe_limit, order_ok, filters_done);
             }
         }
 
@@ -405,12 +406,14 @@ impl QueryPlanner {
         // pushdown, per-doc filter re-verify). P6 takes them instead.
         if use_index_heuristic && !yield_to_secondary {
             if let Some(range_scan) = Self::try_plan_composite_range(query, indexes) {
+                let filters_done =
+                    Self::composite_scan_filters_satisfied(query, &range_scan, indexes);
                 return Self::make_plan(
                     query,
                     range_scan,
                     None,
                     false,
-                    false
+                    filters_done
                 );
             }
         }
@@ -860,6 +863,45 @@ impl QueryPlanner {
             }
         }
         None
+    }
+
+    /// True when a composite range scan pins every predicate of the original
+    /// query: all filters are point/range ops on index fields, no OR,
+    /// elemMatch, or cursor bounds are left for the executor to verify.
+    fn composite_scan_filters_satisfied(
+        query: &Query,
+        scan: &ScanType,
+        indexes: &IndexManager,
+    ) -> bool {
+        if !query.or_groups.is_empty()
+            || !query.elem_match.is_empty()
+            || query.start_at.is_some()
+            || query.start_after.is_some()
+            || query.end_at.is_some()
+            || query.end_before.is_some()
+            || query.filters.is_empty()
+        {
+            return false;
+        }
+        let ScanType::CompositeIndexRange { index_id, .. } = scan else {
+            return false;
+        };
+        let Some(idx) = indexes.composite.get(*index_id) else {
+            return false;
+        };
+        query.filters.iter().all(|f| {
+            let indexed = idx.definition.fields.iter().any(|idx_f| idx_f.field == f.field);
+            indexed
+                && (matches!(
+                    f.op,
+                    Operator::Eq
+                        | Operator::Gt
+                        | Operator::Gte
+                        | Operator::Lt
+                        | Operator::Lte
+                        | Operator::Ne
+                ) || matches!(&f.value, Value::Array(a) if a.len() == 1))
+        })
     }
 
     fn try_plan_composite_range(query: &Query, indexes: &IndexManager) -> Option<ScanType> {
