@@ -675,6 +675,19 @@ pub extern "C" fn hk_config_set_group_commit_interval_ms(config: *mut HK_Config,
     }
 }
 
+/// Commit trigger mode: 0 = legacy (count/size/elapsed), 1 = strict-time.
+/// Setting this is explicit; changing the interval never changes the mode.
+#[no_mangle]
+pub extern "C" fn hk_config_set_commit_trigger_mode(config: *mut HK_Config, mode: u32) {
+    if let Some(cfg) = unsafe { config.as_mut() } {
+        cfg.inner.commit_trigger_mode = if mode == 1 {
+            crate::config::CommitTriggerMode::StrictTime
+        } else {
+            crate::config::CommitTriggerMode::Legacy
+        };
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn hk_config_set_encryption_key(config: *mut HK_Config, key: *const c_char) {
     if let Some(cfg) = unsafe { config.as_mut() } {
@@ -7296,6 +7309,36 @@ pub extern "C" fn hk_engine_compact(engine: *mut HK_Engine) -> i32 {
                 -1 // or ptr::null_mut() depending on function return type
             }
         }
+    })
+}
+
+/// Effective live configuration as JSON (durability, commit mode, interval,
+/// triggers, compression, workers, maintenance, readiness, index defs).
+/// Free with `hk_string_free`.
+#[no_mangle]
+pub extern "C" fn hk_engine_effective_config(engine: *mut HK_Engine) -> *mut c_char {
+    safety_shield!(std::ptr::null_mut(), {
+        let engine = unsafe { &*engine };
+        let json = serde_json::to_string(&engine.db.effective_config())
+            .unwrap_or_else(|_| "{}".to_string());
+        match CString::new(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Set the Interval commit-trigger mode live on every shard: 0 legacy,
+/// 1 strict-time. The interval value is unchanged.
+#[no_mangle]
+pub extern "C" fn hk_engine_set_commit_trigger_mode(engine: *mut HK_Engine, mode: u32) {
+    safety_shield!((), {
+        let engine = unsafe { &*engine };
+        engine.db.set_commit_trigger_mode_all(if mode == 1 {
+            crate::config::CommitTriggerMode::StrictTime
+        } else {
+            crate::config::CommitTriggerMode::Legacy
+        });
     })
 }
 

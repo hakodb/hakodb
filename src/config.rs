@@ -1,5 +1,15 @@
 use std::collections::HashSet;
 
+/// Which triggers flush an Interval-mode WAL batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitTriggerMode {
+    /// Count + size + elapsed (the historical default).
+    Legacy,
+    /// Clock only, with an emergency buffer cap. Changing the interval must
+    /// never switch this implicitly.
+    StrictTime,
+}
+
 /// When writes become durable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DurabilityMode {
@@ -22,6 +32,7 @@ pub struct HakoConfig {
     pub query_workers: usize,
     pub auto_compaction_threshold_bytes: usize,
     pub durability_mode: DurabilityMode,
+    pub commit_trigger_mode: CommitTriggerMode,
     pub group_commit_max_ops: usize,
     /// Group-commit time window in ms (Interval mode): an append flushes
     /// when this long passed since the last flush. Default 5. Cluster
@@ -30,13 +41,8 @@ pub struct HakoConfig {
     /// approach Manual durability without saying so (unbounded loss
     /// window); use Manual + explicit flush if you really mean it.
     ///
-    /// Strict-time rule: the DEFAULT value keeps the legacy triple-trigger
-    /// (count 128 ops / 124KB buffer / elapsed), so benchmarks and gates
-    /// never move. Any CUSTOM value switches to strict time — the count
-    /// and size triggers are disabled (they would re-synchronize fleet
-    /// flushes under balanced load, defeating staggering) and only
-    /// `elapsed >= interval` flushes, plus a 16MB emergency buffer cap
-    /// (memory bound, not latency). Same rule drives the maintenance tick.
+    /// Trigger mode is controlled explicitly by `commit_trigger_mode`;
+    /// changing this value never changes which triggers fire.
     pub group_commit_interval_ms: u64,
     pub encryption_key: Option<String>,
     pub encrypted_cols: Option<HashSet<String>>,
@@ -114,6 +120,7 @@ impl Default for HakoConfig {
             query_workers: 4,
             auto_compaction_threshold_bytes: 8 * 1024 * 1024,
             durability_mode: DurabilityMode::Interval,
+            commit_trigger_mode: CommitTriggerMode::Legacy,
             group_commit_max_ops: 128,
             group_commit_interval_ms: DEFAULT_GROUP_COMMIT_INTERVAL_MS,
             encryption_key: None,

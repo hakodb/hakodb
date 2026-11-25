@@ -749,6 +749,18 @@ impl Wal {
         Ok(())
     }
 
+    pub fn group_commit_interval_ms(&self) -> u64 {
+        self.group_commit_interval.as_millis() as u64
+    }
+
+    pub fn strict_interval(&self) -> bool {
+        self.strict_interval
+    }
+
+    pub fn group_commit_max_ops(&self) -> usize {
+        self.group_commit_max_ops
+    }
+
     pub fn durability_mode(&self) -> DurabilityMode {
         self.mode
     }
@@ -784,13 +796,15 @@ impl Wal {
         self.mode = mode;
     }
 
-    /// Group-commit window (Interval mode). Applied from
-    /// `HakoConfig::group_commit_interval_ms` at engine open (clamped).
-    /// A non-default value also arms strict-time (see field docs).
+    /// Group-commit window (Interval mode). Changing the interval never
+    /// changes the trigger mode; call `set_commit_trigger_mode` explicitly.
     pub fn set_group_commit_interval(&mut self, ms: u64) {
         let ms = crate::config::clamp_group_commit_interval_ms(ms);
         self.group_commit_interval = Duration::from_millis(ms);
-        self.strict_interval = ms != crate::config::DEFAULT_GROUP_COMMIT_INTERVAL_MS;
+    }
+
+    pub fn set_commit_trigger_mode(&mut self, mode: crate::config::CommitTriggerMode) {
+        self.strict_interval = mode == crate::config::CommitTriggerMode::StrictTime;
     }
 
     pub fn tail(&self, start_offset: u64) -> Result<(Vec<WalOp>, u64)> {
