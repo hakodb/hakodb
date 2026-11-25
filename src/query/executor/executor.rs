@@ -2033,7 +2033,7 @@ impl ParallelQueryExecutor {
     /// order is output order. Projection is allowed here; only the page
     /// winners are decoded into projected fields.
     fn projected_residual_eligible(plan: &QueryPlan) -> bool {
-        let ok = plan.scan_limit.is_none()
+        plan.scan_limit.is_none()
             && !plan.filters.is_empty()
             && !plan.filters_satisfied_by_index
             && plan.or_groups.is_empty()
@@ -2042,16 +2042,7 @@ impl ParallelQueryExecutor {
             && (plan.order_by.is_empty() || plan.order_by_satisfied)
             && !(matches!(plan.scan, ScanType::SortedKeys { .. }) && plan.offset.unwrap_or(0) > 0)
             && crate::query::match_key::can_preverify(&plan.filters)
-            && Self::residual_scan_supported(&plan.scan);
-        eprintln!(
-            "DEBUG gate ok={} scan={:?} sf={} filters={} preverify={}",
-            ok,
-            plan.scan,
-            plan.filters_satisfied_by_index,
-            plan.filters.len(),
-            crate::query::match_key::can_preverify(&plan.filters)
-        );
-        ok
+            && Self::residual_scan_supported(&plan.scan)
     }
 
     #[allow(clippy::type_complexity)]
@@ -2079,7 +2070,6 @@ impl ParallelQueryExecutor {
         // borrowed bytes, count offset/limit over survivors, and decode only
         // the winners' projection fields. Unsupported shapes fall through.
         if Self::projected_residual_eligible(&plan) {
-            eprintln!("DEBUG projected residual gate engaged");
             if let Some(keys) = crate::query::match_key::MatchKeys::compile_fast_eq(&plan.filters) {
                 let optimized = crate::query::executor::worker::prepare_optimized_plan(&plan);
                 let offset = plan.offset.unwrap_or(0);
