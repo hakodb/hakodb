@@ -299,6 +299,27 @@ impl ParallelQueryExecutor {
                 return Ok(page);
             }
         }
+        // Offset pushdown: for order-satisfied, index-satisfied bounded range
+        // scans, skip the offset while walking the range so only page pointers
+        // are cloned. All other scans keep the historical post-skip contract.
+        let mut offset_to_apply_later = match plan.scan {
+            ScanType::SortedKeys { .. } => 0,
+            _ => plan.offset.unwrap_or(0),
+        };
+        let can_push_offset = offset_to_apply_later > 0
+            && (plan.order_by.is_empty() || plan.order_by_satisfied)
+            && plan.filters_satisfied_by_index
+            && plan.or_groups.is_empty()
+            && plan.elem_match.is_empty()
+            && !plan.has_cursor_bounds
+            && matches!(
+                plan.scan,
+                ScanType::SecondaryIndexRange { .. } | ScanType::CompositeIndexRange { .. }
+            );
+        if can_push_offset {
+            offset_to_apply_later = 0;
+        }
+
         // 1. PHASE 1: INDEX SCAN
         // Fetch physical pointers from the RAM Index
         let mut keys_from_index = {
@@ -315,6 +336,7 @@ impl ParallelQueryExecutor {
                 &plan.collection,
                 plan.scan_limit,
                 plan.offset,
+                can_push_offset,
             )?
         };
 
@@ -337,6 +359,7 @@ impl ParallelQueryExecutor {
                 &plan.collection,
                 None,
                 plan.offset,
+                false,
             )?;
             plan.scan = ScanType::FullCollection;
             plan.filters_satisfied_by_index = false;
@@ -349,30 +372,6 @@ impl ParallelQueryExecutor {
         }
 
         // 2. PHASE 2: Limit / Offset
-        // ponytail: v0.7.2 hard-coded this to 0 which silently dropped the
-        // user's offset for FullCollection and every other scan that didn't
-        // apply it internally. SortedKeys above already applied offset via
-        // sorted_key_range, so its skip path is a no-op (`0`).
-        let mut offset_to_apply_later = match plan.scan {
-            ScanType::SortedKeys { .. } => 0,
-            _ => plan.offset.unwrap_or(0),
-        };
-        // When the scan already produces output order and every filter is
-        // index-satisfied, skipped rows cannot affect the page. Count the
-        // offset over scan keys and decode only the winners.
-        let can_skip_before_decode = offset_to_apply_later > 0
-            && (plan.order_by.is_empty() || plan.order_by_satisfied)
-            && plan.filters_satisfied_by_index
-            && plan.or_groups.is_empty()
-            && plan.elem_match.is_empty()
-            && !plan.has_cursor_bounds;
-        let mut skip_remaining = if can_skip_before_decode {
-            let skip = offset_to_apply_later;
-            offset_to_apply_later = 0;
-            skip
-        } else {
-            0
-        };
 
         let doc_count = keys_from_index.len();
 
@@ -480,10 +479,6 @@ impl ParallelQueryExecutor {
 
             for (id, ptr) in keys_from_index {
                 Self::check_cancel(cancel)?;
-                if skip_remaining > 0 {
-                    skip_remaining -= 1;
-                    continue;
-                }
                 // Row-cache probe first: a hit linearizes at the version
                 // check (same as get_arc) and skips the storage read and
                 // the decode entirely — the shared Arc leaves the cache
@@ -515,9 +510,9 @@ impl ParallelQueryExecutor {
                     }
                 }
                 // Early termination: the page is full (see above for why
-                // the prefix is output-identical). When offset was applied
-                // over keys, only `limit` winners remain to be decoded.
-                let stop_at = if can_skip_before_decode {
+                // the prefix is output-identical). With offset pushed into
+                // the range walk, only `limit` winners reach this loop.
+                let stop_at = if can_push_offset {
                     plan.limit.unwrap_or(usize::MAX)
                 } else {
                     early_need.unwrap_or(usize::MAX)
@@ -1070,6 +1065,7 @@ impl ParallelQueryExecutor {
             &plan.collection,
             plan.scan_limit,
             plan.offset,
+            false,
         )?;
 
         let mut out = Vec::with_capacity(found.len());
@@ -1895,6 +1891,7 @@ impl ParallelQueryExecutor {
                 &plan.collection,
                 plan.scan_limit,
                 None,
+                false,
             )?
         };
 
@@ -2148,6 +2145,7 @@ impl ParallelQueryExecutor {
                 &plan.collection,
                 plan.scan_limit,
                 plan.offset,
+                false,
             )?
         };
 
@@ -2413,6 +2411,7 @@ impl ParallelQueryExecutor {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_single_scan(
         &self,
         storage: &StorageEngine,
@@ -2421,9 +2420,14 @@ impl ParallelQueryExecutor {
         collection: &str,
         limit: Option<usize>,
         offset: Option<usize>,
+        apply_offset: bool,
     ) -> Result<Vec<(String, Pointer)>> {
-        // Change from Vec<u8> to Pointer
-        let max_ids = limit.unwrap_or(usize::MAX);
+        // Change from Vec<u8> to Pointer. When offset is pushed into the
+        // bounded range walk, the page budget excludes the skipped prefix.
+        let skip_in_scan = if apply_offset { offset.unwrap_or(0) } else { 0 };
+        let max_ids = limit
+            .map(|l| if apply_offset { l.saturating_sub(skip_in_scan) } else { l })
+            .unwrap_or(usize::MAX);
 
         match scan {
             ScanType::FullCollection => {
@@ -2566,12 +2570,14 @@ impl ParallelQueryExecutor {
 
             ScanType::CompositeIndexRange { index_id, ranges, reverse } => {
                 let mut out = Vec::new();
+                let mut skipped = 0usize;
                 if let Some(idx) = indexes.composite.get(*index_id) {
                     for (start_bound, end_bound) in ranges {
                         let iter = idx.tree.range((start_bound.clone(), end_bound.clone()));
-                        
+
                         if *reverse {
                             for (_, doc_id) in iter.rev() {
+                                if skipped < skip_in_scan { skipped += 1; continue; }
                                 if let Some(ptr) = storage.index.get(doc_id.as_ref()) {
                                     if !matches!(ptr, Pointer::Deleted { .. }) {
                                         out.push((doc_id.to_string(), ptr.clone()));
@@ -2581,6 +2587,7 @@ impl ParallelQueryExecutor {
                             }
                         } else {
                             for (_, doc_id) in iter {
+                                if skipped < skip_in_scan { skipped += 1; continue; }
                                 if let Some(ptr) = storage.index.get(doc_id.as_ref()) {
                                     if !matches!(ptr, Pointer::Deleted { .. }) {
                                         out.push((doc_id.to_string(), ptr.clone()));
@@ -2634,13 +2641,15 @@ impl ParallelQueryExecutor {
 
             ScanType::SecondaryIndexRange { field, start, end, reverse } => {
                 let mut out = Vec::new();
+                let mut skipped = 0usize;
                 if let Some(sec_map) = indexes.secondary.get(collection) {
                     if let Some(index) = sec_map.get(field) {
                         let range_iter = index.get_map().range((start.clone(), end.clone()));
-                        
+
                         if *reverse {
                             for (_, ids) in range_iter.rev() {
-                                for doc_id in ids.iter().rev() { 
+                                for doc_id in ids.iter().rev() {
+                                    if skipped < skip_in_scan { skipped += 1; continue; }
                                     if let Some(ptr) = storage.index.get(doc_id.as_ref()) {
                                         if !matches!(ptr, Pointer::Deleted { .. }) {
                                             out.push((doc_id.to_string(), ptr.clone()));
@@ -2653,6 +2662,7 @@ impl ParallelQueryExecutor {
                         } else {
                             for (_, ids) in range_iter {
                                 for doc_id in ids {
+                                    if skipped < skip_in_scan { skipped += 1; continue; }
                                     if let Some(ptr) = storage.index.get(doc_id.as_ref()) {
                                         if !matches!(ptr, Pointer::Deleted { .. }) {
                                             out.push((doc_id.to_string(), ptr.clone()));
@@ -2871,7 +2881,7 @@ impl ParallelQueryExecutor {
                 let mut unique_results = HashMap::new();
                 for sub_scan in scans {
                     // Recursively execute sub-scans (Eq lookups for each item in the "IN" array)
-                    let results = self.execute_single_scan(storage, indexes, sub_scan, collection, None, None)?;
+                    let results = self.execute_single_scan(storage, indexes, sub_scan, collection, None, None, false)?;
                     for (id, ptr) in results {
                         unique_results.insert(id, ptr); 
                     }
