@@ -5334,16 +5334,19 @@ impl Hako {
         drop(shards);
 
         let mut index_defs = Vec::new();
-        let indexes = self.indexes.read().unwrap();
-        for (collection, fields) in &indexes.secondary {
-            for field in fields.keys() {
-                index_defs.push(format!("secondary:{collection}:{field}"));
+        {
+            let indexes = self.indexes.read().unwrap();
+            for (collection, fields) in &indexes.secondary {
+                for field in fields.keys() {
+                    index_defs.push(format!("secondary:{collection}:{field}"));
+                }
+            }
+            for idx in indexes.composite.all_indexes() {
+                let fields: Vec<&str> = idx.definition.fields.iter().map(|f| f.field.as_str()).collect();
+                index_defs.push(format!("composite:{}:{}", idx.definition.collection, fields.join(",")));
             }
         }
-        for idx in indexes.composite.all_indexes() {
-            let fields: Vec<&str> = idx.definition.fields.iter().map(|f| f.field.as_str()).collect();
-            index_defs.push(format!("composite:{}:{}", idx.definition.collection, fields.join(",")));
-        }
+        let q = self.quiescence_status();
 
         serde_json::json!({
             "durability_mode": durability,
@@ -5358,7 +5361,17 @@ impl Hako {
                 "sweep_interval_secs": self.config.soft_delete_sweep_interval_secs
             },
             "indexes_ready": self.is_indexes_ready(),
-            "index_defs": index_defs
+            "index_defs": index_defs,
+            "quiescence": {
+                "is_quiescent": q.is_quiescent(),
+                "indexes_ready": q.indexes_ready,
+                "pending_index_ops": q.pending_index_ops,
+                "index_backfills": q.index_backfills,
+                "pending_blob_bytes": q.pending_blob_bytes,
+                "queued_blob_items": q.queued_blob_items,
+                "maintenance_running": q.maintenance_running
+            },
+            "stats": self.get_stats()
         })
     }
 

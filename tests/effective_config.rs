@@ -60,3 +60,20 @@ fn explicit_strict_config_is_reported_at_open() {
     assert_eq!(report["group_commit_max_ops"], 128);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn effective_config_includes_quiescence_and_stats() {
+    let d = dir("status");
+    let db = Hako::open(&d, HakoConfig::default()).expect("open");
+    let report = db.effective_config();
+    let q = &report["quiescence"];
+    assert_eq!(q["indexes_ready"], report["indexes_ready"]);
+    assert!(q["is_quiescent"].is_boolean());
+    assert!(q["pending_index_ops"].is_number());
+    assert!(q["index_backfills"].is_number());
+    assert!(q["pending_blob_bytes"].is_number());
+    assert!(q["queued_blob_items"].is_number());
+    assert!(q["maintenance_running"].is_boolean());
+    assert!(report["stats"].is_object());
+    let _ = std::fs::remove_dir_all(&d);
+}
