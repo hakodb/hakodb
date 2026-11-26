@@ -353,9 +353,25 @@ impl ParallelQueryExecutor {
         // user's offset for FullCollection and every other scan that didn't
         // apply it internally. SortedKeys above already applied offset via
         // sorted_key_range, so its skip path is a no-op (`0`).
-        let offset_to_apply_later = match plan.scan {
+        let mut offset_to_apply_later = match plan.scan {
             ScanType::SortedKeys { .. } => 0,
             _ => plan.offset.unwrap_or(0),
+        };
+        // When the scan already produces output order and every filter is
+        // index-satisfied, skipped rows cannot affect the page. Count the
+        // offset over scan keys and decode only the winners.
+        let can_skip_before_decode = offset_to_apply_later > 0
+            && (plan.order_by.is_empty() || plan.order_by_satisfied)
+            && plan.filters_satisfied_by_index
+            && plan.or_groups.is_empty()
+            && plan.elem_match.is_empty()
+            && !plan.has_cursor_bounds;
+        let mut skip_remaining = if can_skip_before_decode {
+            let skip = offset_to_apply_later;
+            offset_to_apply_later = 0;
+            skip
+        } else {
+            0
         };
 
         let doc_count = keys_from_index.len();
@@ -464,6 +480,10 @@ impl ParallelQueryExecutor {
 
             for (id, ptr) in keys_from_index {
                 Self::check_cancel(cancel)?;
+                if skip_remaining > 0 {
+                    skip_remaining -= 1;
+                    continue;
+                }
                 // Row-cache probe first: a hit linearizes at the version
                 // check (same as get_arc) and skips the storage read and
                 // the decode entirely — the shared Arc leaves the cache
@@ -495,11 +515,15 @@ impl ParallelQueryExecutor {
                     }
                 }
                 // Early termination: the page is full (see above for why
-                // the prefix is output-identical).
-                if let Some(need) = early_need {
-                    if results.len() >= need {
-                        break;
-                    }
+                // the prefix is output-identical). When offset was applied
+                // over keys, only `limit` winners remain to be decoded.
+                let stop_at = if can_skip_before_decode {
+                    plan.limit.unwrap_or(usize::MAX)
+                } else {
+                    early_need.unwrap_or(usize::MAX)
+                };
+                if results.len() >= stop_at {
+                    break;
                 }
             }
 
