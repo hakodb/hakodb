@@ -65,5 +65,12 @@ fn reset_collection_leaves_no_tombstones_and_keeps_indexes() {
     assert!(indexes.secondary.get("records")
         .map(|f| f.iter().any(|name| name == "score"))
         .unwrap_or(false), "index def survived reset");
+    assert_eq!(db.reset_collection("records").expect("second reset"), 0, "reset is idempotent");
+
+    drop(db);
+    let cfg = HakoConfig { durability_mode: DurabilityMode::Manual, ..Default::default() };
+    let reopened = Hako::open(&d, cfg).expect("reopen");
+    assert!(reopened.query(Query::new("records")).expect("query after reset").is_empty());
+    assert!(reopened.list_indexes(Some("records")).secondary.contains_key("records"));
     let _ = std::fs::remove_dir_all(&d);
 }
