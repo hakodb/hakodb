@@ -4577,27 +4577,76 @@ impl Hako {
     /// records. Unlike `drop_collection`, the collection stays registered and
     /// its index definitions remain in place, so it is safe as a benchmark
     /// reset between iterations.
+    /// Hard-clear a collection in one pass. WAL still records one delete per
+    /// live id, but index RAM is reset via `clear_collection` instead of
+    /// decoding every document to remove its index entries. Index definitions
+    /// survive; only their RAM contents are cleared.
     pub fn reset_collection(&self, collection: &str) -> Result<usize> {
         if self.read_only.load(Ordering::Relaxed) {
             return Err(HakoError::Corrupt("ReadOnly".into()));
         }
-        let ids: Vec<String> = {
-            let shards = self.shards.read().unwrap();
-            let Some(shard) = shards.get(collection) else { return Ok(0) };
-            let storage = shard.read().unwrap();
-            storage.index.keys().cloned().collect()
+        if !self.allowed(collection, AccessOp::Batch) {
+            return Err(HakoError::Corrupt("Security Denied".into()));
+        }
+        let Some(shard_arc) = self.try_get_shard_on_disk(collection)? else {
+            return Ok(0);
         };
-        for chunk in ids.chunks(1000) {
-            let mutations = chunk.iter().map(|id| BatchMutation::Delete {
-                collection: collection.to_string(),
-                doc_id: id.clone(),
-            }).collect();
-            self.write_batch(mutations)?;
+
+        let now_nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64;
+        let watermark = self.last_ts_watermark.load(Ordering::Relaxed);
+        let now_micros = if now_nanos / 1000 <= watermark {
+            watermark.saturating_add(1)
+        } else {
+            now_nanos / 1000
+        };
+        self.last_ts_watermark.store(now_micros, Ordering::Relaxed);
+
+        let (keys, key_arcs) = {
+            let mut shard = shard_arc.write().unwrap();
+            let keys: Vec<String> = shard.index.iter()
+                .filter(|(_, ptr)| !matches!(ptr, Pointer::Deleted { .. }))
+                .map(|(key, _)| key.clone())
+                .collect();
+            if keys.is_empty() {
+                return Ok(0);
+            }
+            let key_arcs: Vec<Arc<str>> = keys.iter().map(|key| Arc::from(key.as_str())).collect();
+            let tx_id = shard.next_tx_id;
+            shard.next_tx_id += 1;
+            let ops: Vec<WalOp> = keys.iter()
+                .map(|key| WalOp::Delete { key: key.clone(), timestamp: now_micros })
+                .collect();
+            shard.wal.append_batch_fast(tx_id, &ops, false)?;
+            let mut pending_sorted = Vec::new();
+            for key in &keys {
+                shard.update_index_entry_deferred(
+                    key.clone(),
+                    Some(Pointer::Deleted { timestamp: now_micros }),
+                    &mut pending_sorted,
+                );
+            }
+            shard.flush_pending_sorted(&mut pending_sorted);
+            shard.compact()?;
+            (keys, key_arcs)
+        };
+
+        let removed: HashSet<Arc<str>> = key_arcs.iter().cloned().collect();
+        let keep: HashSet<Arc<str>> = HashSet::new();
+        self.clear_versions_by_keys(&removed, &keep);
+        self.indexes.write().unwrap().clear_collection(collection);
+        self.finish_index_drop()?;
+        for key in &key_arcs {
+            self.notify_watchers(collection, ChangeEvent { path: key.clone(), kind: ChangeKind::Delete });
         }
-        if !ids.is_empty() {
-            self.compact()?; // reclaim tombstones so reset is truly hard
-        }
-        Ok(ids.len())
+        self.record_audit(AuditEntry {
+            op: AccessOp::Batch,
+            collection: collection.to_string(),
+            doc_id: None,
+            ok: true,
+        });
+        WRITE_STATS.batches.fetch_add(1, Ordering::Relaxed);
+        WRITE_STATS.mutations.fetch_add(keys.len() as u64, Ordering::Relaxed);
+        Ok(keys.len())
     }
 
     pub fn patch_where(&self, query: crate::query::query::Query, updates: Vec<(String, Value)>) -> Result<usize> {
