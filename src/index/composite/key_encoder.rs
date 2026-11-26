@@ -131,3 +131,53 @@ fn maybe_flip(direction: &SortDirection, bytes: &mut [u8]) {
         }
     }
 }
+
+fn value_span(key: &[u8], pos: usize, tag: u8) -> Option<usize> {
+    let len = match tag {
+        0 => 1,
+        1 => 2,
+        2 | 3 | 6 => 9,
+        4 | 5 => {
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(key.get(pos + 1..pos + 5)?);
+            5 + u32::from_be_bytes(bytes) as usize
+        }
+        _ => return None,
+    };
+    pos.checked_add(len).filter(|end| *end <= key.len())
+}
+
+/// Decode only the numeric target field from a composite tree key. Prefix
+/// values are skipped by width, so no `Value` is allocated per row. The
+/// doc-id tail is never read.
+pub(crate) fn decode_composite_numeric(
+    def: &CompositeIndexDefinition,
+    key: &[u8],
+    skip: usize,
+    target: &str,
+) -> Option<f64> {
+    if key.len() < 4 {
+        return None;
+    }
+    let mut pos = 4; // index id
+    for _ in 0..skip {
+        let tag = *key.get(pos)?;
+        pos = value_span(key, pos, tag)?;
+    }
+    for field in def.fields.iter().skip(skip) {
+        let tag = *key.get(pos)?;
+        if field.field == target {
+            let bytes = key.get(pos + 1..pos + 9)?;
+            let mut raw = [0u8; 8];
+            raw.copy_from_slice(bytes);
+            maybe_flip(&field.direction, &mut raw);
+            return match tag {
+                2 => Some(i64::from_be_bytes(raw) as f64),
+                3 => Some(f64::from_bits(u64::from_be_bytes(raw))),
+                _ => None,
+            };
+        }
+        pos = value_span(key, pos, tag)?;
+    }
+    None
+}

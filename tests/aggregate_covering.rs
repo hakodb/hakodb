@@ -191,3 +191,47 @@ fn non_covering_shape_is_unchanged() {
     assert!((got.get("sum_score").copied().unwrap_or(f64::NAN) - want).abs() < 1e-9);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn covering_aggregation_decodes_desc_target() {
+    use hakodb::index::composite::definition::SortDirection;
+
+    let d = dir("desc-target");
+    let cfg = HakoConfig { durability_mode: DurabilityMode::Manual, ..Default::default() };
+    let db = Hako::open(&d, cfg).expect("open");
+    let mut batch = Vec::new();
+    for i in 0..200usize {
+        let mut doc = HakoDoc::default();
+        doc.insert("category", Value::String(format!("cat-{}", i % 5)));
+        doc.insert("tenant", Value::String(format!("t{:02}", i % 12)));
+        doc.insert("score", Value::Int((i % 97) as i64));
+        batch.push(BatchMutation::Put {
+            collection: "records".into(),
+            doc_id: format!("r{i:04}"),
+            doc,
+        });
+    }
+    db.write_batch(batch).expect("seed");
+    db.create_composite_index(
+        "records",
+        vec![
+            ("category".into(), SortDirection::Asc),
+            ("tenant".into(), SortDirection::Asc),
+            ("score".into(), SortDirection::Desc),
+        ],
+    ).expect("composite");
+    assert!(db.await_quiescent(std::time::Duration::from_secs(30)));
+
+    let nums = reference_numbers(&db, &base_query());
+    let got = run_ops(&db, vec![
+        AggregateOp::Count,
+        AggregateOp::Sum("score".into()),
+        AggregateOp::Min("score".into()),
+        AggregateOp::Max("score".into()),
+    ]);
+    assert_eq!(got.get("count").copied(), Some(nums.len() as f64));
+    assert!((got["sum_score"] - nums.iter().sum::<f64>()).abs() < 1e-9);
+    assert!((got["min_score"] - nums.iter().copied().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap()).abs() < 1e-9);
+    assert!((got["max_score"] - nums.iter().copied().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap()).abs() < 1e-9);
+    let _ = std::fs::remove_dir_all(&d);
+}

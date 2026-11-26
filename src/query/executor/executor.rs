@@ -8,6 +8,7 @@ use crate::cancel::CancelToken;
 use crate::document::hako_doc::{BorrowedValue, DocView, HakoDoc, HakoDocView};
 use crate::document::value::Value;
 use crate::error::Result;
+use crate::index::composite::key_encoder::decode_composite_numeric;
 use crate::index::manager::IndexManager;
 use crate::query::order::OrderBy;
 use crate::query::plan::ScanType;
@@ -1585,11 +1586,14 @@ impl ParallelQueryExecutor {
     /// the leading fields of a composite index and every aggregate target is
     /// one of the remaining fields. Returns `None` for every other shape so
     /// the historical secondary-index and scan paths stay authoritative.
-    fn composite_covering_aggregation_ids(
+    /// Index-only aggregation: every filter prefix and aggregate field lives
+    /// in one composite key. Decode only the numeric target values, without
+    /// allocating a `Value` or reading a document per row.
+    fn composite_covering_aggregation_numeric(
         indexes: &IndexManager,
         plan: &QueryPlan,
-        targets: &[&str],
-    ) -> Option<Vec<std::sync::Arc<str>>> {
+        ops: &[AggregateOp],
+    ) -> Option<HashMap<String, f64>> {
         if plan.filters.is_empty()
             || plan.has_cursor_bounds
             || !plan.or_groups.is_empty()
@@ -1598,7 +1602,20 @@ impl ParallelQueryExecutor {
         {
             return None;
         }
-        let mut values: HashMap<&str, crate::document::value::Value> = HashMap::new();
+        let targets: Vec<&str> = ops
+            .iter()
+            .filter_map(|op| match op {
+                AggregateOp::Sum(field)
+                | AggregateOp::Avg(field)
+                | AggregateOp::Min(field)
+                | AggregateOp::Max(field) => Some(field.as_str()),
+                AggregateOp::Count => None,
+            })
+            .collect();
+        if targets.is_empty() {
+            return None;
+        }
+        let mut values: HashMap<&str, Value> = HashMap::new();
         for filter in &plan.filters {
             if filter.op != crate::query::filter::Operator::Eq {
                 return None;
@@ -1628,21 +1645,63 @@ impl ParallelQueryExecutor {
             {
                 continue;
             }
-            let prefix_values: Vec<crate::document::value::Value> = fields[..prefix_len]
+            let prefix_values: Vec<Value> = fields[..prefix_len]
                 .iter()
                 .map(|f| values.get(*f).expect("checked above").clone())
                 .collect();
             let range =
                 crate::index::composite::range_builder::build_prefix_range(&idx.definition, &prefix_values);
-            let ids = idx
-                .tree
-                .range((
-                    std::ops::Bound::Included(range.start),
-                    std::ops::Bound::Included(range.end),
-                ))
-                .map(|(_, doc_id)| doc_id.clone())
-                .collect();
-            return Some(ids);
+            let wants_count = ops.iter().any(|op| matches!(op, AggregateOp::Count));
+            let mut res: HashMap<String, f64> = HashMap::new();
+            for (key, _) in idx.tree.range((
+                std::ops::Bound::Included(range.start),
+                std::ops::Bound::Included(range.end),
+            )) {
+                if wants_count {
+                    *res.entry("count".to_string()).or_insert(0.0) += 1.0;
+                }
+                for target in &targets {
+                    let Some(num) = decode_composite_numeric(
+                        &idx.definition,
+                        key,
+                        prefix_len,
+                        target,
+                    ) else {
+                        continue;
+                    };
+                    for op in ops {
+                        match op {
+                            AggregateOp::Count => {}
+                            AggregateOp::Sum(field) if field == target => {
+                                *res.entry(format!("sum_{target}")).or_insert(0.0) += num;
+                            }
+                            AggregateOp::Avg(field) if field == target => {
+                                *res.entry(format!("avg_tmp_{target}")).or_insert(0.0) += num;
+                                *res.entry(format!("avg_cnt_{target}")).or_insert(0.0) += 1.0;
+                            }
+                            AggregateOp::Min(field) if field == target => {
+                                let entry = res.entry(format!("min_{target}")).or_insert(num);
+                                *entry = entry.min(num);
+                            }
+                            AggregateOp::Max(field) if field == target => {
+                                let entry = res.entry(format!("max_{target}")).or_insert(num);
+                                *entry = entry.max(num);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            for target in &targets {
+                let tmp_key = format!("avg_tmp_{target}");
+                if let Some(sum) = res.remove(&tmp_key) {
+                    let count = res.remove(&format!("avg_cnt_{target}")).unwrap_or(0.0);
+                    if count > 0.0 {
+                        res.insert(format!("avg_{target}"), sum / count);
+                    }
+                }
+            }
+            return Some(res);
         }
         None
     }
@@ -1689,86 +1748,14 @@ impl ParallelQueryExecutor {
 
             if can_use_fast_path {
                 // Composite covering lane: an Eq prefix plus every aggregate
-                // field lives in one index, so one bounded walk covers all
-                // operations and no document is materialised.
-                let targets: Vec<&str> = ops
-                    .iter()
-                    .filter_map(|op| match op {
-                        AggregateOp::Sum(field)
-                        | AggregateOp::Avg(field)
-                        | AggregateOp::Min(field)
-                        | AggregateOp::Max(field) => Some(field.as_str()),
-                        AggregateOp::Count => None,
-                    })
-                    .collect();
-                if !targets.is_empty() {
-                    if let Some(ids) =
-                        Self::composite_covering_aggregation_ids(indexes, &plan, &targets)
-                    {
-                        let storage = storage_arc.read().unwrap();
-                        let mut res: HashMap<String, f64> = HashMap::new();
-                        for id in ids {
-                            let Some(ptr) = storage.index.get(id.as_ref()) else { continue };
-                            let Some(bytes) = storage.read_pointer_shared(ptr).ok().flatten()
-                            else { continue };
-                            let Some(view) = HakoDocView::new(&bytes) else { continue };
-                            for op in ops {
-                                match op {
-                                    AggregateOp::Count => {
-                                        *res.entry("count".to_string()).or_insert(0.0) += 1.0;
-                                    }
-                                    AggregateOp::Sum(target)
-                                    | AggregateOp::Avg(target)
-                                    | AggregateOp::Min(target)
-                                    | AggregateOp::Max(target) => {
-                                        let Some((_, tag, data)) =
-                                            view.iter().find(|(key, _, _)| *key == target)
-                                        else { continue };
-                                        let Some(num) = BorrowedValue { tag, data }.as_f64()
-                                        else { continue };
-                                        match op {
-                                            AggregateOp::Sum(_) => {
-                                                *res.entry(format!("sum_{target}")).or_insert(0.0)
-                                                    += num;
-                                            }
-                                            AggregateOp::Avg(_) => {
-                                                *res.entry(format!("avg_tmp_{target}")).or_insert(0.0)
-                                                    += num;
-                                                *res.entry(format!("avg_cnt_{target}")).or_insert(0.0)
-                                                    += 1.0;
-                                            }
-                                            AggregateOp::Min(_) => {
-                                                let entry = res
-                                                    .entry(format!("min_{target}"))
-                                                    .or_insert(num);
-                                                *entry = entry.min(num);
-                                            }
-                                            AggregateOp::Max(_) => {
-                                                let entry = res
-                                                    .entry(format!("max_{target}"))
-                                                    .or_insert(num);
-                                                *entry = entry.max(num);
-                                            }
-                                            AggregateOp::Count => unreachable!(),
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        for target in &targets {
-                            let tmp_key = format!("avg_tmp_{target}");
-                            if let Some(sum) = res.remove(&tmp_key) {
-                                let count = res
-                                    .remove(&format!("avg_cnt_{target}"))
-                                    .unwrap_or(0.0);
-                                if count > 0.0 {
-                                    res.insert(format!("avg_{target}"), sum / count);
-                                }
-                            }
-                        }
-                        return Ok(res);
-                    }
+                // field lives in one index. Decode only numeric target values
+                // from the tree keys - no document read and no per-row Value.
+                if let Some(res) =
+                    Self::composite_covering_aggregation_numeric(indexes, &plan, ops)
+                {
+                    return Ok(res);
                 }
+
                 if ops.len() == 1 {
                 let op = &ops[0];
                 match op {
