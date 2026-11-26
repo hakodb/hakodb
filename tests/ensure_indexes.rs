@@ -113,3 +113,23 @@ fn traverse_declaration_is_idempotent() {
     db.ensure_indexes(&schema()).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn composite_declaration_is_idempotent() {
+    let dir = tmp("composite");
+    let db = Hako::open(&dir, cfg()).unwrap();
+    let schema = IndexSchema {
+        secondary: vec![("items".into(), "category".into())],
+        composite: vec![(
+            "items".into(),
+            vec!["category".into(), "key".into()],
+        )],
+        ..Default::default()
+    };
+    db.ensure_indexes(&schema).unwrap();
+    db.ensure_indexes(&schema).unwrap();
+    let list = db.list_indexes(Some("items"));
+    assert_eq!(list.composite.len(), 1, "duplicate composite created");
+    assert_eq!(list.secondary["items"].len(), 1, "duplicate secondary created");
+    let _ = std::fs::remove_dir_all(&dir);
+}

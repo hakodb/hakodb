@@ -6126,7 +6126,23 @@ impl Hako {
         for (c, f) in &schema.secondary {
             by_collection.entry(c.clone()).or_default().0.push(f.clone());
         }
+        // `ensure` means declare-or-existing: a repeated composite definition
+        // must not create a second index (nor a second backfill). Secondary
+        // indexes are already idempotent via HashSet insertion; composites
+        // need an explicit check because create_index always assigns a new id.
+        let mut existing: HashMap<String, HashSet<Vec<(String, String)>>> = HashMap::new();
+        for idx in self.list_indexes(None).composite {
+            existing
+                .entry(idx.collection)
+                .or_default()
+                .insert(idx.fields.into_iter().map(|f| (f.field, f.direction)).collect());
+        }
         for (c, fields) in &schema.composite {
+            let signature: Vec<(String, String)> =
+                fields.iter().map(|f| (f.clone(), "asc".to_string())).collect();
+            if !existing.entry(c.clone()).or_default().insert(signature) {
+                continue;
+            }
             by_collection.entry(c.clone()).or_default().1.push(
                 fields.iter().map(|f| (f.clone(), SortDirection::Asc)).collect(),
             );
