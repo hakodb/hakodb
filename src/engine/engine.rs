@@ -5833,6 +5833,29 @@ impl Hako {
         Ok(())
     }
 
+    /// Drop every index family declared for a collection in one operation.
+    /// Document data is untouched. Composite ids are discovered from the
+    /// live definitions, so callers never need to track engine-assigned ids.
+    pub fn drop_indexes(&self, collection: &str) -> Result<()> {
+        let list = self.list_indexes(Some(collection));
+        for field in list.simple.get(collection).into_iter().flatten() {
+            self.drop_index(collection, field)?;
+        }
+        for idx in list.composite {
+            self.drop_composite_index(collection, idx.id)?;
+        }
+        for field in list.fts.get(collection).into_iter().flatten() {
+            self.drop_fts_index(collection, field)?;
+        }
+        for info in list.vector.get(collection).into_iter().flatten() {
+            self.drop_vector_index(collection, &info.field)?;
+        }
+        if list.traverse.iter().any(|c| c == collection) {
+            self.drop_traverse_index(collection)?;
+        }
+        Ok(())
+    }
+
     /// Drop an edge index: its traverse tracking plus the `_from`/`_to`
     /// secondary indexes that `create_edge_index` owns.
     pub fn drop_edge_index(&self, collection: &str) -> Result<()> {
