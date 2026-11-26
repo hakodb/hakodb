@@ -268,3 +268,46 @@ fn dropping_unique_composite_releases_constraint() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn drop_indexes_removes_every_family_and_persists() {
+    let dir = tmp("all");
+    {
+        let db = open_db(&dir);
+        db.put("docs", "a1", &doc("open", "alpha beta", [1.0, 0.0], None))
+            .unwrap();
+        db.put("docs", "a2", &doc("open", "beta gamma", [0.0, 1.0], None))
+            .unwrap();
+        db.create_index("docs", "status").unwrap();
+        db.create_fts_index("docs", "body").unwrap();
+        db.create_composite_index("docs", vec![("status".into(), SortDirection::Asc)])
+            .unwrap();
+        db.create_vector_index("docs", "emb", 2, Metric::Cosine)
+            .unwrap();
+        db.create_traverse_index("docs").unwrap();
+        wait_ready(&db);
+        assert_eq!(open_rows(&db), 2);
+
+        db.drop_indexes("docs").unwrap();
+        let list = db.list_indexes(Some("docs"));
+        assert!(list.secondary.is_empty(), "{list:?}");
+        assert!(list.fts.is_empty(), "{list:?}");
+        assert!(list.composite.is_empty(), "{list:?}");
+        assert!(list.vector.is_empty(), "{list:?}");
+        assert!(!list.traverse.contains(&"docs".into()));
+        assert_eq!(open_rows(&db), 2, "documents must survive index drop");
+
+        // Second call is a no-op.
+        db.drop_indexes("docs").unwrap();
+    }
+    {
+        let db = open_db(&dir);
+        let list = db.list_indexes(Some("docs"));
+        assert!(list.secondary.is_empty(), "resurrected: {list:?}");
+        assert!(list.fts.is_empty(), "resurrected: {list:?}");
+        assert!(list.composite.is_empty(), "resurrected: {list:?}");
+        assert!(list.vector.is_empty(), "resurrected: {list:?}");
+        assert_eq!(open_rows(&db), 2);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

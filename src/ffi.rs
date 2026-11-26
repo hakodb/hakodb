@@ -4861,6 +4861,30 @@ pub extern "C" fn hk_engine_drop_traverse_index(
     }
 }
 
+/// Drop every index family declared for a collection (simple/secondary,
+/// composite, FTS, vector, traverse) in one call. Documents are untouched.
+#[no_mangle]
+pub extern "C" fn hk_engine_drop_indexes(
+    engine: *mut HK_Engine,
+    collection: *const c_char,
+) -> i32 {
+    if engine.is_null() {
+        return set_last_error_err("null engine handle");
+    }
+    let engine = unsafe { &*engine };
+    let col = match cstr_to_string(collection) {
+        Ok(v) => v,
+        Err(e) => return set_last_error_err(e),
+    };
+    match engine.db.drop_indexes(&col) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(e) => set_last_error_err(e),
+    }
+}
+
 /// Graph-traversal marker on a query (issue #53): BFS from
 /// (`start_col`, `start_id`); `direction` 0/1/2, `edge_field` null = any
 /// ref field, `max_depth` bound. Result cap rides query limit.
