@@ -33,7 +33,7 @@ Your app *is* the database host: ideal for local-first/offline-first products, d
 - **Queries** — `eq/ne/gt/gte/lt/lte/in/notIn/arrayContains/match/contains/startsWith`, ordering, limit/offset, cursor bounds, `count/sum/avg/min/max`, cost-aware parallel planner with projection pushdown.
 - **Indexes** — secondary B-Tree, composite, full-text, HNSW vector (KNN, plus scored/filtered variants and RRF-fused hybrid text+vector search), graph (BFS/Dijkstra) with edge predicates; built asynchronously in the background, or declared up front with idempotent `ensure_indexes`.
 - **Storage** — tiered compaction, group-commit WAL, blob offloading, optional zstd compression (`compression` feature, default-on).
-- **Operations** — collection-prefix allow/deny rules, audit logging, `flush/compact/backup`.
+- **Operations** — collection-prefix allow/deny rules, audit logging, `flush/compact/backup`, one-call `ensure_indexes` / `drop_indexes` schema lifecycle, and `effective_config()` introspection (durability, indexes, quiescence, stats).
 - **Deletes** — soft by default: tombstone + retention record, restore any time before the sweeper purges (`restore`/`restore_available`/`delete_queue`/`sweep_now`); `--force`-style hard delete stays available.
 
 ## Quick start (Rust)
@@ -65,13 +65,13 @@ See [`example/rust/basic`](example/rust/basic) for a complete runnable project.
 
 ## Vector search (KNN)
 
-`create_vector_index(collection, field, dim, metric)` + `find_near(collection, field, query, k)`: nearest-first hits over a binary LE-`f32` field, cosine or L2, HNSW with exact rescore. `hybrid_search` fuses the full-text and vector sides with reciprocal-rank fusion; the `_filtered` variants apply admission filters **before** rank truncation, so results are full-k within the filtered set (not top-k with mismatches dropped after); `find_near_scored` adds an optional raw-distance cap.
+`create_vector_index(collection, field, dim, metric)` + `find_near(collection, field, query, k)`: nearest-first hits over a binary LE-`f32` field, cosine or L2, HNSW with exact rescore. The `_filtered` variants are canonical: they apply admission filters **before** rank truncation, so results are full-k within the filtered set (not top-k with mismatches dropped after). Unfiltered variants remain for compatibility; `find_near_scored_filtered` adds an optional raw-distance cap. In the JS SDK, `findNear()` and `hybridSearch()` accept optional filters and use the canonical filtered lanes.
 
 > **The index does not embed.** Turning text/images into vectors needs an embedding model you operate separately; query and corpus must share one model (a dim mismatch is a hard error). **Sync carries index definitions, not graphs** — HNSW graphs rebuild locally from replicated documents.
 
 ## Graph traversal
 
-`create_traverse_index(collection)` tracks `Reference` edges into a backlink index; `find_paths(collection, id, spec)` walks out/in/both with BFS (depth-capped, visited-set, deterministic order). For weighted shortest paths, `create_edge_index(edge_collection)` registers `_from`/`_to` edge docs and `TraverseSpec::via_edge` runs Dijkstra (missing weight = 1.0, negatives clamp 0; hits carry `cost`). `subgraph_json` exports a seed-scoped neighborhood as JSON — `subgraph_json_projected` keeps only named node fields so raw blobs (embeddings) never reach graph clients. Untracked incoming anchors fail loudly instead of returning empty.
+`create_traverse_index(collection)` tracks `Reference` edges into a backlink index; `find_paths(collection, id, spec)` walks out/in/both with BFS (depth-capped, visited-set, deterministic order). For weighted shortest paths, `create_edge_index(edge_collection)` registers `_from`/`_to` edge docs and `TraverseSpec::via_edge` runs Dijkstra (missing weight = 1.0, negatives clamp 0; hits carry `cost`). `subgraph_json` exports a seed-scoped neighborhood as JSON — `subgraph_json_projected` keeps only named node fields so raw blobs (embeddings) never reach graph clients. Untracked incoming anchors fail loudly instead of returning empty. In the JS SDK, `findPathsFull()` / `shortestPathsFull()` (v4 FFI) are canonical; the older `findPaths()` / `shortestPaths()` aliases are advisory-deprecated.
 
 > **Sync carries defs, not state** — backlink/edge indexes rebuild locally from replicated documents, same as HNSW graphs.
 
@@ -79,7 +79,7 @@ See [`example/rust/basic`](example/rust/basic) for a complete runnable project.
 
 Flat C API over opaque handles (`HK_Engine`, `HK_Doc`, `HK_Query`, `HK_Batch`, `HK_Transaction`, `HK_Watch`, `HK_ResultSet`, sync handles): CRUD, batches, transactions, queries, watch, result sets, sync. Build outputs: `target/release/libhakodb.so` (Linux), `.dylib` (macOS), `hakodb.dll` (Windows) + per-target `hakodb.h`.
 
-Use `hk_query_execute_ex` as the canonical query executor; existing execute entry points remain for compatibility but are advisory-deprecated. See [docs/ffi-query-lanes.md](docs/ffi-query-lanes.md) for the materialization trade-offs — the entry points differ in what they return, and only `execute_to_handles` matches `benchmark.cpp`.
+Use `hk_query_execute_ex` as the canonical query executor; plain page queries now take a pinned-byte JSON fast path, while projected/cancellable shapes keep the decoded path. Existing execute entry points remain for compatibility but are advisory-deprecated. For index schema lifecycle use `hk_engine_ensure_indexes` / `hk_engine_drop_indexes`; `hk_engine_effective_config` reports durability, index definitions, quiescence, and stats in one call. See [docs/ffi-query-lanes.md](docs/ffi-query-lanes.md) for the materialization trade-offs — the entry points differ in what they return, and only `execute_to_handles` matches `benchmark.cpp`.
 
 ```bash
 cargo build --release                                   # full (sync + compression)
