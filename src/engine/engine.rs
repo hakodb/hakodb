@@ -681,10 +681,9 @@ impl SerializableTransaction {
             doc_id: doc_id.to_string(),
         });
     }
-    /// Issue #71/F5 item 5: patch inside the transaction. `get` first so the
-    /// doc version joins the read-set (a concurrent commit conflicts), then
-    /// queue the same `Patch` mutation `Hako::patch` uses — top-level field
-    /// upsert semantics included.
+    /// Patch inside a transaction. Registers the doc version in the read-set
+    /// without decoding the document (a concurrent commit still conflicts),
+    /// then queues the same `Patch` mutation `Hako::patch` uses.
     pub fn patch(
         &mut self,
         db: &Hako,
@@ -692,7 +691,8 @@ impl SerializableTransaction {
         doc_id: &str,
         updates: Vec<(String, Value)>,
     ) -> Result<()> {
-        self.get(db, collection, doc_id)?;
+        let version = db.read_version_for_txn(collection, doc_id)?;
+        self.reads.entry(doc_id.to_string()).or_insert(version);
         self.mutations.push(BatchMutation::Patch {
             collection: collection.to_string(),
             doc_id: doc_id.to_string(),
@@ -4968,6 +4968,30 @@ impl Hako {
         let Some(doc) = doc else { return Ok(None) };
         let version = self.current_version(doc_id);
         Ok(Some((doc, version.unwrap_or(0))))
+    }
+
+    /// Version-only read for transaction read-set registration. Avoids the
+    /// full `HakoDoc` decode done by `get_versioned`; `None` means absent or
+    /// deleted, matching the read-set contract of `Transaction::get`.
+    pub(crate) fn read_version_for_txn(
+        &self,
+        collection: &str,
+        doc_id: &str,
+    ) -> Result<Option<u64>> {
+        if !self.allowed(collection, AccessOp::Get) {
+            return Err(self.deny(AccessOp::Get, collection, Some(doc_id)));
+        }
+        let Some(shard) = self.try_get_shard_on_disk(collection)? else {
+            return Ok(None);
+        };
+        let shard = shard.safe_read()?;
+        let Some(ptr) = shard.index.get(doc_id) else {
+            return Ok(None);
+        };
+        if matches!(ptr, Pointer::Deleted { .. }) {
+            return Ok(None);
+        }
+        Ok(Some(self.current_version(doc_id).unwrap_or(0)))
     }
 
     pub fn current_version(&self, key: &str) -> Option<u64> {
