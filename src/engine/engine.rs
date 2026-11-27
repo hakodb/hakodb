@@ -4648,6 +4648,57 @@ impl Hako {
         Ok(removed_count)
     }
 
+    /// Index-only id collection for the common `field = ?` / `field IN [...]`
+    /// patch shapes. Returns `None` for anything requiring document decoding.
+    fn patch_ids_from_index(&self, query: &crate::query::query::Query) -> Option<Vec<String>> {
+        use crate::query::filter::Operator;
+
+        if query.filters.is_empty()
+            || !query.or_groups.is_empty()
+            || !query.elem_match.is_empty()
+            || query.start_at.is_some()
+            || query.start_after.is_some()
+            || query.end_at.is_some()
+            || query.end_before.is_some()
+        {
+            return None;
+        }
+        if !self.allowed(&query.collection, AccessOp::Query) {
+            return None;
+        }
+        let indexes = self.indexes.read().unwrap();
+        let mut matched: Option<HashSet<Arc<str>>> = None;
+        for filter in &query.filters {
+            let values: Vec<Value> = match filter.op {
+                Operator::Eq => vec![filter.value.clone()],
+                Operator::In => match &filter.value {
+                    Value::Array(values) => values.clone(),
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            let mut union: HashSet<Arc<str>> = HashSet::new();
+            for value in values {
+                let encoded = crate::index::index_key::encode_scalar(&value);
+                if let Some(ids) = indexes.lookup_secondary(&query.collection, &filter.field, &encoded) {
+                    union.extend(ids);
+                }
+            }
+            matched = Some(match matched {
+                None => union,
+                Some(existing) => existing.intersection(&union).cloned().collect(),
+            });
+        }
+        let mut ids: Vec<String> = matched?.into_iter().map(|id| id.to_string()).collect();
+        if let Some(skip) = query.offset {
+            ids = ids.into_iter().skip(skip).collect();
+        }
+        if let Some(limit) = query.limit {
+            ids.truncate(limit);
+        }
+        Some(ids)
+    }
+
     pub fn patch_where(&self, query: crate::query::query::Query, updates: Vec<(String, Value)>) -> Result<usize> {
         self.patch_where_impl(query, updates, None)
     }
@@ -4672,18 +4723,30 @@ impl Hako {
         updates: Vec<(String, Value)>,
         cancel: Option<&CancelToken>,
     ) -> Result<usize> {
-        let results = self.query_with_cancel(query.clone(), cancel)?;
+        let ids = match self.patch_ids_from_index(&query) {
+            Some(ids) => {
+                self.record_audit(AuditEntry {
+                    op: AccessOp::Query,
+                    collection: query.collection.clone(),
+                    doc_id: None,
+                    ok: true,
+                });
+                ids
+            }
+            None => self.query_with_cancel(query.clone(), cancel)?
+                .into_iter().map(|(id, _)| id).collect(),
+        };
         if let Some(token) = cancel {
             token.check()?;
         }
-        if results.is_empty() { return Ok(0); }
+        if ids.is_empty() { return Ok(0); }
 
-        let count = results.len();
-        let mutations = results.into_iter()
-            .map(|(id, _)| BatchMutation::Patch { 
-                collection: query.collection.clone(), 
-                doc_id: id, 
-                updates: updates.clone() 
+        let count = ids.len();
+        let mutations = ids.into_iter()
+            .map(|id| BatchMutation::Patch {
+                collection: query.collection.clone(),
+                doc_id: id,
+                updates: updates.clone(),
             })
             .collect();
 
