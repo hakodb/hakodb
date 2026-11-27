@@ -326,7 +326,10 @@ impl QueryPlanner {
                         } else { matches_all = false; break; }
                     }
 
-                    if matches_all {
+                    // With filters, an unbounded order-index walk would verify
+                    // every row. Let P4 build a bounded composite range first;
+                    // this block keeps the pure/cursor pagination case.
+                    if matches_all && query.filters.is_empty() {
                         let start = match (&query.start_at, &query.start_after) {
                             (Some(v), _) => Bound::Included(build_cursor_range(&idx.definition, v, false)),
                             (_, Some(v)) => Bound::Excluded(build_cursor_range(&idx.definition, v, false)),
@@ -914,101 +917,102 @@ impl QueryPlanner {
             matches!(f.op, Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte | Operator::Ne)
         };
 
+        let range_filters: Vec<_> = query.filters.iter().filter(|f| is_range(f)).collect();
         if query.filters.is_empty()
-            || query.filters.iter().filter(|f| is_range(f)).count() > 1
+            || range_filters.len() > 2
             || !query.filters.iter().all(|f| is_point_lookup(f) || is_range(f))
         {
             return None;
         }
+        // BETWEEN is two range filters on the same leading field; ranges on
+        // different fields are not a single bounded composite walk.
+        if range_filters.len() == 2 && range_filters[0].field != range_filters[1].field {
+            return None;
+        }
+        let range_field = range_filters.first().map(|f| f.field.as_str());
 
         for idx in indexes.indexes_for_collection(&query.collection) {
             if !Self::composite_def_usable(&idx.definition, query) {
                 continue;
             }
             let mut eq_prefix = Vec::new();
-            let mut range_filter = None;
+            let mut matched_ranges = Vec::new();
             let mut supported = true;
 
-            let mut matched_fields = Vec::new();
-            let mut matched_values = Vec::new();
-
             for idx_field in &idx.definition.fields {
-                if let Some(filter) = query.filters.iter().find(|f| f.field == idx_field.field) {
-                    matched_fields.push(idx_field.field.clone());
-                    
-                    // Extract value: if array of 1, take the first element
+                if let Some(filter) = query.filters.iter().find(|f| {
+                    f.field == idx_field.field && is_point_lookup(f)
+                }) {
                     let v = match &filter.value {
                         Value::Array(a) if a.len() == 1 => a[0].clone(),
                         other => other.clone(),
                     };
-                    matched_values.push(v);
-                } else { break; }
-            }
-
-            for field in &idx.definition.fields {
-                if let Some(filter) = query.filters.iter().find(|f| f.field == field.field) {
-                    match filter.op {
-                        Operator::Eq => eq_prefix.push(filter.value.clone()),
-                        Operator::Gt
-                        | Operator::Gte
-                        | Operator::Lt
-                        | Operator::Lte
-                        | Operator::Ne => {
-                            range_filter = Some((filter.op, filter.value.clone()));
-                            break;
-                        }
-                        _ => {
-                            supported = false;
-                            break;
-                        }
-                    }
-                } else {
-                    break;
+                    eq_prefix.push(v);
+                    continue;
                 }
+                if range_field == Some(idx_field.field.as_str()) {
+                    matched_ranges.extend(query.filters.iter().filter(|f| {
+                        f.field == idx_field.field && is_range(f)
+                    }));
+                }
+                break;
             }
 
-            if !supported || (eq_prefix.is_empty() && range_filter.is_none()) {
+            if !supported || (eq_prefix.is_empty() && matched_ranges.is_empty()) {
                 continue;
             }
 
             let eq_prefix_key = build_prefix_key(&idx.definition, &eq_prefix);
             let eq_prefix_end = build_prefix_open_end(&eq_prefix_key);
 
-            let ranges = match range_filter {
-                None => vec![(
-                    Bound::Included(eq_prefix_key),
-                    Bound::Included(eq_prefix_end),
-                )],
-                Some((op, value)) => {
-                    let value_key = build_value_key(&idx.definition, &eq_prefix, &value)?;
-                    let value_key_end = key_with_upper_sentinel(&value_key);
-                    match op {
-                        Operator::Gt => vec![(
-                            Bound::Excluded(value_key_end),
-                            Bound::Included(eq_prefix_end),
-                        )],
-                        Operator::Gte => {
-                            vec![(Bound::Included(value_key), Bound::Included(eq_prefix_end))]
-                        }
-                        Operator::Lt => {
-                            vec![(Bound::Included(eq_prefix_key), Bound::Excluded(value_key))]
-                        }
-                        Operator::Lte => vec![(
-                            Bound::Included(eq_prefix_key),
-                            Bound::Included(value_key_end),
-                        )],
-                        Operator::Ne => vec![
-                            (
-                                Bound::Included(eq_prefix_key),
-                                Bound::Excluded(value_key.clone()),
-                            ),
-                            (
-                                Bound::Excluded(value_key_end),
-                                Bound::Included(eq_prefix_end),
-                            ),
-                        ],
-                        _ => return None,
+            let ranges = if matched_ranges.is_empty() {
+                vec![(Bound::Included(eq_prefix_key), Bound::Included(eq_prefix_end))]
+            } else if matched_ranges.len() == 1 {
+                let f = matched_ranges[0];
+                let value_key = build_value_key(&idx.definition, &eq_prefix, &f.value)?;
+                let value_key_end = key_with_upper_sentinel(&value_key);
+                match f.op {
+                    Operator::Gt => vec![(
+                        Bound::Excluded(value_key_end),
+                        Bound::Included(eq_prefix_end),
+                    )],
+                    Operator::Gte => {
+                        vec![(Bound::Included(value_key), Bound::Included(eq_prefix_end))]
                     }
+                    Operator::Lt => {
+                        vec![(Bound::Included(eq_prefix_key), Bound::Excluded(value_key))]
+                    }
+                    Operator::Lte => vec![(
+                        Bound::Included(eq_prefix_key),
+                        Bound::Included(value_key_end),
+                    )],
+                    Operator::Ne => vec![
+                        (Bound::Included(eq_prefix_key), Bound::Excluded(value_key.clone())),
+                        (Bound::Excluded(value_key_end), Bound::Included(eq_prefix_end)),
+                    ],
+                    _ => return None,
+                }
+            } else {
+                // Two bounds on the same field: intersect lower and upper.
+                let mut lower = None;
+                let mut upper = None;
+                for f in &matched_ranges {
+                    let value_key = build_value_key(&idx.definition, &eq_prefix, &f.value)?;
+                    let value_key_end = key_with_upper_sentinel(&value_key);
+                    match f.op {
+                        Operator::Gte => lower = Some(Bound::Included(value_key)),
+                        Operator::Gt => lower = Some(Bound::Excluded(value_key_end)),
+                        Operator::Lte => upper = Some(Bound::Included(value_key_end)),
+                        Operator::Lt => upper = Some(Bound::Excluded(value_key)),
+                        _ => supported = false,
+                    }
+                }
+                if !supported {
+                    continue;
+                }
+                match (lower, upper) {
+                    (Some(lower), Some(upper)) => vec![(lower, upper)],
+                    _ => continue,
                 }
             };
 
