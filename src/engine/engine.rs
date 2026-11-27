@@ -3743,18 +3743,29 @@ impl Hako {
     /// Local-only mass delete ("reset this query scope, don't propagate"):
     /// marks every matched key first (single persist), then batch-deletes.
     pub fn delete_where_local(&self, query: crate::query::query::Query) -> Result<usize> {
-        let results = self.query(query.clone())?;
-        if results.is_empty() { return Ok(0); }
-        let count = results.len();
+        let ids = match self.matching_ids_from_index(&query) {
+            Some(ids) => {
+                self.record_audit(AuditEntry {
+                    op: AccessOp::Query,
+                    collection: query.collection.clone(),
+                    doc_id: None,
+                    ok: true,
+                });
+                ids
+            }
+            None => self.query(query.clone())?.into_iter().map(|(id, _)| id).collect(),
+        };
+        if ids.is_empty() { return Ok(0); }
+        let count = ids.len();
         {
             let mut marks = self.local_only_keys.write().unwrap();
-            for (id, _) in &results {
+            for id in &ids {
                 marks.insert(format!("{}\0{id}", query.collection));
             }
         }
         self.persist_local_only();
-        let mutations = results.into_iter()
-            .map(|(id, _)| BatchMutation::Delete {
+        let mutations = ids.into_iter()
+            .map(|id| BatchMutation::Delete {
                 collection: query.collection.clone(),
                 doc_id: id
             })
@@ -4542,17 +4553,30 @@ impl Hako {
         cancel: Option<&CancelToken>,
         hard: bool,
     ) -> Result<usize> {
-        // 1. Find the matches (cancel checks ride the scan).
-        let results = self.query_with_cancel(query.clone(), cancel)?;
+        // 1. Find the matches. Index-satisfied Eq/IN shapes skip document
+        // decoding; everything else keeps the generic scan path.
+        let ids = match self.matching_ids_from_index(&query) {
+            Some(ids) => {
+                self.record_audit(AuditEntry {
+                    op: AccessOp::Query,
+                    collection: query.collection.clone(),
+                    doc_id: None,
+                    ok: true,
+                });
+                ids
+            }
+            None => self.query_with_cancel(query.clone(), cancel)?
+                .into_iter().map(|(id, _)| id).collect(),
+        };
         if let Some(token) = cancel {
             token.check()?;
         }
-        if results.is_empty() { return Ok(0); }
+        if ids.is_empty() { return Ok(0); }
 
         // 2. Map to delete mutations
-        let count = results.len();
-        let mutations = results.into_iter()
-            .map(|(id, _)| if hard {
+        let count = ids.len();
+        let mutations = ids.into_iter()
+            .map(|id| if hard {
                 BatchMutation::Delete {
                     collection: query.collection.clone(),
                     doc_id: id,
@@ -4649,8 +4673,9 @@ impl Hako {
     }
 
     /// Index-only id collection for the common `field = ?` / `field IN [...]`
-    /// patch shapes. Returns `None` for anything requiring document decoding.
-    fn patch_ids_from_index(&self, query: &crate::query::query::Query) -> Option<Vec<String>> {
+    /// shapes shared by patch and mass-delete. Returns `None` for anything
+    /// requiring document decoding.
+    fn matching_ids_from_index(&self, query: &crate::query::query::Query) -> Option<Vec<String>> {
         use crate::query::filter::Operator;
 
         if query.filters.is_empty()
@@ -4723,7 +4748,7 @@ impl Hako {
         updates: Vec<(String, Value)>,
         cancel: Option<&CancelToken>,
     ) -> Result<usize> {
-        let ids = match self.patch_ids_from_index(&query) {
+        let ids = match self.matching_ids_from_index(&query) {
             Some(ids) => {
                 self.record_audit(AuditEntry {
                     op: AccessOp::Query,
