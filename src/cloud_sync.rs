@@ -1379,6 +1379,7 @@ kind,
             WalOp::PutInlined { key, value } => key.len() + value.len() + 128,
             WalOp::PutBlob { key, .. } | WalOp::Put { key, .. } => key.len() + 96,
             WalOp::Delete { key, .. } => key.len() + 64,
+            WalOp::ClearCollection { collection } => collection.len() + 64,
             WalOp::BeginTx { .. } | WalOp::CommitTx { .. } => 48,
         }
     }

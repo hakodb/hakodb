@@ -38,6 +38,12 @@ pub enum WalOp {
         offset: u64,
         len: u32,
     },
+    /// Truncate every document of a collection in one transaction. Physical
+    /// bytes are reclaimed later by compaction; replay applies this before
+    /// any later Put/Delete for the same collection.
+    ClearCollection {
+        collection: String,
+    },
 }
 
 pub struct Wal {
@@ -885,6 +891,7 @@ impl WalOp {
             WalOp::Delete { key, .. } => key,
             WalOp::PutInlined { key, .. } => key,
             WalOp::PutBlob { key, .. } => key,
+            WalOp::ClearCollection { collection } => collection,
             WalOp::BeginTx { .. } | WalOp::CommitTx { .. } => "",
         }
     }
@@ -918,7 +925,8 @@ fn filter_committed_ops(raw_ops: Vec<WalOp>) -> Vec<WalOp> {
                 current_tx = None;
                 tx_ops.clear();
             }
-            WalOp::Put { .. } | WalOp::Delete { .. } | WalOp::PutInlined { .. } | WalOp::PutBlob { .. }  => {
+            WalOp::Put { .. } | WalOp::Delete { .. } | WalOp::PutInlined { .. }
+            | WalOp::PutBlob { .. } | WalOp::ClearCollection { .. } => {
                 if current_tx.is_some() {
                     tx_ops.push(op);
                 } else {
@@ -980,6 +988,12 @@ fn encode_into(buf: &mut Vec<u8>, op: &WalOp) {
             buf.extend_from_slice(key.as_bytes());
             buf.extend_from_slice(&offset.to_le_bytes());
             buf.extend_from_slice(&len.to_le_bytes());
+        }
+
+        WalOp::ClearCollection { collection } => {
+            buf.push(6);
+            buf.extend_from_slice(&(collection.len() as u16).to_le_bytes());
+            buf.extend_from_slice(collection.as_bytes());
         }
     }
 }
@@ -1116,6 +1130,20 @@ fn decode(payload: &[u8]) -> Result<WalOp> {
             );
             Ok(WalOp::PutBlob { key, offset, len })
         }
+        6 => {
+            let len = u16::from_le_bytes(
+                payload[pos..pos + 2]
+                    .try_into()
+                    .map_err(|_| HakoError::Corrupt("bad wal clear collection len".into()))?,
+            ) as usize;
+            pos += 2;
+            if pos + len > payload.len() {
+                return Err(HakoError::Corrupt("wal clear collection overruns record".into()));
+            }
+            let collection = String::from_utf8(payload[pos..pos + len].to_vec())
+                .map_err(|_| HakoError::Corrupt("bad wal clear collection".into()))?;
+            Ok(WalOp::ClearCollection { collection })
+        }
         _ => Err(HakoError::Corrupt("unknown wal op".into())),
     }
 }
@@ -1238,6 +1266,27 @@ mod tests {
             other => panic!("expected Delete, got {:?}", other),
         }
 
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn clear_collection_wal_op_roundtrips() {
+        let path = std::env::temp_dir().join(format!(
+            "hako-wal-clear-{}.log",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let mut wal = Wal::open(&path, DurabilityMode::Always, 2, None, 0).expect("open");
+        wal.append(&WalOp::BeginTx { tx_id: 11 }, false).expect("begin");
+        wal.append(&WalOp::ClearCollection { collection: "records".into() }, false).expect("clear");
+        wal.append(&WalOp::CommitTx { tx_id: 11 }, false).expect("commit");
+        let replayed = wal.replay().expect("replay");
+        assert_eq!(replayed.len(), 1, "clear op must survive filtering");
+        match &replayed[0] {
+            WalOp::ClearCollection { collection } => assert_eq!(collection, "records"),
+            other => panic!("expected ClearCollection, got {:?}", other),
+        }
+        drop(wal);
         fs::remove_file(path).expect("cleanup");
     }
 
