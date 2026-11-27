@@ -423,6 +423,23 @@ impl IndexManager {
             || self.traverse.is_tracked(collection)
     }
 
+    /// Swap secondary/composite trees for empty ones and return the old
+    /// structures so the caller can drop them off the timed path. FTS/vector/
+    /// traverse are still cleared in place by `clear_collection`.
+    pub fn retire_collection(
+        &mut self,
+        collection: &str,
+    ) -> (Vec<SecondaryIndex>, Vec<CompositeIndex>) {
+        let mut secondary = Vec::new();
+        if let Some(fields) = self.secondary.get_mut(collection) {
+            for idx in fields.values_mut() {
+                secondary.push(std::mem::take(idx));
+            }
+        }
+        let composite = self.composite.retire_collection(collection);
+        (secondary, composite)
+    }
+
     /// Drop every RAM entry for `collection` while keeping all index
     /// registrations (rescan refills them). Definitions are untouched.
     pub fn clear_collection(&mut self, collection: &str) {

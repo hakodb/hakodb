@@ -304,6 +304,9 @@ impl StorageEngine {
                 WalOp::PutBlob { key, offset, len } => {
                     self.update_index_entry_nosort(key, Pointer::Blob { offset, len });
                 }
+                WalOp::ClearCollection { collection } => {
+                    self.clear_collection_prefix(&collection);
+                }
             }
         }
         // Rebuild sorted_keys from the recovered index. We pay the O(N log N)
@@ -749,6 +752,51 @@ impl StorageEngine {
         // RETURN: The blob work goes to the background thread. 
         // The replication work is handled by the Standalone Agent tailing the WAL.
         Ok((blob_work_todo, wal_ops))
+    }
+
+    /// Remove every live key of `collection` from RAM while keeping bytes on
+    /// disk for compaction to reclaim. Returns the number of live keys removed.
+    fn clear_collection_prefix(&mut self, _collection: &str) -> usize {
+        // Storage shards are per collection and keys are bare doc ids, so a
+        // collection clear means clearing this shard's whole live index.
+        let mut removed = 0usize;
+        let mut inlined_bytes = 0usize;
+        for ptr in self.index.values() {
+            if !matches!(ptr, Pointer::Deleted { .. }) {
+                removed += 1;
+                if let Pointer::Inlined(bytes) = ptr {
+                    inlined_bytes += bytes.len();
+                }
+            }
+        }
+        self.index.clear();
+        self.sorted_keys.clear();
+        self.inlined_bytes = self.inlined_bytes.saturating_sub(inlined_bytes);
+        if let Some(count) = self.collection_counts.get_mut(&self.logical_name) {
+            *count = count.saturating_sub(removed);
+        }
+        removed
+    }
+
+    /// Collection-wide truncation: one WAL transaction, no per-document
+    /// delete ops. Later compaction reclaims the orphaned bytes.
+    pub fn clear_collection(&mut self, collection: &str) -> Result<usize> {
+        let removed = self.index.values()
+            .filter(|ptr| !matches!(ptr, Pointer::Deleted { .. }))
+            .count();
+        if removed == 0 {
+            return Ok(0);
+        }
+        let tx_id = self.next_tx_id;
+        self.next_tx_id += 1;
+        let ops = [
+            WalOp::BeginTx { tx_id },
+            WalOp::ClearCollection { collection: collection.to_string() },
+            WalOp::CommitTx { tx_id },
+        ];
+        self.wal.append_batch(&ops, false)?;
+        self.clear_collection_prefix(collection);
+        Ok(removed)
     }
 
     pub fn flush_all(&mut self) -> Result<()> {
@@ -1429,6 +1477,10 @@ impl StorageEngine {
         // the exclusive borrow ends.
         let mut pending_sorted = Vec::new();
         for op in ops {
+            if let WalOp::ClearCollection { collection } = op {
+                self.clear_collection_prefix(collection);
+                continue;
+            }
             match op {
                 // ponytail: route through update_index_entry (not direct
                 // index.insert) so sorted_keys and the live-count cache stay

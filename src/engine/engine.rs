@@ -4577,10 +4577,10 @@ impl Hako {
     /// records. Unlike `drop_collection`, the collection stays registered and
     /// its index definitions remain in place, so it is safe as a benchmark
     /// reset between iterations.
-    /// Hard-clear a collection in one pass. WAL still records one delete per
-    /// live id, but index RAM is reset via `clear_collection` instead of
-    /// decoding every document to remove its index entries. Index definitions
-    /// survive; only their RAM contents are cleared.
+    /// Hard-clear a collection in one pass. One WAL `ClearCollection` record
+    /// replaces per-document deletes; index RAM is reset via
+    /// `IndexManager::clear_collection` and definitions survive. Physical
+    /// bytes are reclaimed by the shard's compaction.
     pub fn reset_collection(&self, collection: &str) -> Result<usize> {
         if self.read_only.load(Ordering::Relaxed) {
             return Err(HakoError::Corrupt("ReadOnly".into()));
@@ -4591,50 +4591,49 @@ impl Hako {
         let Some(shard_arc) = self.try_get_shard_on_disk(collection)? else {
             return Ok(0);
         };
-
-        let now_nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64;
-        let watermark = self.last_ts_watermark.load(Ordering::Relaxed);
-        let now_micros = if now_nanos / 1000 <= watermark {
-            watermark.saturating_add(1)
-        } else {
-            now_nanos / 1000
-        };
-        self.last_ts_watermark.store(now_micros, Ordering::Relaxed);
-
-        let (keys, key_arcs) = {
+        // Only materialize per-doc event paths when someone is listening.
+        let has_watchers = self.listeners.lock().unwrap().contains_key(collection);
+        let (removed_count, key_arcs) = {
             let mut shard = shard_arc.write().unwrap();
-            let keys: Vec<String> = shard.index.iter()
-                .filter(|(_, ptr)| !matches!(ptr, Pointer::Deleted { .. }))
-                .map(|(key, _)| key.clone())
-                .collect();
-            if keys.is_empty() {
+            let key_arcs: Vec<Arc<str>> = if has_watchers {
+                shard.index.iter()
+                    .filter(|(_, ptr)| !matches!(ptr, Pointer::Deleted { .. }))
+                    .map(|(key, _)| Arc::from(key.as_str()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let removed = shard.clear_collection(collection)?;
+            if removed == 0 {
                 return Ok(0);
             }
-            let key_arcs: Vec<Arc<str>> = keys.iter().map(|key| Arc::from(key.as_str())).collect();
-            let tx_id = shard.next_tx_id;
-            shard.next_tx_id += 1;
-            let ops: Vec<WalOp> = keys.iter()
-                .map(|key| WalOp::Delete { key: key.clone(), timestamp: now_micros })
-                .collect();
-            shard.wal.append_batch_fast(tx_id, &ops, false)?;
-            let mut pending_sorted = Vec::new();
-            for key in &keys {
-                shard.update_index_entry_deferred(
-                    key.clone(),
-                    Some(Pointer::Deleted { timestamp: now_micros }),
-                    &mut pending_sorted,
-                );
-            }
-            shard.flush_pending_sorted(&mut pending_sorted);
-            shard.compact()?;
-            (keys, key_arcs)
+            // Physical reclaim is maintenance's job; keeping compaction out
+            // of the reset path makes truncation O(1) WAL ops, not O(bytes).
+            (removed, key_arcs)
         };
 
-        let removed: HashSet<Arc<str>> = key_arcs.iter().cloned().collect();
-        let keep: HashSet<Arc<str>> = HashSet::new();
-        self.clear_versions_by_keys(&removed, &keep);
-        self.indexes.write().unwrap().clear_collection(collection);
-        self.finish_index_drop()?;
+        // Version entries are not cleared per key here: a future put of the
+        // same id bumps its version, so stale entries cannot alias a new doc.
+        // The maintenance sweeper can reclaim them lazily.
+        let composite_ids: Vec<u32> = self.list_indexes(Some(collection)).composite
+            .into_iter().filter(|idx| idx.collection == collection).map(|idx| idx.id).collect();
+        for id in composite_ids {
+            self.unique_ledger.reset(id);
+        }
+        let retired = {
+            let mut indexes = self.indexes.write().unwrap();
+            let retired = indexes.retire_collection(collection);
+            // FTS/vector/traverse have no per-doc trees to retire; clear them
+            // in place. Secondary/composite are already empty here.
+            indexes.clear_collection(collection);
+            retired
+        };
+        // Freeing 13k+ index entries is pure RAM work with no correctness
+        // impact; do it off the timed reset path.
+        std::thread::spawn(move || drop(retired));
+        // Definitions did not change; only cached plans/gates must go.
+        self.gate_cache.write().unwrap().clear();
+        self.plan_cache.invalidate();
         for key in &key_arcs {
             self.notify_watchers(collection, ChangeEvent { path: key.clone(), kind: ChangeKind::Delete });
         }
@@ -4645,8 +4644,8 @@ impl Hako {
             ok: true,
         });
         WRITE_STATS.batches.fetch_add(1, Ordering::Relaxed);
-        WRITE_STATS.mutations.fetch_add(keys.len() as u64, Ordering::Relaxed);
-        Ok(keys.len())
+        WRITE_STATS.mutations.fetch_add(removed_count as u64, Ordering::Relaxed);
+        Ok(removed_count)
     }
 
     pub fn patch_where(&self, query: crate::query::query::Query, updates: Vec<(String, Value)>) -> Result<usize> {

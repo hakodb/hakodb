@@ -18,6 +18,20 @@ pub struct CompositeIndexManager {
 impl CompositeIndexManager {
     /// Clear the ENTRIES of every tree registered for `collection`,
     /// keeping definitions and registrations (rescan refills them).
+    /// Swap out every tree of `collection` with an empty one of the same
+    /// definition, returning the old indexes for background reclamation.
+    pub fn retire_collection(&mut self, collection: &str) -> Vec<CompositeIndex> {
+        let ids = self.by_collection.get(collection).cloned().unwrap_or_default();
+        let mut retired = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(idx) = self.by_id.get_mut(&id) {
+                let definition = idx.definition.clone();
+                retired.push(std::mem::replace(idx, CompositeIndex::new(definition)));
+            }
+        }
+        retired
+    }
+
     pub fn clear_collection(&mut self, collection: &str) {
         if let Some(ids) = self.by_collection.get(collection) {
             for id in ids.clone() {
