@@ -1546,6 +1546,16 @@ impl Hako {
         // a restart until first touch.
         let _ = db.get_shard(crate::engine::softdel::SOFTDEL_COLLECTION);
 
+        // Open every recovered collection now. Otherwise the first query
+        // after restart opens its shard lazily, starts backfill mid-query,
+        // and the planner falls back to a full scan even if the caller
+        // awaited quiescence immediately after `open()`.
+        for collection in db.list_collections().unwrap_or_default() {
+            if !db.is_lazy_collection(&collection) {
+                let _ = db.start_collection_load(&collection);
+            }
+        }
+
         // 6. ORCHESTRATED BACKGROUND RECOVERY
         let shards_ptr = Arc::clone(&db.shards);
         let indexes_ptr = Arc::clone(&db.indexes);
