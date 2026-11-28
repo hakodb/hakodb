@@ -60,7 +60,7 @@ impl PlanCache {
             ));
         }
 
-        let key = hash_query(query);
+        let key = hash_query(query, indexes);
         let now = Instant::now();
 
         // Fast path: read-only peek, no lock if no hit.
@@ -98,14 +98,29 @@ impl Default for PlanCache {
 /// Hash a query's STRUCTURE â€” collection, filters (field+op+value), order,
 /// limit, offset, projection, cursor bounds. Anything that changes the plan.
 /// `aggregation` and `or_groups` included because both affect `ScanType`.
-fn hash_query(q: &Query) -> u64 {
+fn hash_query(q: &Query, indexes: &IndexManager) -> u64 {
     let mut h = DefaultHasher::new();
     q.collection.hash(&mut h);
+    let order_field = q.order_by.first().map(|o| o.field.as_str());
+    let secondary_range_shape = order_field.map(|field| {
+        indexes.secondary.get(&q.collection).is_some_and(|m| m.contains_key(field))
+            && !indexes.indexes_for_collection(&q.collection)
+                .any(|idx| idx.definition.fields.first().is_some_and(|f| f.field == field))
+    }).unwrap_or(false);
 
     for f in &q.filters {
         f.field.hash(&mut h);
         (f.op as u8).hash(&mut h);
-        hash_filter_value(&f.op, &f.value, &mut h);
+        let rebindable_range = secondary_range_shape
+            && order_field == Some(f.field.as_str())
+            && matches!(f.op,
+                crate::query::filter::Operator::Gt
+                | crate::query::filter::Operator::Gte
+                | crate::query::filter::Operator::Lt
+                | crate::query::filter::Operator::Lte);
+        if !rebindable_range {
+            hash_filter_value(&f.op, &f.value, &mut h);
+        }
     }
     for g in &q.or_groups {
         for f in g {
@@ -128,7 +143,8 @@ fn hash_query(q: &Query) -> u64 {
         o.ascending.hash(&mut h);
     }
     q.limit.hash(&mut h);
-    q.offset.hash(&mut h);
+    // Offset is rebound per execution from the live query; including it here
+    // would compile a new plan for every page.
     // ponytail: defer_blobs changes executor output (inflated vs BlobLink),
     // so it must key the plan â€” otherwise a deferred query reuses an eager
     // plan's output shape or vice versa.

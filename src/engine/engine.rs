@@ -3911,6 +3911,61 @@ impl Hako {
         self.query_with_cancel(query, None)
     }
 
+    fn rebind_cached_plan(plan: &mut crate::query::plan::QueryPlan, query: &Query) {
+        use std::ops::Bound;
+
+        plan.offset = query.offset;
+        if plan.scan_limit.is_some() {
+            plan.scan_limit = query.limit.map(|limit| limit + query.offset.unwrap_or(0));
+        }
+        if let crate::query::plan::ScanType::SecondaryIndexRange { field, reverse, .. } = &plan.scan {
+            let mut start = Bound::Unbounded;
+            let mut end = Bound::Unbounded;
+            for filter in &query.filters {
+                if filter.field != *field
+                    || query.or_groups.iter().any(|group| group.iter().any(|f| f.field == *field))
+                {
+                    continue;
+                }
+                let key = crate::index::index_key::encode_scalar(&filter.value);
+                match filter.op {
+                    crate::query::filter::Operator::Eq => {
+                        start = Bound::Included(key.clone());
+                        end = Bound::Included(key);
+                    }
+                    crate::query::filter::Operator::Gt => start = Bound::Excluded(key),
+                    crate::query::filter::Operator::Gte => start = Bound::Included(key),
+                    crate::query::filter::Operator::Lt => end = Bound::Excluded(key),
+                    crate::query::filter::Operator::Lte => end = Bound::Included(key),
+                    _ => {}
+                }
+            }
+            plan.scan = crate::query::plan::ScanType::SecondaryIndexRange {
+                field: field.clone(),
+                start,
+                end,
+                reverse: *reverse,
+            };
+        }
+    }
+
+    fn plan_for(
+        &self,
+        query: &Query,
+        indexes: &crate::index::manager::IndexManager,
+        rows: usize,
+        workers: usize,
+        index_ready: bool,
+        vector_ready: bool,
+    ) -> crate::query::plan::QueryPlan {
+        let cached = self.plan_cache.get_or_compute(
+            query, indexes, rows, workers, index_ready, vector_ready,
+        );
+        let mut plan = (*cached).clone();
+        Self::rebind_cached_plan(&mut plan, query);
+        plan
+    }
+
     pub fn query_with_cancel(
         &self,
         query: Query,
@@ -4036,7 +4091,7 @@ impl Hako {
         let is_ready = self.index_query_ready(&query.collection);
         let vec_ready = self.vector_query_ready();
 
-        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
+        let plan = self.plan_for(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
         WRITE_STATS.queries.fetch_add(1, Ordering::Relaxed);
         if let Some(label) = plan.scan.index_label() {
             record_index_scan(&label);
@@ -4062,7 +4117,7 @@ impl Hako {
         // SIMPLE CALL: No blob_file or encryption passed here!
         let results = self
             .executor
-            .execute_with_cancel(shard_arc, &indexes, (*plan).clone(), cancel, Some(self))?;
+            .execute_with_cancel(shard_arc, &indexes, plan.clone(), cancel, Some(self))?;
 
         // AUDIT RESULT
         self.record_audit(AuditEntry {
@@ -4088,8 +4143,8 @@ impl Hako {
         let rows = shard_arc.read().unwrap().count_prefix("");
         let is_ready = self.index_query_ready(&query.collection);
         let vec_ready = self.vector_query_ready();
-        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
-        Ok((*plan).clone())
+        let plan = self.plan_for(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
+        Ok(plan.clone())
     }
 
     /// F7: human-readable plan report for one query. Plan-only (nothing is
@@ -4106,7 +4161,7 @@ impl Hako {
         let rows = shard_arc.read().unwrap().count_prefix("");
         let is_ready = self.index_query_ready(&query.collection);
         let vec_ready = self.vector_query_ready();
-        let plan = self.plan_cache.get_or_compute(
+        let plan = self.plan_for(
             &query,
             &indexes,
             rows,
@@ -4284,9 +4339,9 @@ impl Hako {
         let is_ready = self.index_query_ready(&query.collection);
         let vec_ready = self.vector_query_ready();
 
-        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
+        let plan = self.plan_for(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
 
-        let results = self.executor.execute_raw(shard_arc, &indexes, (*plan).clone())?;
+        let results = self.executor.execute_raw(shard_arc, &indexes, plan.clone())?;
 
         self.record_audit(AuditEntry {
             op: AccessOp::Query,
@@ -4435,9 +4490,9 @@ impl Hako {
         let is_ready = self.index_query_ready(&query.collection);
         let vec_ready = self.vector_query_ready();
 
-        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
+        let plan = self.plan_for(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
 
-        let visited = self.executor.execute_walk(shard_arc, &indexes, (*plan).clone(), callback)?;
+        let visited = self.executor.execute_walk(shard_arc, &indexes, plan.clone(), callback)?;
 
         self.record_audit(AuditEntry {
             op: AccessOp::Query,
@@ -4468,9 +4523,9 @@ impl Hako {
         let is_ready = self.index_query_ready(&query.collection);
         let vec_ready = self.vector_query_ready();
 
-        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
+        let plan = self.plan_for(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
 
-        let visited = self.executor.execute_walk_view(shard_arc, &indexes, (*plan).clone(), callback)?;
+        let visited = self.executor.execute_walk_view(shard_arc, &indexes, plan.clone(), callback)?;
 
         self.record_audit(AuditEntry {
             op: AccessOp::Query,
@@ -4527,10 +4582,10 @@ impl Hako {
 
         let is_ready = self.index_query_ready(&query.collection);
         let vec_ready = self.vector_query_ready();
-        let plan = self.plan_cache.get_or_compute(&q, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
+        let plan = self.plan_for(&q, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
 
         // SIMPLE CALL: Worker handles blob resolution internally
-        let results = self.executor.execute_projected(shard_arc, &indexes, (*plan).clone(), cancel)?;
+        let results = self.executor.execute_projected(shard_arc, &indexes, plan.clone(), cancel)?;
 
         // 5. Audit & Return
         self.record_audit(AuditEntry {
@@ -5593,11 +5648,11 @@ impl Hako {
         let is_ready = self.index_query_ready(&query.collection);
         let vec_ready = self.vector_query_ready();
         // FIX: Add self.config.query_workers as the 4th argument
-        let plan = self.plan_cache.get_or_compute(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
+        let plan = self.plan_for(&query, &indexes, rows, self.config.query_workers, is_ready, vec_ready);
 
         let res = self
             .executor
-            .execute_aggregation(shard_arc, &indexes, (*plan).clone(), &query.aggregations);
+            .execute_aggregation(shard_arc, &indexes, plan.clone(), &query.aggregations);
 
         self.record_audit(AuditEntry {
             op: AccessOp::Query,
