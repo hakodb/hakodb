@@ -1947,8 +1947,16 @@ impl Hako {
         storage.blob_tx = Some(self.blob_tx.clone());
         let shard_arc = Arc::new(RwLock::new(storage));
 
-        // Shards are opened lazily, so recovered version stamps must be
-        // rebuilt when the shard first loads (including after restart).
+        let mut shards = self.shards.write().map_err(|_| HakoError::LockPoisoned("shards".into()))?;
+        if let Some(existing) = shards.get(collection) {
+            return Ok((Arc::clone(existing), false));
+        }
+        shards.insert(collection.to_string(), Arc::clone(&shard_arc));
+        drop(shards);
+
+        // Rebuild versions only for the shard that won the insert race.
+        // A losing opener must not overwrite version stamps that a read-set
+        // has already captured, or commit sees a phantom conflict.
         {
             let guard = shard_arc.read().unwrap();
             for (id, ptr) in guard.index.iter() {
@@ -1962,12 +1970,6 @@ impl Hako {
                 );
             }
         }
-
-        let mut shards = self.shards.write().map_err(|_| HakoError::LockPoisoned("shards".into()))?;
-        if let Some(existing) = shards.get(collection) {
-            return Ok((Arc::clone(existing), false));
-        }
-        shards.insert(collection.to_string(), Arc::clone(&shard_arc));
         Ok((shard_arc, true))
     }
 
