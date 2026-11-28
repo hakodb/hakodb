@@ -21,5 +21,6 @@
 - Land the version bump on main via PR BEFORE tagging: `v*` tags are permanently locked once pushed (ruleset forbids delete/force-push — v0.20.0 is pinned to a commit whose Cargo.lock differs from main). The bump commit must include Cargo.lock, or every `--locked` consumer fails.
 
 ## Rust
+- Do NOT run `cargo fmt` in this repo: it rewrites line endings and reformats whole files, destroying minimal diffs. Keep edits targeted; rely on the surrounding style.
 - Run `cargo clippy --all-targets` before push; zero warnings. CI does not gate on clippy, so this is the only check.
 - Clear all compiler and clippy warnings before `cargo publish`.

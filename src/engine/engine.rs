@@ -1546,13 +1546,13 @@ impl Hako {
         // a restart until first touch.
         let _ = db.get_shard(crate::engine::softdel::SOFTDEL_COLLECTION);
 
-        // Open every recovered collection now. Otherwise the first query
-        // after restart opens its shard lazily, starts backfill mid-query,
-        // and the planner falls back to a full scan even if the caller
-        // awaited quiescence immediately after `open()`.
+        // Open every recovered collection now so version stamps exist before
+        // any read-set is captured. Recovery owns index rebuild: forcing a
+        // backfill here would mark the collection touched and defeat the
+        // fresh-snapshot fast path, paying a full 10k decode per restart.
         for collection in db.list_collections().unwrap_or_default() {
             if !db.is_lazy_collection(&collection) {
-                let _ = db.start_collection_load(&collection);
+                let _ = db.open_shard_new(&collection);
             }
         }
 
@@ -1646,6 +1646,32 @@ impl Hako {
                     };
                     if apply { Some(EncryptionContext::from_secret(key)) } else { None }
                 });
+                // open() already opened this shard (and rebuilt its version
+                // stamps). If the RAM snapshot is still fresh, recovery has
+                // nothing to do: reuse it instead of a second StorageEngine
+                // open + WAL replay. Stale snapshots fall through to the
+                // existing rebuild path below.
+                if let Some(shard) = shards_ptr
+                    .read()
+                    .ok()
+                    .and_then(|shards| shards.get(&col_name).cloned())
+                {
+                    let touched = index_touched_ptr
+                        .lock()
+                        .map(|g| g.contains(&col_name))
+                        .unwrap_or(false);
+                    let fresh = if let Ok(guard) = shard.read() {
+                        !touched && snap_tails.as_ref().and_then(|t| t.get(&col_name)).is_some_and(
+                            |(d, f)| *d == guard.wal.data_len() && *f == guard.wal.file_len(),
+                        )
+                    } else {
+                        false
+                    };
+                    if fresh {
+                        continue;
+                    }
+                }
+
                 // StorageEngine::open now takes the logical name as well
                 if let Ok(mut storage) = StorageEngine::open(path, &config_thread, col_name.clone(), enc_context) {
                     
@@ -3230,9 +3256,7 @@ impl Hako {
         let storage = shard.safe_read()?;
         LOCK_STATS.read_wait_ns.fetch_add(t_lock.elapsed().as_nanos() as u64, Ordering::Relaxed);
         LOCK_STATS.read_acqs.fetch_add(1, Ordering::Relaxed);
-        let res = storage.get_shared(doc_id)?.and_then(|b| {
-            crate::document::hako_doc::DocView::new(b)
-        });
+        let res = storage.get_shared(doc_id)?.and_then(crate::document::hako_doc::DocView::new);
 
         if self.config.enable_audit_log {
             self.record_audit(AuditEntry {
