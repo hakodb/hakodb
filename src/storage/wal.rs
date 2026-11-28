@@ -6,6 +6,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use serde_json;
+
 use crate::config::DurabilityMode;
 use crate::error::{HakoError, Result};
 
@@ -43,6 +45,13 @@ pub enum WalOp {
     /// any later Put/Delete for the same collection.
     ClearCollection {
         collection: String,
+    },
+    /// Encoded field patch for one document. `value` is the full v5 doc
+    /// after patching; `fields` lists the changed fields for index deltas.
+    PatchFields {
+        key: String,
+        value: Vec<u8>,
+        fields: Vec<String>,
     },
 }
 
@@ -892,6 +901,7 @@ impl WalOp {
             WalOp::PutInlined { key, .. } => key,
             WalOp::PutBlob { key, .. } => key,
             WalOp::ClearCollection { collection } => collection,
+            WalOp::PatchFields { key, .. } => key,
             WalOp::BeginTx { .. } | WalOp::CommitTx { .. } => "",
         }
     }
@@ -926,7 +936,8 @@ fn filter_committed_ops(raw_ops: Vec<WalOp>) -> Vec<WalOp> {
                 tx_ops.clear();
             }
             WalOp::Put { .. } | WalOp::Delete { .. } | WalOp::PutInlined { .. }
-            | WalOp::PutBlob { .. } | WalOp::ClearCollection { .. } => {
+            | WalOp::PutBlob { .. } | WalOp::ClearCollection { .. }
+            | WalOp::PatchFields { .. } => {
                 if current_tx.is_some() {
                     tx_ops.push(op);
                 } else {
@@ -994,6 +1005,17 @@ fn encode_into(buf: &mut Vec<u8>, op: &WalOp) {
             buf.push(6);
             buf.extend_from_slice(&(collection.len() as u16).to_le_bytes());
             buf.extend_from_slice(collection.as_bytes());
+        }
+
+        WalOp::PatchFields { key, value, fields } => {
+            buf.push(7);
+            buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            buf.extend_from_slice(value);
+            let encoded = serde_json::to_vec(fields).unwrap_or_else(|_| b"[]".to_vec());
+            buf.extend_from_slice(&(encoded.len() as u16).to_le_bytes());
+            buf.extend_from_slice(&encoded);
         }
     }
 }
@@ -1144,6 +1166,43 @@ fn decode(payload: &[u8]) -> Result<WalOp> {
                 .map_err(|_| HakoError::Corrupt("bad wal clear collection".into()))?;
             Ok(WalOp::ClearCollection { collection })
         }
+        7 => {
+            let key_len = u16::from_le_bytes(
+                payload[pos..pos + 2]
+                    .try_into()
+                    .map_err(|_| HakoError::Corrupt("bad wal patch key len".into()))?,
+            ) as usize;
+            pos += 2;
+            if pos + key_len > payload.len() {
+                return Err(HakoError::Corrupt("wal patch key overruns record".into()));
+            }
+            let key = String::from_utf8(payload[pos..pos + key_len].to_vec())
+                .map_err(|_| HakoError::Corrupt("bad wal patch key".into()))?;
+            pos += key_len;
+            let value_len = u32::from_le_bytes(
+                payload[pos..pos + 4]
+                    .try_into()
+                    .map_err(|_| HakoError::Corrupt("bad wal patch value len".into()))?,
+            ) as usize;
+            pos += 4;
+            if pos + value_len > payload.len() {
+                return Err(HakoError::Corrupt("wal patch value overruns record".into()));
+            }
+            let value = payload[pos..pos + value_len].to_vec();
+            pos += value_len;
+            let fields_len = u16::from_le_bytes(
+                payload[pos..pos + 2]
+                    .try_into()
+                    .map_err(|_| HakoError::Corrupt("bad wal patch fields len".into()))?,
+            ) as usize;
+            pos += 2;
+            if pos + fields_len > payload.len() {
+                return Err(HakoError::Corrupt("wal patch fields overruns record".into()));
+            }
+            let fields = serde_json::from_slice(&payload[pos..pos + fields_len])
+                .map_err(|_| HakoError::Corrupt("bad wal patch fields".into()))?;
+            Ok(WalOp::PatchFields { key, value, fields })
+        }
         _ => Err(HakoError::Corrupt("unknown wal op".into())),
     }
 }
@@ -1285,6 +1344,32 @@ mod tests {
         match &replayed[0] {
             WalOp::ClearCollection { collection } => assert_eq!(collection, "records"),
             other => panic!("expected ClearCollection, got {:?}", other),
+        }
+        drop(wal);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn patch_fields_wal_op_roundtrips() {
+        let path = std::env::temp_dir().join(format!("hako-wal-patch-{}.log", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let mut wal = Wal::open(&path, DurabilityMode::Always, 2, None, 0).expect("open");
+        wal.append(&WalOp::BeginTx { tx_id: 12 }, false).expect("begin");
+        wal.append(&WalOp::PatchFields {
+            key: "k1".into(),
+            value: vec![1, 2, 3],
+            fields: vec!["active".into()],
+        }, false).expect("patch");
+        wal.append(&WalOp::CommitTx { tx_id: 12 }, false).expect("commit");
+        let replayed = wal.replay().expect("replay");
+        assert_eq!(replayed.len(), 1);
+        match &replayed[0] {
+            WalOp::PatchFields { key, value, fields } => {
+                assert_eq!(key, "k1");
+                assert_eq!(value, &vec![1, 2, 3]);
+                assert_eq!(fields, &vec!["active".to_string()]);
+            }
+            other => panic!("expected PatchFields, got {:?}", other),
         }
         drop(wal);
         fs::remove_file(path).expect("cleanup");

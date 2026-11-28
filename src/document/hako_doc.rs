@@ -154,6 +154,52 @@ impl HakoDoc {
         Some(doc)
     }
 
+    /// Patch fields directly on the v5 byte layout. Unchanged fields are
+    /// copied verbatim; only updated fields are re-encoded.
+    pub(crate) fn patch_encoded(bytes: &[u8], updates: &[(String, Value)]) -> Option<Vec<u8>> {
+        if bytes.len() < 12 || bytes[0] != MAGIC || bytes[1] != VERSION {
+            return None;
+        }
+        let count = u16::from_le_bytes(bytes[10..12].try_into().ok()?) as usize;
+        let mut pos = 12usize;
+        let mut out = Vec::with_capacity(bytes.len());
+        out.extend_from_slice(&bytes[..12]);
+        let mut seen = vec![false; updates.len()];
+        for _ in 0..count {
+            let field_start = pos;
+            let key_len = *bytes.get(pos)? as usize;
+            pos += 1;
+            let key = bytes.get(pos..pos + key_len)?;
+            pos += key_len;
+            let tag = *bytes.get(pos)?;
+            pos += 1;
+            skip_value(tag, bytes, &mut pos)?;
+            if let Some((idx, (_, value))) = updates.iter().enumerate()
+                .find(|(_, (k, _))| k.as_bytes() == key)
+            {
+                out.push(key_len as u8);
+                out.extend_from_slice(key);
+                Self::encode_value_to(value, &mut out);
+                seen[idx] = true;
+            } else {
+                out.extend_from_slice(&bytes[field_start..pos]);
+            }
+        }
+        let mut fresh: Vec<_> = updates.iter().enumerate()
+            .filter(|(idx, _)| !seen[*idx])
+            .map(|(_, entry)| entry)
+            .collect();
+        fresh.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        for (key, value) in fresh {
+            out.push(key.len() as u8);
+            out.extend_from_slice(key.as_bytes());
+            Self::encode_value_to(value, &mut out);
+        }
+        let total = (count + updates.len() - seen.iter().filter(|s| **s).count()) as u16;
+        out[10..12].copy_from_slice(&total.to_le_bytes());
+        Some(out)
+    }
+
     pub fn decode_projected(bytes: &[u8], projection: &[String]) -> Option<Self> {
         let view = HakoDocView::new(bytes)?;
         let mut doc = HakoDoc {

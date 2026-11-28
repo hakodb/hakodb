@@ -2340,6 +2340,7 @@ impl Hako {
         // let mut deletes_for_indexer: Vec<(String, String, HakoDoc)> = Vec::new();
 
         let t_encode = Instant::now();
+        let mut indexed_fields_cache: HashMap<String, HashSet<String>> = HashMap::new();
         // ponytail: last-collection cache â€” consecutive mutations usually hit
         // the same shard, so reuse its handle + blob manager instead of a map
         // lookup and two lock acquisitions per mutation.
@@ -2350,6 +2351,42 @@ impl Hako {
             let (col, mut doc_id, mut doc, is_delete, is_soft) = match m {
                 BatchMutation::Put { collection, doc_id, doc } => (collection, doc_id, doc, false, false),
                 BatchMutation::Patch { collection, doc_id, updates } => {
+                    let indexed = indexed_fields_cache.entry(collection.clone()).or_insert_with(|| {
+                        let mut fields = HashSet::new();
+                        let mgr = self.indexes.read().unwrap();
+                        if let Some(sec) = mgr.secondary.get(&collection) {
+                            fields.extend(sec.keys().cloned());
+                        }
+                        for idx in mgr.indexes_for_collection(&collection) {
+                            fields.extend(idx.definition.fields.iter().map(|f| f.field.clone()));
+                        }
+                        fields
+                    });
+                    if updates.iter().all(|(field, _)| !indexed.contains(field)) {
+                        let shard_arc = self.get_shard(&collection)?;
+                        let guard = shard_arc.read().unwrap();
+                        if let Some(bytes) = guard.get(&doc_id)? {
+                            let patched = HakoDoc::patch_encoded(&bytes, &updates)
+                                .ok_or_else(|| HakoError::Corrupt("bad patch encoding".into()))?;
+                            let key: Arc<str> = Arc::from(doc_id.as_str());
+                            let rw = shard_map.entry(collection.clone()).or_insert_with(|| ShardWork {
+                                ops: Vec::new(), keys: Vec::new(), deleted: HashSet::new(),
+                                events: Vec::new(), index_puts: Vec::new(),
+                                blob_queue_items: Vec::new(), index_deletes: Vec::new(),
+                            });
+                            rw.ops.push(WalOp::PatchFields {
+                                key: doc_id.clone(),
+                                value: patched,
+                                fields: updates.iter().map(|(field, _)| field.clone()).collect(),
+                            });
+                            rw.keys.push(key.clone());
+                            rw.events.push((collection, ChangeEvent {
+                                path: key,
+                                kind: ChangeKind::Put,
+                            }));
+                            continue;
+                        }
+                    }
                     let shard_arc = self.get_shard(&collection)?;
                     let current_doc = {
                         let guard = shard_arc.read().unwrap();
@@ -2594,6 +2631,12 @@ impl Hako {
                             let ptr = Pointer::Inlined(Arc::new(value.clone()));
                             shard.update_index_entry_deferred(doc_id.clone(), Some(ptr), &mut pending_sorted);
                         }
+                    } else if let WalOp::PatchFields { key, value, .. } = op {
+                        shard.update_index_entry_deferred(
+                            key.clone(),
+                            Some(Pointer::Inlined(Arc::new(value.clone()))),
+                            &mut pending_sorted,
+                        );
                     }
                 }
                 debug_assert!(work.index_puts.get(put_idx).is_none(), "ops/index_puts lockstep broke");

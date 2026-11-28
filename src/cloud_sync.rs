@@ -1380,6 +1380,9 @@ kind,
             WalOp::PutBlob { key, .. } | WalOp::Put { key, .. } => key.len() + 96,
             WalOp::Delete { key, .. } => key.len() + 64,
             WalOp::ClearCollection { collection } => collection.len() + 64,
+            WalOp::PatchFields { key, value, fields } => {
+                key.len() + value.len() + fields.iter().map(|f| f.len()).sum::<usize>() + 96
+            }
             WalOp::BeginTx { .. } | WalOp::CommitTx { .. } => 48,
         }
     }

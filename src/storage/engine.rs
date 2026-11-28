@@ -307,6 +307,9 @@ impl StorageEngine {
                 WalOp::ClearCollection { collection } => {
                     self.clear_collection_prefix(&collection);
                 }
+                WalOp::PatchFields { key, value, .. } => {
+                    self.update_index_entry_nosort(key, Pointer::Inlined(Arc::new(value)));
+                }
             }
         }
         // Rebuild sorted_keys from the recovered index. We pay the O(N log N)
@@ -1498,6 +1501,9 @@ impl StorageEngine {
                 }
                 WalOp::PutBlob { key, offset, len } => {
                     self.update_index_entry_deferred(key.clone(), Some(Pointer::Blob { offset: *offset, len: *len }), &mut pending_sorted);
+                }
+                WalOp::PatchFields { key, value, .. } => {
+                    self.update_index_entry_deferred(key.clone(), Some(Pointer::Inlined(Arc::new(value.clone()))), &mut pending_sorted);
                 }
                 _ => {}
             }
