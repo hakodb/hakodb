@@ -8,7 +8,11 @@ use hakodb::engine::{BatchMutation, Hako};
 use std::time::Duration;
 
 fn dir() -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!("hako-txn-patch-{}", std::process::id()));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let p = std::env::temp_dir().join(format!("hako-txn-patch-{}-{nanos}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
     p
 }
@@ -45,3 +49,4 @@ fn transaction_patch_still_detects_concurrent_write() {
     assert!(tx.commit(&db).is_err(), "stale transaction must conflict");
     let _ = std::fs::remove_dir_all(&d);
 }
+

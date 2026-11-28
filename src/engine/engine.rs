@@ -1473,7 +1473,7 @@ impl Hako {
 
         let mut doc_versions = Vec::with_capacity(32);
         for _ in 0..32 {
-            doc_versions.push(RwLock::new(HashMap::new()));
+            doc_versions.push(RwLock::new(HashMap::<Arc<str>, u64>::new()));
         }
         // 5. Assemble and Return
         let db = Self {
@@ -1936,6 +1936,22 @@ impl Hako {
 
         storage.blob_tx = Some(self.blob_tx.clone());
         let shard_arc = Arc::new(RwLock::new(storage));
+
+        // Shards are opened lazily, so recovered version stamps must be
+        // rebuilt when the shard first loads (including after restart).
+        {
+            let guard = shard_arc.read().unwrap();
+            for (id, ptr) in guard.index.iter() {
+                if matches!(ptr, Pointer::Deleted { .. }) {
+                    continue;
+                }
+                let bucket = (fxhash::hash64(id) % 32) as usize;
+                self.doc_versions[bucket].write().unwrap().insert(
+                    Arc::from(id.as_str()),
+                    self.global_version.fetch_add(1, Ordering::Relaxed),
+                );
+            }
+        }
 
         let mut shards = self.shards.write().map_err(|_| HakoError::LockPoisoned("shards".into()))?;
         if let Some(existing) = shards.get(collection) {
@@ -3918,6 +3934,11 @@ impl Hako {
         if plan.scan_limit.is_some() {
             plan.scan_limit = query.limit.map(|limit| limit + query.offset.unwrap_or(0));
         }
+        let has_cursor_bounds = query.start_at.is_some()
+            || query.start_after.is_some()
+            || query.end_at.is_some()
+            || query.end_before.is_some();
+        if !has_cursor_bounds {
         if let crate::query::plan::ScanType::SecondaryIndexRange { field, reverse, .. } = &plan.scan {
             let mut start = Bound::Unbounded;
             let mut end = Bound::Unbounded;
@@ -3946,6 +3967,7 @@ impl Hako {
                 end,
                 reverse: *reverse,
             };
+        }
         }
     }
 
